@@ -122,7 +122,8 @@ public sealed class GuestPageTracker
         return count;
     }
 
-    public void MarkCpuDirtyPages(ulong vaddr, ulong size) => Mark(vaddr, size, WriteOrigin.Cpu, enable: true, create: true);
+    // Reports whether at least one page transitioned from clean to CPU-dirty.
+    public bool MarkCpuDirtyPages(ulong vaddr, ulong size) => Mark(vaddr, size, WriteOrigin.Cpu, enable: true, create: true);
 
     public void MarkGpuDirtyPages(ulong vaddr, ulong size) => Mark(vaddr, size, WriteOrigin.Gpu, enable: true, create: true);
 
@@ -369,22 +370,25 @@ public sealed class GuestPageTracker
         }
     }
 
-    private void Mark(ulong vaddr, ulong size, WriteOrigin side, bool enable, bool create)
+    private bool Mark(ulong vaddr, ulong size, WriteOrigin side, bool enable, bool create)
     {
         RejectUploadCallbackReentry();
+        var changed = false;
         VisitRegions(vaddr, size, create, (region, offset, bytes) =>
         {
             using var _ = region.Lock.Hold();
             if (side == WriteOrigin.Cpu && enable)
             {
-                region.MarkCpuWrite(region.BaseAddress + offset, bytes);
+                changed |= region.MarkCpuWrite(region.BaseAddress + offset, bytes);
             }
             else
             {
                 region.ChangeState(side, enable, region.BaseAddress + offset, bytes);
+                changed = true;
             }
             return false;
         });
+        return changed;
     }
 
     private void VisitDirtyRanges(ulong vaddr, ulong size, WriteOrigin side, bool clear, Action<ulong, ulong> visit) =>

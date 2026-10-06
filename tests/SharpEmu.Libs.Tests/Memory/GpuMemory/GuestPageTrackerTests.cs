@@ -154,6 +154,19 @@ public sealed class GuestPageTrackerTests : IDisposable
     }
 
     [NativePageProtectionFact]
+    public void RepeatedCpuDirtyMarkDoesNotRepeatTheOwnershipTransition()
+    {
+        var address = Allocate(1);
+        _tracker.ForEachUploadRange(address, Page, false, NoRange, NoUpload, preserveCpuWriteHotPages: false);
+
+        Assert.True(_tracker.MarkCpuDirtyPages(address + 16, 8));
+        Assert.False(_tracker.MarkCpuDirtyPages(address + 16, 8));
+
+        _tracker.UntrackMemory(address, Page);
+        Release(address, Page);
+    }
+
+    [NativePageProtectionFact]
     public void LockFreeCpuDirtyQueryAgreesWithTheLockedQuery()
     {
         var address = Allocate(2);

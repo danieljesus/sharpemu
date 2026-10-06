@@ -72,15 +72,21 @@ public sealed class TrackedRegion
     }
 
     // Count only clean-to-dirty transitions. Repeated reads cannot make a page hot.
-    public void MarkCpuWrite(ulong address, ulong size)
+    // Returns whether this write changed ownership from clean to CPU-dirty.
+    // Callers use the result to avoid repeating protection bookkeeping for a
+    // page that was already CPU-owned.
+    public bool MarkCpuWrite(ulong address, ulong size)
     {
         var (start, end) = GetPageRange(address, size);
+        var changed = false;
         for (var page = start; page < end; page++)
         {
             if (_cpuDirty.Get(page))
             {
                 continue;
             }
+
+            changed = true;
 
             if (_recentCpuUploads.Get(page))
             {
@@ -101,7 +107,17 @@ public sealed class TrackedRegion
             }
         }
 
+        // The page is already writable and CPU-owned. Re-running ChangeState
+        // scans every page in the 4 MiB region and republishes the same summary,
+        // once for every managed guest-store; do neither when ownership did not
+        // change. Callers hold Lock while reading and updating these masks.
+        if (!changed)
+        {
+            return false;
+        }
+
         ChangeState(WriteOrigin.Cpu, enable: true, address, size);
+        return true;
     }
 
     public void ChangeState(WriteOrigin side, bool enable, ulong address, ulong size)
