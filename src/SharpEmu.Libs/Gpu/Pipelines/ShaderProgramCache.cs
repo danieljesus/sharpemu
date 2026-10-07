@@ -140,6 +140,16 @@ internal sealed class ShaderProgramCache
 
     public IEnumerable<ProgramSourceEntry> Entries => _programs.Values;
 
+    private void DumpFailedShader(ShaderSource source)
+    {
+        var dumpDir = Environment.GetEnvironmentVariable("LOCAL_DUMP_FAILED_SHADER");
+        if (string.IsNullOrEmpty(dumpDir)) return;
+        var bytes = new byte[Math.Max(source.CodeSize, 64u * 1024u)];
+        var read = 0;
+        while (read < bytes.Length && _context.Memory.TryRead(source.Address + (ulong)read, bytes.AsSpan(read, 4))) read += 4;
+        File.WriteAllBytes(Path.Combine(dumpDir, $"shader_{source.Hash:X16}.bin"), bytes.AsSpan(0, read).ToArray());
+    }
+
     // The decoded instructions of a program, shared by every static variant of the same code.
     public Gen5ShaderProgram Decode(ShaderSource source)
     {
@@ -153,14 +163,7 @@ internal sealed class ShaderProgramCache
         var context = recording is null ? _context : new CpuContext(recording, _context.TargetGeneration);
         if (!Gen5ShaderTranslator.TryDecodeProgram(context, source.Address, out program, out var error))
         {
-            var dumpDir = Environment.GetEnvironmentVariable("LOCAL_DUMP_FAILED_SHADER");
-            if (!string.IsNullOrEmpty(dumpDir))
-            {
-                var bytes = new byte[Math.Max(source.CodeSize, 64u * 1024u)];
-                var read = 0;
-                while (read < bytes.Length && _context.Memory.TryRead(source.Address + (ulong)read, bytes.AsSpan(read, 4))) read += 4;
-                File.WriteAllBytes(Path.Combine(dumpDir, $"shader_{source.Hash:X16}.bin"), bytes.AsSpan(0, read).ToArray());
-            }
+            DumpFailedShader(source);
             throw SubmissionScheduler.Fatal($"The shader program cannot be decoded: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={error}.");
         }
 
@@ -376,6 +379,7 @@ internal sealed class ShaderProgramCache
         catch (ResourcePlanException exception)
         {
             if (dumpPlanning) ShaderPlanningDump.WriteFailure(source, exception.Message);
+            DumpFailedShader(source);
             throw new ShaderProgramRejectedException($"The shader resource plan is invalid: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={exception.Message}.");
         }
 
