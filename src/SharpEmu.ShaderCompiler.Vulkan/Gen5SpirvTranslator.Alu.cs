@@ -284,6 +284,24 @@ public static partial class Gen5SpirvTranslator
 
                     break;
                 }
+                case "VCvtF64F32":
+                {
+                    var converted = _module.AddInstruction(
+                        SpirvOp.FConvert,
+                        DoubleType(),
+                        GetFloatSource(instruction, 0));
+                    if (!TryStoreDoubleResult(
+                            instruction,
+                            destination,
+                            converted,
+                            out result,
+                            out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
                 case "VCvtF32F64":
                 {
                     if (!TryGetDoubleSource(instruction, 0, out var source, out error))
@@ -345,6 +363,7 @@ public static partial class Gen5SpirvTranslator
 
                     break;
                 }
+                case "VFractF64":
                 case "VSqrtF64":
                 {
                     if (!TryGetDoubleSource(instruction, 0, out var source, out error))
@@ -355,7 +374,10 @@ public static partial class Gen5SpirvTranslator
                     if (!TryStoreDoubleResult(
                             instruction,
                             destination,
-                            Ext(31, DoubleType(), source),
+                            Ext(
+                                instruction.Opcode == "VFractF64" ? 10u : 31u,
+                                DoubleType(),
+                                source),
                             out result,
                             out error))
                     {

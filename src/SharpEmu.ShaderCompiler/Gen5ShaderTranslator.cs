@@ -896,6 +896,7 @@ public static partial class Gen5ShaderTranslator
             0x0D => "VCvtFlrI32F32",
             0x0E => "VCvtOffF32I4",
             0x0F => "VCvtF32F64",
+            0x10 => "VCvtF64F32",
             0x11 => "VCvtF32Ubyte0",
             0x12 => "VCvtF32Ubyte1",
             0x13 => "VCvtF32Ubyte2",
@@ -922,6 +923,7 @@ public static partial class Gen5ShaderTranslator
             0x39 => "VFfbhU32",
             0x3A => "VFfblB32",
             0x3B => "VFfbhI32",
+            0x3E => "VFractF64",
             0x42 => "VMovreldB32",
             0x43 => "VMovrelsB32",
             0x44 => "VMovrelsdB32",
@@ -1284,10 +1286,12 @@ public static partial class Gen5ShaderTranslator
             // conversions and transcendentals.
             0x184 => "VCvtF64I32",
             0x18F => "VCvtF32F64",
+            0x190 => "VCvtF64F32",
             0x196 => "VCvtF64U32",
             0x1AF => "VRcpF64",
             0x1B0 => "VRsqF64",
             0x1B4 => "VSqrtF64",
+            0x1BE => "VFractF64",
             // VOP3-encoded half-precision transcendentals and rounding.
             0x1D4 => "VRcpF16",
             0x1D5 => "VSqrtF16",
