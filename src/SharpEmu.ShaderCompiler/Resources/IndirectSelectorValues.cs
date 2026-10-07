@@ -22,6 +22,14 @@ public sealed class IndirectSelectorValues
     // Every graph value the selector evaluates at run time.
     internal IEnumerable<ScalarValue> RuntimeValues()
     {
+        if (_waveBounds is not null)
+        {
+            foreach (var value in _waveBounds.Values)
+            {
+                yield return value;
+            }
+        }
+
         var pending = new Stack<Expression>();
         pending.Push(_root);
         while (pending.TryPop(out var expression))

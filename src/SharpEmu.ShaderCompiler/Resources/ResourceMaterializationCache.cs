@@ -88,7 +88,8 @@ public sealed class ResourceMaterializationCache
             {
                 if (!variant.Matches(plan, inputs))
                     continue;
-                if (Validate(variant, inputs, residentReader, out var variantUnreadable))
+                if (Validate(variant, inputs, residentReader, out var variantUnreadable) &&
+                    variant.SnapshotFor(inputs) is { } hit)
                 {
                     if (previous is not null)
                     {
@@ -99,7 +100,7 @@ public sealed class ResourceMaterializationCache
 
                     Hits++;
                     Interlocked.Increment(ref _totalHits);
-                    snapshot = variant.SnapshotFor(inputs);
+                    snapshot = hit;
                     specialization = variant.Specialization;
                     failure = default;
                     return true;
@@ -477,15 +478,38 @@ public sealed class ResourceMaterializationCache
 
         // The cached snapshot, with the draw's own user data when it differs from the entry's:
         // the words the plan reads through are not part of the key, and the host still binds
-        // every user-data word the shader reads directly.
-        public ResourceSnapshot SnapshotFor(ResourceRuntimeInputs inputs)
+        // every user-data word the shader reads directly. Buffer dwords computed from user data
+        // are evaluated again for this draw; null when one changed beyond its base address, since
+        // the buffer's specialization was derived from the cached words.
+        public ResourceSnapshot? SnapshotFor(ResourceRuntimeInputs inputs)
         {
             if (UserDataEquals(inputs))
                 return Snapshot;
+            var buffers = Snapshot.Buffers;
+            var use = Plan.UserDataUse;
+            foreach (var dword in use.RebasableDwords)
+            {
+                if ((uint)dword.Buffer >= (uint)buffers.Length || (uint)dword.Dword >= (uint)buffers[dword.Buffer].Length ||
+                    !use.TryEvaluatePure(dword.Value, inputs.UserData, out var evaluated))
+                    return null;
+                var word = (uint)evaluated;
+                var cached = buffers[dword.Buffer][dword.Dword];
+                if (word == cached)
+                    continue;
+                // Only the base address may move: dword 0 and the low 16 bits of dword 1.
+                if (dword.Dword > 1 || (dword.Dword == 1 && ((word ^ cached) >> 16) != 0))
+                    return null;
+                if (ReferenceEquals(buffers, Snapshot.Buffers))
+                    buffers = [.. Snapshot.Buffers];
+                if (ReferenceEquals(buffers[dword.Buffer], Snapshot.Buffers[dword.Buffer]))
+                    buffers[dword.Buffer] = [.. Snapshot.Buffers[dword.Buffer]];
+                buffers[dword.Buffer][dword.Dword] = word;
+            }
+
             var userData = inputs.UserData as uint[] ?? [.. inputs.UserData];
             return new ResourceSnapshot
             {
-                Buffers = Snapshot.Buffers,
+                Buffers = buffers,
                 Images = Snapshot.Images,
                 Samplers = Snapshot.Samplers,
                 FlattenedResourceTable = Snapshot.FlattenedResourceTable,

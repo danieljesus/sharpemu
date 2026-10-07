@@ -374,4 +374,48 @@ public sealed class ResourceMaterializationCacheTests
         Assert.True(Run(cache, plan, heap.Moved(0x4000), [0x5000, 0], out _, out _));
         Assert.Equal((0, 2), (cache.Hits, cache.Misses));
     }
+
+    // A buffer descriptor assembled in the shader from the pointer in s[0:1]: the shader sets
+    // the stride and record count, user data supplies the base address.
+    private static ShaderResourcePlan PointerBufferPlan() =>
+        ShaderResourcePlan.Extract(Program(
+            MoveScalar(0, 2, 64),
+            MoveScalar(4, 3, 0x2C004000),
+            BufferAccess(8, "BufferLoadDword", 0, vectorData: 4),
+            EndProgram(16)), ShaderStage.Compute, Hash, 0, 2);
+
+    [Fact]
+    public void ABufferBuiltFromAMovedPointerIsRebasedOnAHit()
+    {
+        if (!ResourceMaterializationCache.ContentKeyed)
+            return;
+        var plan = PointerBufferPlan();
+        Assert.True(plan.UserDataUse.AnyAddressOnly);
+        Assert.NotEmpty(plan.UserDataUse.RebasableDwords);
+        var heap = new Heap();
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, heap, [0x1000, 0x10], out var first, out var firstSpecialization));
+        Assert.Equal(new uint[] { 0x1000, 0x10, 64, 0x2C004000 }, first.Buffers[0]);
+
+        Assert.True(Run(cache, plan, heap, [0x5000, 0x11], out var second, out var secondSpecialization));
+        Assert.Equal((1, 1), (cache.Hits, cache.Misses));
+        Assert.Equal(new uint[] { 0x5000, 0x11, 64, 0x2C004000 }, second.Buffers[0]);
+        Assert.Equal(new uint[] { 0x1000, 0x10, 64, 0x2C004000 }, first.Buffers[0]);
+        Assert.Same(firstSpecialization, secondSpecialization);
+        Assert.Equal(new uint[] { 0x5000, 0x11 }, second.UserData);
+    }
+
+    [Fact]
+    public void ABufferWhoseStrideBitsMovedMaterializesAgain()
+    {
+        var plan = PointerBufferPlan();
+        var heap = new Heap();
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, heap, [0x1000, 0x10], out _, out _));
+
+        // The high word carries the stride above its base-address bits.
+        Assert.True(Run(cache, plan, heap, [0x1000, 0x10 | (1u << 20)], out var second, out _));
+        Assert.Equal((0, 2), (cache.Hits, cache.Misses));
+        Assert.Equal(0x10 | (1u << 20), second.Buffers[0][1]);
+    }
 }

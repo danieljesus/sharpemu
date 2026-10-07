@@ -7,6 +7,8 @@ namespace SharpEmu.ShaderCompiler.Resources;
 // A failed proof leaves the general selector analysis unchanged.
 internal sealed class WaveMaskSelectorBounds(ScalarValue firstRecord, ScalarValue recordCount, uint rowShift)
 {
+    internal IEnumerable<ScalarValue> Values => [firstRecord, recordCount];
+
     internal bool TryEvaluate(RuntimeValueEvaluator evaluator, ComputeSelectorState? state, out uint[] values)
     {
         values = [];
