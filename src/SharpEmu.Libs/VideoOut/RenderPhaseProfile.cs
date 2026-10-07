@@ -380,13 +380,19 @@ internal static class RenderPhaseProfile
     /// Closes out the running phase and switches to <paramref name="next"/>,
     /// returning the phase that was running.
     /// </summary>
+    // [local] Managed bytes allocated by the render thread while each phase ran.
+    private static readonly long[] _allocatedBytes = new long[(int)Phase.Count];
+    [ThreadStatic] private static long _lastAllocated;
+
     private static Phase Charge(Phase next)
     {
         var now = Stopwatch.GetTimestamp();
+        var allocated = GC.GetAllocatedBytesForCurrentThread();
         var previous = _current;
         if (_lastTimestamp != 0)
         {
             _ticks[(int)previous] += now - _lastTimestamp;
+            _allocatedBytes[(int)previous] += allocated - _lastAllocated;
             if (FrameTraceEnabled)
             {
                 _framePhaseTicks[(int)previous] += now - _lastTimestamp;
@@ -394,6 +400,7 @@ internal static class RenderPhaseProfile
         }
 
         _lastTimestamp = now;
+        _lastAllocated = allocated;
         _current = next;
         return previous;
     }
@@ -464,6 +471,22 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(
             $"[PERF][RENDER_MS] window_s={seconds:F1} frames={frames} " +
             string.Join(" ", parts.Select(part => $"{part.Phase}={part.Milliseconds:F2}ms/n{part.Entries}")));
+
+        var allocations = new List<(Phase Phase, long Bytes)>((int)Phase.Count);
+        for (var index = 0; index < (int)Phase.Count; index++)
+        {
+            var bytes = _allocatedBytes[index];
+            _allocatedBytes[index] = 0;
+            if (bytes > 0)
+            {
+                allocations.Add(((Phase)index, bytes));
+            }
+        }
+
+        allocations.Sort(static (left, right) => right.Bytes.CompareTo(left.Bytes));
+        Console.Error.WriteLine(
+            $"[PERF][RENDER_ALLOC] window_s={seconds:F1} frames={frames} total_kb={allocations.Sum(part => part.Bytes) / 1024} " +
+            string.Join(" ", allocations.Select(part => $"{part.Phase}={part.Bytes / 1024}kb")));
 
         ReportImageUploads();
         BufferUploadProfile.Report();
