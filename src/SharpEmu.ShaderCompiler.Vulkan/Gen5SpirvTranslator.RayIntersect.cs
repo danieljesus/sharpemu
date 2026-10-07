@@ -32,9 +32,22 @@ public static partial class Gen5SpirvTranslator
 
         private uint[]? _rayResult;
 
+        // [local] LOCAL_RAY_MISS=1 makes every node test miss, so traversal ends at once.
+        private static readonly bool LocalRayMiss = Environment.GetEnvironmentVariable("LOCAL_RAY_MISS") == "1";
+
         private void EmitRayIntersect(Gen5RayIntersectControl ray, bool bvh64)
         {
             _rayResult ??= DeclareRayResult();
+            if (LocalRayMiss)
+            {
+                EmitExecConditional(() =>
+                {
+                    for (var component = 0u; component < Gen5RayIntersectControl.ResultDwords; component++)
+                        StoreV(ray.VectorData + component, UInt(InvalidNode));
+                });
+                return;
+            }
+
             EmitExecConditional(() => EmitRayIntersectActive(ray, bvh64));
         }
 
