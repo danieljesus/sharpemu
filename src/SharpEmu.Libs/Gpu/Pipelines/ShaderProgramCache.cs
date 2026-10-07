@@ -161,6 +161,12 @@ internal sealed class ShaderProgramCache
 
         var recording = _host.ShaderPrewarm is not null ? new RecordingCpuMemory(_context.Memory) : null;
         var context = recording is null ? _context : new CpuContext(recording, _context.TargetGeneration);
+        if (Environment.GetEnvironmentVariable("LOCAL_DUMP_SHADER_HASH") is { Length: > 0 } wanted &&
+            wanted.Contains($"{source.Hash:X16}", StringComparison.OrdinalIgnoreCase))
+        {
+            DumpFailedShader(source);
+        }
+
         if (!Gen5ShaderTranslator.TryDecodeProgram(context, source.Address, out program, out var error))
         {
             DumpFailedShader(source);
