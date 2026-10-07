@@ -268,6 +268,24 @@ public sealed class DirectImageTableTests
         return (snapshot, new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = 1, ThreadCountX = 1 });
     }
 
+    [Fact]
+    public void CubeCandidateOfAPlain2DAccessIsMaterializedAsNull()
+    {
+        var plan = ShaderResourcePlan.Extract(CreateWaveIndexedDescriptorProgram(), ShaderStage.Compute, Hash, 0, 2);
+        bool Read(ulong address, out uint word)
+        {
+            var success = ReadWaveIndexedMemory(address, out word);
+            if (address == 0x1000 + 0x100 + 5 * 32 + 12) word = (word & 0x0FFFFFFFu) | (11u << 28);
+            return success;
+        }
+
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.True(ResourceMaterializer.Materialize(plan, Inputs([0x1000, 0], readCleanMemory: Read), ref snapshot, ref specialization, out var failure), $"materialize {failure}");
+        Assert.Equal(2, snapshot.Images.Length);
+        Assert.Single(snapshot.Images, image => image.All(word => word == 0));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -555,7 +573,8 @@ public sealed class DirectImageTableTests
             if (address == 0x1000 + 344 + 12)
             {
                 if (!incompatible) return false;
-                word = (word & 0x0FFFFFFF) | (11u << 28);
+                // A 3D descriptor; a cube one would now be dropped as unreachable from a 2D access.
+                word = (word & 0x0FFFFFFF) | (10u << 28);
             }
             return success;
         }

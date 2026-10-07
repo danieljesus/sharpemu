@@ -167,7 +167,7 @@ public static class ResourceMaterializer
                     for (var candidateIndex = 0; candidateIndex < descriptors.Count; candidateIndex++)
                     {
                         var descriptor = descriptors[candidateIndex];
-                        if (!UsableImageCandidate(descriptor.Dwords, image.R128))
+                        if (!UsableImageCandidate(descriptor.Dwords, image))
                             descriptor = DescriptorWords.Empty(8);
                         var existing = directTable.Descriptors.FindIndex(candidate => candidate.SameAs(descriptor));
                         if (existing < 0)
@@ -543,9 +543,13 @@ public static class ResourceMaterializer
         return true;
     }
 
-    private static bool UsableImageCandidate(ReadOnlySpan<uint> candidate, bool r128) =>
-        !NullImageDescriptor(candidate) && ValidImageDescriptor(candidate, r128) && ReservedImageBitsClear(candidate) &&
-        GuestImageFormat.SampledNumericClass(GuestImageFormat.FormatOf(candidate)) != ImageNumericClass.Unsupported;
+    // A table can hold descriptors for several kinds of access. A cube descriptor cannot be
+    // addressed by an instruction whose DIM field is plain 2D, so for that instruction the
+    // candidate is unreachable and is treated like any other unusable entry.
+    private static bool UsableImageCandidate(ReadOnlySpan<uint> candidate, ImageResource image) =>
+        !NullImageDescriptor(candidate) && ValidImageDescriptor(candidate, image.R128) && ReservedImageBitsClear(candidate) &&
+        GuestImageFormat.SampledNumericClass(GuestImageFormat.FormatOf(candidate)) != ImageNumericClass.Unsupported &&
+        !(image.Dimension == ImageDimension.Dim2D && GuestImageFormat.ImageTypeOf(candidate) == GuestImageFormat.ImageTypeCube);
 
     private static ulong ScalarBufferSize(ReadOnlySpan<uint> descriptor)
     {
@@ -656,7 +660,7 @@ public static class ResourceMaterializer
                 }
             }
 
-            if (!UsableImageCandidate(candidate, image.R128))
+            if (!UsableImageCandidate(candidate, image))
             {
                 Array.Clear(candidate);
             }
@@ -709,7 +713,7 @@ public static class ResourceMaterializer
                     return false;
             }
 
-            if (!UsableImageCandidate(candidate, r128))
+            if (!UsableImageCandidate(candidate, image))
                 Array.Clear(candidate);
             probed.Add(candidate);
         }
@@ -766,7 +770,7 @@ public static class ResourceMaterializer
                     return false;
             }
 
-            if (!UsableImageCandidate(candidate, r128))
+            if (!UsableImageCandidate(candidate, image))
                 Array.Clear(candidate);
             probed.Add(candidate);
             offsets.Add(unchecked(indirect.DynamicOffsetBase + (key << 5)));
