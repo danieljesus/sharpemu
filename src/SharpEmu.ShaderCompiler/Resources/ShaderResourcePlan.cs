@@ -43,6 +43,11 @@ public sealed class ShaderResourcePlan
     public ShaderResourceInfo Info { get; private set; } = new();
 
     internal RawReadPrefetchPlan? RawReadPrefetch { get; set; }
+
+    private UserDataUseAnalysis? _userDataUse;
+
+    // Which user-data registers reach the materialized outputs, and which only address raw reads.
+    public UserDataUseAnalysis UserDataUse => _userDataUse ??= UserDataUseAnalysis.Of(this);
     private readonly object _compileGate = new();
     private CompiledResourceEvaluator? _compiledEvaluator;
     private int _compiledEvaluatorState;

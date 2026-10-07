@@ -33,7 +33,11 @@ public sealed class ResourceMaterializationCache
     private static long _totalHits;
     private static long _totalMisses;
     private static long _totalUncacheable;
-    private const int MaxVariants = 4;
+    private const int MaxVariants = 8;
+
+    // SHARPEMU_MATERIALIZATION_CONTENT_KEY=0 keys entries on every user-data word again, as
+    // before the key was reduced to the words that reach the outputs.
+    internal static readonly bool ContentKeyed = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZATION_CONTENT_KEY") != "0";
     private static long _totalStale;
     private static long _totalStaleUnreadable;
     private static long _totalRefreshes;
@@ -84,7 +88,7 @@ public sealed class ResourceMaterializationCache
             {
                 if (!variant.Matches(plan, inputs))
                     continue;
-                if (Validate(variant, residentReader, out var variantUnreadable))
+                if (Validate(variant, inputs, residentReader, out var variantUnreadable))
                 {
                     if (previous is not null)
                     {
@@ -95,7 +99,7 @@ public sealed class ResourceMaterializationCache
 
                     Hits++;
                     Interlocked.Increment(ref _totalHits);
-                    snapshot = variant.Snapshot;
+                    snapshot = variant.SnapshotFor(inputs);
                     specialization = variant.Specialization;
                     failure = default;
                     return true;
@@ -104,7 +108,7 @@ public sealed class ResourceMaterializationCache
                 unreadable |= variantUnreadable;
             }
 
-            if (TryRefreshTable(key, cached, plan, inputs, residentReader, out var refreshed))
+            if (cached.UserDataEquals(inputs) && TryRefreshTable(key, cached, plan, inputs, residentReader, out var refreshed))
             {
                 TableRefreshes++;
                 Interlocked.Increment(ref _totalRefreshes);
@@ -231,7 +235,7 @@ public sealed class ResourceMaterializationCache
             if (!evaluated || recorder.Failed || table.Length != cachedTable.Length)
                 return false;
 
-            foreach (var (address, word, _, _) in recorder.Reads)
+            foreach (var (address, word, _, _, _) in recorder.Reads)
             {
                 if (!TryFindWord(cached, address, out var offset) ||
                     System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(current.AsSpan(offset, sizeof(uint))) != word)
@@ -253,6 +257,8 @@ public sealed class ResourceMaterializationCache
                 RangeOffsets = cached.RangeOffsets,
                 RangeLengths = cached.RangeLengths,
                 RangeClean = cached.RangeClean,
+                RangeBase = cached.RangeBase,
+                ExactUserData = cached.ExactUserData,
                 WordTableOnly = cached.WordTableOnly,
                 TableRefreshable = true,
                 Bytes = current,
@@ -326,14 +332,20 @@ public sealed class ResourceMaterializationCache
         hash.Add(inputs.ShaderBase);
         hash.Add(inputs.ComputeState);
         var userData = inputs.UserData;
+        var use = ContentKeyed ? plan.UserDataUse : null;
         hash.Add(userData.Count);
-        for (var index = 0; index < userData.Count; index++)
-            hash.Add(userData[index]);
-        var low = (uint)hash.ToHashCode();
         // A second, independent mix keeps accidental collisions out of the 64-bit key.
         var high = 0x9E3779B9u;
         for (var index = 0; index < userData.Count; index++)
-            high = (high ^ userData[index]) * 0x01000193u;
+        {
+            // A word the plan only reads through contributes nothing: entries based on other
+            // pointers are found by the key and told apart by what they read.
+            var word = use is null || use.IsValueRegister(index) ? userData[index] : 0u;
+            hash.Add(word);
+            high = (high ^ word) * 0x01000193u;
+        }
+
+        var low = (uint)hash.ToHashCode();
         return ((ulong)high << 32) | low;
     }
 
@@ -359,16 +371,20 @@ public sealed class ResourceMaterializationCache
         _young[key] = entry;
     }
 
-    private bool Validate(Entry entry, ResidentGuestBytesReader residentReader, out bool unreadable)
+    private const ulong AddressMask = 0x0000_FFFF_FFFF_FFFFul;
+
+    private bool Validate(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader, out bool unreadable)
     {
         unreadable = false;
         for (var index = 0; index < entry.RangeAddresses.Length; index++)
         {
+            if (!entry.TryRebase(index, inputs, out var address))
+                return false;
             var length = entry.RangeLengths[index];
             if (_scratch.Length < length)
                 _scratch = new byte[Math.Max(length, _scratch.Length * 2)];
             var current = _scratch.AsSpan(0, length);
-            if (!residentReader(entry.RangeAddresses[index], current, entry.RangeClean[index]))
+            if (!residentReader(address, current, entry.RangeClean[index]))
             {
                 unreadable = true;
                 return false;
@@ -391,6 +407,11 @@ public sealed class ResourceMaterializationCache
         public required int[] RangeOffsets { get; init; }
         public required int[] RangeLengths { get; init; }
         public required bool[] RangeClean { get; init; }
+        // Per range: the user-data register pair its address was based on, AbsoluteBase when the
+        // address does not move with the user data, UnknownBase when the reader could not tell.
+        public required int[] RangeBase { get; init; }
+        // A range read through an unknown base keeps the entry to draws with the same user data.
+        public required bool ExactUserData { get; init; }
         // Per recorded dword: read only while the flattened table was evaluated.
         public required bool[] WordTableOnly { get; init; }
         // The table has the plan's plain layout, so no specialization read or extended it.
@@ -405,16 +426,78 @@ public sealed class ResourceMaterializationCache
             if (!ReferenceEquals(Plan, plan) || ShaderBase != inputs.ShaderBase ||
                 !Nullable.Equals(ComputeState, inputs.ComputeState) || UserData.Length != inputs.UserData.Count)
                 return false;
+            if (ExactUserData || !ContentKeyed)
+                return UserDataEquals(inputs);
+            var use = plan.UserDataUse;
+            for (var index = 0; index < UserData.Length; index++)
+                if (use.IsValueRegister(index) && UserData[index] != inputs.UserData[index])
+                    return false;
+            return true;
+        }
+
+        public bool UserDataEquals(ResourceRuntimeInputs inputs)
+        {
+            if (UserData.Length != inputs.UserData.Count)
+                return false;
             for (var index = 0; index < UserData.Length; index++)
                 if (UserData[index] != inputs.UserData[index])
                     return false;
             return true;
         }
+
+        // The address of a recorded range for this draw: the recorded one, or the recorded one
+        // moved by the difference between the draw's and the entry's base pointer. Only the 48
+        // address bits may differ; the stride and record fields of a buffer handle live in the
+        // same words and change the address formula.
+        public bool TryRebase(int range, ResourceRuntimeInputs inputs, out ulong address)
+        {
+            address = RangeAddresses[range];
+            var register = RangeBase[range];
+            if (register < 0)
+                return register == UserDataUseAnalysis.AbsoluteBase || UserDataEquals(inputs);
+            var index = register - (int)Plan.UserDataBase;
+            if (index < 0 || index + 1 >= UserData.Length)
+                return false;
+            var recorded = (UserData[index] | ((ulong)UserData[index + 1] << 32));
+            var current = (inputs.UserData[index] | ((ulong)inputs.UserData[index + 1] << 32));
+            if (recorded == current)
+                return true;
+            if (((recorded ^ current) & ~AddressMask) != 0)
+                return false;
+            var recordedBase = recorded & AddressMask;
+            var currentBase = current & AddressMask;
+            if (recordedBase == 0 || currentBase == 0)
+                return false;
+            var moved = address + currentBase - recordedBase;
+            if (moved > AddressMask)
+                return false;
+            address = moved;
+            return true;
+        }
+
+        // The cached snapshot, with the draw's own user data when it differs from the entry's:
+        // the words the plan reads through are not part of the key, and the host still binds
+        // every user-data word the shader reads directly.
+        public ResourceSnapshot SnapshotFor(ResourceRuntimeInputs inputs)
+        {
+            if (UserDataEquals(inputs))
+                return Snapshot;
+            var userData = inputs.UserData as uint[] ?? [.. inputs.UserData];
+            return new ResourceSnapshot
+            {
+                Buffers = Snapshot.Buffers,
+                Images = Snapshot.Images,
+                Samplers = Snapshot.Samplers,
+                FlattenedResourceTable = Snapshot.FlattenedResourceTable,
+                UserData = userData,
+                DeviceAddressRanges = Snapshot.DeviceAddressRanges,
+            };
+        }
     }
 
     private sealed class ReadRecorder
     {
-        private readonly List<(ulong Address, uint Word, bool Clean, bool Table)> _reads = new();
+        private readonly List<(ulong Address, uint Word, bool Clean, bool Table, int Base)> _reads = new();
         private bool _inTable;
         private GuestWordReader? _reader;
         private GuestWordReader? _cleanReader;
@@ -451,7 +534,7 @@ public sealed class ResourceMaterializationCache
 
         public bool Failed { get; private set; }
 
-        public List<(ulong Address, uint Word, bool Clean, bool Table)> Reads => _reads;
+        public List<(ulong Address, uint Word, bool Clean, bool Table, int Base)> Reads => _reads;
 
         public Action<bool> TablePhase { get; }
 
@@ -475,7 +558,7 @@ public sealed class ResourceMaterializationCache
                 Failed = true;
                 return false;
             }
-            _reads.Add((address, word, clean, _inTable));
+            _reads.Add((address, word, clean, _inTable, RuntimeValueEvaluator.CurrentReadBase));
             return true;
         }
 
@@ -494,7 +577,8 @@ public sealed class ResourceMaterializationCache
 
             for (var offset = 0; offset + sizeof(uint) <= destination.Length; offset += sizeof(uint))
                 _reads.Add((address + (ulong)offset,
-                    System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(destination[offset..]), clean, _inTable));
+                    System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(destination[offset..]), clean, _inTable,
+                    RuntimeValueEvaluator.CurrentReadBase));
             return true;
         }
 
@@ -509,12 +593,16 @@ public sealed class ResourceMaterializationCache
             var wordCount = 0;
             ulong end = 0;
             var previous = ulong.MaxValue;
+            var previousBase = UserDataUseAnalysis.UnknownBase;
+            var exactUserData = false;
             foreach (var read in _reads)
             {
+                exactUserData |= read.Base == UserDataUseAnalysis.UnknownBase;
                 if (read.Address == previous) continue;
-                if (wordCount == 0 || read.Address != end) rangeCount++;
+                if (wordCount == 0 || read.Address != end || read.Base != previousBase) rangeCount++;
                 wordCount++;
                 previous = read.Address;
+                previousBase = read.Base;
                 end = read.Address + sizeof(uint);
             }
 
@@ -522,28 +610,36 @@ public sealed class ResourceMaterializationCache
             var offsets = new int[rangeCount];
             var lengths = new int[rangeCount];
             var clean = new bool[rangeCount];
+            var bases = new int[rangeCount];
             var bytes = new byte[wordCount * sizeof(uint)];
             var tableOnly = new bool[wordCount];
             var rangeIndex = -1;
             var wordIndex = -1;
             end = 0;
             previous = ulong.MaxValue;
-            foreach (var (address, word, wordClean, table) in _reads)
+            previousBase = UserDataUseAnalysis.UnknownBase;
+            foreach (var (address, word, wordClean, table, readBase) in _reads)
             {
                 if (address == previous)
                 {
                     clean[rangeIndex] |= wordClean;
                     tableOnly[wordIndex] &= table;
+                    // The same word read through two bases cannot follow either: keep it in place.
+                    if (bases[rangeIndex] != readBase)
+                        bases[rangeIndex] = UserDataUseAnalysis.UnknownBase;
                     continue;
                 }
 
                 wordIndex++;
-                if (rangeIndex < 0 || address != end)
+                if (rangeIndex < 0 || address != end || readBase != previousBase)
                 {
                     rangeIndex++;
                     addresses[rangeIndex] = address;
                     offsets[rangeIndex] = wordIndex * sizeof(uint);
+                    bases[rangeIndex] = readBase;
                 }
+
+                previousBase = readBase;
                 lengths[rangeIndex] += sizeof(uint);
                 clean[rangeIndex] |= wordClean;
                 tableOnly[wordIndex] = table;
@@ -566,6 +662,8 @@ public sealed class ResourceMaterializationCache
                 RangeOffsets = offsets,
                 RangeLengths = lengths,
                 RangeClean = clean,
+                RangeBase = bases,
+                ExactUserData = exactUserData,
                 WordTableOnly = tableOnly,
                 TableRefreshable = snapshot.FlattenedResourceTable.Length ==
                     plan.TableReads.Count + plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount,

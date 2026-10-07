@@ -224,10 +224,25 @@ public sealed class RuntimeValueEvaluator
             return false;
         }
 
-        return ReadRawWord(value.Kind, low, high, (uint)offset, records, (int)memory.Offset, out result);
+        return ReadRawWord(value.Kind, low, high, (uint)offset, records, (int)memory.Offset, UserDataUseAnalysis.BaseRegisterOf(handle), out result);
     }
 
-    internal bool ReadRawWord(ScalarValueKind kind, ulong low, ulong high, uint offset, ulong records, long immediate, out ulong result)
+    // The user-data register pair the raw read in progress is based on (UserDataUseAnalysis
+    // values), for a reader that records what a materialization read and from where. Stored
+    // biased so that the thread-static default of zero means AbsoluteBase on every thread.
+    [ThreadStatic]
+    private static int _currentReadBaseBiased;
+
+    internal static int CurrentReadBase => _currentReadBaseBiased + UserDataUseAnalysis.AbsoluteBase;
+
+    internal static int ExchangeReadBase(int baseRegister)
+    {
+        var previous = CurrentReadBase;
+        _currentReadBaseBiased = baseRegister - UserDataUseAnalysis.AbsoluteBase;
+        return previous;
+    }
+
+    internal bool ReadRawWord(ScalarValueKind kind, ulong low, ulong high, uint offset, ulong records, long immediate, int baseRegister, out ulong result)
     {
         result = 0;
         var baseAddress = ((high << 32) | (uint)low) & AddressMask;
@@ -240,7 +255,19 @@ public sealed class RuntimeValueEvaluator
                 return true;
         }
 
-        if (_inputs.ReadMemory is null || !_inputs.ReadMemory(address, out var word))
+        bool read;
+        uint word = 0;
+        var previousBase = ExchangeReadBase(baseRegister);
+        try
+        {
+            read = _inputs.ReadMemory is not null && _inputs.ReadMemory(address, out word);
+        }
+        finally
+        {
+            ExchangeReadBase(previousBase);
+        }
+
+        if (!read)
         {
             // Every read is evaluated up front, including ones in branches the shader skips
             // when a pointer is null. A load through a null base cannot execute on hardware,
