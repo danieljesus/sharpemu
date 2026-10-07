@@ -181,6 +181,31 @@ public sealed partial class ResourceTracker
         return origins.Count == 0 ? string.Empty : $" (undefined from: {string.Join(", ", origins)})";
     }
 
+    // [local] A descriptor dword read from a table at an offset derived from V_READFIRSTLANE:
+    // the per-lane index of a waterfall loop, which the host cannot evaluate.
+    private static bool IsWaterfallTableWord(ScalarValue value)
+    {
+        if (value.Kind != ScalarValueKind.ScalarBufferWord || value.Operands.Length < 2)
+        {
+            return false;
+        }
+
+        var pending = new Stack<ScalarValue>();
+        var seen = new HashSet<ScalarValue>();
+        pending.Push(value.Operands[1]);
+        while (pending.TryPop(out var current))
+        {
+            if (!seen.Add(current)) continue;
+            if (current.Kind == ScalarValueKind.FirstLane) return true;
+            if (current.Kind == ScalarValueKind.Operation)
+            {
+                foreach (var operand in current.Operands) pending.Push(operand);
+            }
+        }
+
+        return false;
+    }
+
     private bool HasUndefinedOrigin(ScalarValue value, string opcodePrefix)
     {
         var seen = new HashSet<ScalarValue>();
@@ -459,7 +484,8 @@ public sealed partial class ResourceTracker
             // still hard-fail, since those aren't safe to silently zero.
             var dynamicImageFallback = expected is (ScalarValueKind.ImageHandle or ScalarValueKind.SamplerHandle) &&
                 (controlDependent || HasUndefinedOrigin(source.Dwords[badDword], "BufferLoadFormat") ||
-                 (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))));
+                 (nonContiguousImage && source.Dwords.Any(dword => HasUndefinedOrigin(dword, "SAndB32"))) ||
+                 IsWaterfallTableWord(source.Dwords[badDword]));
             if (dynamicImageFallback)
             {
                 source = new DescriptorSource
