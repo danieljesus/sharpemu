@@ -25,7 +25,7 @@ public static partial class Gen5SpirvTranslator
 
         private void DeclareInterpolationParameters()
         {
-            foreach (var instruction in _request.Program.Instructions)
+            foreach (var instruction in _program.Instructions)
             {
                 if (instruction.Opcode == "VInterpMovF32" &&
                     instruction.Control is Gen5InterpolationControl interpolation)
@@ -44,7 +44,7 @@ public static partial class Gen5SpirvTranslator
                 // emitting SPV_KHR_fragment_shader_barycentric on an unsupported device.
                 foreach (var attribute in _perVertexAttributes.ToArray())
                 {
-                    if (_request.Program.Instructions.All(instruction =>
+                    if (_program.Instructions.All(instruction =>
                             instruction.Control is not Gen5InterpolationControl control ||
                             control.Attribute != attribute ||
                             (instruction.Opcode == "VInterpMovF32" && (instruction.Words[0] & 0xFFu) == 2)))

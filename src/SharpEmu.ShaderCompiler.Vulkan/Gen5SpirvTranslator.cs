@@ -256,15 +256,15 @@ public static partial class Gen5SpirvTranslator
             {
                 if (Environment.GetEnvironmentVariable(
                         "SHARPEMU_TRACE_TITLE_INTERFACE") == "1" &&
-                    _request.Program.Address is 0x0000000500780000ul or
+                    _program.Address is 0x0000000500780000ul or
                         0x0000000500781200ul)
                 {
                     Console.Error.WriteLine(
                         $"[AGC][TITLE-INTERFACE] stage={_stage} " +
-                        $"address=0x{_request.Program.Address:X16} " +
+                        $"address=0x{_program.Address:X16} " +
                         $"required_vertex_outputs={_requiredVertexOutputCount} " +
                         $"ps_ena=0x{_pixelInputEnable:X8} ps_addr=0x{_pixelInputAddress:X8}");
-                    foreach (var instruction in _request.Program.Instructions)
+                    foreach (var instruction in _program.Instructions)
                     {
                         if (instruction.Control is Gen5ExportControl export)
                         {
@@ -286,7 +286,7 @@ public static partial class Gen5SpirvTranslator
                     }
                 }
 
-                var blocks = BuildBasicBlocks(_request.Program.Instructions);
+                var blocks = BuildBasicBlocks(_program.Instructions);
                 // The fallback when the full structurer declines: blocks in program order behind a
                 // next-block guard, with natural loops as structured loops.
                 var structuredForward = StructuredForwardBlocks && blocks.Count != 0 && TryBuildLoopRegions(blocks, out _loopLatchByHeader);
@@ -305,7 +305,7 @@ public static partial class Gen5SpirvTranslator
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_FORCE_TITLE_EARLY_COLOR") == "1" &&
-                    _request.Program.Address == 0x0000000500781200ul)
+                    _program.Address == 0x0000000500781200ul)
                 {
                     var earlyOutput = _pixelOutputs
                         .OrderBy(static pair => pair.Key)
@@ -447,7 +447,7 @@ public static partial class Gen5SpirvTranslator
                 if (_stage == Gen5SpirvStage.Pixel &&
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_TRACE_TITLE_SHADER_STATE") == "1" &&
-                    _request.Program.Address == 0x0000000500781200ul)
+                    _program.Address == 0x0000000500781200ul)
                 {
                     var stateOutput = _pixelOutputs
                         .OrderBy(static pair => pair.Key)
@@ -593,14 +593,14 @@ public static partial class Gen5SpirvTranslator
             _privateVec2Pointer =
                 _module.TypePointer(SpirvStorageClass.Private, _vec2Type);
 
-            if (_request.Program.Instructions.Any(static instruction => instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal)))
+            if (_program.Instructions.Any(static instruction => instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal)))
             {
                 // A dynamically indexed private array cannot live in registers: Metal spills the
                 // whole 2 KiB file to thread memory and every VGPR access becomes a memory access
                 // (Octopath's instanced vertex shader: 112 ms per draw). Keep one variable per
                 // register and resolve V_MOVREL* with a select over the registers the program uses.
-                _dynamicVectorRange = DynamicVectorRange(_request.Program);
-                if (MoveRelativeSelectCount(_request.Program, _dynamicVectorRange) > MoveRelativeSelectBudget)
+                _dynamicVectorRange = DynamicVectorRange(_program);
+                if (MoveRelativeSelectCount(_program, _dynamicVectorRange) > MoveRelativeSelectBudget)
                 {
                     // Past the budget the select chains are what costs: one GTA V compute
                     // shader grew to 3 MB of SPIR-V that NVIDIA's compiler did not finish in
@@ -688,7 +688,7 @@ public static partial class Gen5SpirvTranslator
 
         private void DeclareScratch()
         {
-            if (!_request.Program.Instructions.Any(static instruction =>
+            if (!_program.Instructions.Any(static instruction =>
                     instruction.Opcode.StartsWith("Scratch", StringComparison.Ordinal)) &&
                 !_request.Memory.Entries.Any(static memory =>
                     memory.AddressSpace is FlatAddressSpace.Private or FlatAddressSpace.SharedOrPrivate))
@@ -916,7 +916,7 @@ public static partial class Gen5SpirvTranslator
 
                 DeclareAuxPositionOutputs();
 
-                var parameters = _request.Program.Instructions
+                var parameters = _program.Instructions
                     .Select(instruction => instruction.Control)
                     .OfType<Gen5ExportControl>()
                     .Where(export => export.Target is >= 32 and < 64)
@@ -945,7 +945,7 @@ public static partial class Gen5SpirvTranslator
             {
                 var inputVec4Pointer =
                     _module.TypePointer(SpirvStorageClass.Input, _vec4Type);
-                var attributes = _request.Program.Instructions
+                var attributes = _program.Instructions
                     .Select(instruction => instruction.Control)
                     .OfType<Gen5InterpolationControl>()
                     .Select(control => control.Attribute)
@@ -1064,7 +1064,7 @@ public static partial class Gen5SpirvTranslator
                 var declaredPixelOutputs =
                     Environment.GetEnvironmentVariable(
                         "SHARPEMU_FORCE_TITLE_SINGLE_MRT") == "1" &&
-                    _request.Program.Address == 0x0000000500781200ul
+                    _program.Address == 0x0000000500781200ul
                         ? _pixelOutputBindings.Take(1)
                         : _pixelOutputBindings;
                 foreach (var binding in declaredPixelOutputs)
@@ -1470,7 +1470,7 @@ public static partial class Gen5SpirvTranslator
             var sharedMemoryPhase = SharedMemoryPhase.None;
             for (var index = block.StartIndex; index < block.EndIndex; index++)
             {
-                var instruction = _request.Program.Instructions[index];
+                var instruction = _program.Instructions[index];
                 if (halfMaskPlan is not null)
                 {
                     if (halfMaskPlan.ExactPairsBefore.TryGetValue(instruction.Pc, out var exactPairs))
@@ -1532,7 +1532,7 @@ public static partial class Gen5SpirvTranslator
         {
             error = string.Empty;
             var block = blocks[blockIndex];
-            var terminator = _request.Program.Instructions[block.EndIndex - 1];
+            var terminator = _program.Instructions[block.EndIndex - 1];
             if (terminator.Opcode == "SEndpgm")
             {
                 Store(_programActive, _module.ConstantBool(false));
@@ -1550,7 +1550,7 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
-                if (IsExitBranchTarget(_request.Program.Instructions, targetPc))
+                if (IsExitBranchTarget(_program.Instructions, targetPc))
                 {
                     Store(_programActive, _module.ConstantBool(false));
                     return true;
@@ -1571,7 +1571,7 @@ public static partial class Gen5SpirvTranslator
                 var hasTarget = TryGetBranchTargetPc(terminator, out var targetPc);
                 var targetBlock = -1;
                 var hasTargetBlock = hasTarget && TryFindBlock(blocks, targetPc, out targetBlock);
-                var targetExits = hasTarget && IsExitBranchTarget(_request.Program.Instructions, targetPc);
+                var targetExits = hasTarget && IsExitBranchTarget(_program.Instructions, targetPc);
                 var hasCondition = TryGetBranchCondition(terminator.Opcode, out var condition);
                 if (!hasTarget || (!hasTargetBlock && !targetExits) || !hasCondition)
                 {
@@ -1630,7 +1630,7 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            if (IsExitBranchTarget(_request.Program.Instructions, targetPc))
+            if (IsExitBranchTarget(_program.Instructions, targetPc))
             {
                 target = blocks.Count;
                 return true;
@@ -1653,7 +1653,7 @@ public static partial class Gen5SpirvTranslator
             int latch = -1)
         {
             error = string.Empty;
-            var instructions = _request.Program.Instructions;
+            var instructions = _program.Instructions;
             var index = begin;
             while (index < end)
             {
@@ -1840,7 +1840,7 @@ public static partial class Gen5SpirvTranslator
         private bool TryFindLoopLatch(IReadOnlyList<ShaderBlock> blocks, int header, int end, out int latch)
         {
             latch = -1;
-            var instructions = _request.Program.Instructions;
+            var instructions = _program.Instructions;
             for (var index = end - 1; index >= header; index--)
             {
                 var terminator = instructions[blocks[index].EndIndex - 1];
@@ -1898,7 +1898,7 @@ public static partial class Gen5SpirvTranslator
 
             _module.AddStatement(SpirvOp.Branch, continueLabel);
             _module.AddLabel(continueLabel);
-            var terminator = _request.Program.Instructions[blocks[latch].EndIndex - 1];
+            var terminator = _program.Instructions[blocks[latch].EndIndex - 1];
             var again = _module.ConstantBool(true);
             if (terminator.Opcode != "SBranch")
             {
@@ -1932,7 +1932,7 @@ public static partial class Gen5SpirvTranslator
             latchByHeader = [];
             for (var index = 0; index < blocks.Count; index++)
             {
-                var terminator = _request.Program.Instructions[blocks[index].EndIndex - 1];
+                var terminator = _program.Instructions[blocks[index].EndIndex - 1];
                 if (terminator.Opcode != "SBranch" && !terminator.Opcode.StartsWith("SCbranch", StringComparison.Ordinal))
                 {
                     continue;
@@ -1943,7 +1943,7 @@ public static partial class Gen5SpirvTranslator
                     return false;
                 }
 
-                if (IsExitBranchTarget(_request.Program.Instructions, targetPc))
+                if (IsExitBranchTarget(_program.Instructions, targetPc))
                 {
                     continue;
                 }
@@ -6517,7 +6517,7 @@ public static partial class Gen5SpirvTranslator
                 }
                 if (Environment.GetEnvironmentVariable(
                         "SHARPEMU_FORCE_TITLE_EXPORT_EXEC") == "1" &&
-                    _request.Program.Address == 0x0000000500781200ul)
+                    _program.Address == 0x0000000500781200ul)
                 {
                     Store(_exec, _module.ConstantBool(true));
                     StoreS64(
@@ -6580,7 +6580,7 @@ public static partial class Gen5SpirvTranslator
             {
                 outputValue = ConvertPositionToClipSpace(outputValue);
             }
-            if (_request.Program.Address == 0x0000000500780000ul &&
+            if (_program.Address == 0x0000000500780000ul &&
                 export.Target is >= 32 and < 36 &&
                 Environment.GetEnvironmentVariable(
                     "SHARPEMU_FORCE_TITLE_VERTEX_OUTPUTS_ONE") == "1")
@@ -6691,7 +6691,7 @@ public static partial class Gen5SpirvTranslator
             var clipCount = 0u;
             var cullCount = 0u;
 
-            foreach (var export in _request.Program.Instructions
+            foreach (var export in _program.Instructions
                          .Select(static instruction => instruction.Control)
                          .OfType<Gen5ExportControl>()
                          .Where(static export => export.Target is >= 13 and < 16))
@@ -6723,7 +6723,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             if (_request.SupportsClipDistance && clipCount + cullCount < 8 &&
-                _request.Program.Instructions.Any(static instruction =>
+                _program.Instructions.Any(static instruction =>
                     instruction.Control is Gen5ExportControl { Target: 12, EnableMask: not 0 }))
             {
                 // Use a separate plane so auxiliary position exports keep their own distances.
@@ -6981,7 +6981,7 @@ public static partial class Gen5SpirvTranslator
                        System.Globalization.NumberStyles.HexNumber,
                        System.Globalization.CultureInfo.InvariantCulture,
                        out var address) &&
-                   _request.Program.Address == address;
+                   _program.Address == address;
         }
 
         private bool PixelImageCaptureAddressMatches()
@@ -7004,7 +7004,7 @@ public static partial class Gen5SpirvTranslator
                        System.Globalization.NumberStyles.HexNumber,
                        System.Globalization.CultureInfo.InvariantCulture,
                        out var address) &&
-                   _request.Program.Address == address;
+                   _program.Address == address;
         }
 
         private void CapturePixelVgprs(Gen5ShaderInstruction instruction)
@@ -7088,7 +7088,7 @@ public static partial class Gen5SpirvTranslator
                        System.Globalization.NumberStyles.HexNumber,
                        System.Globalization.CultureInfo.InvariantCulture,
                        out var address) &&
-                   _request.Program.Address == address;
+                   _program.Address == address;
         }
 
         private void CapturePixelVgprPoints(Gen5ShaderInstruction instruction)
@@ -7228,7 +7228,7 @@ public static partial class Gen5SpirvTranslator
                        System.Globalization.NumberStyles.HexNumber,
                        System.Globalization.CultureInfo.InvariantCulture,
                        out var address) &&
-                   _request.Program.Address == address;
+                   _program.Address == address;
         }
 
         private uint LoadCompressedExportComponent(
@@ -7270,7 +7270,7 @@ public static partial class Gen5SpirvTranslator
                     $"{packedSource.Value}");
                 if (component == 0 && exportInstruction.Pc == 0x630)
                 {
-                    foreach (var decoded in _request.Program.Instructions.Where(
+                    foreach (var decoded in _program.Instructions.Where(
                                  static decoded => decoded.Pc <= 0x640))
                     {
                         Console.Error.WriteLine(
@@ -7294,9 +7294,9 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            for (var index = _request.Program.Instructions.Count - 1; index >= 0; index--)
+            for (var index = _program.Instructions.Count - 1; index >= 0; index--)
             {
-                var candidate = _request.Program.Instructions[index];
+                var candidate = _program.Instructions[index];
                 if (candidate.Pc >= exportInstruction.Pc)
                 {
                     continue;
@@ -7337,7 +7337,7 @@ public static partial class Gen5SpirvTranslator
                 var packedPointer = PackedHalfPointer(packedSource.Value);
                 if (Environment.GetEnvironmentVariable(
                         "SHARPEMU_FORCE_PACKED_EXPORT_STORE_ONE") == "1" &&
-                    _request.Program.Address == 0x0000000500781200ul)
+                    _program.Address == 0x0000000500781200ul)
                 {
                     Store(
                         packedPointer,
@@ -7396,7 +7396,7 @@ public static partial class Gen5SpirvTranslator
                        System.Globalization.NumberStyles.HexNumber,
                        System.Globalization.CultureInfo.InvariantCulture,
                        out var address) &&
-                   _request.Program.Address == address;
+                   _program.Address == address;
         }
 
         private uint GetPixelOutputType(Gen5PixelOutputKind kind) =>
@@ -7481,13 +7481,13 @@ public static partial class Gen5SpirvTranslator
             }
 
             var ownsLaneZero = !UsesSubgroupOperations();
-            var readRegisters = _request.Program.Instructions
+            var readRegisters = _program.Instructions
                 .Where(static instruction => instruction.Opcode == "VReadlaneB32" &&
                     instruction.Sources.Count > 0 &&
                     instruction.Sources[0].Kind == Gen5OperandKind.VectorRegister)
                 .Select(static instruction => instruction.Sources[0].Value)
                 .ToHashSet();
-            foreach (var instruction in _request.Program.Instructions)
+            foreach (var instruction in _program.Instructions)
             {
                 if (instruction.Opcode == "VWritelaneB32" &&
                     TryGetVectorDestination(instruction, out var register) &&
@@ -7800,7 +7800,7 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            _execFullPcs ??= Ir.Gen5ExecFullAnalysis.Analyze(_request.Program, wave32: _waveLaneCount == 32);
+            _execFullPcs ??= Ir.Gen5ExecFullAnalysis.Analyze(_program, wave32: _waveLaneCount == 32);
             return _execFullPcs.Contains(pc);
         }
 
@@ -7832,7 +7832,7 @@ public static partial class Gen5SpirvTranslator
             var active = Load(_boolType, _exec);
             if (Environment.GetEnvironmentVariable(
                     "SHARPEMU_FORCE_PACKED_STORE_EXEC_VALUES") == "1" &&
-                _request.Program.Address == 0x0000000500781200ul)
+                _program.Address == 0x0000000500781200ul)
             {
                 var activePair = _module.AddInstruction(
                     SpirvOp.CompositeConstruct,
@@ -8270,7 +8270,7 @@ public static partial class Gen5SpirvTranslator
                     .Where(static memory => memory.AddressSpace is FlatAddressSpace.Shared or FlatAddressSpace.SharedOrPrivate)
                     .Select(static memory => memory.Pc)
                     .ToHashSet();
-                _halfMaskPlan = Ir.Gen5Wave64HalfMaskAnalysis.Analyze(_request.Program, sharedFlatPcs);
+                _halfMaskPlan = Ir.Gen5Wave64HalfMaskAnalysis.Analyze(_program, sharedFlatPcs);
             }
 
             return _halfMaskPlan;
@@ -8376,24 +8376,24 @@ public static partial class Gen5SpirvTranslator
         // just those must not get an 8 KiB zero-initialized per-invocation array: Metal pays for it
         // in compile time (seconds for a large pixel shader) and in private memory per pixel.
         private bool UsesLds() =>
-            _request.Program.Instructions.Any(static instruction =>
+            _program.Instructions.Any(static instruction =>
                 instruction.Control is Gen5DataShareControl { Gds: false } &&
                 instruction.Opcode is not ("DsSwizzleB32" or "DsBpermuteB32")) ||
             _request.Memory.Entries.Any(static memory =>
                 memory.AddressSpace is FlatAddressSpace.Shared or FlatAddressSpace.SharedOrPrivate);
 
         private bool UsesSubgroupShuffle() =>
-            _request.Program.Instructions.Any(instruction =>
+            _program.Instructions.Any(instruction =>
                 instruction.Control is Gen5DppControl or Gen5Dpp8Control ||
                 instruction.Opcode is "VPermlane16B32" or "VPermlanex16B32" or "VReadlaneB32" or
                     "DsAppend" or "DsConsume" or "DsSwizzleB32" or "DsBpermuteB32");
 
         private bool UsesSubgroupBroadcast() =>
-            _request.Program.Instructions.Any(instruction =>
+            _program.Instructions.Any(instruction =>
                 instruction.Opcode == "VReadfirstlaneB32");
 
         private bool UsesWaveControl() =>
-            _request.Program.Instructions.Any(instruction =>
+            _program.Instructions.Any(instruction =>
                 instruction.Opcode.Contains("Saveexec", StringComparison.Ordinal) ||
                 instruction.Opcode.StartsWith("SCbranchExec", StringComparison.Ordinal) ||
                 instruction.Opcode.StartsWith("SCbranchVcc", StringComparison.Ordinal) ||
@@ -8406,7 +8406,7 @@ public static partial class Gen5SpirvTranslator
             (UsesSubgroupShuffle() ||
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||
-             _request.Program.Instructions.Any(static instruction =>
+             _program.Instructions.Any(static instruction =>
                  instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32" or "DsWriteAddtidB32" or "DsReadAddtidB32"));
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
