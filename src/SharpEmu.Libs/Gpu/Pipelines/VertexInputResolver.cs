@@ -31,10 +31,12 @@ public readonly record struct ShaderInputSemantic(uint Word)
 // The vertex tables of a draw: attributes from the header semantics, buffers merged by stream.
 public static class VertexInputResolver
 {
+    // The caller may pass the shader's tables when it already read them for this binary.
     public static VertexInputInfo ResolveVertexInputs(CpuContext context, RegisteredShader shader, ReadOnlySpan<uint> userData,
-        uint positionExportControl = 0, ClipSpaceTransform clipSpace = default)
+        uint positionExportControl = 0, ClipSpaceTransform clipSpace = default, VertexTableMetadata? tables = null)
     {
-        if (!TryReadTables(context, shader, GpuCommands.Registers.UserScalarRegisters.Capacity, out var metadata, out var error))
+        var metadata = tables;
+        if (metadata is null && !TryReadTables(context, shader, GpuCommands.Registers.UserScalarRegisters.Capacity, out metadata, out var error))
         {
             throw SubmissionScheduler.Fatal($"The vertex program header is invalid: shader=0x{shader.CodeAddress:X16} error={error}.");
         }

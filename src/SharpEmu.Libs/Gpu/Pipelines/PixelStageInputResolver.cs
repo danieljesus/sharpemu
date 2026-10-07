@@ -63,9 +63,14 @@ public static class PixelStageInputResolver
         ShaderInterfaceRegisters shaderInterface,
         ReadOnlySpan<byte> targetOutputModes,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        uint inputCount)
+        uint inputCount) =>
+        Resolve(shader, shaderInterface, targetOutputModes, targetExportMapping, inputCount,
+            ReadCustomInterpolationMask(context, shader, inputCount));
+
+    // The inputs with custom (non-half) interpolation, from the shader's input semantics. It
+    // depends only on the binary and the input count, so a caller may read it once per shader.
+    public static uint ReadCustomInterpolationMask(CpuContext context, RegisteredShader shader, uint inputCount)
     {
-        var activeInputs = shaderInterface.PixelInputEnable & shaderInterface.PixelInputAddress;
         var customMask = 0u;
         var semanticCount = Math.Min(Math.Min(shader.InputSemanticsCount, inputCount), (uint)PixelInputInfo.InterpolatorCount);
         for (var index = 0u; index < semanticCount; index++)
@@ -82,6 +87,18 @@ public static class PixelStageInputResolver
             }
         }
 
+        return customMask;
+    }
+
+    public static PixelInputInfo Resolve(
+        RegisteredShader shader,
+        ShaderInterfaceRegisters shaderInterface,
+        ReadOnlySpan<byte> targetOutputModes,
+        ReadOnlySpan<ColorComponentMap> targetExportMapping,
+        uint inputCount,
+        uint customMask)
+    {
+        var activeInputs = shaderInterface.PixelInputEnable & shaderInterface.PixelInputAddress;
         var interpolators = new uint[PixelInputInfo.InterpolatorCount];
         for (var index = 0u; index < inputCount; index++)
         {
