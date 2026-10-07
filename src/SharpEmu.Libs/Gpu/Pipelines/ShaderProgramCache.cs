@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Runtime.InteropServices;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Gpu.Rendering;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -68,6 +69,36 @@ public sealed class ProgramKey : IEquatable<ProgramKey>
     public override int GetHashCode() => HashCode.Combine(Stage, Hash, UserDataCount, CodeSize, StaticState.Length);
 }
 
+// The same key over a span of state words, so that a lookup copies nothing: every draw looks
+// its programs up, and a key with its own array is only made when a program is first seen.
+internal readonly ref struct ProgramKeyLookup(ShaderStage stage, ulong hash, uint userDataCount, uint codeSize, ReadOnlySpan<uint> staticState)
+{
+    public readonly ShaderStage Stage = stage;
+    public readonly ulong Hash = hash;
+    public readonly uint UserDataCount = userDataCount;
+    public readonly uint CodeSize = codeSize;
+    public readonly ReadOnlySpan<uint> StaticState = staticState;
+}
+
+internal sealed class ProgramKeyComparer : IEqualityComparer<ProgramKey>, IAlternateEqualityComparer<ProgramKeyLookup, ProgramKey>
+{
+    public static readonly ProgramKeyComparer Instance = new();
+
+    public bool Equals(ProgramKey? x, ProgramKey? y) => x is null ? y is null : x.Equals(y);
+
+    public int GetHashCode(ProgramKey key) => key.GetHashCode();
+
+    public bool Equals(ProgramKeyLookup alternate, ProgramKey other) =>
+        alternate.Stage == other.Stage && alternate.Hash == other.Hash && alternate.UserDataCount == other.UserDataCount &&
+        alternate.CodeSize == other.CodeSize && alternate.StaticState.SequenceEqual(other.StaticState);
+
+    public int GetHashCode(ProgramKeyLookup alternate) =>
+        HashCode.Combine(alternate.Stage, alternate.Hash, alternate.UserDataCount, alternate.CodeSize, alternate.StaticState.Length);
+
+    public ProgramKey Create(ProgramKeyLookup alternate) =>
+        new(alternate.Stage, alternate.Hash, alternate.UserDataCount, alternate.CodeSize, alternate.StaticState.ToArray());
+}
+
 // One compiled module of a program entry for one specialization and push-data start.
 internal sealed class ProgramPermutation
 {
@@ -102,7 +133,7 @@ internal sealed class ShaderProgramCache
     private readonly CpuContext _context;
     private readonly IGuestGpuBackend _compiler;
     private readonly IShaderPipelineHost _host;
-    private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new();
+    private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new(ProgramKeyComparer.Instance);
     private readonly Dictionary<(ulong Hash, uint CodeSize), Gen5ShaderProgram> _decoded = new();
     private readonly Dictionary<(ulong Hash, uint CodeSize), ShaderCodeCapture> _codeCaptures = new();
     private readonly List<uint> _staticState = new(StageStaticKey.MaxWords);
@@ -216,13 +247,16 @@ internal sealed class ShaderProgramCache
 
     private ShaderProgram GetOrCompileCore(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor, out ShaderStageResources stage)
     {
-        ProgramKey key;
+        ProgramKey? key = null;
         ProgramSourceEntry? entry;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCacheLookup))
         {
             BuildStaticState(source.Stage, options);
-            key = new ProgramKey(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, _staticState.ToArray());
-            _programs.TryGetValue(key, out entry);
+            var lookup = new ProgramKeyLookup(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, CollectionsMarshal.AsSpan(_staticState));
+            if (!_programs.GetAlternateLookup<ProgramKeyLookup>().TryGetValue(lookup, out entry))
+            {
+                key = ProgramKeyComparer.Instance.Create(lookup);
+            }
         }
         var sourceWasCached = entry is not null;
         if (RenderTrace.Enabled && RenderTrace.Pipeline())
@@ -246,7 +280,7 @@ internal sealed class ShaderProgramCache
         if (entry is null)
         {
             entry = CreateEntry(source, options);
-            _programs.Add(key, entry);
+            _programs.Add(key!, entry);
             ShaderCacheCounters.CountProgram();
         }
 
@@ -295,6 +329,7 @@ internal sealed class ShaderProgramCache
             }
         }
 
+        key ??= new ProgramKey(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, _staticState.ToArray());
         var permutation = CompilePermutation(source, options, entry, specialization, pushDataCursor, key, sourceWasCached);
         entry.Permutations.Add(permutation);
         ShaderCacheCounters.CountPermutation();

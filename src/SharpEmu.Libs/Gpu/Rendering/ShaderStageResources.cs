@@ -148,9 +148,14 @@ public sealed class PixelInputInfo
     public uint SystemInputBase { get; init; }
     public uint CustomInterpolationMask { get; init; }
     public uint PerspectiveCenterRegister { get; init; } = NoPerspectiveCenterRegister;
-    public uint[] InterpolatorSettings { get; init; } = new uint[InterpolatorCount];
-    public byte[] TargetOutputModes { get; init; } = new byte[TargetCount];
-    public ColorComponentMap[] TargetExportMappings { get; init; } = new ColorComponentMap[TargetCount];
+    // Instances that keep the defaults never write them, so one zeroed set is shared.
+    private static readonly uint[] DefaultInterpolatorSettings = new uint[InterpolatorCount];
+    private static readonly byte[] DefaultTargetOutputModes = new byte[TargetCount];
+    private static readonly ColorComponentMap[] DefaultTargetExportMappings = new ColorComponentMap[TargetCount];
+
+    public uint[] InterpolatorSettings { get; init; } = DefaultInterpolatorSettings;
+    public byte[] TargetOutputModes { get; init; } = DefaultTargetOutputModes;
+    public ColorComponentMap[] TargetExportMappings { get; init; } = DefaultTargetExportMappings;
     public uint ScratchDwords { get; init; }
     public bool PositionX { get; init; }
     public bool PositionY { get; init; }

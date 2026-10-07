@@ -280,14 +280,20 @@ internal static unsafe partial class VulkanVideoPresenter
             _boundGraphicsPipeline = null;
         }
 
+        // One record serves every draw's color targets; it only lives through the acquisition.
+        private ColorAttachment? _drawColorAttachment;
+
         ColorAttachmentAcquisition IRenderHost.AcquireColorAttachment(in ColorTargetState target)
         {
-            var attachment = new ColorAttachment
-            {
-                ImageIdentifier = target.Image,
-                Request = target.Resolution.Request,
-                Resolution = target.Resolution,
-            };
+            var attachment = _drawColorAttachment ??= new ColorAttachment();
+            attachment.ImageIdentifier = target.Image;
+            attachment.Request = target.Resolution.Request;
+            attachment.Resolution = target.Resolution;
+            attachment.Image = null!;
+            attachment.View = default;
+            attachment.Layout = default;
+            attachment.Clear = false;
+            attachment.ClearValue = default;
             AcquireColorAttachment(attachment);
             return new ColorAttachmentAcquisition(
                 attachment.ImageIdentifier,
