@@ -62,6 +62,28 @@ public sealed class Gen5ScalarAbsoluteTests
         Assert.Equal(changesMask ? 0u : registers[15], result.Dwords[3]);
     }
 
+    [Fact]
+    public void SamplerMaskAppliedBeforeALoopIsDiscardedInsideIt()
+    {
+        // The reserved-bit mask is ORed into the sampler before the loop, so the sample in
+        // the loop body sees dword 3 through a loop-invariant phi.
+        var sample = Image(28, "ImageSampleA", 0, 8) with { Words = [0xF0800709u, 0u] };
+        var program = Program(
+            Decode(0x7D840A81), Decode(0xBEEA2D6A) with { Pc = 4 },
+            Decode(0x8F388C6A) with { Pc = 8 }, MoveScalar(12, 24, 0),
+            Decode(0xBE8B030F) with { Pc = 20 }, Decode(0x880B380B) with { Pc = 24 }, sample,
+            Sop2(36, "SAddI32", 24, Gen5Operand.Scalar(24), Operand(1)),
+            Sopc(40, "SCmpLgU32", Gen5Operand.Scalar(24), Operand(4)),
+            Branch(44, "SCbranchScc1", -5), EndProgram(48));
+
+        var plan = Extract(program, userDataCount: 16);
+        var registers = new uint[16];
+        registers[8] = 6;
+        registers[15] = 0xC0000123;
+        Assert.True(RuntimeValueEvaluator.EvaluateDescriptorSource(plan, plan.Info.Samplers[0].Source, Inputs(registers), out var result));
+        Assert.Equal(registers[15], result.Dwords[3]);
+    }
+
     public static TheoryData<uint, uint, uint> QuadmaskValues => new()
     {
         { 0, 0, 0 }, { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFF },

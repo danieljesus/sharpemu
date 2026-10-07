@@ -269,6 +269,13 @@ public sealed partial class ResourceTracker
     {
         for (;;)
         {
+            // A descriptor loaded before a loop reaches its use through a loop-invariant phi.
+            if (value.Kind == ScalarValueKind.Phi && _graph.ResolveInvariantPhi(value) is { } invariant)
+            {
+                value = invariant;
+                continue;
+            }
+
             if (value.Kind != ScalarValueKind.Operation || value.Operation != ScalarOperation.Or32)
             {
                 return value;
