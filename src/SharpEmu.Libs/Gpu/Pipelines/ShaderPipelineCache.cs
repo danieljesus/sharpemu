@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Runtime.CompilerServices;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Images;
@@ -61,13 +62,77 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         return registers.Values.AsSpan(0, (int)count).ToArray();
     }
 
+    // Headers and tables are read from guest memory once per shader binary. The binary at a
+    // code address is known by the hash of its code (declared in the header or computed), which
+    // every draw still establishes: the same hash at the same address is the same binary, so its
+    // registered header, vertex tables and input semantics are reused. A different hash means
+    // the game put another shader there, and everything is read again.
+    private readonly Dictionary<ulong, KnownShader> _knownShaders = new();
+    private readonly Dictionary<RegisteredShader, VertexTableMetadata> _vertexTables = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<(RegisteredShader Shader, uint InputCount), uint> _pixelCustomMasks = new(PixelMaskKeyComparer.Instance);
+
+    private sealed record KnownShader(ulong Hash, RegisteredShader Registered, (ulong Address, uint SizeBytes)[] CodeRanges);
+
+    private sealed class PixelMaskKeyComparer : IEqualityComparer<(RegisteredShader Shader, uint InputCount)>
+    {
+        public static readonly PixelMaskKeyComparer Instance = new();
+
+        public bool Equals((RegisteredShader Shader, uint InputCount) x, (RegisteredShader Shader, uint InputCount) y) =>
+            ReferenceEquals(x.Shader, y.Shader) && x.InputCount == y.InputCount;
+
+        public int GetHashCode((RegisteredShader Shader, uint InputCount) key) =>
+            HashCode.Combine(RuntimeHelpers.GetHashCode(key.Shader), key.InputCount);
+    }
+
     private ShaderSource PrepareSource(ulong codeAddress, ShaderStage stage, string label, UserScalarRegisters registers, uint declaredCount, bool probeWrittenRegisters, uint userDataBase)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramSourceRead);
-        var registered = _registry.Require(codeAddress, label);
-        var hash = ShaderIdentity.Compute(_context.Memory, codeAddress, registered.CodeRanges, label);
+        RegisteredShader registered;
+        ulong hash;
+        if (_knownShaders.TryGetValue(codeAddress, out var known) &&
+            ShaderIdentity.Compute(_context.Memory, codeAddress, known.CodeRanges, label) == known.Hash)
+        {
+            registered = known.Registered;
+            hash = known.Hash;
+        }
+        else
+        {
+            registered = _registry.Require(codeAddress, label);
+            var ranges = registered.CodeRanges;
+            hash = ShaderIdentity.Compute(_context.Memory, codeAddress, ranges, label);
+            _knownShaders[codeAddress] = new KnownShader(hash, registered, ranges);
+        }
+
         var userData = UserData(registers, declaredCount, probeWrittenRegisters, codeAddress, label);
         return new ShaderSource(registered, hash, userData, userDataBase, stage);
+    }
+
+    private VertexTableMetadata VertexTablesOf(RegisteredShader shader)
+    {
+        if (_vertexTables.TryGetValue(shader, out var tables))
+        {
+            return tables;
+        }
+
+        if (!VertexInputResolver.TryReadTables(_context, shader, UserScalarRegisters.Capacity, out tables, out var error))
+        {
+            throw SubmissionScheduler.Fatal($"The vertex program header is invalid: shader=0x{shader.CodeAddress:X16} error={error}.");
+        }
+
+        _vertexTables.Add(shader, tables);
+        return tables;
+    }
+
+    private uint PixelCustomMaskOf(RegisteredShader shader, uint inputCount)
+    {
+        if (_pixelCustomMasks.TryGetValue((shader, inputCount), out var mask))
+        {
+            return mask;
+        }
+
+        mask = PixelStageInputResolver.ReadCustomInterpolationMask(_context, shader, inputCount);
+        _pixelCustomMasks.Add((shader, inputCount), mask);
+        return mask;
     }
 
     public GraphicsPrograms GetGraphicsPrograms(
@@ -113,7 +178,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
             pixelOutputs = ResolveBoundTargets(context, targetExportMapping, depthBound ? pixelProgram.PixelColorExportMasks : null,
                 out var outputModes, out var outputMappings);
-            pixelInfo = PixelStageInputResolver.Resolve(_context, pixelSource.Registered, shaderInterface, outputModes, outputMappings, inputCount);
+            pixelInfo = PixelStageInputResolver.Resolve(pixelSource.Registered, shaderInterface, outputModes, outputMappings, inputCount,
+                PixelCustomMaskOf(pixelSource.Registered, inputCount));
             // SPI_PS_INPUT_CNTL can map an input to any parameter export, beyond the input count;
             // the vertex program must declare every location the pixel program reads.
             attributeCount = Math.Max(attributeCount, ReadVertexOutputCount(pixelFacts, pixelInfo));
@@ -207,7 +273,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         }
 
         return VertexInputResolver.ResolveVertexInputs(_context, source.Registered, source.UserData,
-            shaderInterface.VertexOutputControl, clipSpace);
+            shaderInterface.VertexOutputControl, clipSpace, VertexTablesOf(source.Registered));
     }
 
     // What every draw with a pixel program needs to know about its interpolation: one past the
