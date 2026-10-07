@@ -64,6 +64,8 @@ public static partial class Gen5SpirvTranslator
     private sealed partial class CompilationContext
     {
         private readonly ShaderCompileRequest _request;
+        // The request's program with waterfall loops around relative moves collapsed.
+        private readonly Gen5ShaderProgram _program;
         private readonly Dictionary<DescriptorBindingKind, LayoutImageClass> _imageClasses = [];
         private readonly Dictionary<int, uint> _indirectKeyScratch = [];
         private uint _pushData;
@@ -100,6 +102,7 @@ public static partial class Gen5SpirvTranslator
         public CompilationContext(ShaderCompileRequest request)
         {
             _request = request;
+            _program = Ir.Gen5WaterfallMoveRelative.Collapse(request.Program);
             _stage = request.Stage switch
             {
                 ShaderStage.Vertex => Gen5SpirvStage.Vertex,

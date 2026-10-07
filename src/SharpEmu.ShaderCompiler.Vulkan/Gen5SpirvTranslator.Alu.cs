@@ -41,6 +41,12 @@ public static partial class Gen5SpirvTranslator
                 return TryEmitVectorCompare(instruction, out error);
             }
 
+            if (instruction.Opcode == Ir.Gen5WaterfallMoveRelative.IndexToM0)
+            {
+                StoreS(M0ScalarRegister, LoadV(instruction.Sources[0].Value));
+                return true;
+            }
+
             if (instruction.Opcode == "VReadfirstlaneB32")
             {
                 if (instruction.Destinations.Count == 0 ||
@@ -1577,7 +1583,7 @@ public static partial class Gen5SpirvTranslator
             }
 
             var m0 = LoadS(M0ScalarRegister);
-            _moveRelativeOffsets ??= Ir.Gen5MoveRelativeOffsets.Analyze(_request.Program);
+            _moveRelativeOffsets ??= Ir.Gen5MoveRelativeOffsets.Analyze(_program);
             if (_vectorRegisters == 0 && _moveRelativeOffsets.TryGetValue(instruction.Pc, out var offsets))
             {
                 return TryEmitBoundedMoveRelative(instruction, destination, m0, offsets, out error);
@@ -2515,7 +2521,7 @@ public static partial class Gen5SpirvTranslator
                 condition = _module.AddInstruction(operation, _boolType, left, right);
             }
 
-            if (_request.Program.Address == 0x0000000500781200ul &&
+            if (_program.Address == 0x0000000500781200ul &&
                 ((instruction.Pc == 0x4D4 &&
                   Environment.GetEnvironmentVariable(
                       "SHARPEMU_FORCE_TITLE_COMPARE_4D4") == "1") ||
