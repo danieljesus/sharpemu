@@ -19,7 +19,19 @@ public readonly record struct RenderingAttachment(
     bool HasDepth,
     bool DepthClear,
     bool HasStencil,
-    bool StencilClear);
+    bool StencilClear)
+{
+    // The generated comparison boxed the view handle on every draw; compare the handle itself.
+    public bool Equals(RenderingAttachment other) =>
+        View.Handle == other.View.Handle && Layout == other.Layout && Format == other.Format &&
+        ClearWord0 == other.ClearWord0 && ClearWord1 == other.ClearWord1 && ClearWord2 == other.ClearWord2 && ClearWord3 == other.ClearWord3 &&
+        IsClear == other.IsClear && HasDepth == other.HasDepth && DepthClear == other.DepthClear &&
+        HasStencil == other.HasStencil && StencilClear == other.StencilClear;
+
+    public override int GetHashCode() =>
+        HashCode.Combine(View.Handle, (int)Layout, (int)Format, ClearWord0 ^ ClearWord1 ^ ClearWord2 ^ ClearWord3,
+            (IsClear ? 1 : 0) | (HasDepth ? 2 : 0) | (DepthClear ? 4 : 0) | (HasStencil ? 8 : 0) | (StencilClear ? 16 : 0));
+}
 
 [InlineArray(RenderingState.ColorAttachmentCapacity)]
 public struct RenderingColorAttachments

@@ -1697,6 +1697,30 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return bufferIdentifier;
     }
 
+    // Kept apart from SynchronizeBuffer so that its closure is only allocated for buffers with
+    // dirty ranges; most calls return before needing it.
+    private GpuBuffer? CollectUploadRanges(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten,
+        bool preserveCpuWriteHotPages, out List<BufferCopy> copies, out ulong totalSize)
+    {
+        var collected = new List<BufferCopy>();
+        var collectedSize = 0UL;
+        GpuBuffer? source = null;
+        _tracker.ForEachUploadRange(
+            guestAddress,
+            size,
+            isWritten,
+            (address, bytes) =>
+            {
+                collected.Add(new BufferCopy(collectedSize, buffer.Offset(address), bytes));
+                collectedSize += bytes;
+            },
+            () => source = _uploader.PrepareSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(collected), collectedSize, guestAddress, size),
+            preserveCpuWriteHotPages);
+        copies = collected;
+        totalSize = collectedSize;
+        return source;
+    }
+
     private bool SynchronizeBuffer(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer,
         bool preserveCpuWriteHotPages = true)
     {
@@ -1713,20 +1737,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         profileScope.SwitchPhase(isWritten
             ? RenderPhaseProfile.Phase.BufferDirtySyncWritten
             : isTexelBuffer ? RenderPhaseProfile.Phase.BufferDirtySyncTexel : RenderPhaseProfile.Phase.BufferDirtySyncUpload);
-        var copies = new List<BufferCopy>();
-        var totalSize = 0UL;
-        GpuBuffer? source = null;
-        _tracker.ForEachUploadRange(
-            guestAddress,
-            size,
-            isWritten,
-            (address, bytes) =>
-            {
-                copies.Add(new BufferCopy(totalSize, buffer.Offset(address), bytes));
-                totalSize += bytes;
-            },
-            () => source = _uploader.PrepareSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(copies), totalSize, guestAddress, size),
-            preserveCpuWriteHotPages);
+        var source = CollectUploadRanges(buffer, guestAddress, size, isWritten, preserveCpuWriteHotPages, out var copies, out var totalSize);
         if (source != null)
         {
             buffer.NoteGpuWrite();

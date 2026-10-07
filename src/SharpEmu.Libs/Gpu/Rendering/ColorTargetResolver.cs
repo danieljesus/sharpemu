@@ -25,10 +25,33 @@ public static class ColorTargetResolver
         return 0;
     }
 
+    // Building a slot's request decodes the tiling of the surface, with its own arrays, and the
+    // registers rarely change between draws: the last resolution of each slot is kept on the
+    // resolving thread while its inputs stay the same. The result is a value with immutable
+    // tables, so sharing it between draws is safe.
+    private readonly record struct ResolutionKey(ColorTargetWords Words, uint TargetMask, uint DrawLayerOffset, bool IgnoreTargetMask);
+
+    [ThreadStatic] private static ResolutionKey[]? _lastKeys;
+    [ThreadStatic] private static ColorTargetResolution?[]? _lastResolutions;
+    [ThreadStatic] private static bool[]? _lastValid;
+
     // Null means the slot carries no color output.
     public static ColorTargetResolution? Resolve(ContextRegisters context, uint slot, uint drawLayerOffset, bool ignoreTargetMask, out uint resolvedSlot)
     {
         resolvedSlot = slot == FirstBoundSlot ? FirstBound(context) : slot;
-        return ImageRequestBuilders.ColorTarget(in context.ColorTargets[resolvedSlot], context.RenderTargetMaskForSlot(resolvedSlot), drawLayerOffset, ignoreTargetMask);
+        var key = new ResolutionKey(context.ColorTargets[resolvedSlot], context.RenderTargetMaskForSlot(resolvedSlot), drawLayerOffset, ignoreTargetMask);
+        var keys = _lastKeys ??= new ResolutionKey[ContextRegisters.ColorTargetCount];
+        var resolutions = _lastResolutions ??= new ColorTargetResolution?[ContextRegisters.ColorTargetCount];
+        var valid = _lastValid ??= new bool[ContextRegisters.ColorTargetCount];
+        if (valid[resolvedSlot] && keys[resolvedSlot] == key)
+        {
+            return resolutions[resolvedSlot];
+        }
+
+        var resolution = ImageRequestBuilders.ColorTarget(in context.ColorTargets[resolvedSlot], key.TargetMask, drawLayerOffset, ignoreTargetMask);
+        keys[resolvedSlot] = key;
+        resolutions[resolvedSlot] = resolution;
+        valid[resolvedSlot] = true;
+        return resolution;
     }
 }
