@@ -2286,6 +2286,41 @@ public static partial class Gen5SpirvTranslator
                         GetRawSource(instruction, 1));
                     return true;
                 }
+                case "DsWriteB8":
+                case "DsWriteB8D16Hi":
+                {
+                    if (instruction.Sources.Count < 2)
+                    {
+                        error = "missing LDS byte write source";
+                        return false;
+                    }
+
+                    // LDS is modelled as a dword array, so a byte store is a masked
+                    // read-modify-write of its dword. It has to be a CAS loop: lanes
+                    // storing neighbouring bytes of the same dword run concurrently
+                    // and a plain load/store would drop their bytes.
+                    var address = GetRawSource(instruction, 0);
+                    var byteAddress = control.SingleOffsetBytes == 0
+                        ? address
+                        : IAdd(address, UInt(control.SingleOffsetBytes));
+                    var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
+                    var mask = ShiftLeftLogical(UInt(0xFF), shift);
+                    var data = GetRawSource(instruction, 1);
+                    if (instruction.Opcode == "DsWriteB8D16Hi")
+                    {
+                        data = ShiftRightLogical(data, UInt(16));
+                    }
+                    var value = ShiftLeftLogical(BitwiseAnd(data, UInt(0xFF)), shift);
+                    var keepMask = _module.AddInstruction(SpirvOp.Not, _uintType, mask);
+                    var pointer = LdsPointer(address, control.SingleOffsetBytes);
+                    EmitExecConditional(() =>
+                        EmitDataShareCompareExchangeLoop(
+                            pointer,
+                            observed => BitwiseOr(BitwiseAnd(observed, keepMask), value),
+                            scope: 2,
+                            semantics: 0x108));
+                    return true;
+                }
                 case "DsWriteB64":
                 {
                     if (instruction.Sources.Count < 3)
@@ -2459,10 +2494,11 @@ public static partial class Gen5SpirvTranslator
                     return true;
                 }
                 case "DsReadI8":
+                case "DsReadU8":
                 {
                     if (instruction.Destinations.Count < 1 || instruction.Sources.Count < 1)
                     {
-                        error = "missing LDS signed byte read operand";
+                        error = "missing LDS byte read operand";
                         return false;
                     }
 
@@ -2473,13 +2509,15 @@ public static partial class Gen5SpirvTranslator
                     var word = Load(_uintType, LdsPointer(address, control.SingleOffsetBytes));
                     var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
                     var packed = ShiftRightLogical(word, shift);
-                    var signedByte = _module.AddInstruction(
-                        SpirvOp.BitFieldSExtract,
-                        _intType,
-                        Bitcast(_intType, packed),
-                        UInt(0),
-                        UInt(8));
-                    StoreV(instruction.Destinations[0].Value, Bitcast(_uintType, signedByte));
+                    var value = instruction.Opcode == "DsReadU8"
+                        ? BitwiseAnd(packed, UInt(0xFF))
+                        : Bitcast(_uintType, _module.AddInstruction(
+                            SpirvOp.BitFieldSExtract,
+                            _intType,
+                            Bitcast(_intType, packed),
+                            UInt(0),
+                            UInt(8)));
+                    StoreV(instruction.Destinations[0].Value, value);
                     return true;
                 }
                 case "DsReadB64":
@@ -2813,6 +2851,29 @@ public static partial class Gen5SpirvTranslator
             uint scope,
             uint semantics)
         {
+            EmitDataShareCompareExchangeLoop(
+                pointer,
+                observed =>
+                {
+                    var observedFloat = Bitcast(_floatType, observed);
+                    var compareFloat = Bitcast(_floatType, compare);
+                    var replace = _module.AddInstruction(
+                        maxValue ? SpirvOp.FOrdGreaterThan : SpirvOp.FOrdLessThan,
+                        _boolType,
+                        maxValue ? observedFloat : compareFloat,
+                        maxValue ? compareFloat : observedFloat);
+                    return _module.AddInstruction(SpirvOp.Select, _uintType, replace, data, observed);
+                },
+                scope,
+                semantics);
+        }
+
+        private void EmitDataShareCompareExchangeLoop(
+            uint pointer,
+            Func<uint, uint> computeNext,
+            uint scope,
+            uint semantics)
+        {
             var preheader = _module.AllocateId();
             var header = _module.AllocateId();
             var continueLabel = _module.AllocateId();
@@ -2837,14 +2898,7 @@ public static partial class Gen5SpirvTranslator
                 preheader,
                 exchanged,
                 continueLabel);
-            var observedFloat = Bitcast(_floatType, observed);
-            var compareFloat = Bitcast(_floatType, compare);
-            var replace = _module.AddInstruction(
-                maxValue ? SpirvOp.FOrdGreaterThan : SpirvOp.FOrdLessThan,
-                _boolType,
-                maxValue ? observedFloat : compareFloat,
-                maxValue ? compareFloat : observedFloat);
-            var next = _module.AddInstruction(SpirvOp.Select, _uintType, replace, data, observed);
+            var next = computeNext(observed);
 
             _module.AddStatement(
                 SpirvOp.AtomicCompareExchange,

@@ -1449,6 +1449,7 @@ public static partial class Gen5ShaderTranslator
             0x10 => "DsCmpstB32",
             0x12 => "DsMinF32",
             0x13 => "DsMaxF32",
+            0x1E => "DsWriteB8",
             0x20 => "DsAddRtnU32",
             0x21 => "DsSubRtnU32",
             0x23 => "DsIncRtnU32",
@@ -1467,6 +1468,7 @@ public static partial class Gen5ShaderTranslator
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
             0x39 => "DsReadI8",
+            0x3A => "DsReadU8",
             0x3D => "DsConsume",
             0x3E => "DsAppend",
             // gfx10 groups the 64-bit LDS atomics at 0x40..0x4C, directly ahead
@@ -1481,6 +1483,7 @@ public static partial class Gen5ShaderTranslator
             0x4F => "DsWrite2St64B64",
             0x76 => "DsReadB64",
             0x77 => "DsRead2B64",
+            0xA0 => "DsWriteB8D16Hi",
             0xB0 => "DsWriteAddtidB32",
             0xB1 => "DsReadAddtidB32",
             0xB3 => "DsBpermuteB32",
@@ -2500,7 +2503,7 @@ public static partial class Gen5ShaderTranslator
                 {
                     "DsAppend" or "DsConsume" or "DsReadAddtidB32" => [Gen5Operand.Scalar(124)],
                     "DsWriteAddtidB32" => [Gen5Operand.Scalar(124), Gen5Operand.Vector(vectorData0)],
-                    "DsWriteB32" => [
+                    "DsWriteB32" or "DsWriteB8" or "DsWriteB8D16Hi" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
                     ],
@@ -2575,7 +2578,7 @@ public static partial class Gen5ShaderTranslator
                     "DsAppend" or "DsConsume" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
-                    "DsReadB32" or "DsReadI8" or "DsReadAddtidB32" or
+                    "DsReadB32" or "DsReadI8" or "DsReadU8" or "DsReadAddtidB32" or
                     "DsSwizzleB32" or "DsBpermuteB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
