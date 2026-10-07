@@ -153,6 +153,14 @@ internal sealed class ShaderProgramCache
         var context = recording is null ? _context : new CpuContext(recording, _context.TargetGeneration);
         if (!Gen5ShaderTranslator.TryDecodeProgram(context, source.Address, out program, out var error))
         {
+            var dumpDir = Environment.GetEnvironmentVariable("LOCAL_DUMP_FAILED_SHADER");
+            if (!string.IsNullOrEmpty(dumpDir))
+            {
+                var bytes = new byte[Math.Max(source.CodeSize, 64u * 1024u)];
+                var read = 0;
+                while (read < bytes.Length && _context.Memory.TryRead(source.Address + (ulong)read, bytes.AsSpan(read, 4))) read += 4;
+                File.WriteAllBytes(Path.Combine(dumpDir, $"shader_{source.Hash:X16}.bin"), bytes.AsSpan(0, read).ToArray());
+            }
             throw SubmissionScheduler.Fatal($"The shader program cannot be decoded: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={error}.");
         }
 
