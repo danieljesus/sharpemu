@@ -600,6 +600,17 @@ public static partial class Gen5SpirvTranslator
                 // (Octopath's instanced vertex shader: 112 ms per draw). Keep one variable per
                 // register and resolve V_MOVREL* with a select over the registers the program uses.
                 _dynamicVectorRange = DynamicVectorRange(_request.Program);
+                if (MoveRelativeSelectCount(_request.Program, _dynamicVectorRange) > MoveRelativeSelectBudget)
+                {
+                    // Past the budget the select chains are what costs: one GTA V compute
+                    // shader grew to 3 MB of SPIR-V that NVIDIA's compiler did not finish in
+                    // ten minutes. Index one register array instead and let the driver decide.
+                    var arrayType = _module.TypeArray(_uintType, VectorRegisterCount);
+                    _vectorRegisters = _module.AddGlobalVariable(
+                        _module.TypePointer(SpirvStorageClass.Private, arrayType),
+                        SpirvStorageClass.Private,
+                        _module.ConstantNull(arrayType));
+                }
             }
 
             // Keep scalar state in uint variables, matching upstream's flag load/store conversion.
@@ -7632,8 +7643,44 @@ public static partial class Gen5SpirvTranslator
             return (Math.Min(first, last), last);
         }
 
+        // Above this many selects a program's relative moves index the register array instead.
+        private const int MoveRelativeSelectBudget = 4096;
+
+        // The selects the per-register form emits for the program's relative moves: one per
+        // reachable register for a bounded move, one per register in the range otherwise.
+        private static int MoveRelativeSelectCount(Gen5ShaderProgram program, (uint First, uint Last) range)
+        {
+            var offsets = Ir.Gen5MoveRelativeOffsets.Analyze(program);
+            var unbounded = (int)(range.Last - range.First + 1);
+            var count = 0;
+            foreach (var instruction in program.Instructions)
+            {
+                if (!instruction.Opcode.StartsWith("VMovrel", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var perAccess = offsets.TryGetValue(instruction.Pc, out var values) ? values.Length : unbounded;
+                count += instruction.Opcode is "VMovrelsdB32" or "VMovrelsd2B32" ? 2 * perAccess : perAccess;
+            }
+
+            return count;
+        }
+
+        private uint VectorArrayPointer(uint registerIndex) =>
+            _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _privateUintPointer,
+                _vectorRegisters,
+                BitwiseAnd(registerIndex, UInt(VectorRegisterCount - 1)));
+
         private uint LoadVDynamic(uint registerIndex)
         {
+            if (_vectorRegisters != 0)
+            {
+                return Load(_uintType, VectorArrayPointer(registerIndex));
+            }
+
             var result = UInt(0);
             for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
             {
@@ -7652,6 +7699,13 @@ public static partial class Gen5SpirvTranslator
         {
             // With EXEC known to be all ones the write needs no EXEC test.
             var exec = _execKnownFull ? 0 : Load(_boolType, _exec);
+            if (_vectorRegisters != 0)
+            {
+                var pointer = VectorArrayPointer(registerIndex);
+                Store(pointer, exec == 0 ? value : _module.AddInstruction(SpirvOp.Select, _uintType, exec, value, Load(_uintType, pointer)));
+                return;
+            }
+
             for (var register = _dynamicVectorRange.First; register <= _dynamicVectorRange.Last; register++)
             {
                 var pointer = VectorPointer(register);
