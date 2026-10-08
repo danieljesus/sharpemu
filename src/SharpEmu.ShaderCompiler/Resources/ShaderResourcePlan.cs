@@ -52,13 +52,29 @@ public sealed class ShaderResourcePlan
     private CompiledResourceEvaluator? _compiledEvaluator;
     private int _compiledEvaluatorState;
 
+    // The evaluator is compiled on a background thread and the interpreter serves until it is
+    // ready; SHARPEMU_SRT_COMPILE_SYNC=1 compiles it on first use instead, so a test run
+    // exercises the compiled path on every plan.
+    private static readonly bool CompileSynchronously = Environment.GetEnvironmentVariable("SHARPEMU_SRT_COMPILE_SYNC") == "1";
+
     internal CompiledResourceEvaluator? CompiledEvaluator
     {
         get
         {
             if (Volatile.Read(ref _compiledEvaluatorState) == 2) return _compiledEvaluator;
+            if (CompileSynchronously) return CompileEvaluatorNow();
             if (Interlocked.CompareExchange(ref _compiledEvaluatorState, 1, 0) == 0) CompiledResourceEvaluator.Enqueue(this);
             return null;
+        }
+    }
+
+    // Keeps this plan on the interpreter, for a test that compares it with a compiled one.
+    internal void UseInterpreter()
+    {
+        lock (_compileGate)
+        {
+            _compiledEvaluator = null;
+            Volatile.Write(ref _compiledEvaluatorState, 2);
         }
     }
 

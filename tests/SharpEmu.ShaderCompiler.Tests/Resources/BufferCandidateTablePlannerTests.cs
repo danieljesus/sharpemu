@@ -16,7 +16,7 @@ public sealed class BufferCandidateTablePlannerTests
 {
     // preheader: s0..s3 = SRT V#, s10 = 0; branch to header
     // header: s12 = s10 * stride; dwordx4 read; formatted load; s10 += 1; guard loop
-    private static Gen5ShaderProgram CandidateProgram(
+    internal static Gen5ShaderProgram CandidateProgram(
         uint stride = 16,
         uint records = 4,
         string guard = "SCmpLtU32",
