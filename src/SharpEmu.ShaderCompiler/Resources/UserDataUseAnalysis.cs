@@ -28,12 +28,13 @@ public sealed class UserDataUseAnalysis
     private readonly bool[] _dwordRegisters;
 
     private UserDataUseAnalysis(bool[] valueRegisters, bool[] addressRegisters, bool[] dwordRegisters,
-        RebasableDword[] rebasableDwords)
+        RebasableDword[] rebasableDwords, Dictionary<int, PatchTarget[]> patchableReads)
     {
         _valueRegisters = valueRegisters;
         _addressRegisters = addressRegisters;
         _dwordRegisters = dwordRegisters;
         RebasableDwords = rebasableDwords;
+        PatchableReads = patchableReads;
         for (var index = 0; index < addressRegisters.Length; index++)
         {
             AnyAddressOnly |= (addressRegisters[index] || dwordRegisters[index]) && !valueRegisters[index];
@@ -44,12 +45,21 @@ public sealed class UserDataUseAnalysis
     // buffer it belongs to in the snapshot's Buffers.
     public readonly record struct RebasableDword(int Buffer, int Dword, ScalarValue Value);
 
+    // Where a raw read's word is copied verbatim: a slot of the flattened table, or a dword of a
+    // buffer in the snapshot's Buffers.
+    public readonly record struct PatchTarget(bool Table, int Index, int Dword);
+
     public uint UserDataBase { get; private init; }
 
     public bool AnyAddressOnly { get; }
 
     // Every buffer dword that depends on a register which is not a value register.
     public RebasableDword[] RebasableDwords { get; }
+
+    // By ScalarValue.Id: the raw reads whose word reaches nothing but table slots and buffer
+    // dwords, each copied as read. Such a word may differ between draws without changing what
+    // else the plan materializes, so a cached entry can take the draw's word in those places.
+    public Dictionary<int, PatchTarget[]> PatchableReads { get; }
 
     // A register outside the analysed range is compared like a value, which is the safe choice.
     public bool IsValueRegister(int index) => (uint)index >= (uint)_valueRegisters.Length || _valueRegisters[index];
@@ -120,13 +130,13 @@ public sealed class UserDataUseAnalysis
         var valueRegisters = new bool[count];
         var addressRegisters = new bool[count];
         var dwordRegisters = new bool[count];
-        var visited = new HashSet<(ScalarValue, int)>();
-        var pending = new Stack<(ScalarValue Value, int Mode)>();
-        void Root(ScalarValue? value, int mode = ValueMode)
+        var visited = new HashSet<(ScalarValue, int, bool)>();
+        var pending = new Stack<(ScalarValue Value, int Mode, bool Verbatim)>();
+        void Root(ScalarValue? value, int mode = ValueMode, bool verbatim = false)
         {
             if (value is not null)
             {
-                pending.Push((value, mode));
+                pending.Push((value, mode, verbatim));
             }
         }
 
@@ -157,6 +167,31 @@ public sealed class UserDataUseAnalysis
             }
         }
 
+        // A raw read is a patch candidate while every use of it is verbatim: the read itself as
+        // a buffer dword or a table slot. Any other use (an operand, an image dword, a range base)
+        // keeps the word fixed.
+        var verbatimReads = new Dictionary<ScalarValue, List<PatchTarget>>();
+        var fixedReads = new HashSet<ScalarValue>();
+        ScalarValue? VerbatimRead(ScalarValue value)
+        {
+            if (value.Kind == ScalarValueKind.ResourceTableWord && value.Payload < (ulong)plan.TableReads.Count)
+            {
+                value = plan.TableReads[(int)value.Payload].Value;
+            }
+
+            return value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord ? value : null;
+        }
+
+        void Candidate(ScalarValue read, PatchTarget target)
+        {
+            if (!verbatimReads.TryGetValue(read, out var targets))
+            {
+                verbatimReads[read] = targets = [];
+            }
+
+            targets.Add(target);
+        }
+
         var rebasable = new List<RebasableDword>();
         for (var sourceIndex = 0; sourceIndex < plan.DescriptorSources.Count; sourceIndex++)
         {
@@ -172,6 +207,18 @@ public sealed class UserDataUseAnalysis
                         Root(dwords[dword], DwordMode);
                     }
                 }
+                else if (buffer >= 0 && VerbatimRead(dwords[dword]) is { } read)
+                {
+                    for (var index = 0; index < plan.Info.Buffers.Count; index++)
+                    {
+                        if (plan.Info.Buffers[index].Source == sourceIndex)
+                        {
+                            Candidate(read, new PatchTarget(false, index, dword));
+                        }
+                    }
+
+                    Root(read, ValueMode, verbatim: true);
+                }
                 else
                 {
                     Root(dwords[dword]);
@@ -179,9 +226,18 @@ public sealed class UserDataUseAnalysis
             }
         }
 
-        foreach (var read in plan.TableReads)
+        for (var slot = 0; slot < plan.TableReads.Count; slot++)
         {
-            Root(read.Value);
+            var read = plan.TableReads[slot].Value;
+            if (VerbatimRead(read) is { } verbatim)
+            {
+                Candidate(verbatim, new PatchTarget(true, slot, 0));
+                Root(verbatim, ValueMode, verbatim: true);
+            }
+            else
+            {
+                Root(read);
+            }
         }
 
         foreach (var read in plan.DynamicReads)
@@ -237,15 +293,30 @@ public sealed class UserDataUseAnalysis
                 continue;
             }
 
-            var (value, mode) = item;
+            var (value, mode, verbatim) = item;
             if (value.Kind == ScalarValueKind.UserData)
             {
                 MarkRegister(mode == DwordMode ? dwordRegisters : valueRegisters, value.UserDataRegister);
                 continue;
             }
 
+            if (value.Kind == ScalarValueKind.ResourceTableWord)
+            {
+                if (value.Payload < (ulong)plan.TableReads.Count)
+                {
+                    pending.Push((plan.TableReads[(int)value.Payload].Value, mode, verbatim));
+                }
+
+                continue;
+            }
+
             if (value.Kind is ScalarValueKind.ScalarBufferWord or ScalarValueKind.ScalarAddressWord && value.Operands.Length >= 1)
             {
+                if (!verbatim)
+                {
+                    fixedReads.Add(value);
+                }
+
                 var handle = value.Operands[0];
                 var baseRegister = BaseRegisterOf(handle);
                 if (baseRegister >= 0)
@@ -254,17 +325,17 @@ public sealed class UserDataUseAnalysis
                     MarkRegister(addressRegisters, (uint)baseRegister + 1);
                     for (var index = 2; index < handle.Operands.Length; index++)
                     {
-                        pending.Push((handle.Operands[index], ValueMode));
+                        pending.Push((handle.Operands[index], ValueMode, false));
                     }
                 }
                 else
                 {
-                    pending.Push((handle, ValueMode));
+                    pending.Push((handle, ValueMode, false));
                 }
 
                 for (var index = 1; index < value.Operands.Length; index++)
                 {
-                    pending.Push((value.Operands[index], ValueMode));
+                    pending.Push((value.Operands[index], ValueMode, false));
                 }
 
                 continue;
@@ -272,13 +343,22 @@ public sealed class UserDataUseAnalysis
 
             foreach (var operand in value.Operands)
             {
-                pending.Push((operand, mode));
+                pending.Push((operand, mode, false));
             }
         }
 
         // A dword whose registers are all values is rebuilt by the key, not by re-evaluation.
         rebasable.RemoveAll(dword => !DependsOnNonValueRegister(dword.Value, graph.UserDataBase, valueRegisters));
-        return new UserDataUseAnalysis(valueRegisters, addressRegisters, dwordRegisters, [.. rebasable]) { UserDataBase = graph.UserDataBase };
+        var patchable = new Dictionary<int, PatchTarget[]>();
+        foreach (var (read, targets) in verbatimReads)
+        {
+            if (!fixedReads.Contains(read))
+            {
+                patchable[read.Id] = [.. targets];
+            }
+        }
+
+        return new UserDataUseAnalysis(valueRegisters, addressRegisters, dwordRegisters, [.. rebasable], patchable) { UserDataBase = graph.UserDataBase };
     }
 
     private static int BufferOfSource(ShaderResourcePlan plan, int source)

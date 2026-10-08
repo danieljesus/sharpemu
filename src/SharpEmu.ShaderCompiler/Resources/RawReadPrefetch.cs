@@ -219,6 +219,7 @@ internal static class RawReadPrefetch
     private static void ReadRuns(RuntimeValueEvaluator evaluator, Scratch scratch)
     {
         var previousBase = RuntimeValueEvaluator.ExchangeReadBase(UserDataUseAnalysis.UnknownBase);
+        var previousNode = RuntimeValueEvaluator.ExchangeReadNode(RuntimeValueEvaluator.NoReadNode);
         try
         {
             ReadRunsCore(evaluator, scratch);
@@ -226,6 +227,7 @@ internal static class RawReadPrefetch
         finally
         {
             RuntimeValueEvaluator.ExchangeReadBase(previousBase);
+            RuntimeValueEvaluator.ExchangeReadNode(previousNode);
         }
     }
 

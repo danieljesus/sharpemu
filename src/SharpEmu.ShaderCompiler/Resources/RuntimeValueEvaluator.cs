@@ -224,8 +224,10 @@ public sealed class RuntimeValueEvaluator
             return false;
         }
 
-        return ReadRawWord(value.Kind, low, high, (uint)offset, records, (int)memory.Offset, UserDataUseAnalysis.BaseRegisterOf(handle), out result);
+        return ReadRawWord(value.Kind, low, high, (uint)offset, records, (int)memory.Offset, UserDataUseAnalysis.BaseRegisterOf(handle), value.Id, out result);
     }
+
+    public const int NoReadNode = -1;
 
     // The user-data register pair the raw read in progress is based on (UserDataUseAnalysis
     // values), for a reader that records what a materialization read and from where. Stored
@@ -242,7 +244,20 @@ public sealed class RuntimeValueEvaluator
         return previous;
     }
 
-    internal bool ReadRawWord(ScalarValueKind kind, ulong low, ulong high, uint offset, ulong records, long immediate, int baseRegister, out ulong result)
+    // The graph node (ScalarValue.Id) whose raw read is in progress, NoReadNode outside one.
+    [ThreadStatic]
+    private static int _currentReadNodeBiased;
+
+    internal static int CurrentReadNode => _currentReadNodeBiased + NoReadNode;
+
+    internal static int ExchangeReadNode(int node)
+    {
+        var previous = CurrentReadNode;
+        _currentReadNodeBiased = node - NoReadNode;
+        return previous;
+    }
+
+    internal bool ReadRawWord(ScalarValueKind kind, ulong low, ulong high, uint offset, ulong records, long immediate, int baseRegister, int node, out ulong result)
     {
         result = 0;
         var baseAddress = ((high << 32) | (uint)low) & AddressMask;
@@ -258,6 +273,7 @@ public sealed class RuntimeValueEvaluator
         bool read;
         uint word = 0;
         var previousBase = ExchangeReadBase(baseRegister);
+        var previousNode = ExchangeReadNode(node);
         try
         {
             read = _inputs.ReadMemory is not null && _inputs.ReadMemory(address, out word);
@@ -265,6 +281,7 @@ public sealed class RuntimeValueEvaluator
         finally
         {
             ExchangeReadBase(previousBase);
+            ExchangeReadNode(previousNode);
         }
 
         if (!read)
