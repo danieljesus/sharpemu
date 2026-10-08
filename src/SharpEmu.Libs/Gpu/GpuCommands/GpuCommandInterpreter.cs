@@ -233,9 +233,14 @@ public sealed partial class GpuCommandInterpreter
 
     private void RunPackets(PacketCursorStack execution, int stopDepth)
     {
+        DropWindow();
         while (execution.Depth > stopDepth)
         {
-            _host.RunPendingCommands();
+            if (_host.RunPendingCommands())
+            {
+                DropWindow();
+            }
+
             var cursorIndex = execution.Depth - 1;
             ref var cursor = ref execution.At(cursorIndex);
             if (cursor.Offset > cursor.DwordCount)
@@ -263,7 +268,8 @@ public sealed partial class GpuCommandInterpreter
             }
 
             var packetAddress = cursor.Address + ((ulong)cursor.Offset * sizeof(uint));
-            var header = ReadDword(packetAddress, RenderPhaseProfile.CommandReadKind.Header);
+            var cursorEnd = cursor.Address + ((ulong)cursor.DwordCount * sizeof(uint));
+            var header = ReadHeader(packetAddress, cursorEnd);
             _packetSerial++;
             var total = cursor.DwordCount;
             var remaining = cursor.Remaining;
@@ -318,9 +324,13 @@ public sealed partial class GpuCommandInterpreter
                 throw _host.Fatal($"The packet opcode is unknown: offset=0x{offset:X5} header=0x{header:X8} opcode=0x{opcode:X2} address=0x{packetAddress:X16}.");
             }
 
-            var payload = ReadPayload(cursorIndex, packetAddress, length - 1);
+            var payload = ReadPayload(cursorIndex, packetAddress, length - 1, cursorEnd);
             var packet = new PacketContext(header & ~1u, packetAddress, offset, remaining, total);
             var consumed = handler(this, in packet, payload) + 1;
+            if (!KeepsWindow(opcode, header))
+            {
+                DropWindow();
+            }
             if (consumed > remaining)
             {
                 throw _host.Fatal($"The handler consumed more than the buffer holds: consumed={consumed} remaining={remaining} header=0x{header:X8} address=0x{packetAddress:X16}.");
@@ -354,8 +364,80 @@ public sealed partial class GpuCommandInterpreter
         }
     }
 
+    // The packet stream is read through a window: one host read (with its CPU-read
+    // synchronization) serves the headers and payloads of the packets that follow, instead of
+    // one per header and one per payload. The window never reaches past its buffer, is dropped
+    // whenever something may have changed guest memory, and does not serve operand reads.
+    private const int WindowDwords = 256;
+    private readonly uint[] _window = new uint[WindowDwords];
+    private ulong _windowAddress;
+    private int _windowCount;
+
+    private void DropWindow() => _windowCount = 0;
+
+    // Packets that neither write guest memory nor run anything that could: the window stays.
+    private static bool KeepsWindow(uint opcode, uint header) => opcode switch
+    {
+        PacketOpcode.Nop => PacketHeader.CustomCode(header) is 0 or PacketCustomCode.PushMarker or PacketCustomCode.PopMarker or
+            PacketCustomCode.ShaderRegisterTable or PacketCustomCode.ContextRegisterTable or PacketCustomCode.UserConfigRegisterTable or
+            PacketCustomCode.IndexCount or PacketCustomCode.DrawIndexAuto or PacketCustomCode.DrawReset or PacketCustomCode.DispatchReset,
+        PacketOpcode.SetContextRegister or PacketOpcode.SetShaderRegister or PacketOpcode.SetUserConfigRegister or
+            PacketOpcode.SetUserConfigRegisterIndex or PacketOpcode.ContextControl or PacketOpcode.ClearState or PacketOpcode.SetBase or
+            PacketOpcode.DrawIndex2 or PacketOpcode.DrawIndexAuto or PacketOpcode.DrawIndexOffset2 or PacketOpcode.DrawIndexIndirect or
+            PacketOpcode.DrawIndirect or PacketOpcode.DrawIndexIndirectMulti or PacketOpcode.DrawIndirectMulti or PacketOpcode.DrawIndexMultiAuto or
+            PacketOpcode.NumInstances or PacketOpcode.IndexType or PacketOpcode.IndexBase or PacketOpcode.IndexBufferSize or
+            PacketOpcode.DispatchDirect or PacketOpcode.DispatchIndirect or PacketOpcode.EventWrite or PacketOpcode.AcquireMemory or
+            PacketOpcode.PfpSyncMe or PacketOpcode.SetPredication => true,
+        _ => false,
+    };
+
+    private bool TryReadStream(ulong address, ulong bufferEnd, Span<uint> destination)
+    {
+        var count = destination.Length;
+        if (count == 0)
+        {
+            return true;
+        }
+
+        var bytes = (ulong)count * sizeof(uint);
+        if (address >= _windowAddress && address + bytes <= _windowAddress + ((ulong)_windowCount * sizeof(uint)))
+        {
+            _window.AsSpan((int)((address - _windowAddress) / sizeof(uint)), count).CopyTo(destination);
+            return true;
+        }
+
+        var available = bufferEnd > address ? (int)Math.Min((bufferEnd - address) / sizeof(uint), WindowDwords) : 0;
+        if (available < count)
+        {
+            return _host.TryReadGuest(address, MemoryMarshal.AsBytes(destination));
+        }
+
+        _windowCount = 0;
+        if (!_host.TryReadGuest(address, MemoryMarshal.AsBytes(_window.AsSpan(0, available))))
+        {
+            return false;
+        }
+
+        _windowAddress = address;
+        _windowCount = available;
+        _window.AsSpan(0, count).CopyTo(destination);
+        return true;
+    }
+
+    private uint ReadHeader(ulong packetAddress, ulong bufferEnd)
+    {
+        RenderPhaseProfile.RecordCommandRead(RenderPhaseProfile.CommandReadKind.Header, sizeof(uint));
+        Span<uint> header = stackalloc uint[1];
+        if (!TryReadStream(packetAddress, bufferEnd, header))
+        {
+            throw _host.Fatal($"The command stream cannot read guest memory: address=0x{packetAddress:X16} size=4.");
+        }
+
+        return header[0];
+    }
+
     // The payload lives in a per-depth scratch buffer for the handler call only.
-    private ReadOnlySpan<uint> ReadPayload(int depth, ulong packetAddress, uint payloadDwords)
+    private ReadOnlySpan<uint> ReadPayload(int depth, ulong packetAddress, uint payloadDwords, ulong bufferEnd)
     {
         while (_payloadScratchByDepth.Count <= depth)
         {
@@ -367,7 +449,7 @@ public sealed partial class GpuCommandInterpreter
         {
             RenderPhaseProfile.RecordCommandRead(RenderPhaseProfile.CommandReadKind.Payload, scratch.Length * sizeof(uint));
         }
-        if (payloadDwords != 0 && !_host.TryReadGuest(packetAddress + sizeof(uint), MemoryMarshal.AsBytes(scratch)))
+        if (payloadDwords != 0 && !TryReadStream(packetAddress + sizeof(uint), bufferEnd, scratch))
         {
             throw _host.Fatal($"The command stream cannot read a packet: address=0x{packetAddress:X16} dwords={payloadDwords + 1}.");
         }
@@ -443,6 +525,7 @@ public sealed partial class GpuCommandInterpreter
         {
             throw _host.Fatal($"The command stream cannot write guest memory: address=0x{address:X16} size={source.Length}.");
         }
+        DropWindow();
         _lastWriteLength = 0;
         if (source.Length is sizeof(uint) or sizeof(ulong))
         {
