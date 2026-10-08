@@ -104,22 +104,32 @@ public static partial class Gen5SpirvTranslator
             var direction = LoadRayVector(ray, bvh64, inverse: false);
             var inverseDirection = LoadRayVector(ray, bvh64, inverse: true);
 
-            // Other node types (user nodes 6 and 7, unused 2 and 3), a null BVH or an
-            // out-of-range node return four invalid dwords.
+            // Other node types (user nodes 6 and 7, unused 2 and 3), a null BVH, an
+            // out-of-range node or a node on an unmapped page return four invalid dwords.
             foreach (var variable in result)
                 Store(variable, UInt(InvalidNode));
             EmitConditional(isTriangle, () =>
             {
-                var values = EmitRayTriangle(nodeAddress, nodeType, barycentrics, origin, direction);
-                for (var component = 0; component < values.Length; component++)
-                    Store(result[component], values[component]);
+                var unit = ResolveNodeUnit(nodeAddress, 0);
+                EmitConditional(unit.Valid, () =>
+                {
+                    var values = EmitRayTriangle(unit, nodeType, barycentrics, origin, direction);
+                    for (var component = 0; component < values.Length; component++)
+                        Store(result[component], values[component]);
+                });
             });
             // Each box format reads only its own node bytes.
             void EmitBoxes(bool fp16)
             {
-                var children = EmitRayBoxes(nodeAddress, fp16, boxGrow, boxSort, extent, origin, inverseDirection);
-                for (var component = 0; component < children.Length; component++)
-                    Store(result[component], children[component]);
+                var first = ResolveNodeUnit(nodeAddress, 0);
+                var second = fp16 ? first : ResolveNodeUnit(nodeAddress, 1);
+                var readable = fp16 ? first.Valid : LogicalAnd(first.Valid, second.Valid);
+                EmitConditional(readable, () =>
+                {
+                    var children = EmitRayBoxes(first, second, fp16, boxGrow, boxSort, extent, origin, inverseDirection);
+                    for (var component = 0; component < children.Length; component++)
+                        Store(result[component], children[component]);
+                });
             }
 
             EmitConditional(isBox16, () => EmitBoxes(fp16: true));
@@ -153,17 +163,37 @@ public static partial class Gen5SpirvTranslator
             return values;
         }
 
-        private uint LoadNodeDword(uint nodeAddress, uint dword) =>
-            LoadDeviceDword(IAdd64(nodeAddress, ULong(dword * 4ul)));
+        // A node is 64-byte aligned, so each 64-byte unit lies on one page: the page table
+        // is consulted once per unit and every dword of the unit reads through that pointer.
+        private readonly record struct NodeUnit(uint Pointer, uint Valid);
 
-        private uint LoadNodeFloat(uint nodeAddress, uint dword) =>
-            Bitcast(_floatType, LoadNodeDword(nodeAddress, dword));
+        private const uint NodeUnitDwords = 16;
+
+        private NodeUnit ResolveNodeUnit(uint nodeAddress, uint unit)
+        {
+            var address = unit == 0 ? nodeAddress : IAdd64(nodeAddress, ULong(unit * NodeUnitDwords * 4ul));
+            var (pointer, valid) = ResolveDeviceAddress(address);
+            return new NodeUnit(pointer, valid);
+        }
+
+        private uint LoadNodeDword(NodeUnit unit, uint dword) =>
+            _module.AddInstruction(SpirvOp.Load, _uintType,
+                DeviceWordPointer(dword == 0 ? unit.Pointer : IAdd64(unit.Pointer, ULong(dword * 4ul))), 2u, 4u);
+
+        private uint LoadNodeDword(NodeUnit first, NodeUnit second, uint dword) =>
+            dword < NodeUnitDwords ? LoadNodeDword(first, dword) : LoadNodeDword(second, dword - NodeUnitDwords);
+
+        private uint LoadNodeFloat(NodeUnit unit, uint dword) =>
+            Bitcast(_floatType, LoadNodeDword(unit, dword));
+
+        private uint LoadNodeFloat(NodeUnit first, NodeUnit second, uint dword) =>
+            Bitcast(_floatType, LoadNodeDword(first, second, dword));
 
         // fast_intersect_triangle and SwizzleBarycentrics. Node type 0 tests (v0, v1, v2),
         // type 1 tests (v1, v3, v2). A miss returns t_num = +inf over t_denom = 1. The
         // barycentric return mode yields the i/j numerators the builder's rotation maps
         // back; the other mode yields the triangle id and a hit flag.
-        private uint[] EmitRayTriangle(uint nodeAddress, uint nodeType, uint barycentrics,
+        private uint[] EmitRayTriangle(NodeUnit node, uint nodeType, uint barycentrics,
             IReadOnlyList<uint> origin, IReadOnlyList<uint> direction)
         {
             var second = _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeTriangle1));
@@ -172,10 +202,10 @@ public static partial class Gen5SpirvTranslator
             var v3 = new uint[3];
             for (var axis = 0u; axis < 3; axis++)
             {
-                var first = LoadNodeFloat(nodeAddress, axis);
-                var vertex1 = LoadNodeFloat(nodeAddress, 3 + axis);
-                var vertex2 = LoadNodeFloat(nodeAddress, 6 + axis);
-                var vertex3 = LoadNodeFloat(nodeAddress, 9 + axis);
+                var first = LoadNodeFloat(node, axis);
+                var vertex1 = LoadNodeFloat(node, 3 + axis);
+                var vertex2 = LoadNodeFloat(node, 6 + axis);
+                var vertex3 = LoadNodeFloat(node, 9 + axis);
                 v1[axis] = SelectF(second, vertex1, first);
                 v2[axis] = SelectF(second, vertex3, vertex1);
                 v3[axis] = vertex2;
@@ -205,7 +235,7 @@ public static partial class Gen5SpirvTranslator
             tNum = SelectF(missed, Float(float.PositiveInfinity), tNum);
             tDenom = SelectF(missed, one, tDenom);
 
-            var triangleId = LoadNodeDword(nodeAddress, TriangleIdDword);
+            var triangleId = LoadNodeDword(node, TriangleIdDword);
             var shift = ShiftLeftLogical(nodeType, UInt(3));
             uint Barycentric(int sourceShift)
             {
@@ -228,7 +258,7 @@ public static partial class Gen5SpirvTranslator
         // IntersectNodeBvh4 with fast_intersect_bbox: slab test clipped to [0, extent], a
         // NaN interval misses, box_grow_value widens the exit time by that many 2^-24
         // steps, and the optional sort orders hit children by entry time.
-        private uint[] EmitRayBoxes(uint nodeAddress, bool fp16, uint boxGrow, uint boxSort, uint extent,
+        private uint[] EmitRayBoxes(NodeUnit first, NodeUnit second, bool fp16, uint boxGrow, uint boxSort, uint extent,
             IReadOnlyList<uint> origin, IReadOnlyList<uint> inverseDirection)
         {
             var zero = Float(0f);
@@ -238,13 +268,13 @@ public static partial class Gen5SpirvTranslator
             var keys = new uint[4];
             for (var child = 0u; child < 4; child++)
             {
-                var pointer = LoadNodeDword(nodeAddress, child);
+                var pointer = LoadNodeDword(first, child);
                 var enter = Float(float.NegativeInfinity);
                 var leave = Float(float.PositiveInfinity);
                 for (var axis = 0u; axis < 3; axis++)
                 {
-                    var min = BoxBound(nodeAddress, fp16, child, axis);
-                    var max = BoxBound(nodeAddress, fp16, child, axis + 3);
+                    var min = BoxBound(first, second, fp16, child, axis);
+                    var max = BoxBound(first, second, fp16, child, axis + 3);
                     var planeMin = FMul(FSub(min, origin[(int)axis]), inverseDirection[(int)axis]);
                     var planeMax = FMul(FSub(max, origin[(int)axis]), inverseDirection[(int)axis]);
                     var positive = FCompare(SpirvOp.FOrdGreaterThanEqual, inverseDirection[(int)axis], zero);
@@ -284,13 +314,13 @@ public static partial class Gen5SpirvTranslator
         }
 
         // Bound 0-2 is the minimum, 3-5 the maximum of one child box.
-        private uint BoxBound(uint nodeAddress, bool fp16, uint child, uint bound)
+        private uint BoxBound(NodeUnit first, NodeUnit second, bool fp16, uint child, uint bound)
         {
             var index = child * 6 + bound;
             if (!fp16)
-                return LoadNodeFloat(nodeAddress, BoxBoundsDword + index);
+                return LoadNodeFloat(first, second, BoxBoundsDword + index);
 
-            var packed = LoadNodeDword(nodeAddress, BoxBoundsDword + index / 2);
+            var packed = LoadNodeDword(first, BoxBoundsDword + index / 2);
             var bits = index % 2 == 0 ? BitwiseAnd(packed, UInt(0xFFFF)) : ShiftRightLogical(packed, UInt(16));
             return Bitcast(_floatType, EmitHalfToFloat(bits));
         }
