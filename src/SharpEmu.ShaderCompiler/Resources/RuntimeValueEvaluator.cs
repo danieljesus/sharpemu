@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 namespace SharpEmu.ShaderCompiler.Resources;
 
@@ -328,12 +329,31 @@ public sealed class RuntimeValueEvaluator
         else _cache[value] = result;
     }
 
-    internal int BeginCompiled(int index, out ulong result) => _compiledValues.Begin(index, out result);
-    internal void StoreCompiled(int index, ulong result) => _compiledValues.Store(index, result);
-    internal void EndCompiled(int index) => _compiledValues.End(index);
-    internal bool EvaluateCompiled(int index, out ulong result) => _compiled!.Evaluate(this, index, out result);
+    internal CompiledResourceEvaluator? Compiled => _compiled;
+
+    internal bool EvaluateCompiled(int index, out ulong result) =>
+        _compiledValues.TryGet(index, out result) ||
+        (_compiled!.Evaluate(this, _compiledValues, [index]) && _compiledValues.TryGet(index, out result));
+
+    // Evaluates every root in one pass; false when any cannot be evaluated.
+    internal bool EvaluateCompiledRoots(ReadOnlySpan<int> roots) => roots.IsEmpty || _compiled!.Evaluate(this, _compiledValues, roots);
+
+    internal ulong CompiledValue(int index) => _compiledValues.Values[index];
+
     internal bool EvaluateCompiledSpecial(int index, out ulong result) => EvaluateNode(_compiled!.Values[index], out result);
     internal bool IsCompiledActiveMask(int index) => ReferenceEquals(_activeMask, _compiled!.Values[index]);
+
+    // A table slot the clean evaluator reads instead of this one.
+    internal bool IsCleanSlot(int slot) => slot < _cleanFlatSlots.Count && _cleanFlatSlots[slot] != 0 && _cleanEvaluator is not null;
+
+    // A resource table word: the clean evaluator's read of a clean slot, else the value of
+    // the table word it aliases, which the pass computed before it.
+    internal bool EvaluateCompiledTableWord(int slot, ulong tableWord, out ulong result)
+    {
+        if (IsCleanSlot(slot)) return EvaluateTableReference(slot, out result);
+        result = tableWord;
+        return true;
+    }
 
     internal bool ReadUserData(int index, out ulong result)
     {
@@ -449,6 +469,30 @@ public sealed class RuntimeValueEvaluator
             activeSources = EvaluateActiveSources(plan, inputs, cleanEvaluator, cleanScratch);
         var evaluated = new List<DescriptorWords>(sources.Count);
         RawReadPrefetch.PrefetchSources(plan, sources, activeSources, evaluator);
+        // The background compile may finish between the two evaluators' construction; the
+        // batches need both on the same evaluator, else each word is evaluated on its own.
+        var compiled = evaluator.Compiled is { } shared && ReferenceEquals(cleanEvaluator.Compiled, shared) ? shared : null;
+        if (compiled is not null)
+        {
+            // Every active word of this call in one pass over the nodes they need.
+            var roots = scratch.Roots;
+            roots.Clear();
+            foreach (var sourceIndex in sources)
+            {
+                if (sourceIndex >= plan.DescriptorSources.Count)
+                {
+                    return false;
+                }
+
+                if (activeSources.Length == 0 || activeSources[sourceIndex]) roots.AddRange(compiled.SourceWords[(int)sourceIndex]);
+            }
+
+            if (!evaluator.EvaluateCompiledRoots(CollectionsMarshal.AsSpan(roots)))
+            {
+                return false;
+            }
+        }
+
         foreach (var sourceIndex in sources)
         {
             if (sourceIndex >= plan.DescriptorSources.Count)
@@ -460,12 +504,13 @@ public sealed class RuntimeValueEvaluator
             var words = new uint[source.DwordCount];
             if (activeSources.Length == 0 || activeSources[sourceIndex])
             {
+                var sourceWords = compiled?.SourceWords[(int)sourceIndex];
                 for (var index = 0; index < words.Length; index++)
                 {
-                    if (!evaluator.EvaluateSourceWord((int)sourceIndex, index, out words[index]))
-                    {
+                    if (sourceWords is not null && index < sourceWords.Length)
+                        words[index] = (uint)evaluator.CompiledValue(sourceWords[index]);
+                    else if (!evaluator.EvaluateSourceWord((int)sourceIndex, index, out words[index]))
                         return false;
-                    }
                 }
             }
 
@@ -480,16 +525,44 @@ public sealed class RuntimeValueEvaluator
             try
             {
                 RawReadPrefetch.PrefetchTable(plan, evaluator, cleanEvaluator, cleanFlatSlots);
+                if (compiled is not null)
+                {
+                    // The clean slots in one pass of the clean evaluator, the others in one of the general one.
+                    var roots = scratch.Roots;
+                    var cleanRoots = cleanScratch.Roots;
+                    roots.Clear();
+                    cleanRoots.Clear();
+                    for (var index = 0; index < plan.TableReads.Count; index++)
+                    {
+                        var read = plan.TableReads[index];
+                        if (read.FlatOffset >= plan.TableReads.Count)
+                        {
+                            return false;
+                        }
+
+                        (evaluator.IsCleanSlot((int)read.FlatOffset) ? cleanRoots : roots).Add(compiled.TableWords[index]);
+                    }
+
+                    if (!evaluator.EvaluateCompiledRoots(CollectionsMarshal.AsSpan(roots)) ||
+                        !cleanEvaluator.EvaluateCompiledRoots(CollectionsMarshal.AsSpan(cleanRoots)))
+                    {
+                        return false;
+                    }
+                }
+
                 for (var index = 0; index < plan.TableReads.Count; index++)
                 {
                     var read = plan.TableReads[index];
                     var clean = read.FlatOffset < cleanFlatSlots.Count && cleanFlatSlots[(int)read.FlatOffset] != 0;
                     var selected = clean ? cleanEvaluator : evaluator;
-                    if (read.FlatOffset >= plan.TableReads.Count || !selected.EvaluateTableRead(index, out var word))
+                    if (read.FlatOffset >= plan.TableReads.Count)
                     {
                         return false;
                     }
 
+                    uint word;
+                    if (compiled is not null) word = (uint)selected.CompiledValue(compiled.TableWords[index]);
+                    else if (!selected.EvaluateTableRead(index, out word)) return false;
                     flattened[(int)read.FlatOffset] = word;
                 }
             }
