@@ -70,6 +70,21 @@ public sealed class GpuCommandInterpreterWindowTests
     }
 
     [Fact]
+    public void ANestedBuffer_KeepsTheParentsWindow()
+    {
+        const ulong nested = Command + 0x800;
+        var runner = new StreamRunner();
+        runner.Load(nested, StreamRunner.Concat(InstanceCount(5), InstanceCount(6)));
+        var indirect = StreamRunner.Packet(PacketOpcode.IndirectBuffer, StreamRunner.Low(nested), StreamRunner.High(nested) & 0xFFFF, 4);
+
+        var progress = runner.Run(InstanceCount(1), indirect, InstanceCount(2));
+
+        Assert.Equal(SubmissionProgress.Complete, progress);
+        Assert.Equal(2u, runner.Interpreter.InstanceCount);
+        Assert.Equal([Command, nested], StreamReads(runner));
+    }
+
+    [Fact]
     public void APacketLongerThanTheWindow_IsReadDirectly()
     {
         var runner = new StreamRunner();
