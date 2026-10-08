@@ -2557,13 +2557,6 @@ public static partial class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData0 + 1),
                     ],
-                    // GFX10 DS_MIN/MAX_F32 use DATA0 as the replacement value and
-                    // DATA1 as the floating-point compare operand.
-                    "DsMinF32" or "DsMaxF32" => [
-                        Gen5Operand.Vector(vectorAddress),
-                        Gen5Operand.Vector(vectorData0),
-                        Gen5Operand.Vector(vectorData1),
-                    ],
                     _ when IsDataShareAtomic(opcode) => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),

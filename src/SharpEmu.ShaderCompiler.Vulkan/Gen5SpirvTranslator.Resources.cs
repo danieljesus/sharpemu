@@ -1798,20 +1798,20 @@ public static partial class Gen5SpirvTranslator
             error = string.Empty;
             if (instruction.Opcode is "DsMinF32" or "DsMaxF32")
             {
-                if (instruction.Sources.Count < 3)
+                if (instruction.Sources.Count < 2)
                 {
                     error = $"missing GDS operands for {instruction.Opcode}";
                     return false;
                 }
 
                 var floatIndex = GlobalDataShareIndex(GetRawSource(instruction, 0), control.SingleOffsetBytes);
+                // DS_MIN/MAX_F32: mem = min/max(mem, DATA0); there is no DATA1 operand.
                 EmitExecConditional(() =>
                 {
                     EmitConditional(IsBlockWordInRange(_globalDataShare, floatIndex), () =>
-                        EmitDataShareFloatAtomic(
+                        EmitBufferFloatAtomic(
                             BlockWordPointer(_globalDataShare, floatIndex),
                             GetRawSource(instruction, 1),
-                            GetRawSource(instruction, 2),
                             instruction.Opcode == "DsMaxF32",
                             scope: 1,
                             semantics: 0x48));
