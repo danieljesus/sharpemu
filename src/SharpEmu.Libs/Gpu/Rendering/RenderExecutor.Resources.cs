@@ -278,53 +278,6 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x200);
         }
 
-        _host.BindVertexBuffers(vertexBuffers, vertexInput);
-
-        if (pixelBindings is not null && setAutoDebug)
-        {
-            SetDrawDebugPhase(submitId, in draw, 0x300);
-        }
-
-        Span<IPreparedBindings> stages = pixelBindings is null ? [vertexBindings] : [vertexBindings, pixelBindings];
-        _host.CommitBindings(PipelineBindPoint.Graphics, in pipeline, stages);
-        if (indexBuffer.Size != 0)
-        {
-            _host.BindIndexBuffer(indexBuffer.Binding, indexBuffer.Type);
-        }
-
-        _host.SetDynamicState(DynamicStateOf(context, ref state));
-        if (setAutoDebug)
-        {
-            SetDrawDebugPhase(submitId, in draw, 0x400);
-        }
-
-        if (DrawWritesMemory(vertexInput.Stage) || (pixelBindings is not null && DrawWritesMemory(pixelInput.Stage)))
-        {
-            _host.PrepareMemoryWritingDraw();
-        }
-
-        _host.BeginRendering(in state.Rendering);
-        _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
-        if (setAutoDebug)
-        {
-            SetDrawDebugPhase(submitId, in draw, 0x500);
-        }
-
-        if (emission.IndirectArgumentsAddress != 0)
-        {
-            // Uploads and shader writes end with barriers to all commands, so the
-            // indirect read sees them.
-            _host.DrawIndexedIndirect(indirectArguments);
-        }
-        else
-        {
-            EmitDraw(banks.UserConfig, vertexInput, in draw, in emission);
-        }
-        if (setAutoDebug)
-        {
-            SetDrawDebugPhase(submitId, in draw, 0x600);
-        }
-
         var writeStages = PipelineStageFlags.None;
         if (HasBufferWrites(vertexInput.Stage))
         {
@@ -336,13 +289,147 @@ public sealed partial class RenderExecutor
             writeStages |= PipelineStageFlags.FragmentShaderBit;
         }
 
-        if (writeStages != PipelineStageFlags.None)
+        var recording = new DrawRecording(
+            submitId,
+            in draw,
+            in emission,
+            in pipeline,
+            vertexBuffers,
+            vertexInput,
+            vertexBindings,
+            pixelBindings,
+            in indexBuffer,
+            indirectArguments,
+            in state.Rendering,
+            DynamicStateOf(context, ref state),
+            banks.UserConfig,
+            DrawWritesMemory(vertexInput.Stage) || (pixelBindings is not null && DrawWritesMemory(pixelInput.Stage)),
+            writeStages,
+            setAutoDebug);
+        EmitDrawRecording(in recording);
+    }
+
+    // Everything the recording half of a draw needs once its resources are resolved: the
+    // pipeline, the bindings the host prepared, the buffers it obtained, the attachments it
+    // acquired and the state that follows from the registers. Nothing in it touches guest
+    // memory or a cache, so the recording can follow the resolution later.
+    private readonly struct DrawRecording
+    {
+        public readonly ulong SubmitId;
+        public readonly DrawCall Draw;
+        public readonly DrawEmission Emission;
+        public readonly PipelineHandle Pipeline;
+        public readonly BufferBinding[] VertexBuffers;
+        public readonly VertexInputInfo VertexInput;
+        public readonly IPreparedBindings VertexBindings;
+        public readonly IPreparedBindings? PixelBindings;
+        public readonly PreparedIndexBuffer IndexBuffer;
+        public readonly BufferBinding IndirectArguments;
+        public readonly RenderingState Rendering;
+        public readonly DynamicDrawState DynamicState;
+        public readonly UserConfigRegisters UserConfig;
+        public readonly bool WritesMemory;
+        public readonly PipelineStageFlags WriteStages;
+        public readonly bool SetAutoDebug;
+
+        public DrawRecording(
+            ulong submitId,
+            in DrawCall draw,
+            in DrawEmission emission,
+            in PipelineHandle pipeline,
+            BufferBinding[] vertexBuffers,
+            VertexInputInfo vertexInput,
+            IPreparedBindings vertexBindings,
+            IPreparedBindings? pixelBindings,
+            in PreparedIndexBuffer indexBuffer,
+            BufferBinding indirectArguments,
+            in RenderingState rendering,
+            in DynamicDrawState dynamicState,
+            UserConfigRegisters userConfig,
+            bool writesMemory,
+            PipelineStageFlags writeStages,
+            bool setAutoDebug)
         {
-            _host.EndRendering();
-            _host.ShaderWriteBarrier(writeStages);
+            SubmitId = submitId;
+            Draw = draw;
+            Emission = emission;
+            Pipeline = pipeline;
+            VertexBuffers = vertexBuffers;
+            VertexInput = vertexInput;
+            VertexBindings = vertexBindings;
+            PixelBindings = pixelBindings;
+            IndexBuffer = indexBuffer;
+            IndirectArguments = indirectArguments;
+            Rendering = rendering;
+            DynamicState = dynamicState;
+            UserConfig = userConfig;
+            WritesMemory = writesMemory;
+            WriteStages = writeStages;
+            SetAutoDebug = setAutoDebug;
+        }
+    }
+
+    // Records a resolved draw: the commands of the draw itself and nothing else.
+    private void EmitDrawRecording(in DrawRecording recording)
+    {
+        var submitId = recording.SubmitId;
+        ref readonly var draw = ref recording.Draw;
+        _host.BindVertexBuffers(recording.VertexBuffers, recording.VertexInput);
+
+        if (recording.PixelBindings is not null && recording.SetAutoDebug)
+        {
+            SetDrawDebugPhase(submitId, in draw, 0x300);
         }
 
-        if (setAutoDebug)
+        Span<IPreparedBindings> stages = recording.PixelBindings is null
+            ? [recording.VertexBindings]
+            : [recording.VertexBindings, recording.PixelBindings];
+        _host.CommitBindings(PipelineBindPoint.Graphics, in recording.Pipeline, stages);
+        if (recording.IndexBuffer.Size != 0)
+        {
+            _host.BindIndexBuffer(recording.IndexBuffer.Binding, recording.IndexBuffer.Type);
+        }
+
+        _host.SetDynamicState(in recording.DynamicState);
+        if (recording.SetAutoDebug)
+        {
+            SetDrawDebugPhase(submitId, in draw, 0x400);
+        }
+
+        if (recording.WritesMemory)
+        {
+            _host.PrepareMemoryWritingDraw();
+        }
+
+        _host.BeginRendering(in recording.Rendering);
+        _host.BindPipeline(PipelineBindPoint.Graphics, in recording.Pipeline);
+        if (recording.SetAutoDebug)
+        {
+            SetDrawDebugPhase(submitId, in draw, 0x500);
+        }
+
+        if (recording.Emission.IndirectArgumentsAddress != 0)
+        {
+            // Uploads and shader writes end with barriers to all commands, so the
+            // indirect read sees them.
+            _host.DrawIndexedIndirect(recording.IndirectArguments);
+        }
+        else
+        {
+            EmitDraw(recording.UserConfig, recording.VertexInput, in draw, in recording.Emission);
+        }
+        if (recording.SetAutoDebug)
+        {
+            SetDrawDebugPhase(submitId, in draw, 0x600);
+        }
+
+        if (recording.WriteStages != PipelineStageFlags.None)
+        {
+            _host.EndRendering();
+            _host.ShaderWriteBarrier(recording.WriteStages);
+        }
+
+        if (recording.SetAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x700);
         }
