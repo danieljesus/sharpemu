@@ -268,12 +268,19 @@ public static class Gen5WaterfallMoveRelative
                     }
 
                     var target = IndexOfPc(code, BranchTarget(instruction));
-                    if (target <= position)
+                    if (target < start)
                     {
+                        // Back before the loop's exit: the code there may read the register.
                         return false;
                     }
 
-                    pending.Push(target);
+                    if (target > position)
+                    {
+                        pending.Push(target);
+                    }
+                    // A branch back to code this walk already passed without a read or a
+                    // write of the register cannot reach one by repeating it.
+
                     if (instruction.Opcode == "SBranch")
                     {
                         break;
@@ -311,12 +318,17 @@ public static class Gen5WaterfallMoveRelative
         return -1;
     }
 
+    // On GFX10 only the GWS and ordered-count LDS instructions read M0, and a buffer
+    // instruction only when it targets LDS (the LDS bit of its first word).
+    private const uint BufferLdsBit = 1u << 16;
+
     private static bool ReadsM0Implicitly(Gen5ShaderInstruction instruction) =>
         instruction.Opcode.Contains("Movrel", StringComparison.Ordinal) ||
-        instruction.Opcode.StartsWith("Ds", StringComparison.Ordinal) ||
+        instruction.Opcode.StartsWith("DsGws", StringComparison.Ordinal) ||
+        instruction.Opcode.StartsWith("DsOrderedCount", StringComparison.Ordinal) ||
         instruction.Opcode.StartsWith("VInterp", StringComparison.Ordinal) ||
         instruction.Opcode.StartsWith("SSendmsg", StringComparison.Ordinal) ||
-        instruction.Opcode.StartsWith("Buffer", StringComparison.Ordinal) ||
+        instruction.Opcode.StartsWith("Buffer", StringComparison.Ordinal) && (instruction.Words.Count == 0 || (instruction.Words[0] & BufferLdsBit) != 0) ||
         instruction.Opcode.StartsWith("Global", StringComparison.Ordinal) ||
         instruction.Opcode.StartsWith("Flat", StringComparison.Ordinal) ||
         instruction.Opcode.StartsWith("Scratch", StringComparison.Ordinal);

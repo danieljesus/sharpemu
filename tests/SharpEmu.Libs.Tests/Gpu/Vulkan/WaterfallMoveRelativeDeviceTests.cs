@@ -132,6 +132,8 @@ public sealed class WaterfallMoveRelativeDeviceTests(HeadlessVulkanFixture fixtu
             // BVH refit has after its loop; both paths write them before any read.
             Add(at => Branch(at, "SCbranchScc0", 1));
             Add(at => Nop(at));
+            // A plain buffer load does not read M0 (only an LDS load does).
+            Add(at => BufferAccess(at, "BufferLoadDword", 4, vectorData: 22, offsetEnabled: true, vectorAddress: 3));
         }
         // M0 is rewritten before the store, which conservatively counts as reading M0.
         Add(at => MoveScalar(at, 124, 0));
