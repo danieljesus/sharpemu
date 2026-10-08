@@ -708,6 +708,10 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 // Destroying the pool frees the scratch buffer allocated from it.
                 _vk.DestroyCommandPool(_device, _commandPool, null);
+                // The batch secondaries came from that pool; they go with it.
+                _secondaries.Clear();
+                _batchRecording = false;
+                _batchSecondary = default;
                 _commandPool = default;
                 _commandBuffer = default;
                 _syncCommandBuffer = default;

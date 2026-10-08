@@ -435,6 +435,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _back = new BackQueue(WakeRenderThread, BackQueueCapacity);
             _front = new FrontCommandStreamHost(this, _back);
             RenderPhaseProfile.FrontReport = TakeFrontReport;
+            RenderPhaseProfile.BatchReport = TakeBatchReport;
             ShaderPipelineCache.BeforeGuestWrite = _front.Drain;
         }
 

@@ -736,6 +736,47 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // Joins every stage's writes, records the image work and binds the set by push or from the heap.
+        // The commands a draw's bindings need before its rendering scope opens: the data share
+        // barrier, the texture layout transitions and the host movie uploads. CommitBindings
+        // records them itself when nothing called this first (a dispatch, another host).
+        public void PrepareBindingCommands(PipelineBindPoint bindPoint, ReadOnlySpan<IPreparedBindings> stages)
+        {
+            var preparation = RequirePreparation();
+            var uploadStage = bindPoint == PipelineBindPoint.Compute ? PipelineStageFlags.ComputeShaderBit : PipelineStageFlags.FragmentShaderBit;
+            foreach (var prepared in stages)
+            {
+                var stage = (PreparedStageBindings)prepared;
+                RecordStageBindingCommands(stage, DescriptorWriter.ShaderStageFlag(StageOf(stage.Program)), uploadStage);
+            }
+
+            preparation.BindingCommandsPrepared = true;
+        }
+
+        private void RecordStageBindingCommands(PreparedStageBindings stage, ShaderStageFlags stageFlag, PipelineStageFlags uploadStage)
+        {
+            var descriptors = stage.Descriptors;
+            if (descriptors.GlobalDataShare.Buffer.Handle != 0)
+            {
+                // The host and every earlier queue write to the data share complete before the shader reads it.
+                EndRendering();
+                var command = BeginBatchedGuestCommands();
+                var barrier = GlobalDataShareBarrier.Make(descriptors.GlobalDataShare.Buffer);
+                VulkanSynchronization.PipelineBarrier(_vk, command, GlobalDataShareBarrier.SourceStages, DescriptorWriter.PipelineStageFlag(stageFlag), 0, 0, null, 1, &barrier, 0, null);
+            }
+
+            RecordStageTextureTransitions(stage.Textures);
+            foreach (var texture in stage.Textures)
+            {
+                if (texture.IsHostMovie && texture.NeedsUpload)
+                {
+                    EndRendering();
+                    break;
+                }
+            }
+
+            RecordHostMovieUploads(stage.Textures, uploadStage);
+        }
+
         public void CommitBindings(PipelineBindPoint bindPoint, in PipelineHandle pipeline, ReadOnlySpan<IPreparedBindings> stages)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorCommit);
@@ -827,26 +868,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     var descriptors = stage.Descriptors;
                     var shaderStage = StageOf(program);
                     var stageFlag = DescriptorWriter.ShaderStageFlag(shaderStage);
-                    if (descriptors.GlobalDataShare.Buffer.Handle != 0)
+                    if (!preparation.BindingCommandsPrepared)
                     {
-                        // The host and every earlier queue write to the data share complete before the shader reads it.
-                        EndRendering();
+                        RecordStageBindingCommands(stage, stageFlag, uploadStage);
                         command = BeginBatchedGuestCommands();
-                        var barrier = GlobalDataShareBarrier.Make(descriptors.GlobalDataShare.Buffer);
-                        VulkanSynchronization.PipelineBarrier(_vk,command, GlobalDataShareBarrier.SourceStages, DescriptorWriter.PipelineStageFlag(stageFlag), 0, 0, null, 1, &barrier, 0, null);
                     }
 
-                    RecordStageTextureTransitions(stage.Textures);
-                    foreach (var texture in stage.Textures)
-                    {
-                        if (texture.IsHostMovie && texture.NeedsUpload)
-                        {
-                            EndRendering();
-                            break;
-                        }
-                    }
-
-                    RecordHostMovieUploads(stage.Textures, uploadStage);
                     foreach (var texture in stage.Textures)
                     {
                         textures[textureIndex++] = texture;

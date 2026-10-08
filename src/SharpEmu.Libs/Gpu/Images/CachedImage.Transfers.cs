@@ -141,7 +141,9 @@ public sealed unsafe partial class CachedImage
         }
 
         _scheduler.EndRendering();
-        RecordBarriers(command, sourceStages, stage, null, barriers);
+        // Ending the rendering may retire the buffer the caller held (a scope recorded apart);
+        // the barrier goes to the buffer that is current now.
+        RecordBarriers(new CommandBuffer(_scheduler.Current.Handle), sourceStages, stage, null, barriers);
     }
 
     private const AccessFlags2 AttachmentAccess =

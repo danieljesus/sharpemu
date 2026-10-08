@@ -62,6 +62,10 @@ internal static unsafe partial class VulkanVideoPresenter
 
             public bool CommandsRecorded { get; set; }
 
+            // The binding commands (data share barrier, texture transitions, movie uploads)
+            // were recorded ahead of the rendering scope by PrepareBindingCommands.
+            public bool BindingCommandsPrepared { get; set; }
+
             public void Dispose()
             {
                 if (!ReferenceEquals(owner._preparation, this))
@@ -894,6 +898,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var rendering = new RenderingInfo
             {
                 SType = StructureType.RenderingInfo,
+                Flags = RecordBatches ? RenderingFlags.ContentsSecondaryCommandBuffersBit : 0,
                 RenderArea = new Rect2D(new Offset2D(0, 0), new Extent2D(state.Width, state.Height)),
                 LayerCount = state.Layers,
                 ColorAttachmentCount = state.ColorAttachmentCount,
@@ -905,6 +910,10 @@ internal static unsafe partial class VulkanVideoPresenter
             _renderingScopesBegun++;
             _renderingActive = true;
             _renderingState = state;
+            if (RecordBatches)
+            {
+                OpenRecordingBatch(in state);
+            }
         }
 
         public void EndRendering()
@@ -917,6 +926,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _renderingActive = false;
             _renderingState = default;
             var command = new CommandBuffer(_scheduler.Current.Handle);
+            CloseRecordingBatch(command);
             _vk.CmdEndRendering(command);
             foreach (var (sourceStages, destinationStages, barriers) in _barriersAfterRendering)
             {

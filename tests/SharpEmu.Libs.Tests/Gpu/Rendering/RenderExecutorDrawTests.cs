@@ -56,11 +56,11 @@ public sealed class RenderExecutorDrawTests : IDisposable
             "obtain 100500000 C written=False",
             "acquire_color 0 100000000 image=1",
             "debug DrawIndex 7 100 6 0 2 0",
+            "begin_rendering 64x64x1 colors=1 samples=1",
             "bind_vertex 100:0",
             "commit Graphics A1 [1,2]",
             "bind_index",
             "dynamic_state",
-            "begin_rendering 64x64x1 colors=1 samples=1",
             "bind_pipeline Graphics A1",
             "draw_indexed 6 2 0 3 0",
             "reset_bindings");
@@ -120,9 +120,9 @@ public sealed class RenderExecutorDrawTests : IDisposable
         AssertOrder(
             "debug DrawIndexAuto 3 3 0 5 1 0",
             "debug DrawIndexAuto 3 200 3 0 1 0",
+            "begin_rendering",
             "debug DrawIndexAuto 3 300 3 0 1 0",
             "debug DrawIndexAuto 3 400 3 0 1 0",
-            "begin_rendering",
             "debug DrawIndexAuto 3 500 3 0 1 0",
             "draw 3 1 5 0",
             "debug DrawIndexAuto 3 600 3 0 1 0",

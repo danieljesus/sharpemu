@@ -374,6 +374,17 @@ public sealed partial class RenderExecutor
     {
         var submitId = recording.SubmitId;
         ref readonly var draw = ref recording.Draw;
+        Span<IPreparedBindings> stages = recording.PixelBindings is null
+            ? [recording.VertexBindings]
+            : [recording.VertexBindings, recording.PixelBindings];
+        _host.PrepareBindingCommands(PipelineBindPoint.Graphics, stages);
+        if (recording.WritesMemory)
+        {
+            _host.PrepareMemoryWritingDraw();
+        }
+
+        // The binds follow the scope: a scope recorded apart starts with no state.
+        _host.BeginRendering(in recording.Rendering);
         _host.BindVertexBuffers(recording.VertexBuffers, recording.VertexInput);
 
         if (recording.PixelBindings is not null && recording.SetAutoDebug)
@@ -381,9 +392,6 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x300);
         }
 
-        Span<IPreparedBindings> stages = recording.PixelBindings is null
-            ? [recording.VertexBindings]
-            : [recording.VertexBindings, recording.PixelBindings];
         _host.CommitBindings(PipelineBindPoint.Graphics, in recording.Pipeline, stages);
         if (recording.IndexBuffer.Size != 0)
         {
@@ -396,12 +404,6 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x400);
         }
 
-        if (recording.WritesMemory)
-        {
-            _host.PrepareMemoryWritingDraw();
-        }
-
-        _host.BeginRendering(in recording.Rendering);
         _host.BindPipeline(PipelineBindPoint.Graphics, in recording.Pipeline);
         if (recording.SetAutoDebug)
         {

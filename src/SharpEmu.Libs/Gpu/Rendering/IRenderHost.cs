@@ -131,6 +131,10 @@ public interface IRenderHost
 
     void CommitBindings(PipelineBindPoint bindPoint, in PipelineHandle pipeline, ReadOnlySpan<IPreparedBindings> stages);
 
+    // The commands the bindings need before the draw's rendering scope opens (barriers,
+    // layout transitions, uploads); a host that records them in CommitBindings ignores it.
+    void PrepareBindingCommands(PipelineBindPoint bindPoint, ReadOnlySpan<IPreparedBindings> stages) { }
+
     void SetDynamicState(in DynamicDrawState state);
 
     void BeginRendering(in RenderingState state);

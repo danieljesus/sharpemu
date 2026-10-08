@@ -183,6 +183,7 @@ internal static class RenderPhaseProfile
 
     // Set by a presenter that interprets on a front thread; its line joins the window report.
     internal static Func<string>? FrontReport;
+    internal static Func<string>? BatchReport;
 
     internal static void RecordSubmissionArrival()
     {
@@ -498,6 +499,7 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(FormattableString.Invariant(
             $"[PERF][PREPARED_PROGRAMS] used={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsUsed, 0)} rejected={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsRejected, 0)} dynamic_state_rebuilt={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedDynamicStateMismatches, 0)}"));
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.GuestBufferCache.TakeAsyncReadbackReport());
+        if (BatchReport?.Invoke() is { Length: > 0 } batchReport) Console.Error.WriteLine(batchReport);
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeLookupReport());
         SharpEmu.ShaderCompiler.Resources.ResourceMaterializationProfile.WriteReport();
         SharpEmu.Libs.Diagnostics.AgcRegisterPacketProfile.WriteReport();

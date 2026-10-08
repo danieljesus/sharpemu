@@ -53,7 +53,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 _batchDrawCount = 0;
             }
 
-            return commandBuffer;
+            // Inside a rendering scope recorded as a batch, the scope's secondary takes the commands.
+            return _batchRecording ? _batchSecondary : commandBuffer;
         }
 
         // Submits the current recording buffer with everything the batch lists own.
