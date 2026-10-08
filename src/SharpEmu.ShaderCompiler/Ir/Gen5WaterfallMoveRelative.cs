@@ -102,6 +102,13 @@ public static class Gen5WaterfallMoveRelative
                 continue;
             }
 
+            // A wait between the M0 copy and the move (GTA V's BVH refit does this) changes
+            // nothing the loop computes.
+            if (instruction.Opcode is "SWaitcnt" or "SNop")
+            {
+                continue;
+            }
+
             if (instruction.Opcode == "SAndn2B64" && retire < 0 && IsScalar(instruction.Destinations, out left) &&
                 instruction.Sources.Count == 2 &&
                 instruction.Sources[0] == Gen5Operand.Scalar(left) && instruction.Sources[1] == Gen5Operand.Scalar(Exec))

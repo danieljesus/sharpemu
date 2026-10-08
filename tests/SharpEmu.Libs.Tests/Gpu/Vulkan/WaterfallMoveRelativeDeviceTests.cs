@@ -23,6 +23,15 @@ public sealed class WaterfallMoveRelativeDeviceTests(HeadlessVulkanFixture fixtu
         Assert.DoesNotContain(collapsed.Instructions, instruction => instruction.Opcode == "SCbranchScc1");
     }
 
+    // GTA V's BVH refit waits for the loads between the M0 copy and the relative move.
+    [Fact]
+    public void LoopsWithAWaitInsideAreCollapsed()
+    {
+        var collapsed = Gen5WaterfallMoveRelative.Collapse(CreateProgram(readM0AfterFirstLoop: false, waitInsideLoops: true));
+        Assert.Equal(3, collapsed.Instructions.Count(instruction => instruction.Opcode == Gen5WaterfallMoveRelative.IndexToM0));
+        Assert.DoesNotContain(collapsed.Instructions, instruction => instruction.Opcode == "SCbranchScc1");
+    }
+
     [Fact]
     public void LoopWhoseM0IsReadAfterwardIsKept()
     {
@@ -64,7 +73,7 @@ public sealed class WaterfallMoveRelativeDeviceTests(HeadlessVulkanFixture fixtu
     // v10..v17 = 110..117 and v30..v37 = 0 in every lane; index (v5) = lane & 7. Three waterfall
     // loops (shaped like a compiler's per-lane array access) run v20 = v[10 + index],
     // v[30 + index] = v20 and v21 = v[30 + index], then each lane stores v21.
-    private static Gen5ShaderProgram CreateProgram(bool readM0AfterFirstLoop)
+    private static Gen5ShaderProgram CreateProgram(bool readM0AfterFirstLoop, bool waitInsideLoops = false)
     {
         var code = new List<Gen5ShaderInstruction>();
         var pc = 0u;
@@ -94,6 +103,8 @@ public sealed class WaterfallMoveRelativeDeviceTests(HeadlessVulkanFixture fixtu
             var head = Add(at => ReadFirstLane(at, 10, 5));
             Add(at => Vopc(at, "VCmpxEqU32", Gen5Operand.Scalar(10), 5));
             Add(at => MoveScalarRegister(at, 124, 10));
+            if (waitInsideLoops)
+                Add(at => Wait(at));
             Add(at => Vop1(at, opcode, destination, Gen5Operand.Vector(source)));
             Add(at => Sop2(at, "SAndn2B64", 2, Gen5Operand.Scalar(2), Gen5Operand.Scalar(126)));
             Add(at => Sop1(at, "SMovB64", 126, Gen5Operand.Scalar(2)));
@@ -114,4 +125,7 @@ public sealed class WaterfallMoveRelativeDeviceTests(HeadlessVulkanFixture fixtu
         code.Add(EndProgram(pc));
         return Program([.. code]);
     }
+
+    private static Gen5ShaderInstruction Wait(uint pc) =>
+        new(pc, Gen5ShaderEncoding.Sopp, "SWaitcnt", [0xBF8C3F70], [], [], null);
 }
