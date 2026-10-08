@@ -30,6 +30,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private int _backThreadId = -1;
         private int _count;
         private Exception? _failure;
+        // For the profile: the ticks the front spent waiting on this queue, the deepest it got.
+        internal long WaitTicks;
+        internal int MaxDepth;
 
         // Read without the gate: the render thread asks while it holds its own gate, and the
         // front wakes the render thread (taking that gate) only after releasing this one.
@@ -55,11 +58,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (_items.Count >= capacity && _failure is null)
                 {
                     beforeWait?.Invoke();
+                    var waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                     while (_items.Count >= capacity && _failure is null)
                     {
                         Monitor.Wait(_gate);
                     }
 
+                    WaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
                     afterWait?.Invoke();
                 }
 
@@ -71,6 +76,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 wasEmpty = _items.Count == 0;
                 _items.Enqueue(work);
                 Volatile.Write(ref _count, _items.Count);
+                if (_items.Count > MaxDepth) MaxDepth = _items.Count;
             }
 
             if (wasEmpty)
@@ -121,11 +127,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (!completion.Done && _failure is null)
                 {
                     beforeWait?.Invoke();
+                    var waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                     while (!completion.Done && _failure is null)
                     {
                         Monitor.Wait(_gate);
                     }
 
+                    WaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
                     afterWait?.Invoke();
                 }
 
@@ -373,6 +381,21 @@ internal static unsafe partial class VulkanVideoPresenter
     {
         private FrontCommandStreamHost? _front;
         private BackQueue? _back;
+        private long _frontBusyTicks;
+        private long _frontSlices;
+
+        // [PERF][FRONT]: what the front thread spent interpreting and preparing, what it spent
+        // waiting on the render thread, and how deep the queue got in the window.
+        internal string TakeFrontReport()
+        {
+            if (_back is null) return string.Empty;
+            var busy = Interlocked.Exchange(ref _frontBusyTicks, 0);
+            var slices = Interlocked.Exchange(ref _frontSlices, 0);
+            var wait = Interlocked.Exchange(ref _back.WaitTicks, 0);
+            var depth = Interlocked.Exchange(ref _back.MaxDepth, 0);
+            return FormattableString.Invariant(
+                $"[PERF][FRONT] busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
+        }
 
         internal ICpuMemory GuestMemory => _guestMemory;
 
@@ -392,6 +415,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _back = new BackQueue(WakeRenderThread, BackQueueCapacity);
             _front = new FrontCommandStreamHost(this, _back);
+            RenderPhaseProfile.FrontReport = TakeFrontReport;
             ShaderPipelineCache.BeforeGuestWrite = _front.Drain;
         }
 
@@ -443,6 +467,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     SliceResult result;
                     ResumeFrontAliasAccess();
+                    var sliceStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                     try
                     {
                         result = _commandStream.ProcessOne();
@@ -450,6 +475,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     finally
                     {
                         PauseFrontAliasAccess();
+                        Interlocked.Add(ref _frontBusyTicks, System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted);
+                        Interlocked.Increment(ref _frontSlices);
                     }
 
                     switch (result)
