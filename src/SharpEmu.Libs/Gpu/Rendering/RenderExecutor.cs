@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using SharpEmu.Libs.Gpu.GpuCommands;
+using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -679,6 +680,20 @@ public sealed partial class RenderExecutor
             targetExportMapping[(int)color.Slot] = color.Resolution.ExportMapping;
         }
 
+        if (_preparedPrograms is { } prepared)
+        {
+            _preparedPrograms = null;
+            var actual = new DrawProgramInputs { PixelActive = state.PixelActive, DepthBound = state.Depth.HasTarget, ExportMapping = mappingStorage[0] };
+            if (actual.Equals(_preparedInputs))
+            {
+                PreparedProgramsUsed++;
+                state.Programs = prepared;
+                return;
+            }
+
+            PreparedProgramsRejected++;
+        }
+
         state.Programs = _pipelines.GetGraphicsPrograms(
             banks.Shader.Vertex,
             banks.Shader.Pixel,
@@ -690,9 +705,88 @@ public sealed partial class RenderExecutor
     }
 
     [System.Runtime.CompilerServices.InlineArray(RenderingState.ColorAttachmentCapacity)]
-    private struct ColorComponentMapArray
+    internal struct ColorComponentMapArray
     {
         private ColorComponentMap _element0;
+    }
+
+    // What the shader provider is given beside the registers: whether the pixel stage runs,
+    // whether a depth target is bound, and the export mapping of each bound color slot. They
+    // follow from the registers alone, so a draw's programs can be prepared before the host
+    // resolves its targets, and checked here against what the host resolved.
+    internal struct DrawProgramInputs : IEquatable<DrawProgramInputs>
+    {
+        public bool PixelActive;
+        public bool DepthBound;
+        public ColorComponentMapArray ExportMapping;
+
+        public bool Equals(DrawProgramInputs other) =>
+            PixelActive == other.PixelActive && DepthBound == other.DepthBound &&
+            ((ReadOnlySpan<ColorComponentMap>)ExportMapping).SequenceEqual(other.ExportMapping);
+
+        public override bool Equals(object? obj) => obj is DrawProgramInputs other && Equals(other);
+
+        public override int GetHashCode() => HashCode.Combine(PixelActive, DepthBound);
+    }
+
+    // The provider inputs of a draw from its registers, as TryResolveDrawTargets and
+    // ResolveShaderPrograms derive them, without touching the host.
+    internal static DrawProgramInputs ResolveProgramInputs(RegisterBanks banks, IImageFormatSupport formatSupport, Func<string, Exception> fatal)
+    {
+        var context = banks.Context;
+        var inputs = new DrawProgramInputs();
+        Span<ColorComponentMap> mapping = inputs.ExportMapping;
+        mapping.Fill(ColorComponentMap.Identity);
+        for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
+        {
+            if (slot != 0 && (context.RenderTargetMaskForSlot(slot) == 0 || context.ColorTargets[slot].BaseAddress == 0))
+            {
+                continue;
+            }
+
+            if (ColorTargetResolver.Resolve(context, slot, DrawLayerOffset, ignoreTargetMask: false, out var resolvedSlot) is { } resolution)
+            {
+                mapping[(int)resolvedSlot] = resolution.ExportMapping;
+            }
+        }
+
+        inputs.DepthBound = DepthTargetResolver.Resolve(context, formatSupport, fatal) is not null;
+        inputs.PixelActive = HasActivePixelShader(banks);
+        return inputs;
+    }
+
+    // Programs prepared ahead for the draw being executed, and the inputs they were prepared
+    // with; taken by the first program resolution of the draw when the inputs agree.
+    private GraphicsPrograms? _preparedPrograms;
+    private DrawProgramInputs _preparedInputs;
+    internal static long PreparedProgramsUsed, PreparedProgramsRejected;
+
+    internal void DrawIndexed(ulong submitId, RegisterBanks banks, in DrawIndexedArguments arguments, GraphicsPrograms? preparedPrograms, in DrawProgramInputs preparedInputs)
+    {
+        _preparedPrograms = preparedPrograms;
+        _preparedInputs = preparedInputs;
+        try
+        {
+            DrawIndexed(submitId, banks, in arguments);
+        }
+        finally
+        {
+            _preparedPrograms = null;
+        }
+    }
+
+    internal void DrawAuto(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments, GraphicsPrograms? preparedPrograms, in DrawProgramInputs preparedInputs)
+    {
+        _preparedPrograms = preparedPrograms;
+        _preparedInputs = preparedInputs;
+        try
+        {
+            DrawAuto(submitId, banks, in arguments);
+        }
+        finally
+        {
+            _preparedPrograms = null;
+        }
     }
 
     private static void TraceDrawState(ulong submitId, RegisterBanks banks, in DrawCall draw, in DrawState state)
