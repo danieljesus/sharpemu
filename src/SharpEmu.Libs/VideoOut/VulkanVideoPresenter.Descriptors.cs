@@ -758,8 +758,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     throw SubmissionScheduler.Fatal($"A stage does not belong to the bind point: stage={stage.Program.Stage} bindPoint={bindPoint}.");
                 }
 
-                foreach (var binding in stage.Layout.Descriptors)
+                var layoutDescriptors = stage.Layout.Descriptors;
+                for (var descriptorIndex = 0; descriptorIndex < layoutDescriptors.Count; descriptorIndex++)
                 {
+                    var binding = layoutDescriptors[descriptorIndex];
                     writeCount++;
                     var count = (int)DescriptorWriter.DescriptorCount(binding);
                     if (ImageDescriptorBinding.ResourceClass(binding.Kind) != ShaderCompiler.Resources.ImageResourceClass.None || binding.Kind == DescriptorBindingKind.Samplers)
@@ -852,8 +854,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     var occurrences = occurrenceScratch[..descriptors.Images.Length];
                     occurrences.Clear();
-                    foreach (var binding in stage.Layout.Descriptors)
+                    var layoutDescriptors = stage.Layout.Descriptors;
+                    for (var descriptorIndex = 0; descriptorIndex < layoutDescriptors.Count; descriptorIndex++)
                     {
+                        var binding = layoutDescriptors[descriptorIndex];
+                        var resources = binding.Resources;
                         var write = new WriteDescriptorSet
                         {
                             SType = StructureType.WriteDescriptorSet,
@@ -865,8 +870,9 @@ internal static unsafe partial class VulkanVideoPresenter
                         var imageStart = imageIndex;
                         if (ImageDescriptorBinding.ResourceClass(binding.Kind) != ShaderCompiler.Resources.ImageResourceClass.None)
                         {
-                            foreach (var resource in binding.Resources)
+                            for (var slot = 0; slot < resources.Count; slot++)
                             {
+                                var resource = resources[slot];
                                 imageInfos[imageIndex++] = ImageInfo(descriptors.Images[(int)resource], occurrences[(int)resource]++, program, (int)resource);
                             }
                         }
@@ -875,8 +881,9 @@ internal static unsafe partial class VulkanVideoPresenter
                             switch (binding.Kind)
                             {
                                 case DescriptorBindingKind.Buffers:
-                                    foreach (var resource in binding.Resources)
+                                    for (var slot = 0; slot < resources.Count; slot++)
                                     {
+                                        var resource = resources[slot];
                                         var view = descriptors.Buffers[(int)resource];
                                         if (view.Buffer.Handle == 0)
                                         {
@@ -915,8 +922,9 @@ internal static unsafe partial class VulkanVideoPresenter
                                 }
 
                                 case DescriptorBindingKind.Samplers:
-                                    foreach (var resource in binding.Resources)
+                                    for (var slot = 0; slot < resources.Count; slot++)
                                     {
+                                        var resource = resources[slot];
                                         var sampler = descriptors.Samplers[(int)resource];
                                         if (sampler.Handle == 0)
                                         {

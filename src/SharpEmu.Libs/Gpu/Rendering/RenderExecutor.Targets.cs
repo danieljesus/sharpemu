@@ -42,7 +42,7 @@ public sealed partial class RenderExecutor
             state.Colors[(int)state.ColorCount++] = new ColorTargetState(in resolution, resolvedSlot, image);
         }
 
-        if (DepthTargetResolver.Resolve(context, _host.FormatSupport, _host.Fatal) is { } depthTarget)
+        if (DepthTargetResolver.Resolve(context, _host.FormatSupport, _fatal) is { } depthTarget)
         {
             var request = depthTarget.Target.Request;
             var image = _host.FindImage(ref request, exactFormat: false);

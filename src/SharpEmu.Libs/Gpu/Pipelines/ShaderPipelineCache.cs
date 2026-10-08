@@ -25,8 +25,14 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private readonly ShaderHeaderRegistry _registry;
     private readonly ShaderProgramCache _programs;
     private readonly Dictionary<GraphicsPipelineKey, PipelineHandle> _graphicsPipelines = new();
+    // Filled for every draw under the gate; a pipeline is inserted under a copy of it.
+    private readonly GraphicsPipelineKey _graphicsLookup = new() { Rendering = new(), VertexInput = new(), StaticParameters = new() };
     private readonly Dictionary<ComputePipelineKey, PipelineHandle> _computePipelines = new();
     private readonly object _gate = new();
+    // One per stage, refilled under the gate for every lookup.
+    private readonly StageCompileOptions _vertexOptions = new();
+    private readonly StageCompileOptions _pixelOptions = new();
+    private readonly StageCompileOptions _computeOptions = new();
     private readonly bool _strictShaders = Environment.GetEnvironmentVariable("SHARPEMU_STRICT_COMPUTE") != "0";
     private readonly HashSet<(ShaderStage Stage, ulong Hash, uint CodeSize)> _reportedShaderSkips = [];
 
@@ -127,27 +133,19 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             var pushDataCursor = 0u;
             if (pixelSource is not null)
             {
-                if (!TryPrepareProgram(
-                    pixelSource,
-                    new StageCompileOptions
-                    {
-                        PixelInfo = pixelInfo,
-                        PixelOutputs = pixelOutputs,
-                        PixelInputEnable = shaderInterface.PixelInputEnable,
-                        PixelInputAddress = shaderInterface.PixelInputAddress,
-                    },
-                    ref pushDataCursor,
-                    out pixelProgramHandle,
-                    out pixelStage))
+                var pixelOptions = _pixelOptions.Reset();
+                pixelOptions.PixelInfo = pixelInfo;
+                pixelOptions.PixelOutputs = pixelOutputs;
+                pixelOptions.PixelInputEnable = shaderInterface.PixelInputEnable;
+                pixelOptions.PixelInputAddress = shaderInterface.PixelInputAddress;
+                if (!TryPrepareProgram(pixelSource, pixelOptions, ref pushDataCursor, out pixelProgramHandle, out pixelStage))
                     return new GraphicsPrograms { Available = false };
             }
 
-            if (!TryPrepareProgram(
-                vertexSource,
-                new StageCompileOptions { VertexInfo = vertexInfo, RequiredVertexOutputCount = (int)attributeCount },
-                ref pushDataCursor,
-                out vertexProgram,
-                out vertexStage))
+            var vertexOptions = _vertexOptions.Reset();
+            vertexOptions.VertexInfo = vertexInfo;
+            vertexOptions.RequiredVertexOutputCount = (int)attributeCount;
+            if (!TryPrepareProgram(vertexSource, vertexOptions, ref pushDataCursor, out vertexProgram, out vertexStage))
                 return new GraphicsPrograms { Available = false };
         }
 
@@ -342,12 +340,10 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         lock (_gate)
         {
             var pushDataCursor = 0u;
-            if (!TryPrepareProgram(
-                source,
-                new StageCompileOptions { ComputeInfo = input, ComputeSystemRegisters = systemRegisters },
-                ref pushDataCursor,
-                out handle,
-                out stage))
+            var computeOptions = _computeOptions.Reset();
+            computeOptions.ComputeInfo = input;
+            computeOptions.ComputeSystemRegisters = systemRegisters;
+            if (!TryPrepareProgram(source, computeOptions, ref pushDataCursor, out handle, out stage))
             {
                 return new ComputeProgram { Available = false };
             }
@@ -417,17 +413,32 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderProgram pixelProgram)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineCreation);
-        var description = BuildGraphicsDescription(
-            colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending,
-            vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts);
-        var key = KeyOf(description);
         lock (_gate)
         {
-            if (_graphicsPipelines.TryGetValue(key, out var cached))
+            var lookup = _graphicsLookup;
+            FillStaticState(lookup.Rendering, lookup.VertexInput, lookup.StaticParameters,
+                colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending,
+                vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts, out var vertexStage, out var pixelStage);
+            lookup.VertexProgramId = vertexProgram.Id;
+            lookup.PixelProgramId = pixelInput is not null ? pixelProgram.Id : 0;
+            if (_graphicsPipelines.TryGetValue(lookup, out var cached))
             {
                 return cached;
             }
 
+            var key = lookup.Clone();
+            var description = new GraphicsPipelineDescription
+            {
+                Rendering = key.Rendering,
+                VertexInput = key.VertexInput,
+                VertexInfo = vertexInput,
+                VertexProgram = vertexProgram,
+                VertexStage = vertexStage,
+                PixelInfo = pixelInput,
+                PixelProgram = pixelProgram,
+                PixelStage = pixelStage,
+                StaticParameters = key.StaticParameters,
+            };
             if (RenderTrace.Enabled && RenderTrace.Pipeline())
             {
                 RenderTrace.Write(
@@ -458,6 +469,46 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderProgram pixelProgram,
         SampleCountFlags noAttachmentSampleCounts)
     {
+        var renderingState = new PipelineRenderingState();
+        var vertexInputState = new PipelineVertexInputState();
+        var parameters = new PipelineStaticParameters();
+        FillStaticState(renderingState, vertexInputState, parameters,
+            colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending,
+            vertexProgram, pixelProgram, noAttachmentSampleCounts, out var vertexStage, out var pixelStage);
+        return new GraphicsPipelineDescription
+        {
+            Rendering = renderingState,
+            VertexInput = vertexInputState,
+            VertexInfo = vertexInput,
+            VertexProgram = vertexProgram,
+            VertexStage = vertexStage,
+            PixelInfo = pixelInput,
+            PixelProgram = pixelProgram,
+            PixelStage = pixelStage,
+            StaticParameters = parameters,
+        };
+    }
+
+    // Writes the same state into instances the caller owns; the cache fills its lookup key with it.
+    private static void FillStaticState(
+        PipelineRenderingState renderingState,
+        PipelineVertexInputState vertexInputState,
+        PipelineStaticParameters parameters,
+        ReadOnlySpan<ColorTargetState> colors,
+        in DepthAttachmentState depth,
+        VertexInputInfo vertexInput,
+        PixelInputInfo? pixelInput,
+        ContextRegisters context,
+        in RenderingState rendering,
+        PrimitiveTopology topology,
+        bool primitiveRestartEnabled,
+        bool disableBlending,
+        ShaderProgram vertexProgram,
+        ShaderProgram pixelProgram,
+        SampleCountFlags noAttachmentSampleCounts,
+        out ShaderProgramInfo vertexStage,
+        out ShaderProgramInfo? pixelStage)
+    {
         if (colors.Length > PipelineStaticParameters.ColorAttachmentCount)
         {
             throw SubmissionScheduler.Fatal($"The draw binds more color attachments than a pipeline holds: count={colors.Length}.");
@@ -474,11 +525,13 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             throw SubmissionScheduler.Fatal("The draw has an active pixel stage without a pixel program.");
         }
 
-        var vertexStage = vertexInput.Stage.Program ?? throw SubmissionScheduler.Fatal("The vertex stage has no program.");
-        var pixelStage = pixelActive ? pixelInput!.Stage.Program ?? throw SubmissionScheduler.Fatal("The pixel stage has no program.") : null;
+        vertexStage = vertexInput.Stage.Program ?? throw SubmissionScheduler.Fatal("The vertex stage has no program.");
+        pixelStage = pixelActive ? pixelInput!.Stage.Program ?? throw SubmissionScheduler.Fatal("The pixel stage has no program.") : null;
         var colorCount = (uint)colors.Length;
-        var parameters = new PipelineStaticParameters { ColorCount = colorCount };
-        var renderingState = new PipelineRenderingState { ColorCount = colorCount };
+        parameters.Reset();
+        parameters.ColorCount = colorCount;
+        renderingState.Reset();
+        renderingState.ColorCount = colorCount;
         for (var index = 0; index < colors.Length; index++)
         {
             ref readonly var color = ref colors[index];
@@ -564,18 +617,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             parameters.SetBlendBypass(index, ((context.ColorTargets[slot].Info >> 16) & 0x1) != 0);
         }
 
-        return new GraphicsPipelineDescription
-        {
-            Rendering = renderingState,
-            VertexInput = BuildVertexInputState(vertexInput),
-            VertexInfo = vertexInput,
-            VertexProgram = vertexProgram,
-            VertexStage = vertexStage,
-            PixelInfo = pixelInput,
-            PixelProgram = pixelProgram,
-            PixelStage = pixelStage,
-            StaticParameters = parameters,
-        };
+        FillVertexInputState(vertexInputState, vertexInput);
     }
 
     internal static GraphicsPipelineKey KeyOf(GraphicsPipelineDescription description) => new()
@@ -587,18 +629,16 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         StaticParameters = description.StaticParameters,
     };
 
-    private static PipelineVertexInputState BuildVertexInputState(VertexInputInfo info)
+    private static void FillVertexInputState(PipelineVertexInputState state, VertexInputInfo info)
     {
         if (info.Buffers.Length > VertexInputInfo.MaxBuffers || info.Attributes.Length > VertexInputInfo.MaxBuffers)
         {
             throw SubmissionScheduler.Fatal($"The vertex input is too large: buffers={info.Buffers.Length} attributes={info.Attributes.Length}.");
         }
 
-        var state = new PipelineVertexInputState
-        {
-            BindingCount = (byte)info.Buffers.Length,
-            AttributeCount = (byte)info.Attributes.Length,
-        };
+        state.Reset();
+        state.BindingCount = (byte)info.Buffers.Length;
+        state.AttributeCount = (byte)info.Attributes.Length;
         for (var binding = 0; binding < info.Buffers.Length; binding++)
         {
             var buffer = info.Buffers[binding];
@@ -615,8 +655,6 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
             state.Attributes[index] = new PipelineVertexAttribute(attribute.OffsetBytes, (byte)attribute.BufferIndex);
         }
-
-        return state;
     }
 
     public PipelineHandle CreateComputePipeline(ComputeInputInfo input, ShaderProgram program)
