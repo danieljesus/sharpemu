@@ -89,7 +89,7 @@ public sealed class ResourceMaterializationCache
                 if (!variant.Matches(plan, inputs))
                     continue;
                 if (Validate(variant, inputs, residentReader, out var variantUnreadable) &&
-                    variant.SnapshotFor(inputs) is { } hit)
+                    variant.SnapshotFor(inputs, _patches) is { } hit)
                 {
                     if (previous is not null)
                     {
@@ -236,7 +236,7 @@ public sealed class ResourceMaterializationCache
             if (!evaluated || recorder.Failed || table.Length != cachedTable.Length)
                 return false;
 
-            foreach (var (address, word, _, _, _) in recorder.Reads)
+            foreach (var (address, word, _, _, _, _) in recorder.Reads)
             {
                 if (!TryFindWord(cached, address, out var offset) ||
                     System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(current.AsSpan(offset, sizeof(uint))) != word)
@@ -261,6 +261,7 @@ public sealed class ResourceMaterializationCache
                 RangeBase = cached.RangeBase,
                 ExactUserData = cached.ExactUserData,
                 WordTableOnly = cached.WordTableOnly,
+                WordPatches = cached.WordPatches,
                 TableRefreshable = true,
                 Bytes = current,
                 Snapshot = new ResourceSnapshot
@@ -374,9 +375,14 @@ public sealed class ResourceMaterializationCache
 
     private const ulong AddressMask = 0x0000_FFFF_FFFF_FFFFul;
 
+    // The words of the entry being validated that this draw reads differently, when every one
+    // of them is a patchable read: (word index, the draw's word).
+    private readonly List<(int Word, uint Value)> _patches = new();
+
     private bool Validate(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader, out bool unreadable)
     {
         unreadable = false;
+        _patches.Clear();
         for (var index = 0; index < entry.RangeAddresses.Length; index++)
         {
             if (!entry.TryRebase(index, inputs, out var address))
@@ -391,8 +397,22 @@ public sealed class ResourceMaterializationCache
                 return false;
             }
 
-            if (!current.SequenceEqual(entry.Bytes.AsSpan(entry.RangeOffsets[index], length)))
+            var cached = entry.Bytes.AsSpan(entry.RangeOffsets[index], length);
+            if (current.SequenceEqual(cached))
+                continue;
+            if (entry.WordPatches is null)
                 return false;
+            for (var offset = 0; offset < length; offset += sizeof(uint))
+            {
+                var word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(current[offset..]);
+                var was = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cached[offset..]);
+                if (word == was)
+                    continue;
+                var wordIndex = (entry.RangeOffsets[index] + offset) / sizeof(uint);
+                if (!entry.WordPatches.TryGetValue(wordIndex, out var targets) || !Entry.PatchAllowed(targets, word, was))
+                    return false;
+                _patches.Add((wordIndex, word));
+            }
         }
 
         return true;
@@ -415,10 +435,12 @@ public sealed class ResourceMaterializationCache
         public required bool ExactUserData { get; init; }
         // Per recorded dword: read only while the flattened table was evaluated.
         public required bool[] WordTableOnly { get; init; }
+        // By recorded dword: where the plan copies it verbatim (UserDataUseAnalysis.PatchableReads).
+        public required Dictionary<int, UserDataUseAnalysis.PatchTarget[]>? WordPatches { get; init; }
         // The table has the plan's plain layout, so no specialization read or extended it.
         public required bool TableRefreshable { get; init; }
         public required byte[] Bytes { get; init; }
-        public required ResourceSnapshot Snapshot { get; init; }
+        public required ResourceSnapshot Snapshot { get; set; }
         public required ResourceSpecialization Specialization { get; init; }
         public Entry? Next { get; set; }
 
@@ -476,16 +498,43 @@ public sealed class ResourceMaterializationCache
             return true;
         }
 
+        // A buffer dword may take another value only where the base address and record count
+        // live: dword 0, dword 2 and the low 16 bits of dword 1. The specialization was derived
+        // from the stride and format bits of the cached words, which must stay.
+        private static bool BufferDwordMayChange(int dword, uint word, uint cached) =>
+            dword is 0 or 2 || (dword == 1 && ((word ^ cached) >> 16) == 0);
+
+        public static bool PatchAllowed(UserDataUseAnalysis.PatchTarget[] targets, uint word, uint cached)
+        {
+            foreach (var target in targets)
+            {
+                if (!target.Table && !BufferDwordMayChange(target.Dword, word, cached))
+                    return false;
+            }
+
+            return true;
+        }
+
         // The cached snapshot, with the draw's own user data when it differs from the entry's:
         // the words the plan reads through are not part of the key, and the host still binds
         // every user-data word the shader reads directly. Buffer dwords computed from user data
-        // are evaluated again for this draw; null when one changed beyond its base address, since
-        // the buffer's specialization was derived from the cached words.
-        public ResourceSnapshot? SnapshotFor(ResourceRuntimeInputs inputs)
+        // are evaluated again for this draw, and the words the draw reads differently go to the
+        // places they are copied to. Null when a buffer dword changed beyond its base address.
+        public ResourceSnapshot? SnapshotFor(ResourceRuntimeInputs inputs, List<(int Word, uint Value)> patches)
         {
-            if (UserDataEquals(inputs))
+            if (patches.Count == 0 && UserDataEquals(inputs))
                 return Snapshot;
             var buffers = Snapshot.Buffers;
+            var table = Snapshot.FlattenedResourceTable;
+            void SetBuffer(int buffer, int dword, uint word)
+            {
+                if (ReferenceEquals(buffers, Snapshot.Buffers))
+                    buffers = [.. Snapshot.Buffers];
+                if (ReferenceEquals(buffers[buffer], Snapshot.Buffers[buffer]))
+                    buffers[buffer] = [.. Snapshot.Buffers[buffer]];
+                buffers[buffer][dword] = word;
+            }
+
             var use = Plan.UserDataUse;
             foreach (var dword in use.RebasableDwords)
             {
@@ -496,32 +545,57 @@ public sealed class ResourceMaterializationCache
                 var cached = buffers[dword.Buffer][dword.Dword];
                 if (word == cached)
                     continue;
-                // Only the base address may move: dword 0 and the low 16 bits of dword 1.
-                if (dword.Dword > 1 || (dword.Dword == 1 && ((word ^ cached) >> 16) != 0))
+                if (!BufferDwordMayChange(dword.Dword, word, cached))
                     return null;
-                if (ReferenceEquals(buffers, Snapshot.Buffers))
-                    buffers = [.. Snapshot.Buffers];
-                if (ReferenceEquals(buffers[dword.Buffer], Snapshot.Buffers[dword.Buffer]))
-                    buffers[dword.Buffer] = [.. Snapshot.Buffers[dword.Buffer]];
-                buffers[dword.Buffer][dword.Dword] = word;
+                SetBuffer(dword.Buffer, dword.Dword, word);
             }
 
-            var userData = inputs.UserData as uint[] ?? [.. inputs.UserData];
-            return new ResourceSnapshot
+            foreach (var (wordIndex, word) in patches)
+            {
+                foreach (var target in WordPatches![wordIndex])
+                {
+                    if (target.Table)
+                    {
+                        if ((uint)target.Index >= (uint)table.Length)
+                            return null;
+                        if (ReferenceEquals(table, Snapshot.FlattenedResourceTable))
+                            table = [.. Snapshot.FlattenedResourceTable];
+                        table[target.Index] = word;
+                    }
+                    else
+                    {
+                        if ((uint)target.Index >= (uint)buffers.Length || (uint)target.Dword >= (uint)buffers[target.Index].Length)
+                            return null;
+                        SetBuffer(target.Index, target.Dword, word);
+                    }
+                }
+            }
+
+            var sameUserData = UserDataEquals(inputs);
+            var snapshot = new ResourceSnapshot
             {
                 Buffers = buffers,
                 Images = Snapshot.Images,
                 Samplers = Snapshot.Samplers,
-                FlattenedResourceTable = Snapshot.FlattenedResourceTable,
-                UserData = userData,
+                FlattenedResourceTable = table,
+                UserData = sameUserData ? Snapshot.UserData : inputs.UserData as uint[] ?? [.. inputs.UserData],
                 DeviceAddressRanges = Snapshot.DeviceAddressRanges,
             };
+            if (sameUserData)
+            {
+                // The entry's own draw now reads these words: keep them, so the next one is a plain hit.
+                foreach (var (wordIndex, word) in patches)
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(Bytes.AsSpan(wordIndex * sizeof(uint)), word);
+                Snapshot = snapshot;
+            }
+
+            return snapshot;
         }
     }
 
     private sealed class ReadRecorder
     {
-        private readonly List<(ulong Address, uint Word, bool Clean, bool Table, int Base)> _reads = new();
+        private readonly List<(ulong Address, uint Word, bool Clean, bool Table, int Base, int Node)> _reads = new();
         private bool _inTable;
         private GuestWordReader? _reader;
         private GuestWordReader? _cleanReader;
@@ -558,7 +632,7 @@ public sealed class ResourceMaterializationCache
 
         public bool Failed { get; private set; }
 
-        public List<(ulong Address, uint Word, bool Clean, bool Table, int Base)> Reads => _reads;
+        public List<(ulong Address, uint Word, bool Clean, bool Table, int Base, int Node)> Reads => _reads;
 
         public Action<bool> TablePhase { get; }
 
@@ -582,7 +656,7 @@ public sealed class ResourceMaterializationCache
                 Failed = true;
                 return false;
             }
-            _reads.Add((address, word, clean, _inTable, RuntimeValueEvaluator.CurrentReadBase));
+            _reads.Add((address, word, clean, _inTable, RuntimeValueEvaluator.CurrentReadBase, RuntimeValueEvaluator.CurrentReadNode));
             return true;
         }
 
@@ -602,7 +676,7 @@ public sealed class ResourceMaterializationCache
             for (var offset = 0; offset + sizeof(uint) <= destination.Length; offset += sizeof(uint))
                 _reads.Add((address + (ulong)offset,
                     System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(destination[offset..]), clean, _inTable,
-                    RuntimeValueEvaluator.CurrentReadBase));
+                    RuntimeValueEvaluator.CurrentReadBase, RuntimeValueEvaluator.CurrentReadNode));
             return true;
         }
 
@@ -637,12 +711,14 @@ public sealed class ResourceMaterializationCache
             var bases = new int[rangeCount];
             var bytes = new byte[wordCount * sizeof(uint)];
             var tableOnly = new bool[wordCount];
+            var patchableReads = plan.UserDataUse.PatchableReads;
+            Dictionary<int, UserDataUseAnalysis.PatchTarget[]>? patches = null;
             var rangeIndex = -1;
             var wordIndex = -1;
             end = 0;
             previous = ulong.MaxValue;
             previousBase = UserDataUseAnalysis.UnknownBase;
-            foreach (var (address, word, wordClean, table, readBase) in _reads)
+            foreach (var (address, word, wordClean, table, readBase, node) in _reads)
             {
                 if (address == previous)
                 {
@@ -651,10 +727,16 @@ public sealed class ResourceMaterializationCache
                     // The same word read through two bases cannot follow either: keep it in place.
                     if (bases[rangeIndex] != readBase)
                         bases[rangeIndex] = UserDataUseAnalysis.UnknownBase;
+                    // A word read by two nodes is fixed unless both are the same patchable read.
+                    if (patches is not null && patches.TryGetValue(wordIndex, out var existing) &&
+                        (node == RuntimeValueEvaluator.NoReadNode || !patchableReads.TryGetValue(node, out var again) || !ReferenceEquals(again, existing)))
+                        patches.Remove(wordIndex);
                     continue;
                 }
 
                 wordIndex++;
+                if (node != RuntimeValueEvaluator.NoReadNode && patchableReads.TryGetValue(node, out var targets))
+                    (patches ??= new Dictionary<int, UserDataUseAnalysis.PatchTarget[]>())[wordIndex] = targets;
                 if (rangeIndex < 0 || address != end || readBase != previousBase)
                 {
                     rangeIndex++;
@@ -689,6 +771,7 @@ public sealed class ResourceMaterializationCache
                 RangeBase = bases,
                 ExactUserData = exactUserData,
                 WordTableOnly = tableOnly,
+                WordPatches = patches is { Count: > 0 } ? patches : null,
                 TableRefreshable = snapshot.FlattenedResourceTable.Length ==
                     plan.TableReads.Count + plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount,
                 Bytes = bytes,

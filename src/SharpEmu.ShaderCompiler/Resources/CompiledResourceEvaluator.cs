@@ -289,6 +289,7 @@ internal sealed class CompiledResourceEvaluator
                     else Constant(0);
                     Constant(unchecked((ulong)(long)(int)plan.Memory[value.MemoryIndex].Offset));
                     il.Emit(OpCodes.Ldc_I4, UserDataUseAnalysis.BaseRegisterOf(handle));
+                    il.Emit(OpCodes.Ldc_I4, value.Id);
                     il.Emit(OpCodes.Ldloca, result);
                     Call(nameof(RuntimeValueEvaluator.ReadRawWord));
                     il.Emit(OpCodes.Brfalse, failed);

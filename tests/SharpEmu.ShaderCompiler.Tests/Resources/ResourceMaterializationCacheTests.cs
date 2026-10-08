@@ -35,7 +35,9 @@ public sealed class ResourceMaterializationCacheTests
                         _ => 0,
                     };
             }
+
         }
+
 
         // The same words, moved by delta: a game's table allocated at another address.
         public Heap Moved(ulong delta)
@@ -47,11 +49,13 @@ public sealed class ResourceMaterializationCacheTests
             return moved;
         }
 
+
         public bool Read(ulong address, out uint word)
         {
             Reads++;
             return Words.TryGetValue(address, out word);
         }
+
 
         public bool ReadResident(ulong address, Span<byte> destination, bool clean)
         {
@@ -64,21 +68,25 @@ public sealed class ResourceMaterializationCacheTests
                 BitConverter.TryWriteBytes(destination[offset..], word);
             }
 
+
             return true;
         }
+
     }
+
 
     private static ShaderResourcePlan Plan() =>
         ShaderResourcePlan.Extract(DirectImageTableTests.CreateWaveIndexedDescriptorProgram(), ShaderStage.Compute, Hash, 0, 2);
 
     private static bool Run(ResourceMaterializationCache cache, ShaderResourcePlan plan, Heap heap, uint[] userData,
-        out ResourceSnapshot snapshot, out ResourceSpecialization specialization, ulong shaderBase = 0)
+        out ResourceSnapshot snapshot, out ResourceSpecialization specialization, ulong shaderBase = 0, bool readsDirty = false)
     {
         snapshot = new ResourceSnapshot();
         specialization = new ResourceSpecialization();
-        return cache.Materialize(plan, Inputs(userData, readCleanMemory: heap.Read, shaderBase: shaderBase), heap.ReadResident,
+        return cache.Materialize(plan, Inputs(userData, readsDirty ? heap.Read : null, heap.Read, shaderBase: shaderBase), heap.ReadResident,
             ref snapshot, ref specialization, out _);
     }
+
 
     [Fact]
     public void UnchangedMemoryReusesTheMaterialization()
@@ -96,6 +104,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Same(firstSpecialization, secondSpecialization);
         Assert.Equal((1, 1), (cache.Hits, cache.Misses));
     }
+
 
     [Fact]
     public void AChangedDescriptorWordMaterializesAgain()
@@ -118,6 +127,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(reference.Images.Select(image => image.ToArray()), second.Images.Select(image => image.ToArray()));
     }
 
+
     [Fact]
     public void AlternatingDescriptorsReuseEveryRecentVariant()
     {
@@ -139,6 +149,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal((2, 2), (cache.Hits, cache.Misses));
     }
 
+
     [Fact]
     public void AChangedMaskMaterializesAgain()
     {
@@ -151,6 +162,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(0, cache.Hits);
     }
 
+
     [Fact]
     public void GpuOwnedMemoryIsNeverTrusted()
     {
@@ -162,6 +174,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.True(Run(cache, plan, heap, [0x1000, 0], out _, out _));
         Assert.Equal(0, cache.Hits);
     }
+
 
     [Fact]
     public void ADifferentDrawKeyIsADifferentEntry()
@@ -177,6 +190,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal((1, 2), (cache.Hits, cache.Misses));
     }
 
+
     [Fact]
     public void AFailedReadIsNotCached()
     {
@@ -190,6 +204,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.True(heap.Reads > reads);
         Assert.Equal(0, cache.Hits);
     }
+
 
     [Fact]
     public void AFailedRecordingDoesNotPoisonTheNextReader()
@@ -214,6 +229,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Same(first, restored);
     }
 
+
     // The table pointer in s[0:1]; the rest of the nine user-data registers the program declares.
     private static readonly uint[] TableUserData = [0x1000, 0, 0, 0, 0, 0, 0, 0, 0];
 
@@ -232,12 +248,14 @@ public sealed class ResourceMaterializationCacheTests
                 BitConverter.TryWriteBytes(destination[offset..], word);
             }
 
+
             return true;
         }, ref snapshot, ref specialization, out _);
     }
 
+
     [Fact]
-    public void AChangedTableOnlyWordRefreshesOnlyTheTable()
+    public void AChangedTableOnlyWordIsTakenByTheEntry()
     {
         var (plan, _, _) = Prepare(FlattenedReadReuseTests.RepeatedReadProgram(4), userDataCount: 9);
         var memory = new TestWordMemory { Words = [11, 22, 33, 44] };
@@ -247,8 +265,9 @@ public sealed class ResourceMaterializationCacheTests
 
         memory.Words[2] = 99;
         Assert.True(RunTable(cache, plan, memory, out var second));
-        Assert.Equal((0, 1, 1), (cache.Hits, cache.Misses, cache.TableRefreshes));
+        Assert.Equal((1, 1, 0), (cache.Hits, cache.Misses, cache.TableRefreshes));
         Assert.Equal([11u, 22, 99, 44], second.FlattenedResourceTable);
+        Assert.Equal([11u, 22, 33, 44], first.FlattenedResourceTable);
         Assert.Same(first.Buffers, second.Buffers);
 
         // The refreshed table matches an uncached full walk, and the refreshed entry is then a hit.
@@ -258,8 +277,9 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(reference.FlattenedResourceTable, second.FlattenedResourceTable);
         Assert.True(RunTable(cache, plan, memory, out var third));
         Assert.Same(second, third);
-        Assert.Equal((1, 1, 1), (cache.Hits, cache.Misses, cache.TableRefreshes));
+        Assert.Equal((2, 1, 0), (cache.Hits, cache.Misses, cache.TableRefreshes));
     }
+
 
     [Fact]
     public void AnUnreadableTableWordFallsBackToAFullWalk()
@@ -274,6 +294,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(0, cache.TableRefreshes);
     }
 
+
     [Fact]
     public void AFullGenerationKeepsRecentEntries()
     {
@@ -286,6 +307,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.True(Run(cache, plan, heap, [0x1000, 0], out _, out _));
         Assert.Equal(1, cache.Hits);
     }
+
 
     // A plan whose only use of s[0:1] is as the base of its descriptor reads.
     private static ShaderResourcePlan DirectPlan() =>
@@ -301,8 +323,10 @@ public sealed class ResourceMaterializationCacheTests
                 heap.Words[address] = word;
         }
 
+
         return heap;
     }
+
 
     [Fact]
     public void TheSameTableAtAnotherAddressIsAHit()
@@ -327,6 +351,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(new uint[] { 0x1000, 0 }, first.UserData);
     }
 
+
     [Fact]
     public void ADifferentTableAtAnotherAddressMaterializesAgain()
     {
@@ -342,11 +367,13 @@ public sealed class ResourceMaterializationCacheTests
                 moved.Words[address] = 21u << 20;
         }
 
+
         Assert.True(Run(cache, plan, moved, [0x5000, 0], out var second, out _));
         Assert.Equal(0, cache.Hits);
         Assert.NotEqual(0, moved.Reads);
         Assert.NotEqual(first.Images, second.Images);
     }
+
 
     [Fact]
     public void ANullTablePointerIsNeverRebased()
@@ -361,6 +388,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(materializedBefore + 1, cache.Misses);
     }
 
+
     [Fact]
     public void APointerThatAlsoAddressesAGlobalLoadIsComparedAsAValue()
     {
@@ -374,6 +402,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.True(Run(cache, plan, heap.Moved(0x4000), [0x5000, 0], out _, out _));
         Assert.Equal((0, 2), (cache.Hits, cache.Misses));
     }
+
 
     // A buffer descriptor assembled in the shader from the pointer in s[0:1]: the shader sets
     // the stride and record count, user data supplies the base address.
@@ -405,6 +434,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(new uint[] { 0x5000, 0x11 }, second.UserData);
     }
 
+
     [Fact]
     public void ABufferWhoseStrideBitsMovedMaterializesAgain()
     {
@@ -417,5 +447,66 @@ public sealed class ResourceMaterializationCacheTests
         Assert.True(Run(cache, plan, heap, [0x1000, 0x10 | (1u << 20)], out var second, out _));
         Assert.Equal((0, 2), (cache.Hits, cache.Misses));
         Assert.Equal(0x10 | (1u << 20), second.Buffers[0][1]);
+    }
+
+    // A buffer descriptor loaded from the table at s[0:1]: the words reach the flattened table
+    // and the buffer, nothing else.
+    private static ShaderResourcePlan TableBufferPlan() =>
+        ShaderResourcePlan.Extract(Program(
+            ScalarLoad(0, 0, 4, 4, immediateOffset: 0x20),
+            BufferAccess(8, "BufferLoadDword", 4, vectorData: 8),
+            EndProgram(16)), ShaderStage.Compute, Hash, 0, 2);
+
+    private static Heap TableBufferHeap(uint baseLow)
+    {
+        var heap = new Heap();
+        heap.Words.Clear();
+        heap.Words[HeapBase + 0x20] = baseLow;
+        heap.Words[HeapBase + 0x24] = 0x10;
+        heap.Words[HeapBase + 0x28] = 256;
+        heap.Words[HeapBase + 0x2C] = 0x2C004000;
+        return heap;
+    }
+
+    [Fact]
+    public void ABufferWhoseBaseIsReadFromTheTableTakesTheDrawsBaseOnAHit()
+    {
+        if (!ResourceMaterializationCache.ContentKeyed)
+            return;
+        var plan = TableBufferPlan();
+        Assert.NotEmpty(plan.UserDataUse.PatchableReads);
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, TableBufferHeap(0x7000), [0x1000, 0], out var first, out var firstSpecialization, readsDirty: true));
+        Assert.Equal(new uint[] { 0x7000, 0x10, 256, 0x2C004000 }, first.Buffers[0]);
+
+        // The next draw's table holds a constant buffer allocated elsewhere.
+        var moved = TableBufferHeap(0x9000);
+        Assert.True(Run(cache, plan, moved, [0x1000, 0], out var second, out var secondSpecialization, readsDirty: true));
+        Assert.Equal((1, 1), (cache.Hits, cache.Misses));
+        Assert.Equal(new uint[] { 0x9000, 0x10, 256, 0x2C004000 }, second.Buffers[0]);
+        Assert.Equal(new uint[] { 0x7000, 0x10, 256, 0x2C004000 }, first.Buffers[0]);
+        Assert.Same(firstSpecialization, secondSpecialization);
+        Assert.Equal(second.FlattenedResourceTable.Length, first.FlattenedResourceTable.Length);
+        for (var slot = 0; slot < first.FlattenedResourceTable.Length; slot++)
+        {
+            if (first.FlattenedResourceTable[slot] == 0x7000)
+                Assert.Equal(0x9000u, second.FlattenedResourceTable[slot]);
+            else
+                Assert.Equal(first.FlattenedResourceTable[slot], second.FlattenedResourceTable[slot]);
+        }
+    }
+
+    [Fact]
+    public void ABufferWhoseFormatIsReadFromTheTableMaterializesAgainWhenItChanges()
+    {
+        var plan = TableBufferPlan();
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, TableBufferHeap(0x7000), [0x1000, 0], out _, out _, readsDirty: true));
+
+        var changed = TableBufferHeap(0x7000);
+        changed.Words[HeapBase + 0x2C] = 0x2C005000;
+        Assert.True(Run(cache, plan, changed, [0x1000, 0], out var second, out _, readsDirty: true));
+        Assert.Equal((0, 2), (cache.Hits, cache.Misses));
+        Assert.Equal(0x2C005000u, second.Buffers[0][3]);
     }
 }
