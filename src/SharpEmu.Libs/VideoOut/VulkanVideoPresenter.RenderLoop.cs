@@ -52,7 +52,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (_closed ||
                     Volatile.Read(ref _presenterCloseRequested) ||
                     _relay.HasPendingCommands ||
-                    (_vulkanReady && _commandStream.HasUnblockedPending) ||
+                    (_vulkanReady && (_front is null ? _commandStream.HasUnblockedPending : _front.HasQueuedWork)) ||
                     blockedRetryWait == 0 ||
                     HasReadyPresentationLocked())
                 {
@@ -144,7 +144,14 @@ internal static unsafe partial class VulkanVideoPresenter
             var renderWorkDeadline = _renderWorkBudgetTicks > 0
                 ? System.Diagnostics.Stopwatch.GetTimestamp() + _renderWorkBudgetTicks
                 : long.MaxValue;
-            RunCommandStreamSlices(renderWorkDeadline);
+            if (_front is not null)
+            {
+                RunBackQueue(renderWorkDeadline);
+            }
+            else
+            {
+                RunCommandStreamSlices(renderWorkDeadline);
+            }
 
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Flush))
             {

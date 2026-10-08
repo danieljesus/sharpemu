@@ -123,7 +123,7 @@ public sealed partial class GpuCommandInterpreter
 
         if (writesMemory)
         {
-            WriteDword(writeAddress, writeValue);
+            WriteDwordNow(writeAddress, writeValue);
         }
         else
         {

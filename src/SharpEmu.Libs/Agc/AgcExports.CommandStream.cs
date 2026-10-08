@@ -244,13 +244,12 @@ public static partial class AgcExports
 
         private bool TryRunExecutorDraw(ulong submitId, SubmittedDcbState state, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments)
         {
-            if (_executor is not { } executor)
+            if (_executor is null)
             {
                 return false;
             }
 
             var banks = RequireTypedRegisters(state);
-            RecordKnownColorTargets(state, banks);
             GraphicsPrograms? prepared = null;
             RenderExecutor.DrawProgramInputs preparedInputs = default;
             if (SnapshotDraws)
@@ -259,6 +258,46 @@ public static partial class AgcExports
                 prepared = PrepareGraphicsPrograms(banks, out preparedInputs);
             }
 
+            return TryRunExecutorDraw(submitId, state, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs);
+        }
+
+        // Runs a draw on the executor from the given banks, which a host interpreting ahead
+        // captured when the packet ran, with the programs it prepared from them.
+        internal void ExecuteDraw(ulong submitId, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments,
+            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs)
+        {
+            if (indexed) RecordIndexedDrawState(in indexedArguments);
+            else RecordAutoDrawState(in autoArguments);
+            if (!TryRunExecutorDraw(submitId, RequireCurrent(), banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs))
+                throw _host.Fatal("The command stream has no render executor.");
+        }
+
+        internal void ExecuteDispatch(ulong submitId, RegisterBanks banks, uint endX, uint endY, uint endZ, uint dispatchInitiator, ulong indirectArgumentsAddress,
+            ComputeProgram? prepared)
+        {
+            var state = RequireCurrent();
+            if (_executor is not { } executor) throw _host.Fatal("The command stream has no render executor.");
+            state.FrameDispatchCount++;
+            var executorStarted = DcbParseProfile.Begin();
+            try
+            {
+                executor.Dispatch(submitId, banks, endX, endY, endZ, dispatchInitiator, indirectArgumentsAddress, prepared);
+            }
+            finally
+            {
+                DcbParseProfile.RecordDispatch(executorStarted);
+            }
+        }
+
+        private bool TryRunExecutorDraw(ulong submitId, SubmittedDcbState state, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments,
+            in DrawAutoArguments autoArguments, GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs)
+        {
+            if (_executor is not { } executor)
+            {
+                return false;
+            }
+
+            RecordKnownColorTargets(state, banks);
             state.FrameDrawCount++;
             state.SawIndexedDraw |= indexed;
             var drawStarted = DcbParseProfile.Begin();

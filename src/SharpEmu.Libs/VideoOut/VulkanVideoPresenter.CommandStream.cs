@@ -277,7 +277,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // Milliseconds until the blocked heads are due for a retry; null when none is blocked.
         private int? BlockedRetryWaitMilliseconds()
         {
-            if (!_vulkanReady || !_commandStream.HasPending || _commandStream.HasUnblockedPending)
+            // With a front thread the blocked retries are its business.
+            if (_front is not null || !_vulkanReady || !_commandStream.HasPending || _commandStream.HasUnblockedPending)
             {
                 return null;
             }

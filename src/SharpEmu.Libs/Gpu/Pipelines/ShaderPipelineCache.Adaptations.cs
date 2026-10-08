@@ -226,7 +226,9 @@ internal sealed partial class ShaderPipelineCache
             }
         }
 
-        // The dispatch runs in stream order on the worker, so the replacement writes at once.
+        // The dispatch runs in stream order on the worker, so the replacement writes at once;
+        // a host interpreting ahead first lets the queued work capture what it replaces.
+        BeforeGuestWrite?.Invoke();
         if (!_context.Memory.TryWrite(destinationAddress, output))
         {
             Console.Error.WriteLine($"[LOADER][ERROR] AGC masked-copy fast path failed dst=0x{destinationAddress:X16} bytes={output.Length}");

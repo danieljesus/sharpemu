@@ -98,9 +98,42 @@ internal static unsafe partial class VulkanVideoPresenter
         SampleCountFlags IShaderPipelineHost.NoAttachmentSampleCounts => _noAttachmentSampleCounts;
 
         // A range the GPU wrote is downloaded first, so the word is what the guest CPU would read.
+        // On the front thread the buffer and image caches belong to the render thread, so the
+        // readers take guest memory as it is: a word the GPU is still writing is not observed
+        // ([TEMP] measured none in GTA V; the cache then rebuilds the next time).
+        private bool TryReadGuestWordDirect(ulong address, out uint word)
+        {
+            word = 0;
+            if (!_guestMemory.CanRead(address, sizeof(uint)))
+            {
+                return false;
+            }
+
+            if (TryGetAliasPointer(address, sizeof(uint), out var alias))
+            {
+                word = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<uint>(alias);
+                return true;
+            }
+
+            Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            if (!_guestMemory.TryRead(address, bytes))
+            {
+                return false;
+            }
+
+            NoteCleanReadPage(address, sizeof(uint));
+            word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            return true;
+        }
+
         public bool TryReadGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
+            if (_front is not null)
+            {
+                return TryReadGuestWordDirect(address, out word);
+            }
+
             word = 0;
             var synchronized = false;
             if (IsCleanReadPage(address, sizeof(uint)))
@@ -163,6 +196,11 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
+            if (_front is not null)
+            {
+                return TryReadGuestWordDirect(address, out word);
+            }
+
             word = 0;
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
@@ -190,6 +228,22 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
             var size = (ulong)destination.Length;
+            if (_front is not null)
+            {
+                if (!_guestMemory.CanRead(address, size))
+                {
+                    return false;
+                }
+
+                if (TryGetAliasPointer(address, size, out var frontAlias))
+                {
+                    new ReadOnlySpan<byte>(frontAlias, destination.Length).CopyTo(destination);
+                    return true;
+                }
+
+                return _guestMemory.TryRead(address, destination);
+            }
+
             if (clean || !IsCleanReadPage(address, size))
             {
                 if (!_guestMemory.CanRead(address, size) ||
@@ -286,15 +340,22 @@ internal static unsafe partial class VulkanVideoPresenter
             pages.Versions[slot] = version;
         }
 
+        // The front thread creates modules while the render thread creates pipelines from them.
+        private readonly object _shaderModuleGate = new();
+
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCompile);
             var module = CreateShaderModule(shader.Payload);
             SetDebugName(ObjectType.ShaderModule, module.Handle, $"SharpEmu {stage} 0x{hash:X16}");
-            _shaderModules.Add(programId, module);
-            _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
             var identity = VulkanPipelineCacheStorage.CompiledShaderIdentity(shader.Payload);
-            _shaderModuleCacheIdentities[module.Handle] = identity;
+            lock (_shaderModuleGate)
+            {
+                _shaderModules.Add(programId, module);
+                _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
+                _shaderModuleCacheIdentities[module.Handle] = identity;
+            }
+
             if (stage == ShaderStage.Compute)
             {
                 NoteRuntimeComputeModule(identity);
@@ -308,8 +369,13 @@ internal static unsafe partial class VulkanVideoPresenter
         // the SPIR-V size that produced it.
         private const long SlowPipelineCreationMilliseconds = 250;
 
-        private int SpirvBytesOf(ulong moduleHandle) =>
-            _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
+        private int SpirvBytesOf(ulong moduleHandle)
+        {
+            lock (_shaderModuleGate)
+            {
+                return _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
+            }
+        }
 
         private void ReportPipelineCreation(long elapsedMilliseconds, string kind, string stages, string spirv)
         {

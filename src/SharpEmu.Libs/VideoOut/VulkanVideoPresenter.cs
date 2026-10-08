@@ -265,7 +265,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public Presenter(uint width, uint height)
         {
-            _commandStream = new CommandStreamQueue(this);
+            CreateFrontPipeline();
+            _commandStream = new CommandStreamQueue((ICommandStreamHost?)_front ?? this);
             _relay = new GpuWorkerRelay(WakeRenderThread, _commandStream.TryEnqueueControlBarrier);
             _hostBufferPool = new VulkanHostBufferPool(
                 MaximumCachedHostBufferBytes,

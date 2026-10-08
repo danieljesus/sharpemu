@@ -544,12 +544,36 @@ public sealed partial class GpuCommandInterpreter
         WriteBytes(address, bytes);
     }
 
+    // A label or event store: the host applies it in stream order.
     internal void WriteBytes(ulong address, ReadOnlySpan<byte> source)
     {
-        if (!_host.Memory.TryWrite(address, source))
-        {
-            throw _host.Fatal($"The command stream cannot write guest memory: address=0x{address:X16} size={source.Length}.");
-        }
+        _host.WriteGuest(address, source);
+        NoteOwnWrite(address, source);
+    }
+
+    internal void WriteDwordNow(ulong address, uint value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
+        WriteBytesNow(address, bytes);
+    }
+
+    internal void WriteQwordNow(ulong address, ulong value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, value);
+        WriteBytesNow(address, bytes);
+    }
+
+    // Data the stream itself may read back: the host applies it before the next packet runs.
+    internal void WriteBytesNow(ulong address, ReadOnlySpan<byte> source)
+    {
+        _host.WriteGuestNow(address, source);
+        NoteOwnWrite(address, source);
+    }
+
+    private void NoteOwnWrite(ulong address, ReadOnlySpan<byte> source)
+    {
         DropWindow();
         _lastWriteLength = 0;
         if (source.Length is sizeof(uint) or sizeof(ulong))
