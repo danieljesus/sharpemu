@@ -115,6 +115,78 @@ public sealed class EmbeddedVertexFetchDetectorTests
         Assert.DoesNotContain("s[12] = sharpemu_load_device_dword", metal.Source);
     }
 
+    // The attribute record load also feeds a buffer walk the detector does not
+    // recognize as a fetch: removing it would leave that descriptor undefined.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SharedPrologLoadStaysWhenAnotherWalkReadsItsDwords(bool foreignRead)
+    {
+        var program = Program(
+            ScalarLoad(0, AttributeTable, destination: 8, count: 4, immediateOffset: 8),
+            Sop2(8, "SLshlB32", 9, Gen5Operand.Scalar(10), Operand(4)),
+            ScalarLoad(12, BufferTable, destination: 12, count: 4, dynamicOffsetRegister: 9),
+            IndexSelect(20),
+            FetchLoad(24, 12, 4),
+            foreignRead ? Sop2(32, "SLshlB32", 20, Gen5Operand.Scalar(11), Operand(4)) : Nop(32),
+            foreignRead ? ScalarLoad(36, BufferTable, destination: 16, count: 4, dynamicOffsetRegister: 20) : Nop(36),
+            foreignRead ? BufferAccess(44, "BufferLoadFormatX", 16, vectorData: 6, indexEnabled: true, vectorAddress: 2) : Nop(44),
+            EndProgram(52));
+
+        var fetch = EmbeddedVertexFetchDetector.Detect(program, AttributeTable, BufferTable, 0, 8, 32);
+        var load = Assert.Single(fetch.Loads);
+        Assert.Equal([0u, 12u], load.PrologLoads);
+
+        var prepared = fetch.RemoveReplacedTableLoads(program);
+        Assert.Equal(foreignRead ? program.Instructions[0].Opcode : "SNop", prepared.Instructions[0].Opcode);
+        Assert.Equal("SNop", prepared.Instructions[2].Opcode);
+        Assert.Equal(program.Instructions.Select(instruction => instruction.Pc), prepared.Instructions.Select(instruction => instruction.Pc));
+
+        var plan = ShaderResourcePlan.Extract(prepared, ShaderStage.Vertex, Hash, 0, 8,
+            fetch.Loads.Select(fetchLoad => fetchLoad.Pc).ToHashSet());
+        Assert.Null(plan.Memory.Find(24));
+        if (foreignRead)
+        {
+            Assert.NotNull(plan.Memory.Find(0));
+            Assert.Equal(BufferDescriptorProvenance.Static, plan.Memory.Find(44)!.BufferDescriptor!.Provenance);
+        }
+
+        var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
+        var layout = BindingLayout.Allocate(resources.Info, BindingLayout.CollectUserDataRegisters(prepared, 0, 8), false,
+            ShaderCompileRequest.RequiresFlattenedTable(plan, resources), false, 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            VertexInputs = [new ShaderVertexInput(24, 0, 4, 7, false, [])],
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var spirvError), spirvError);
+        Assert.True(Gen5MslTranslator.TryCompileProgram(request, out _, out var metalError), metalError);
+    }
+
+    // A redefinition only hides the loaded dword from later readers when it cannot be skipped.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RedefinitionUnderAForwardBranchDoesNotHideALaterRead(bool branch)
+    {
+        var program = Program(
+            ScalarLoad(0, AttributeTable, destination: 8, count: 4, immediateOffset: 8),
+            Sop2(8, "SLshlB32", 9, Gen5Operand.Scalar(10), Operand(4)),
+            ScalarLoad(12, BufferTable, destination: 12, count: 4, dynamicOffsetRegister: 9),
+            IndexSelect(20),
+            FetchLoad(24, 12, 4),
+            branch ? Branch(32, "SCbranchScc0", 1) : Nop(32),
+            MoveScalar(36, 11, 0),
+            ScalarLoad(40, BufferTable, destination: 16, count: 4, dynamicOffsetRegister: 11),
+            EndProgram(48));
+
+        var fetch = EmbeddedVertexFetchDetector.Detect(program, AttributeTable, BufferTable, 0, 8, 32);
+        Assert.Equal([0u, 12u], Assert.Single(fetch.Loads).PrologLoads);
+
+        var prepared = fetch.RemoveReplacedTableLoads(program);
+        Assert.Equal(branch ? program.Instructions[0].Opcode : "SNop", prepared.Instructions[0].Opcode);
+        Assert.Equal("SNop", prepared.Instructions[2].Opcode);
+    }
+
     [Fact]
     public void BufferTableWalk_YieldsOneLoadPerAttributeBuffer()
     {
