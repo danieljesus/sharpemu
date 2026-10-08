@@ -469,8 +469,27 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public ulong PrepareFlip(int handle, int index, int flipMode, long flipArgument)
         {
+            ResetMappedSizes();
             _ = BeginBatchedGuestCommands();
             return _endOfPipe.PrepareVideoOutFlip(_scheduler.Current, handle, index, flipMode, flipArgument);
+        }
+
+        // A flip whose request the front already reserved: the translation's preparation and the
+        // capture run here, in stream order, as they did inside PrepareFlip.
+        internal void CompleteQueuedFlip(int handle, int index, int flipMode, long flipArgument, ulong requestId)
+        {
+            ResetMappedSizes();
+            _ = BeginBatchedGuestCommands();
+            _translation.PrepareFlip(handle, index);
+            try
+            {
+                CaptureFlip(handle, index, requestId, flipMode, flipArgument);
+            }
+            catch
+            {
+                VideoOutExports.CancelFlip(requestId);
+                throw;
+            }
         }
 
         public bool IsFlipDone(int handle, int index) => VideoOutExports.IsFlipDone(handle, index);

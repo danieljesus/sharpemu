@@ -103,16 +103,17 @@ internal static unsafe partial class VulkanVideoPresenter
         // ([TEMP] measured none in GTA V; the cache then rebuilds the next time).
         private bool TryReadGuestWordDirect(ulong address, out uint word)
         {
+            // A page read before through its alias: no mapping check, no copy.
+            if (IsCleanReadPage(address, sizeof(uint)) && TryGetAliasPointer(address, sizeof(uint), out var alias))
+            {
+                word = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<uint>(alias);
+                return true;
+            }
+
             word = 0;
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
                 return false;
-            }
-
-            if (TryGetAliasPointer(address, sizeof(uint), out var alias))
-            {
-                word = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<uint>(alias);
-                return true;
             }
 
             Span<byte> bytes = stackalloc byte[sizeof(uint)];
@@ -121,9 +122,29 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            NoteCleanReadPage(address, sizeof(uint));
+            NoteFrontReadPage(address, sizeof(uint));
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
             return true;
+        }
+
+        // The front's clean-page note: the buffer cache's dirty state belongs to the render
+        // thread, so only the mapping is checked.
+        private void NoteFrontReadPage(ulong address, ulong size)
+        {
+            if (!TryGetCleanReadPage(address, size, out var page, out var slot) || !_guestMemory.CanRead(page, CleanReadPageBytes))
+            {
+                return;
+            }
+
+            var pages = _cleanReadPages ??= new CleanReadPages();
+            if (pages.Tags[slot] != page + 1)
+            {
+                pages.Tags[slot] = page + 1;
+                pages.Aliases[slot] = 0;
+                pages.Snapshots[slot] = null;
+            }
+
+            pages.Versions[slot] = _bufferCache.GpuModifiedVersion;
         }
 
         public bool TryReadGuestWord(ulong address, out uint word)
@@ -230,18 +251,19 @@ internal static unsafe partial class VulkanVideoPresenter
             var size = (ulong)destination.Length;
             if (_front is not null)
             {
-                if (!_guestMemory.CanRead(address, size))
-                {
-                    return false;
-                }
-
-                if (TryGetAliasPointer(address, size, out var frontAlias))
+                if (IsCleanReadPage(address, size) && TryGetAliasPointer(address, size, out var frontAlias))
                 {
                     new ReadOnlySpan<byte>(frontAlias, destination.Length).CopyTo(destination);
                     return true;
                 }
 
-                return _guestMemory.TryRead(address, destination);
+                if (!_guestMemory.CanRead(address, size) || !_guestMemory.TryRead(address, destination))
+                {
+                    return false;
+                }
+
+                NoteFrontReadPage(address, size);
+                return true;
             }
 
             if (clean || !IsCleanReadPage(address, size))
@@ -341,7 +363,8 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // The front thread creates modules while the render thread creates pipelines from them.
-        private readonly object _shaderModuleGate = new();
+        // Static: a test harness may build the presenter without running its initializers.
+        private static readonly object _shaderModuleGate = new();
 
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
         {

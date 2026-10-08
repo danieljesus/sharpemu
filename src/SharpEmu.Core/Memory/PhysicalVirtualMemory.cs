@@ -2379,6 +2379,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public bool CanRead(ulong address, ulong size) => size != 0 && (IsBackedRange(address, size) || IsAccessible(address, size));
 
+    public long MappingGeneration => Volatile.Read(ref _mappingGeneration);
+
     public bool IsAccessible(ulong virtualAddress, ulong size)
     {
         _gate.EnterReadLock();

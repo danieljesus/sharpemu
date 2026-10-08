@@ -171,7 +171,7 @@ public static partial class AgcExports
             if (_pipelines is null || _renderHost is null) return null;
             try
             {
-                inputs = RenderExecutor.ResolveProgramInputs(banks, _renderHost.FormatSupport, _renderHost.Fatal);
+                inputs = RenderExecutor.ResolveProgramInputs(banks, _renderHost.FormatSupport, _renderHost.Limits, _renderHost.Fatal);
                 return _pipelines.GetGraphicsPrograms(banks.Shader.Vertex, banks.Shader.Pixel, banks.Context.ShaderInterface, banks.Context,
                     inputs.ExportMapping, inputs.PixelActive, inputs.DepthBound);
             }

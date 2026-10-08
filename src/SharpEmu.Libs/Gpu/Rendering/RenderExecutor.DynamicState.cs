@@ -32,7 +32,6 @@ public sealed partial class RenderExecutor
     private DynamicDrawState BuildDynamicState(ContextRegisters context, in DrawState state)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawDynamicStatePreparation);
-        var viewportRegisters = context.ScreenViewport;
         var limits = _host.Limits;
         uint framebufferWidth;
         uint framebufferHeight;
@@ -52,6 +51,19 @@ public sealed partial class RenderExecutor
             framebufferHeight = limits.MaxFramebufferHeight;
         }
 
+        Span<uint> slots = stackalloc uint[(int)state.ColorCount];
+        for (var i = 0; i < state.ColorCount; i++) slots[i] = state.Colors[i].Slot;
+        return BuildDynamicState(context, limits, framebufferWidth, framebufferHeight, state.Depth.HasTarget ? state.Depth.Target : null, slots);
+    }
+
+    // The dynamic state from the registers and the resolved targets alone, so a host that
+    // interprets ahead can prepare it from a snapshot (see ResolveProgramInputs).
+    internal static DynamicDrawState BuildDynamicState(ContextRegisters context, RenderHostLimits limits, uint framebufferWidth, uint framebufferHeight,
+        DepthTargetState? depthTarget, ReadOnlySpan<uint> colorSlots)
+    {
+        var viewportRegisters = context.ScreenViewport;
+        var state = default(DrawState);
+        state.ColorCount = (uint)colorSlots.Length;
         var scissor = ResolveScissor(viewportRegisters, context.ScanMode, framebufferWidth, framebufferHeight);
         ref readonly var viewport = ref viewportRegisters.Viewports[0];
         float viewportX;
@@ -84,9 +96,8 @@ public sealed partial class RenderExecutor
             lineWidth = 1f;
         }
 
-        var depthTarget = state.Depth.HasTarget ? state.Depth.Target : default;
-        var depthState = depthTarget.State;
-        var depthFormat = depthTarget.Target.Format;
+        var depthState = (depthTarget ?? default).State;
+        var depthFormat = (depthTarget ?? default).Target.Format;
         var mode = context.RasterMode;
         var polygonOffset = context.PolygonOffset;
         var useFront = mode.PolygonOffsetFrontEnable && !mode.CullFront;
@@ -103,9 +114,9 @@ public sealed partial class RenderExecutor
         }
 
         byte colorWriteMask = 0;
-        for (var i = 0; i < state.ColorCount; i++)
+        for (var i = 0; i < colorSlots.Length; i++)
         {
-            if (context.RenderTargetMaskForSlot(state.Colors[i].Slot) != 0)
+            if (context.RenderTargetMaskForSlot(colorSlots[i]) != 0)
             {
                 colorWriteMask |= (byte)(1 << i);
             }

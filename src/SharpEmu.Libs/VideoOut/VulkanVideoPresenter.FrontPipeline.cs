@@ -30,8 +30,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private int _backThreadId = -1;
         private int _count;
         private Exception? _failure;
-        // For the profile: the ticks the front spent waiting on this queue, the deepest it got.
+        // For the profile: the ticks the front spent waiting for room and for a result, the deepest the queue got.
         internal long WaitTicks;
+        internal long SyncWaitTicks;
         internal int MaxDepth;
 
         // Read without the gate: the render thread asks while it holds its own gate, and the
@@ -133,7 +134,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         Monitor.Wait(_gate);
                     }
 
-                    WaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
+                    SyncWaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
                     afterWait?.Invoke();
                 }
 
@@ -271,8 +272,25 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool HasFlipSlot() => presenter.HasFlipSlot();
 
-        public ulong PrepareFlip(int handle, int index, int flipMode, long flipArgument) =>
-            queue.Run(() => presenter.PrepareFlip(handle, index, flipMode, flipArgument), _pauseAlias, _resumeAlias);
+        // The request is reserved here (the interpreter checked HasFlipSlot first), so the front
+        // does not wait for the render thread to reach the flip; the preparation and the capture
+        // follow in order.
+        public ulong PrepareFlip(int handle, int index, int flipMode, long flipArgument)
+        {
+            var result = VideoOutExports.TryReserveFlipRequest(handle, index, flipMode, flipArgument, gpuQueued: true, out var requestId);
+            if (result != 0)
+            {
+                throw SubmissionScheduler.Fatal($"Could not submit the GPU flip: result={result} handle={handle} index={index} mode={flipMode} arg={flipArgument}");
+            }
+
+            if (requestId == 0)
+            {
+                throw SubmissionScheduler.Fatal("The GPU flip submission returned an invalid request ID of zero.");
+            }
+
+            queue.Enqueue(() => presenter.CompleteQueuedFlip(handle, index, flipMode, flipArgument, requestId), _pauseAlias, _resumeAlias);
+            return requestId;
+        }
 
         public bool IsFlipDone(int handle, int index) => presenter.IsFlipDone(handle, index);
 
@@ -392,9 +410,10 @@ internal static unsafe partial class VulkanVideoPresenter
             var busy = Interlocked.Exchange(ref _frontBusyTicks, 0);
             var slices = Interlocked.Exchange(ref _frontSlices, 0);
             var wait = Interlocked.Exchange(ref _back.WaitTicks, 0);
+            var syncWait = Interlocked.Exchange(ref _back.SyncWaitTicks, 0);
             var depth = Interlocked.Exchange(ref _back.MaxDepth, 0);
             return FormattableString.Invariant(
-                $"[PERF][FRONT] busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
+                $"[PERF][FRONT] busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
         }
 
         internal ICpuMemory GuestMemory => _guestMemory;

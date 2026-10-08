@@ -687,6 +687,7 @@ public sealed partial class RenderExecutor
             if (actual.Equals(_preparedInputs))
             {
                 PreparedProgramsUsed++;
+                _preparedDynamicStateUsable = true;
                 state.Programs = prepared;
                 return;
             }
@@ -719,6 +720,15 @@ public sealed partial class RenderExecutor
         public bool PixelActive;
         public bool DepthBound;
         public ColorComponentMapArray ExportMapping;
+        // The dynamic state prepared with the programs, and the resolved targets it was built
+        // from: the color count, slots and framebuffer extent after the executor's own
+        // resolution must agree before it is taken (the executor may drop unwritten targets).
+        public bool HasDynamicState;
+        public DynamicDrawState DynamicState;
+        public uint DynamicColorCount;
+        public ColorSlotArray DynamicSlots;
+        public uint DynamicWidth;
+        public uint DynamicHeight;
 
         public bool Equals(DrawProgramInputs other) =>
             PixelActive == other.PixelActive && DepthBound == other.DepthBound &&
@@ -750,9 +760,127 @@ public sealed partial class RenderExecutor
             }
         }
 
-        inputs.DepthBound = DepthTargetResolver.Resolve(context, formatSupport, fatal) is not null;
+        var depthTarget = DepthTargetResolver.Resolve(context, formatSupport, fatal);
+        inputs.DepthBound = depthTarget is not null;
         inputs.PixelActive = HasActivePixelShader(banks);
         return inputs;
+    }
+
+    // The provider inputs plus the dynamic state, from the registers and the resolved targets.
+    internal static DrawProgramInputs ResolveProgramInputs(RegisterBanks banks, IImageFormatSupport formatSupport, RenderHostLimits limits, Func<string, Exception> fatal)
+    {
+        var context = banks.Context;
+        var inputs = new DrawProgramInputs();
+        Span<ColorComponentMap> mapping = inputs.ExportMapping;
+        mapping.Fill(ColorComponentMap.Identity);
+        Span<uint> slots = stackalloc uint[(int)ContextRegisters.ColorTargetCount];
+        var colorCount = 0;
+        uint framebufferWidth = 0, framebufferHeight = 0;
+        for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
+        {
+            if (slot != 0 && (context.RenderTargetMaskForSlot(slot) == 0 || context.ColorTargets[slot].BaseAddress == 0))
+            {
+                continue;
+            }
+
+            if (ColorTargetResolver.Resolve(context, slot, DrawLayerOffset, ignoreTargetMask: false, out var resolvedSlot) is { } resolution)
+            {
+                mapping[(int)resolvedSlot] = resolution.ExportMapping;
+                if (colorCount == 0)
+                {
+                    framebufferWidth = resolution.Extent.Width;
+                    framebufferHeight = resolution.Extent.Height;
+                }
+
+                slots[colorCount++] = resolvedSlot;
+            }
+        }
+
+        var depthTarget = DepthTargetResolver.Resolve(context, formatSupport, fatal);
+        inputs.DepthBound = depthTarget is not null;
+        inputs.PixelActive = HasActivePixelShader(banks);
+        if (colorCount == 0)
+        {
+            if (depthTarget is { } depth)
+            {
+                framebufferWidth = depth.Target.Width;
+                framebufferHeight = depth.Target.Height;
+            }
+            else
+            {
+                framebufferWidth = limits.MaxFramebufferWidth;
+                framebufferHeight = limits.MaxFramebufferHeight;
+            }
+        }
+
+        inputs.DynamicState = BuildDynamicState(context, limits, framebufferWidth, framebufferHeight, depthTarget, slots[..colorCount]);
+        inputs.HasDynamicState = true;
+        inputs.DynamicColorCount = (uint)colorCount;
+        inputs.DynamicWidth = framebufferWidth;
+        inputs.DynamicHeight = framebufferHeight;
+        Span<uint> preparedSlots = inputs.DynamicSlots;
+        slots[..colorCount].CopyTo(preparedSlots);
+        return inputs;
+    }
+
+    [System.Runtime.CompilerServices.InlineArray(RenderingState.ColorAttachmentCapacity)]
+    internal struct ColorSlotArray
+    {
+        private uint _element0;
+    }
+
+    // Prepared dynamic state is used as prepared programs are: when the prepared inputs
+    // agreed with the resolved ones. Under the render profile it is still compared with the
+    // state built here and a disagreement counted, as a check of the preparation.
+    private bool _preparedDynamicStateUsable;
+    internal static long PreparedDynamicStateMismatches;
+
+    private DynamicDrawState DynamicStateOf(ContextRegisters context, ref DrawState state)
+    {
+        if (!_preparedDynamicStateUsable || !_preparedInputs.HasDynamicState || !PreparedTargetsAgree(ref state))
+        {
+            if (_preparedDynamicStateUsable && _preparedInputs.HasDynamicState) PreparedDynamicStateMismatches++;
+            return BuildDynamicState(context, in state);
+        }
+
+        return _preparedInputs.DynamicState;
+    }
+
+    // The targets the executor resolved are the ones the dynamic state was prepared from.
+    private bool PreparedTargetsAgree(ref DrawState state)
+    {
+        if (state.ColorCount != _preparedInputs.DynamicColorCount)
+        {
+            return false;
+        }
+
+        ReadOnlySpan<uint> slots = _preparedInputs.DynamicSlots;
+        for (var i = 0; i < state.ColorCount; i++)
+        {
+            if (state.Colors[i].Slot != slots[i])
+            {
+                return false;
+            }
+        }
+
+        uint width, height;
+        if (state.ColorCount > 0 && state.Colors[0].Image.IsValid)
+        {
+            width = state.Colors[0].Resolution.Extent.Width;
+            height = state.Colors[0].Resolution.Extent.Height;
+        }
+        else if (state.Depth.Image.IsValid)
+        {
+            width = state.Depth.Target.Target.Width;
+            height = state.Depth.Target.Target.Height;
+        }
+        else
+        {
+            width = _host.Limits.MaxFramebufferWidth;
+            height = _host.Limits.MaxFramebufferHeight;
+        }
+
+        return width == _preparedInputs.DynamicWidth && height == _preparedInputs.DynamicHeight;
     }
 
     // Programs prepared ahead for the draw being executed, and the inputs they were prepared
@@ -765,6 +893,7 @@ public sealed partial class RenderExecutor
     {
         _preparedPrograms = preparedPrograms;
         _preparedInputs = preparedInputs;
+        _preparedDynamicStateUsable = false;
         try
         {
             DrawIndexed(submitId, banks, in arguments);
@@ -772,6 +901,7 @@ public sealed partial class RenderExecutor
         finally
         {
             _preparedPrograms = null;
+            _preparedDynamicStateUsable = false;
         }
     }
 
@@ -779,6 +909,7 @@ public sealed partial class RenderExecutor
     {
         _preparedPrograms = preparedPrograms;
         _preparedInputs = preparedInputs;
+        _preparedDynamicStateUsable = false;
         try
         {
             DrawAuto(submitId, banks, in arguments);
@@ -786,6 +917,7 @@ public sealed partial class RenderExecutor
         finally
         {
             _preparedPrograms = null;
+            _preparedDynamicStateUsable = false;
         }
     }
 
