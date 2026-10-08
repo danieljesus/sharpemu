@@ -37,6 +37,16 @@ public sealed class ResourceMaterializationCacheTests
             }
         }
 
+        // The same words, moved by delta: a game's table allocated at another address.
+        public Heap Moved(ulong delta)
+        {
+            var moved = new Heap();
+            moved.Words.Clear();
+            foreach (var (address, word) in Words)
+                moved.Words[address + delta] = word;
+            return moved;
+        }
+
         public bool Read(ulong address, out uint word)
         {
             Reads++;
@@ -275,5 +285,137 @@ public sealed class ResourceMaterializationCacheTests
         // The first entry moved to the old generation and is still found.
         Assert.True(Run(cache, plan, heap, [0x1000, 0], out _, out _));
         Assert.Equal(1, cache.Hits);
+    }
+
+    // A plan whose only use of s[0:1] is as the base of its descriptor reads.
+    private static ShaderResourcePlan DirectPlan() =>
+        ShaderResourcePlan.Extract(DirectImageTableTests.CreateProgram(), ShaderStage.Compute, Hash, 0, 2);
+
+    private static Heap DirectHeap()
+    {
+        var heap = new Heap();
+        heap.Words.Clear();
+        for (var address = HeapBase + 312; address < HeapBase + 344 + 32 * 32; address += 4)
+        {
+            if (DirectImageTableTests.ReadDescriptor(address, out var word))
+                heap.Words[address] = word;
+        }
+
+        return heap;
+    }
+
+    [Fact]
+    public void TheSameTableAtAnotherAddressIsAHit()
+    {
+        if (!ResourceMaterializationCache.ContentKeyed)
+            return;
+        var plan = DirectPlan();
+        Assert.True(plan.UserDataUse.AnyAddressOnly);
+        var heap = DirectHeap();
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var first, out var firstSpecialization));
+        Assert.Equal(0, cache.Hits);
+
+        // The table pointer in s[0:1] moves; every word it points at is the same.
+        var moved = heap.Moved(0x4000);
+        Assert.True(Run(cache, plan, moved, [0x5000, 0], out var second, out var secondSpecialization));
+        Assert.Equal(1, cache.Hits);
+        Assert.Equal(0, moved.Reads);
+        Assert.Equal(first.Images, second.Images);
+        Assert.Same(firstSpecialization, secondSpecialization);
+        Assert.Equal(new uint[] { 0x5000, 0 }, second.UserData);
+        Assert.Equal(new uint[] { 0x1000, 0 }, first.UserData);
+    }
+
+    [Fact]
+    public void ADifferentTableAtAnotherAddressMaterializesAgain()
+    {
+        var plan = DirectPlan();
+        var heap = DirectHeap();
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var first, out _));
+
+        var moved = heap.Moved(0x4000);
+        foreach (var address in moved.Words.Keys.ToArray())
+        {
+            if ((address - HeapBase - 0x4000 - 344) % 32 == 4)
+                moved.Words[address] = 21u << 20;
+        }
+
+        Assert.True(Run(cache, plan, moved, [0x5000, 0], out var second, out _));
+        Assert.Equal(0, cache.Hits);
+        Assert.NotEqual(0, moved.Reads);
+        Assert.NotEqual(first.Images, second.Images);
+    }
+
+    [Fact]
+    public void ANullTablePointerIsNeverRebased()
+    {
+        var plan = DirectPlan();
+        var heap = DirectHeap();
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out _, out _));
+        var materializedBefore = cache.Misses;
+        _ = Run(cache, plan, heap.Moved(0x4000), [0, 0], out _, out _);
+        Assert.Equal(0, cache.Hits);
+        Assert.Equal(materializedBefore + 1, cache.Misses);
+    }
+
+    [Fact]
+    public void APointerThatAlsoAddressesAGlobalLoadIsComparedAsAValue()
+    {
+        // The wave-indexed program loads through s[0:1] with GLOBAL_LOAD, whose device range
+        // is part of the materialization, so the pointer is a value and a move is a miss.
+        var plan = Plan();
+        Assert.False(plan.UserDataUse.AnyAddressOnly);
+        var heap = new Heap();
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out _, out _));
+        Assert.True(Run(cache, plan, heap.Moved(0x4000), [0x5000, 0], out _, out _));
+        Assert.Equal((0, 2), (cache.Hits, cache.Misses));
+    }
+
+    // A buffer descriptor assembled in the shader from the pointer in s[0:1]: the shader sets
+    // the stride and record count, user data supplies the base address.
+    private static ShaderResourcePlan PointerBufferPlan() =>
+        ShaderResourcePlan.Extract(Program(
+            MoveScalar(0, 2, 64),
+            MoveScalar(4, 3, 0x2C004000),
+            BufferAccess(8, "BufferLoadDword", 0, vectorData: 4),
+            EndProgram(16)), ShaderStage.Compute, Hash, 0, 2);
+
+    [Fact]
+    public void ABufferBuiltFromAMovedPointerIsRebasedOnAHit()
+    {
+        if (!ResourceMaterializationCache.ContentKeyed)
+            return;
+        var plan = PointerBufferPlan();
+        Assert.True(plan.UserDataUse.AnyAddressOnly);
+        Assert.NotEmpty(plan.UserDataUse.RebasableDwords);
+        var heap = new Heap();
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, heap, [0x1000, 0x10], out var first, out var firstSpecialization));
+        Assert.Equal(new uint[] { 0x1000, 0x10, 64, 0x2C004000 }, first.Buffers[0]);
+
+        Assert.True(Run(cache, plan, heap, [0x5000, 0x11], out var second, out var secondSpecialization));
+        Assert.Equal((1, 1), (cache.Hits, cache.Misses));
+        Assert.Equal(new uint[] { 0x5000, 0x11, 64, 0x2C004000 }, second.Buffers[0]);
+        Assert.Equal(new uint[] { 0x1000, 0x10, 64, 0x2C004000 }, first.Buffers[0]);
+        Assert.Same(firstSpecialization, secondSpecialization);
+        Assert.Equal(new uint[] { 0x5000, 0x11 }, second.UserData);
+    }
+
+    [Fact]
+    public void ABufferWhoseStrideBitsMovedMaterializesAgain()
+    {
+        var plan = PointerBufferPlan();
+        var heap = new Heap();
+        var cache = new ResourceMaterializationCache();
+        Assert.True(Run(cache, plan, heap, [0x1000, 0x10], out _, out _));
+
+        // The high word carries the stride above its base-address bits.
+        Assert.True(Run(cache, plan, heap, [0x1000, 0x10 | (1u << 20)], out var second, out _));
+        Assert.Equal((0, 2), (cache.Hits, cache.Misses));
+        Assert.Equal(0x10 | (1u << 20), second.Buffers[0][1]);
     }
 }

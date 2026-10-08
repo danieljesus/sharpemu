@@ -214,7 +214,22 @@ internal static class RawReadPrefetch
         }
     }
 
+    // The prefetched words are read in runs, not per handle, so a recording reader cannot tell
+    // which pointer each came from; it records them as reads it must not move.
     private static void ReadRuns(RuntimeValueEvaluator evaluator, Scratch scratch)
+    {
+        var previousBase = RuntimeValueEvaluator.ExchangeReadBase(UserDataUseAnalysis.UnknownBase);
+        try
+        {
+            ReadRunsCore(evaluator, scratch);
+        }
+        finally
+        {
+            RuntimeValueEvaluator.ExchangeReadBase(previousBase);
+        }
+    }
+
+    private static void ReadRunsCore(RuntimeValueEvaluator evaluator, Scratch scratch)
     {
         var count = scratch.Count;
         if (count < MinimumRunWords)
