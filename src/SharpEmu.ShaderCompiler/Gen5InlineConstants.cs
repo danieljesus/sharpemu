@@ -15,10 +15,12 @@ public static class Gen5InlineConstants
     public const uint PrivateLimit = 238;
 
     // The PS5 FLAT apertures, as title shaders hard-code them: a high dword of
-    // 0x7xxxxxxx selects LDS and 0x8xxxxxxx scratch. Guest device addresses fit in
+    // 0x8xxxxxxx selects LDS and 0x7xxxxxxx scratch (GTA V's BVH traversal pushes
+    // its stack through 0x8xxxxxxx and pops it with ds_read, and pushes through
+    // 0x7xxxxxxx what it pops with scratch_load). Guest device addresses fit in
     // 40 bits and never reach them.
-    public const uint SharedApertureHigh = 0x7000_0000;
-    public const uint PrivateApertureHigh = 0x8000_0000;
+    public const uint SharedApertureHigh = 0x8000_0000;
+    public const uint PrivateApertureHigh = 0x7000_0000;
 
     // Each aperture is the window of high dwords sharing its top nibble.
     public const int ApertureShift = 28;

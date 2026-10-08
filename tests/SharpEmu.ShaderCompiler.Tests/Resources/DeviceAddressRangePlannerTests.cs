@@ -86,9 +86,9 @@ public sealed class DeviceAddressRangePlannerTests
         Assert.Equal(Gen5InlineConstants.SharedApertureHigh, shared);
         Assert.True(Gen5InlineConstants.TryDecode(Gen5InlineConstants.PrivateLimit, out var privateLimit));
         Assert.Equal(Gen5InlineConstants.PrivateApertureHigh, privateLimit);
-        Assert.Equal(0x7000_0000_0000_0000ul, Gen5InlineConstants.DecodeAperture64(Gen5InlineConstants.SharedBase));
-        Assert.Equal(0x7000_0000_FFFF_FFFFul, Gen5InlineConstants.DecodeAperture64(Gen5InlineConstants.SharedLimit));
-        Assert.Equal(0x8000_0000_0000_0000ul, Gen5InlineConstants.DecodeAperture64(Gen5InlineConstants.PrivateBase));
+        Assert.Equal(0x8000_0000_0000_0000ul, Gen5InlineConstants.DecodeAperture64(Gen5InlineConstants.SharedBase));
+        Assert.Equal(0x8000_0000_FFFF_FFFFul, Gen5InlineConstants.DecodeAperture64(Gen5InlineConstants.SharedLimit));
+        Assert.Equal(0x7000_0000_0000_0000ul, Gen5InlineConstants.DecodeAperture64(Gen5InlineConstants.PrivateBase));
     }
 
     [Fact]
