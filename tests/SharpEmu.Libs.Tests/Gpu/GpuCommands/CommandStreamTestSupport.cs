@@ -66,13 +66,16 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
         return GuestMemory.TryRead(address, destination);
     }
 
-    public void RunPendingCommands()
+    public bool RunPendingCommands()
     {
         PendingCommandRuns++;
+        var ran = PendingCommands.Count != 0;
         while (PendingCommands.Count != 0)
         {
             PendingCommands.Dequeue()();
         }
+
+        return ran;
     }
 
     public void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots) => Calls.Add($"begin {queueId} {submissionId}");

@@ -303,10 +303,10 @@ internal static unsafe partial class VulkanVideoPresenter
             return _guestMemory.TryRead(address, destination);
         }
 
-        public void RunPendingCommands()
+        public bool RunPendingCommands()
         {
             using var relayScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueRelay);
-            _relay.RunPendingCommands();
+            return _relay.RunPendingCommands();
         }
 
         public void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots)

@@ -105,13 +105,15 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
         return true;
     }
 
-    public void RunPendingCommands()
+    // True when at least one command ran.
+    public bool RunPendingCommands()
     {
         if (!IsGpuQueueThread)
         {
             throw SubmissionScheduler.Fatal("Only the GPU worker can run relay commands.");
         }
 
+        var ran = false;
         while (HasPendingCommands)
         {
             Action command;
@@ -122,7 +124,10 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
             }
 
             command();
+            ran = true;
         }
+
+        return ran;
     }
 
     public void RunOnGpuQueue(Action work)

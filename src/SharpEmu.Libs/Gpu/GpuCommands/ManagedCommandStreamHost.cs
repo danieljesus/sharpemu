@@ -43,9 +43,7 @@ public class ManagedCommandStreamHost : ICommandStreamHost
 
     public virtual bool TryReadGuest(ulong address, Span<byte> destination) => Memory.TryRead(address, destination);
 
-    public virtual void RunPendingCommands()
-    {
-    }
+    public virtual bool RunPendingCommands() => false;
 
     public virtual void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots)
     {

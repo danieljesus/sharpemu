@@ -85,7 +85,8 @@ public interface ICommandStreamHost
     bool TryReadGuest(ulong address, Span<byte> destination);
 
     // Runs commands other threads posted to this worker. Called before every packet.
-    void RunPendingCommands();
+    // True when at least one command ran: it may have changed guest memory.
+    bool RunPendingCommands();
 
     // Starts a slice of a submission; the geometry snapshots were captured when it was submitted.
     void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots);
