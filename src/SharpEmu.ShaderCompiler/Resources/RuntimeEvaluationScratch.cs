@@ -15,8 +15,6 @@ internal sealed class RuntimeEvaluationScratch : IDisposable
     internal ScalarValueCache Values { get; } = new();
     internal CompiledValueCache CompiledValues { get; } = new();
     internal List<ScalarValue> Visiting { get; } = [];
-    // The roots of one batched evaluation.
-    internal List<int> Roots { get; } = [];
     internal Stack<int> PendingBranches { get; } = new();
     private bool[] _visitedBranches = [];
 
@@ -47,7 +45,6 @@ internal sealed class RuntimeEvaluationScratch : IDisposable
         Values.Reset();
         CompiledValues.Reset();
         Visiting.Clear();
-        Roots.Clear();
         PendingBranches.Clear();
         _rented = false;
         _nextAvailable = _available;
@@ -55,44 +52,34 @@ internal sealed class RuntimeEvaluationScratch : IDisposable
     }
 }
 
-// Plan-local indices avoid hashing graph nodes on every dependency evaluation. The marks and
-// the stack carry one evaluation pass over the nodes a draw needs.
+// Plan-local indices avoid hashing graph nodes on every dependency evaluation.
 internal sealed class CompiledValueCache
 {
     private ulong[] _values = [];
     private uint[] _stamps = [];
-    private uint[] _marks = [];
-    private int[] _stack = new int[64];
-    private uint _generation = 1;
-    private uint _pass = 1;
-    private int _passDepth;
-    private int _stackDepth;
-
-    internal ulong[] Values => _values;
-
-    internal int StackDepth => _stackDepth;
+    private uint _generation = 2;
 
     internal void EnsureCapacity(int count)
     {
         if (_values.Length >= count) return;
         Array.Resize(ref _values, count);
         Array.Resize(ref _stamps, count);
-        Array.Resize(ref _marks, count);
+    }
+
+    internal int Begin(int index, out ulong result)
+    {
+        result = 0;
+        if (_stamps[index] == _generation)
+        {
+            result = _values[index];
+            return 1;
+        }
+        if (_stamps[index] == _generation + 1) return -1;
+        _stamps[index] = _generation + 1;
+        return 0;
     }
 
     internal bool Contains(int index) => _stamps[index] == _generation;
-
-    internal bool TryGet(int index, out ulong value)
-    {
-        if (_stamps[index] == _generation)
-        {
-            value = _values[index];
-            return true;
-        }
-
-        value = 0;
-        return false;
-    }
 
     internal void Store(int index, ulong value)
     {
@@ -100,41 +87,16 @@ internal sealed class CompiledValueCache
         _stamps[index] = _generation;
     }
 
-    // A pass marks the nodes it has started; a pass that a running node's callback starts
-    // shares those marks, so the nodes in progress stay in progress.
-    internal void BeginPass()
+    internal void End(int index)
     {
-        if (_passDepth++ != 0 || ++_pass != 0) return;
-        Array.Clear(_marks);
-        _pass = 1;
+        if (_stamps[index] == _generation + 1) _stamps[index] = 0;
     }
-
-    internal void EndPass() => _passDepth--;
-
-    internal bool IsInProgress(int index) => _marks[index] == _pass;
-
-    internal void MarkInProgress(int index) => _marks[index] = _pass;
-
-    internal void Push(int entry)
-    {
-        if (_stackDepth == _stack.Length) Array.Resize(ref _stack, _stackDepth * 2);
-        _stack[_stackDepth++] = entry;
-    }
-
-    internal int Pop() => _stack[--_stackDepth];
-
-    internal void Truncate(int depth) => _stackDepth = depth;
 
     internal void Reset()
     {
-        _generation++;
-        if (_generation == 0)
-        {
-            Array.Clear(_stamps);
-            _generation = 1;
-        }
-
-        _stackDepth = 0;
-        _passDepth = 0;
+        _generation = unchecked(_generation + 2);
+        if (_generation != 0) return;
+        Array.Clear(_stamps);
+        _generation = 2;
     }
 }

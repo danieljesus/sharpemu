@@ -8,27 +8,13 @@ using System.Runtime.CompilerServices;
 namespace SharpEmu.ShaderCompiler.Resources;
 
 // Compile the immutable SRT graph once, not the draw's pointers or memory contents.
-// Each node is a case of a small method that computes it from the dense values of its
-// operands. A draw marks the nodes its roots need, skipping the ones its cache already
-// holds, and runs them in dependency order without recursion; small methods bound JIT cost.
+// Small methods bound JIT cost; dependency calls use constant indices and a dense cache.
 internal sealed class CompiledResourceEvaluator
 {
-    private const int NodesPerMethod = 256;
-    private delegate bool NodeFunction(RuntimeValueEvaluator evaluator, int index, ulong[] values, out ulong result);
+    private const int NodesPerMethod = 64;
+    private delegate bool EvaluateFunction(RuntimeValueEvaluator evaluator, int index, out ulong result);
     private readonly Dictionary<ScalarValue, int> _indices;
-    private readonly NodeFunction[] _functions;
-    // The operand indices of each node, as the marking walks them: a node's dependencies are
-    // _dependencies[_dependencyStart[node].._dependencyStart[node + 1]).
-    private readonly int[] _dependencyStart;
-    private readonly int[] _dependencies;
-    // For a select, the indices of its condition and its first arm (-1 when constant): under
-    // an active-lane mask the select takes the first arm without evaluating the others.
-    private readonly int[] _selectCondition;
-    private readonly int[] _selectArm;
-    // For a resource table word, its slot and the index of the table word it aliases (-1 when
-    // the slot is out of range); a clean slot is read by the clean evaluator instead.
-    private readonly int[] _tableSlot;
-    private readonly int[] _tableWord;
+    private readonly EvaluateFunction[] _functions;
     internal ScalarValue[] Values { get; }
     internal int[][] SourceWords { get; }
     internal int[] TableWords { get; }
@@ -36,9 +22,10 @@ internal sealed class CompiledResourceEvaluator
 
     private static readonly Dictionary<string, MethodInfo> Helpers = new[]
     {
+        nameof(RuntimeValueEvaluator.BeginCompiled), nameof(RuntimeValueEvaluator.EndCompiled),
+        nameof(RuntimeValueEvaluator.StoreCompiled), nameof(RuntimeValueEvaluator.EvaluateCompiled),
         nameof(RuntimeValueEvaluator.EvaluateCompiledSpecial), nameof(RuntimeValueEvaluator.IsCompiledActiveMask),
-        nameof(RuntimeValueEvaluator.EvaluateCompiledTableWord), nameof(RuntimeValueEvaluator.ReadUserData),
-        nameof(RuntimeValueEvaluator.ReadShaderBase), nameof(RuntimeValueEvaluator.ReadRawWord),
+        nameof(RuntimeValueEvaluator.ReadUserData), nameof(RuntimeValueEvaluator.ReadShaderBase), nameof(RuntimeValueEvaluator.ReadRawWord),
     }.ToDictionary(name => name, name => typeof(RuntimeValueEvaluator).GetMethod(name, BindingFlags.NonPublic | BindingFlags.Instance)!);
     private static readonly MethodInfo EvaluateOperation = typeof(ScalarOperationSemantics)
         .GetMethod(nameof(ScalarOperationSemantics.TryEvaluateFixed), BindingFlags.NonPublic | BindingFlags.Static)!;
@@ -50,70 +37,9 @@ internal sealed class CompiledResourceEvaluator
         _indices = indices;
         SourceWords = plan.DescriptorSources.Select(source => source.Dwords.Select(word => indices[word]).ToArray()).ToArray();
         TableWords = plan.TableReads.Select(read => indices[read.Value]).ToArray();
-        _dependencyStart = new int[Count + 1];
-        _selectCondition = new int[Count];
-        _selectArm = new int[Count];
-        _tableSlot = new int[Count];
-        _tableWord = new int[Count];
-        var dependencies = new List<int>();
-        for (var index = 0; index < Count; index++)
-        {
-            _dependencyStart[index] = dependencies.Count;
-            _selectCondition[index] = _selectArm[index] = _tableSlot[index] = _tableWord[index] = -1;
-            CollectDependencies(plan, index, phis, dependencies);
-        }
-
-        _dependencyStart[Count] = dependencies.Count;
-        _dependencies = [.. dependencies];
-        _functions = new NodeFunction[(Count + NodesPerMethod - 1) / NodesPerMethod];
+        _functions = new EvaluateFunction[(Count + NodesPerMethod - 1) / NodesPerMethod];
         for (var chunk = 0; chunk < _functions.Length; chunk++)
             _functions[chunk] = Compile(plan, chunk * NodesPerMethod, phis);
-    }
-
-    private int IndexOf(ScalarValue value) => value.IsConstant ? -1 : _indices.TryGetValue(value, out var index) ? index : -1;
-
-    // The operands a node reads through the dense values; constants are immediates.
-    private void CollectDependencies(ShaderResourcePlan plan, int index, Dictionary<ScalarValue, ScalarValue?> phis, List<int> dependencies)
-    {
-        var value = Values[index];
-        void Add(ScalarValue operand)
-        {
-            var operandIndex = IndexOf(operand);
-            if (operandIndex >= 0) dependencies.Add(operandIndex);
-        }
-
-        switch (value.Kind)
-        {
-            case ScalarValueKind.Phi:
-                if (phis[value] is { } invariant) Add(invariant);
-                break;
-            case ScalarValueKind.ResourceTableWord:
-                // The clean evaluator or the aliased table word, decided per draw by the marking.
-                if (value.Payload < (ulong)plan.TableReads.Count)
-                {
-                    _tableSlot[index] = (int)value.Payload;
-                    _tableWord[index] = TableWords[(int)value.Payload];
-                }
-
-                break;
-            case ScalarValueKind.Select:
-                _selectCondition[index] = IndexOf(value.Operands[0]);
-                _selectArm[index] = IndexOf(value.Operands[1]);
-                // Ordinary selects are eager, including reads on the inactive arm.
-                foreach (var operand in value.Operands) Add(operand);
-                break;
-            case ScalarValueKind.ScalarAddressWord:
-            case ScalarValueKind.ScalarBufferWord:
-                if ((uint)value.MemoryIndex >= (uint)plan.Memory.Count || value.Operands.Length < 2) break;
-                foreach (var word in value.Operands[0].Operands) Add(word);
-                Add(value.Operands[1]);
-                break;
-            case ScalarValueKind.Operation:
-                if (RuntimeValueValidator.IsUniformOperation(value.Operation))
-                    foreach (var operand in value.Operands) Add(operand);
-                break;
-            // A first-lane value is evaluated by its own evaluator under the active mask.
-        }
     }
 
     private static readonly System.Collections.Concurrent.ConcurrentQueue<ShaderResourcePlan> Pending = new();
@@ -141,80 +67,8 @@ internal sealed class CompiledResourceEvaluator
     }
 
     internal bool TryGetIndex(ScalarValue value, out int index) => _indices.TryGetValue(value, out index);
-
-    // Evaluates every root the cache does not hold yet, each after its dependencies; false as
-    // soon as one needed node cannot be evaluated, with the nodes computed so far kept. A node
-    // whose dependency is still in progress is on a cycle, which fails like the interpreter's
-    // visiting set. A pass started by a callback from a running node shares the marks of the
-    // outer one, so the in-progress nodes stay in progress.
-    internal bool Evaluate(RuntimeValueEvaluator evaluator, CompiledValueCache cache, ReadOnlySpan<int> roots)
-    {
-        cache.BeginPass();
-        var stackBase = cache.StackDepth;
-        var values = cache.Values;
-        var succeeded = true;
-        foreach (var root in roots)
-        {
-            if (cache.Contains(root)) continue;
-            if (cache.IsInProgress(root))
-            {
-                succeeded = false;
-                break;
-            }
-
-            cache.Push(root);
-            while (succeeded && cache.StackDepth > stackBase)
-            {
-                var top = cache.Pop();
-                if (top < 0)
-                {
-                    // Its dependencies ran: compute the node and keep its value.
-                    var index = ~top;
-                    if (_functions[index / NodesPerMethod](evaluator, index, values, out var result)) cache.Store(index, result);
-                    else succeeded = false;
-                    continue;
-                }
-
-                if (cache.Contains(top) || cache.IsInProgress(top)) continue;
-                cache.MarkInProgress(top);
-                cache.Push(~top);
-                succeeded = PushDependencies(evaluator, cache, top);
-            }
-
-            if (!succeeded) break;
-        }
-
-        cache.Truncate(stackBase);
-        cache.EndPass();
-        return succeeded;
-    }
-
-    private bool PushDependencies(RuntimeValueEvaluator evaluator, CompiledValueCache cache, int index)
-    {
-        switch (Values[index].Kind)
-        {
-            case ScalarValueKind.Select when _selectCondition[index] >= 0 && evaluator.IsCompiledActiveMask(_selectCondition[index]):
-                return _selectArm[index] < 0 || PushDependency(cache, _selectArm[index]);
-            case ScalarValueKind.ResourceTableWord:
-                return _tableWord[index] < 0 || evaluator.IsCleanSlot(_tableSlot[index]) || PushDependency(cache, _tableWord[index]);
-            default:
-                // Pushed last to first, so the first operand is evaluated first, as the interpreter does.
-                for (var position = _dependencyStart[index + 1] - 1; position >= _dependencyStart[index]; position--)
-                {
-                    if (!PushDependency(cache, _dependencies[position])) return false;
-                }
-
-                return true;
-        }
-    }
-
-    private static bool PushDependency(CompiledValueCache cache, int index)
-    {
-        if (cache.Contains(index)) return true;
-        if (cache.IsInProgress(index)) return false;
-        cache.Push(index);
-        return true;
-    }
+    internal bool Evaluate(RuntimeValueEvaluator evaluator, int index, out ulong result) =>
+        _functions[index / NodesPerMethod](evaluator, index, out result);
 
     internal static CompiledResourceEvaluator? Build(ShaderResourcePlan plan)
     {
@@ -242,7 +96,8 @@ internal sealed class CompiledResourceEvaluator
         foreach (var candidates in plan.BufferCandidateTables)
             if (candidates.Limit is { } limit) Add(limit);
 
-        // An iterative walk also admits cycles; the marking fails them at run time.
+        // An iterative walk also admits cycles. At run time, an in-progress dense slot
+        // fails just like the interpreter's visiting set, without recursing forever.
         for (var index = 0; index < values.Count; index++)
         {
             var value = values[index];
@@ -275,39 +130,38 @@ internal sealed class CompiledResourceEvaluator
         return values.Count == 0 ? null : new(plan, values, indices, phis);
     }
 
-    private NodeFunction Compile(ShaderResourcePlan plan, int first, Dictionary<ScalarValue, ScalarValue?> phis)
+    private EvaluateFunction Compile(ShaderResourcePlan plan, int first, Dictionary<ScalarValue, ScalarValue?> phis)
     {
         var count = Math.Min(NodesPerMethod, Count - first);
         var method = new DynamicMethod($"Srt_{plan.Hash:X16}_{first}", typeof(bool),
-            [typeof(RuntimeValueEvaluator), typeof(int), typeof(ulong[]), typeof(ulong).MakeByRefType()], typeof(CompiledResourceEvaluator).Module, true);
+            [typeof(RuntimeValueEvaluator), typeof(int), typeof(ulong).MakeByRefType()], typeof(CompiledResourceEvaluator).Module, true);
         var il = method.GetILGenerator();
         var result = il.DeclareLocal(typeof(ulong));
+        var success = il.DeclareLocal(typeof(bool));
+        var status = il.DeclareLocal(typeof(int));
         var operands = Enumerable.Range(0, 5).Select(_ => il.DeclareLocal(typeof(ulong))).ToArray();
         var failed = il.DefineLabel();
         var store = il.DefineLabel();
+        var exit = il.DefineLabel();
         var cases = Enumerable.Range(0, count).Select(_ => il.DefineLabel()).ToArray();
 
         void Call(string helper) => il.Emit(OpCodes.Call, Helpers[helper]);
         void Constant(ulong value) => il.Emit(OpCodes.Ldc_I8, unchecked((long)value));
-        // The operand's value onto the stack: an immediate, or the dense value its node left.
-        bool PushOperand(ScalarValue value)
+        void Operand(ScalarValue value, LocalBuilder destination)
         {
             if (value.IsConstant)
             {
                 Constant(value.Payload);
-                return true;
+                il.Emit(OpCodes.Stloc, destination);
+                return;
             }
-            if (!_indices.TryGetValue(value, out var index)) return false;
-            il.Emit(OpCodes.Ldarg_2);
+            var index = _indices[value];
+            il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Ldc_I4, index);
-            il.Emit(OpCodes.Ldelem_I8);
-            return true;
-        }
-        bool Operand(ScalarValue value, LocalBuilder destination)
-        {
-            if (!PushOperand(value)) return false;
-            il.Emit(OpCodes.Stloc, destination);
-            return true;
+            il.Emit(OpCodes.Ldloca, destination);
+            if (index >= first && index < first + count) il.Emit(OpCodes.Call, method);
+            else Call(nameof(RuntimeValueEvaluator.EvaluateCompiled));
+            il.Emit(OpCodes.Brfalse, failed);
         }
         void Load(int index, bool narrow = false)
         {
@@ -323,6 +177,20 @@ internal sealed class CompiledResourceEvaluator
             il.Emit(OpCodes.Brfalse, failed);
         }
 
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Ldarg_2);
+        Call(nameof(RuntimeValueEvaluator.BeginCompiled));
+        il.Emit(OpCodes.Stloc, status);
+        var compute = il.DefineLabel();
+        il.Emit(OpCodes.Ldloc, status);
+        il.Emit(OpCodes.Brfalse, compute);
+        il.Emit(OpCodes.Ldloc, status);
+        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Cgt);
+        il.Emit(OpCodes.Ret);
+        il.MarkLabel(compute);
+        il.BeginExceptionBlock();
         il.Emit(OpCodes.Ldarg_1);
         il.Emit(OpCodes.Ldc_I4, first);
         il.Emit(OpCodes.Sub);
@@ -362,52 +230,35 @@ internal sealed class CompiledResourceEvaluator
                     il.Emit(OpCodes.Stloc, result);
                     break;
                 case ScalarValueKind.Phi:
-                    if (phis[value] is not { } invariant || !Operand(invariant, result)) il.Emit(OpCodes.Br, failed);
+                    if (phis[value] is { } invariant) Operand(invariant, result);
+                    else il.Emit(OpCodes.Br, failed);
                     break;
                 case ScalarValueKind.FirstLane:
-                    // Crosses evaluator contexts: the active-lane cache of its own evaluator.
-                    Special(index);
-                    break;
                 case ScalarValueKind.ResourceTableWord:
-                    if (_tableWord[index] < 0)
-                    {
-                        il.Emit(OpCodes.Br, failed);
-                        break;
-                    }
-                    il.Emit(OpCodes.Ldarg_0);
-                    il.Emit(OpCodes.Ldc_I4, _tableSlot[index]);
-                    il.Emit(OpCodes.Ldarg_2);
-                    il.Emit(OpCodes.Ldc_I4, _tableWord[index]);
-                    il.Emit(OpCodes.Ldelem_I8);
-                    il.Emit(OpCodes.Ldloca, result);
-                    Call(nameof(RuntimeValueEvaluator.EvaluateCompiledTableWord));
-                    il.Emit(OpCodes.Brfalse, failed);
+                    // These cross evaluator contexts: active-lane cache or clean reader.
+                    Special(index);
                     break;
                 case ScalarValueKind.Select:
                 {
-                    if (value.Operands.Length < 3 || value.Operands.Any(operand => IndexOf(operand) < 0 && !operand.IsConstant))
-                    {
-                        il.Emit(OpCodes.Br, failed);
-                        break;
-                    }
                     var ordinary = il.DefineLabel();
                     var chosen = il.DefineLabel();
-                    if (_selectCondition[index] >= 0)
-                    {
-                        il.Emit(OpCodes.Ldarg_0);
-                        il.Emit(OpCodes.Ldc_I4, _selectCondition[index]);
-                        Call(nameof(RuntimeValueEvaluator.IsCompiledActiveMask));
-                        il.Emit(OpCodes.Brfalse, ordinary);
-                        Operand(value.Operands[1], result);
-                        il.Emit(OpCodes.Br, store);
-                    }
-                    il.MarkLabel(ordinary);
-                    PushOperand(value.Operands[0]);
-                    il.Emit(OpCodes.Brfalse, chosen);
+                    il.Emit(OpCodes.Ldarg_0);
+                    il.Emit(OpCodes.Ldc_I4, _indices[value.Operands[0]]);
+                    Call(nameof(RuntimeValueEvaluator.IsCompiledActiveMask));
+                    il.Emit(OpCodes.Brfalse, ordinary);
                     Operand(value.Operands[1], result);
                     il.Emit(OpCodes.Br, store);
+                    il.MarkLabel(ordinary);
+                    for (var operand = 0; operand < 3; operand++) Operand(value.Operands[operand], operands[operand]);
+                    // Ordinary selects are eager, including reads on the inactive arm.
+                    Load(0);
+                    il.Emit(OpCodes.Brfalse, chosen);
+                    Load(1);
+                    il.Emit(OpCodes.Stloc, result);
+                    il.Emit(OpCodes.Br, store);
                     il.MarkLabel(chosen);
-                    Operand(value.Operands[2], result);
+                    Load(2);
+                    il.Emit(OpCodes.Stloc, result);
                     break;
                 }
                 case ScalarValueKind.ScalarAddressWord:
@@ -421,11 +272,13 @@ internal sealed class CompiledResourceEvaluator
                         break;
                     }
                     var handle = value.Operands[0];
-                    if (!Operand(handle.Operands[0], operands[0]) || !Operand(handle.Operands[1], operands[1]) || !Operand(value.Operands[1], operands[2]) ||
-                        (buffer && (!Operand(handle.Operands[2], operands[3]) || !Operand(handle.Operands[3], operands[4]))))
+                    Operand(handle.Operands[0], operands[0]);
+                    Operand(handle.Operands[1], operands[1]);
+                    Operand(value.Operands[1], operands[2]);
+                    if (buffer)
                     {
-                        il.Emit(OpCodes.Br, failed);
-                        break;
+                        Operand(handle.Operands[2], operands[3]);
+                        Operand(handle.Operands[3], operands[4]);
                     }
                     il.Emit(OpCodes.Ldarg_0);
                     il.Emit(OpCodes.Ldc_I4, (int)value.Kind);
@@ -453,20 +306,14 @@ internal sealed class CompiledResourceEvaluator
                         Special(index);
                         break;
                     }
-                    var missing = false;
                     for (var operand = 0; operand < 4; operand++)
                     {
-                        if (operand < value.Operands.Length) missing |= !Operand(value.Operands[operand], operands[operand]);
+                        if (operand < value.Operands.Length) Operand(value.Operands[operand], operands[operand]);
                         else
                         {
                             Constant(0);
                             il.Emit(OpCodes.Stloc, operands[operand]);
                         }
-                    }
-                    if (missing)
-                    {
-                        il.Emit(OpCodes.Br, failed);
-                        break;
                     }
                     if (EmitArithmetic(il, value.Operation, operands)) il.Emit(OpCodes.Stloc, result);
                     else
@@ -486,18 +333,27 @@ internal sealed class CompiledResourceEvaluator
         }
 
         il.MarkLabel(store);
-        il.Emit(OpCodes.Ldarg_3);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Ldloc, result);
+        Call(nameof(RuntimeValueEvaluator.StoreCompiled));
+        il.Emit(OpCodes.Ldarg_2);
         il.Emit(OpCodes.Ldloc, result);
         il.Emit(OpCodes.Stind_I8);
         il.Emit(OpCodes.Ldc_I4_1);
-        il.Emit(OpCodes.Ret);
+        il.Emit(OpCodes.Stloc, success);
+        il.Emit(OpCodes.Leave, exit);
         il.MarkLabel(failed);
-        il.Emit(OpCodes.Ldarg_3);
-        il.Emit(OpCodes.Ldc_I8, 0L);
-        il.Emit(OpCodes.Stind_I8);
-        il.Emit(OpCodes.Ldc_I4_0);
+        il.Emit(OpCodes.Leave, exit);
+        il.BeginFinallyBlock();
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldarg_1);
+        Call(nameof(RuntimeValueEvaluator.EndCompiled));
+        il.EndExceptionBlock();
+        il.MarkLabel(exit);
+        il.Emit(OpCodes.Ldloc, success);
         il.Emit(OpCodes.Ret);
-        var function = method.CreateDelegate<NodeFunction>();
+        var function = method.CreateDelegate<EvaluateFunction>();
         RuntimeHelpers.PrepareDelegate(function);
         return function;
     }
