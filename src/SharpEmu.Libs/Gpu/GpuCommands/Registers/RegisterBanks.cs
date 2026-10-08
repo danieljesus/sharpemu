@@ -43,6 +43,18 @@ public sealed class RegisterBanks
         return clone;
     }
 
+    // Copies the live banks into this instance without allocating; like Clone, the saved
+    // context is not part of it.
+    public void CopyFrom(RegisterBanks source)
+    {
+        RegisterBankCopier.Copy(source.Context, Context);
+        RegisterBankCopier.Copy(source.Shader, Shader);
+        RegisterBankCopier.Copy(source.UserConfig, UserConfig);
+        CompositeDepthSizeXy = source.CompositeDepthSizeXy;
+        UserDataMarker = source.UserDataMarker;
+        IndexTypeAndSize = source.IndexTypeAndSize;
+    }
+
     public void Reset()
     {
         Context = new ContextRegisters();

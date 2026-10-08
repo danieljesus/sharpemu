@@ -150,6 +150,17 @@ public static partial class AgcExports
         private int _currentQueueId;
         private readonly ShaderPipelineCache? _pipelines;
         private readonly RenderExecutor? _executor;
+        // [pipeline] Draws and dispatches run on a copy of the banks, as they will when the
+        // interpreter runs ahead of the executor; SHARPEMU_RENDER_SNAPSHOT=1 enables it.
+        private static readonly bool SnapshotDraws = Environment.GetEnvironmentVariable("SHARPEMU_RENDER_SNAPSHOT") == "1";
+        private RegisterBanks? _snapshot;
+
+        private RegisterBanks Snapshot(RegisterBanks banks)
+        {
+            _snapshot ??= new RegisterBanks(banks.Fatal);
+            _snapshot.CopyFrom(banks);
+            return _snapshot;
+        }
 
         internal CommandStreamTranslation(ICpuMemory memory, ICommandStreamHost host)
         {
@@ -205,6 +216,7 @@ public static partial class AgcExports
 
             var banks = RequireTypedRegisters(state);
             RecordKnownColorTargets(state, banks);
+            if (SnapshotDraws) banks = Snapshot(banks);
             state.FrameDrawCount++;
             state.SawIndexedDraw |= indexed;
             var drawStarted = DcbParseProfile.Begin();
@@ -362,6 +374,7 @@ public static partial class AgcExports
             if (_executor is { } executor)
             {
                 var banks = RequireTypedRegisters(state);
+                if (SnapshotDraws) banks = Snapshot(banks);
                 state.FrameDispatchCount++;
                 var executorStarted = DcbParseProfile.Begin();
                 try
