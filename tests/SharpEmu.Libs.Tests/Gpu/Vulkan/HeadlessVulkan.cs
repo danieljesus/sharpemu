@@ -45,6 +45,9 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
     public bool SupportsFragmentShaderBarycentric { get; private init; }
     public bool SupportsFillRectangle { get; private init; }
 
+    // shaderFloat16 with the 16-bit float controls the native f16 conversions need.
+    public bool SupportsFloat16Conversions { get; private init; }
+
     private static readonly string[] RenderingExtensionNames =
     [
         "VK_KHR_push_descriptor",
@@ -308,10 +311,15 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         {
             SType = StructureType.PhysicalDeviceVulkan13Features,
         };
+        var float16Features = new PhysicalDeviceShaderFloat16Int8Features
+        {
+            SType = StructureType.PhysicalDeviceShaderFloat16Int8Features,
+            PNext = &vulkan13Features,
+        };
         var addressFeatures = new PhysicalDeviceBufferDeviceAddressFeatures
         {
             SType = StructureType.PhysicalDeviceBufferDeviceAddressFeatures,
-            PNext = &vulkan13Features,
+            PNext = &float16Features,
         };
         var timelineFeatures = new PhysicalDeviceTimelineSemaphoreFeatures
         {
@@ -320,6 +328,14 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         };
         var features = new PhysicalDeviceFeatures2 { SType = StructureType.PhysicalDeviceFeatures2, PNext = &timelineFeatures };
         vk.GetPhysicalDeviceFeatures2(physical, &features);
+        var floatControls = new PhysicalDeviceFloatControlsProperties { SType = StructureType.PhysicalDeviceFloatControlsProperties };
+        var floatControlsQuery = new PhysicalDeviceProperties2 { SType = StructureType.PhysicalDeviceProperties2, PNext = &floatControls };
+        vk.GetPhysicalDeviceProperties2(physical, &floatControlsQuery);
+        var float16Conversions = (bool)float16Features.ShaderFloat16 &&
+            (bool)floatControls.ShaderDenormPreserveFloat16 && (bool)floatControls.ShaderSignedZeroInfNanPreserveFloat16 &&
+            (bool)floatControls.ShaderRoundingModeRtefloat16 &&
+            floatControls.DenormBehaviorIndependence != ShaderFloatControlsIndependence.None &&
+            floatControls.RoundingModeIndependence != ShaderFloatControlsIndependence.None;
         var dynamicRendering = vulkan13Features.DynamicRendering && vulkan13Features.Synchronization2 &&
             HasDeviceExtensions(vk, physical, RenderingExtensionNames);
         if (family == uint.MaxValue || !timelineFeatures.TimelineSemaphore || !addressFeatures.BufferDeviceAddress ||
@@ -361,6 +377,17 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             BufferDeviceAddress = true,
             PNext = &vulkan13Features,
         };
+        if (float16Conversions)
+        {
+            float16Features = new PhysicalDeviceShaderFloat16Int8Features
+            {
+                SType = StructureType.PhysicalDeviceShaderFloat16Int8Features,
+                ShaderFloat16 = true,
+                PNext = &vulkan13Features,
+            };
+            addressFeatures.PNext = &float16Features;
+        }
+
         timelineFeatures.PNext = &addressFeatures;
         if (barycentric)
         {
@@ -401,6 +428,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         {
             SupportsFragmentShaderBarycentric = barycentric,
             SupportsFillRectangle = fillRectangle,
+            SupportsFloat16Conversions = float16Conversions,
         };
         if (validation)
         {

@@ -2040,6 +2040,14 @@ public static partial class Gen5SpirvTranslator
         // Mirrors the branchless HalfToFloat reference validated against System.Half.
         private uint EmitHalfToFloat(uint halfBits)
         {
+            if (_request.SupportsFloat16Conversions)
+            {
+                // The low half of the word as a float16, widened exactly by the device.
+                var halves = _module.AddInstruction(SpirvOp.Bitcast, _half2Type, halfBits);
+                var half = _module.AddInstruction(SpirvOp.CompositeExtract, _halfType, halves, 0);
+                return Bitcast(_uintType, _module.AddInstruction(SpirvOp.FConvert, _floatType, half));
+            }
+
             var sign = ShiftLeftLogical(BitwiseAnd(halfBits, UInt(0x8000)), UInt(16));
             var exponent = BitwiseAnd(ShiftRightLogical(halfBits, UInt(10)), UInt(0x1F));
             var mantissa = BitwiseAnd(halfBits, UInt(0x3FF));
@@ -2071,6 +2079,15 @@ public static partial class Gen5SpirvTranslator
         // branchless FloatToHalf reference validated exhaustively against System.Half.
         private uint EmitFloatToHalf(uint bits)
         {
+            if (_request.SupportsFloat16Conversions)
+            {
+                // Round-to-nearest-even with denormals and NaN kept, per the execution modes;
+                // the result sits in the low half of the word with a zero above it.
+                var half = _module.AddInstruction(SpirvOp.FConvert, _halfType, Bitcast(_floatType, bits));
+                var halves = _module.AddInstruction(SpirvOp.CompositeConstruct, _half2Type, half, _module.ConstantNull(_halfType));
+                return _module.AddInstruction(SpirvOp.Bitcast, _uintType, halves);
+            }
+
             var sign = BitwiseAnd(ShiftRightLogical(bits, UInt(16)), UInt(0x8000));
             var absolute = BitwiseAnd(bits, UInt(0x7FFF_FFFF));
 
