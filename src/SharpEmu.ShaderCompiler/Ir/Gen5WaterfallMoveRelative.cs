@@ -242,32 +242,73 @@ public static class Gen5WaterfallMoveRelative
         IsScalar(restore.Destinations, out var register) && register == Exec &&
         restore.Sources.Count == 1 && restore.Sources[0].Kind == Gen5OperandKind.ScalarRegister;
 
-    // Straight-line code after the loop must write the register before anything that could
-    // read it; M0 is also read implicitly by relative moves, LDS/GDS and a few others.
+    // Every path out of the loop must write the register before anything that could read
+    // it; M0 is also read implicitly by relative moves, LDS/GDS and a few others. Forward
+    // branches are followed on both sides; a backward or indirect branch may reach a read.
     private static bool IsDeadAfter(IReadOnlyList<Gen5ShaderInstruction> code, int start, uint register)
     {
-        for (var position = start; position < code.Count; position++)
+        var visited = new HashSet<int>();
+        var pending = new Stack<int>();
+        pending.Push(start);
+        while (pending.Count > 0)
         {
-            var instruction = code[position];
-            // Other paths into a branch target don't matter here: only this path's next use does.
-            if (IsBranch(instruction) || instruction.Opcode == "SEndpgm")
+            for (var position = pending.Pop(); position < code.Count && visited.Add(position); position++)
             {
-                return instruction.Opcode == "SEndpgm";
-            }
+                var instruction = code[position];
+                if (instruction.Opcode == "SEndpgm")
+                {
+                    break;
+                }
 
-            if (instruction.Sources.Any(operand => operand.Kind == Gen5OperandKind.ScalarRegister && operand.Value == register) ||
-                register == M0 && ReadsM0Implicitly(instruction))
-            {
-                return false;
-            }
+                if (IsBranch(instruction))
+                {
+                    if (instruction.Opcode is not "SBranch" && !instruction.Opcode.StartsWith("SCbranch", StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
 
-            if (instruction.Destinations.Any(operand => operand.Kind == Gen5OperandKind.ScalarRegister && operand.Value == register))
-            {
-                return true;
+                    var target = IndexOfPc(code, BranchTarget(instruction));
+                    if (target <= position)
+                    {
+                        return false;
+                    }
+
+                    pending.Push(target);
+                    if (instruction.Opcode == "SBranch")
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (instruction.Sources.Any(operand => operand.Kind == Gen5OperandKind.ScalarRegister && operand.Value == register) ||
+                    register == M0 && ReadsM0Implicitly(instruction))
+                {
+                    return false;
+                }
+
+                if (instruction.Destinations.Any(operand => operand.Kind == Gen5OperandKind.ScalarRegister && operand.Value == register))
+                {
+                    break;
+                }
             }
         }
 
         return true;
+    }
+
+    private static int IndexOfPc(IReadOnlyList<Gen5ShaderInstruction> code, uint pc)
+    {
+        for (var index = 0; index < code.Count; index++)
+        {
+            if (code[index].Pc == pc)
+            {
+                return index;
+            }
+        }
+
+        return -1;
     }
 
     private static bool ReadsM0Implicitly(Gen5ShaderInstruction instruction) =>

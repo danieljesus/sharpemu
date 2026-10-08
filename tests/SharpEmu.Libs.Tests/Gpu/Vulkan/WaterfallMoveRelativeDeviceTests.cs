@@ -33,6 +33,14 @@ public sealed class WaterfallMoveRelativeDeviceTests(HeadlessVulkanFixture fixtu
     }
 
     [Fact]
+    public void LoopsFollowedByAForwardBranchAreCollapsed()
+    {
+        var collapsed = Gen5WaterfallMoveRelative.Collapse(CreateProgram(readM0AfterFirstLoop: false, branchAfterLoops: true));
+        Assert.Equal(3, collapsed.Instructions.Count(instruction => instruction.Opcode == Gen5WaterfallMoveRelative.IndexToM0));
+        Assert.DoesNotContain(collapsed.Instructions, instruction => instruction.Opcode == "SCbranchScc1");
+    }
+
+    [Fact]
     public void LoopWhoseM0IsReadAfterwardIsKept()
     {
         var collapsed = Gen5WaterfallMoveRelative.Collapse(CreateProgram(readM0AfterFirstLoop: true));
@@ -73,7 +81,7 @@ public sealed class WaterfallMoveRelativeDeviceTests(HeadlessVulkanFixture fixtu
     // v10..v17 = 110..117 and v30..v37 = 0 in every lane; index (v5) = lane & 7. Three waterfall
     // loops (shaped like a compiler's per-lane array access) run v20 = v[10 + index],
     // v[30 + index] = v20 and v21 = v[30 + index], then each lane stores v21.
-    private static Gen5ShaderProgram CreateProgram(bool readM0AfterFirstLoop, bool waitInsideLoops = false)
+    private static Gen5ShaderProgram CreateProgram(bool readM0AfterFirstLoop, bool waitInsideLoops = false, bool branchAfterLoops = false)
     {
         var code = new List<Gen5ShaderInstruction>();
         var pc = 0u;
@@ -118,6 +126,13 @@ public sealed class WaterfallMoveRelativeDeviceTests(HeadlessVulkanFixture fixtu
         Waterfall("VMovrelsB32", 20, 10, readM0AfterFirstLoop);
         Waterfall("VMovreldB32", 30, 20, false);
         Waterfall("VMovrelsB32", 21, 30, false);
+        if (branchAfterLoops)
+        {
+            // A conditional branch before M0 and the lane register are rewritten, as GTA V's
+            // BVH refit has after its loop; both paths write them before any read.
+            Add(at => Branch(at, "SCbranchScc0", 1));
+            Add(at => Nop(at));
+        }
         // M0 is rewritten before the store, which conservatively counts as reading M0.
         Add(at => MoveScalar(at, 124, 0));
         Add(at => Vop2(at, "VLshlrevB32", 3, Operand(2), Gen5Operand.Vector(0)));
