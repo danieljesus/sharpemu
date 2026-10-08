@@ -195,6 +195,9 @@ public enum SpirvCapability : uint
     Sampled1D = 43,
     Image1D = 44,
     Float16 = 9,
+    DenormPreserve = 4464,
+    SignedZeroInfNanPreserve = 4466,
+    RoundingModeRTE = 4467,
     Float64 = 10,
     Int64 = 11,
     Int64Atomics = 12,
@@ -242,6 +245,9 @@ public enum SpirvExecutionMode : uint
     OriginUpperLeft = 7,
     DepthReplacing = 12,
     LocalSize = 17,
+    DenormPreserve = 4459,
+    SignedZeroInfNanPreserve = 4461,
+    RoundingModeRTE = 4462,
 }
 
 public enum SpirvDecoration : uint

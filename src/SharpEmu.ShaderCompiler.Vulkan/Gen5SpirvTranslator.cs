@@ -136,6 +136,8 @@ public static partial class Gen5SpirvTranslator
         private uint _longType;
         private uint _ulongType;
         private uint _floatType;
+        private uint _halfType;
+        private uint _half2Type;
         private uint _vec2Type;
         private uint _vec3Type;
         private uint _vec4Type;
@@ -518,6 +520,15 @@ public static partial class Gen5SpirvTranslator
                     _ => SpirvExecutionModel.GLCompute,
                 };
                 _module.AddEntryPoint(model, main, "main", _interfaces);
+                if (_request.SupportsFloat16Conversions)
+                {
+                    // The 16-bit float controls the native conversions rely on; the other
+                    // widths keep the device defaults.
+                    _module.AddExecutionMode(main, SpirvExecutionMode.DenormPreserve, 16);
+                    _module.AddExecutionMode(main, SpirvExecutionMode.SignedZeroInfNanPreserve, 16);
+                    _module.AddExecutionMode(main, SpirvExecutionMode.RoundingModeRTE, 16);
+                }
+
                 if (_stage == Gen5SpirvStage.Pixel)
                 {
                     _module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
@@ -557,6 +568,14 @@ public static partial class Gen5SpirvTranslator
             _module.AddCapability(SpirvCapability.Shader);
             _module.AddCapability(SpirvCapability.Int64);
             _module.AddCapability(SpirvCapability.ImageQuery);
+            if (_request.SupportsFloat16Conversions)
+            {
+                _module.AddCapability(SpirvCapability.Float16);
+                _module.AddCapability(SpirvCapability.DenormPreserve);
+                _module.AddCapability(SpirvCapability.SignedZeroInfNanPreserve);
+                _module.AddCapability(SpirvCapability.RoundingModeRTE);
+            }
+
             if (UsesSubgroupOperations())
             {
                 _module.AddCapability(SpirvCapability.GroupNonUniform);
@@ -582,6 +601,12 @@ public static partial class Gen5SpirvTranslator
             _longType = _module.TypeInt(64, signed: true);
             _ulongType = _module.TypeInt(64, signed: false);
             _floatType = _module.TypeFloat(32);
+            if (_request.SupportsFloat16Conversions)
+            {
+                _halfType = _module.TypeFloat(16);
+                _half2Type = _module.TypeVector(_halfType, 2);
+            }
+
             _vec2Type = _module.TypeVector(_floatType, 2);
             _vec3Type = _module.TypeVector(_floatType, 3);
             _vec4Type = _module.TypeVector(_floatType, 4);

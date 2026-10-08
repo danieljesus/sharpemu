@@ -171,6 +171,13 @@ public sealed class ShaderCompileRequest
     // 64-bit atomics are emitted as real 64-bit atomics instead of a pair of
     // 32-bit ones, which is not atomic as a pair.
     public bool SupportsSharedInt64Atomics { get; init; }
+
+    // The device supports 16-bit floats with their float controls (shaderFloat16, and
+    // denormals, signed zero/Inf/NaN and round-to-nearest-even preserved for 16-bit
+    // results, settable independently of the other widths). When set, f16 <-> f32
+    // conversions use OpFConvert under those execution modes instead of the explicit
+    // integer sequences, which are bit-exact but about forty instructions each.
+    public bool SupportsFloat16Conversions { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
 
     public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];
