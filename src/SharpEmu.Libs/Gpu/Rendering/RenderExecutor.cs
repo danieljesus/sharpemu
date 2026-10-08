@@ -51,6 +51,8 @@ public sealed partial class RenderExecutor
     private static int _geometryWarningShown;
 
     private readonly IRenderHost _host;
+    // The method group would allocate a delegate on every draw that resolves a depth target.
+    private readonly Func<string, Exception> _fatal;
     private readonly IShaderPipelineProvider _pipelines;
     private readonly bool _strictDrawResources;
     private readonly HashSet<(ulong ShaderHash, ImageType ImageType, ImageViewType ViewType)> _reportedDrawImageTypeMismatches = [];
@@ -63,6 +65,7 @@ public sealed partial class RenderExecutor
     internal RenderExecutor(IRenderHost host, IShaderPipelineProvider pipelines, bool strictDrawResources)
     {
         _host = host;
+        _fatal = host.Fatal;
         _pipelines = pipelines;
         _strictDrawResources = strictDrawResources;
     }

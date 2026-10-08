@@ -45,11 +45,7 @@ public sealed class PipelineStaticParameters : IEquatable<PipelineStaticParamete
 
     public PipelineStaticParameters()
     {
-        DepthClipEnable = true;
-        Samples = 1;
-        ColorCount = 1;
-        StencilFront = StencilOperations.Default;
-        StencilBack = StencilOperations.Default;
+        Reset();
     }
 
     public ReadOnlySpan<byte> Bytes => _bytes;
@@ -60,6 +56,19 @@ public sealed class PipelineStaticParameters : IEquatable<PipelineStaticParamete
         bytes[..ByteSize].CopyTo(parameters._bytes);
         return parameters;
     }
+
+    // Back to the defaults of a new instance.
+    public void Reset()
+    {
+        Array.Clear(_bytes);
+        DepthClipEnable = true;
+        Samples = 1;
+        ColorCount = 1;
+        StencilFront = StencilOperations.Default;
+        StencilBack = StencilOperations.Default;
+    }
+
+    public PipelineStaticParameters Clone() => FromBytes(_bytes);
 
     private bool GetBool(int offset) => _bytes[offset] != 0;
 
@@ -146,6 +155,21 @@ public sealed class PipelineRenderingState : IEquatable<PipelineRenderingState>
     public Format StencilFormat { get; set; } = Format.Undefined;
     public uint ColorCount { get; set; }
 
+    public void Reset()
+    {
+        Array.Clear(ColorFormats);
+        DepthFormat = Format.Undefined;
+        StencilFormat = Format.Undefined;
+        ColorCount = 0;
+    }
+
+    public PipelineRenderingState Clone()
+    {
+        var clone = new PipelineRenderingState { DepthFormat = DepthFormat, StencilFormat = StencilFormat, ColorCount = ColorCount };
+        ColorFormats.CopyTo(clone.ColorFormats, 0);
+        return clone;
+    }
+
     public bool Equals(PipelineRenderingState? other) =>
         other is not null && ColorCount == other.ColorCount && DepthFormat == other.DepthFormat && StencilFormat == other.StencilFormat &&
         ColorFormats.AsSpan().SequenceEqual(other.ColorFormats);
@@ -179,6 +203,22 @@ public sealed class PipelineVertexInputState : IEquatable<PipelineVertexInputSta
     public byte BindingCount { get; set; }
     public byte AttributeCount { get; set; }
 
+    public void Reset()
+    {
+        Array.Clear(Bindings);
+        Array.Clear(Attributes);
+        BindingCount = 0;
+        AttributeCount = 0;
+    }
+
+    public PipelineVertexInputState Clone()
+    {
+        var clone = new PipelineVertexInputState { BindingCount = BindingCount, AttributeCount = AttributeCount };
+        Bindings.CopyTo(clone.Bindings, 0);
+        Attributes.CopyTo(clone.Attributes, 0);
+        return clone;
+    }
+
     public bool Equals(PipelineVertexInputState? other) =>
         other is not null && BindingCount == other.BindingCount && AttributeCount == other.AttributeCount &&
         Bindings.AsSpan().SequenceEqual(other.Bindings) && Attributes.AsSpan().SequenceEqual(other.Attributes);
@@ -204,13 +244,23 @@ public sealed class PipelineVertexInputState : IEquatable<PipelineVertexInputSta
     }
 }
 
+// The cache looks every draw up through one key it fills in place and copies only to insert.
 public sealed class GraphicsPipelineKey : IEquatable<GraphicsPipelineKey>
 {
     public required PipelineRenderingState Rendering { get; init; }
-    public ulong VertexProgramId { get; init; }
-    public ulong PixelProgramId { get; init; }
+    public ulong VertexProgramId { get; set; }
+    public ulong PixelProgramId { get; set; }
     public required PipelineVertexInputState VertexInput { get; init; }
     public required PipelineStaticParameters StaticParameters { get; init; }
+
+    public GraphicsPipelineKey Clone() => new()
+    {
+        Rendering = Rendering.Clone(),
+        VertexProgramId = VertexProgramId,
+        PixelProgramId = PixelProgramId,
+        VertexInput = VertexInput.Clone(),
+        StaticParameters = StaticParameters.Clone(),
+    };
 
     public bool Equals(GraphicsPipelineKey? other) =>
         other is not null && Rendering.Equals(other.Rendering) && VertexProgramId == other.VertexProgramId && PixelProgramId == other.PixelProgramId &&

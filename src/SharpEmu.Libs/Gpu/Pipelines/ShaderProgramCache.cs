@@ -28,17 +28,31 @@ public sealed record ShaderSource(RegisteredShader Registered, ulong Hash, uint[
     };
 }
 
-// The stage-specific compile inputs one lookup carries beside its static key.
+// The stage-specific compile inputs one lookup carries beside its static key. Nothing keeps
+// them past the lookup, so the pipeline cache refills one instance per stage.
 public sealed class StageCompileOptions
 {
-    public VertexInputInfo? VertexInfo { get; init; }
-    public int RequiredVertexOutputCount { get; init; }
-    public PixelInputInfo? PixelInfo { get; init; }
-    public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];
-    public uint PixelInputEnable { get; init; }
-    public uint PixelInputAddress { get; init; }
-    public ComputeInputInfo? ComputeInfo { get; init; }
-    public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
+    public VertexInputInfo? VertexInfo { get; set; }
+    public int RequiredVertexOutputCount { get; set; }
+    public PixelInputInfo? PixelInfo { get; set; }
+    public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; set; } = [];
+    public uint PixelInputEnable { get; set; }
+    public uint PixelInputAddress { get; set; }
+    public ComputeInputInfo? ComputeInfo { get; set; }
+    public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; set; }
+
+    public StageCompileOptions Reset()
+    {
+        VertexInfo = null;
+        RequiredVertexOutputCount = 0;
+        PixelInfo = null;
+        PixelOutputs = [];
+        PixelInputEnable = 0;
+        PixelInputAddress = 0;
+        ComputeInfo = null;
+        ComputeSystemRegisters = null;
+        return this;
+    }
 }
 
 // The key of a program entry: what the emitter reads besides the resource specialization.
@@ -151,6 +165,12 @@ internal sealed class ShaderProgramCache
 
     private readonly GuestWordReader _readGuestWord;
     private readonly GuestWordReader _readCleanGuestWord;
+    // Refilled per lookup: the readers never change and nothing keeps the instance.
+    private readonly ResourceRuntimeInputs _inputs;
+    // The materializer replaces both outputs on success and the caller stops on failure,
+    // so no lookup builds its own to be thrown away.
+    private static readonly ResourceSnapshot EmptySnapshot = new();
+    private static readonly ResourceSpecialization EmptySpecialization = new();
     private readonly ResidentGuestBytesReader _readResidentGuestBytes;
     private readonly ResidentGuestBytesReader? _prefetchResidentGuestBytes;
 
@@ -165,6 +185,12 @@ internal sealed class ShaderProgramCache
         _readCleanGuestWord = host.TryReadCleanGuestWord;
         _readResidentGuestBytes = host.TryReadResidentGuestBytes;
         _prefetchResidentGuestBytes = PrefetchEnabled ? _readResidentGuestBytes : null;
+        _inputs = new ResourceRuntimeInputs
+        {
+            ReadMemory = _readGuestWord,
+            ReadCleanMemory = _readCleanGuestWord,
+            ReadResidentMemory = _prefetchResidentGuestBytes,
+        };
     }
 
     public int ProgramCount => _programs.Count;
@@ -281,19 +307,14 @@ internal sealed class ShaderProgramCache
             RenderTrace.Write($"ProgramCache lookup stage={source.Label} hash=0x{source.Hash:X16} cached={entry is not null} permutations={entry?.Permutations.Count ?? 0}");
         }
 
-        var inputs = new ResourceRuntimeInputs
-        {
-            UserData = source.UserData,
-            ShaderBase = source.Address,
-            ReadMemory = _readGuestWord,
-            ReadCleanMemory = _readCleanGuestWord,
-            ReadResidentMemory = _prefetchResidentGuestBytes,
-            ComputeState = source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeState
-                ? new ComputeSelectorState(computeState.WaveSize, Math.Max(computeState.ThreadsX, 1),
-                    Math.Max(computeState.ThreadsY, 1), Math.Max(computeState.ThreadsZ, 1), computeState.DispatchThreadDimensions,
-                    computeState.LocalDataShareDwords, computeState.ThreadIdCount)
-                : null,
-        };
+        var inputs = _inputs;
+        inputs.UserData = source.UserData;
+        inputs.ShaderBase = source.Address;
+        inputs.ComputeState = source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeState
+            ? new ComputeSelectorState(computeState.WaveSize, Math.Max(computeState.ThreadsX, 1),
+                Math.Max(computeState.ThreadsY, 1), Math.Max(computeState.ThreadsZ, 1), computeState.DispatchThreadDimensions,
+                computeState.LocalDataShareDwords, computeState.ThreadIdCount)
+            : null;
         if (entry is null)
         {
             entry = CreateEntry(source, options);
@@ -301,8 +322,8 @@ internal sealed class ShaderProgramCache
             ShaderCacheCounters.CountProgram();
         }
 
-        var snapshot = new ResourceSnapshot();
-        var specialization = new ResourceSpecialization();
+        var snapshot = EmptySnapshot;
+        var specialization = EmptySpecialization;
         var captureIndirectImageFailure = _spirvDumpEnabled ? ShaderPermutationDump.CreateFailureCapture(source) : null;
         if (Diagnostics.GpuReadTrace.Enabled)
         {

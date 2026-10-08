@@ -10,13 +10,14 @@ public delegate bool GuestWordReader(ulong address, out uint word);
 
 // What one draw supplies to materialise a plan: its user data, the shader base and
 // the two memory readers. The clean reader refuses memory the GPU may still own.
+// Nothing keeps the instance past the materialisation, so a caller may refill one per draw.
 public sealed class ResourceRuntimeInputs
 {
-    public IReadOnlyList<uint> UserData { get; init; } = [];
-    public ulong ShaderBase { get; init; }
+    public IReadOnlyList<uint> UserData { get; set; } = [];
+    public ulong ShaderBase { get; set; }
     public GuestWordReader? ReadMemory { get; init; }
     public GuestWordReader? ReadCleanMemory { get; init; }
-    public ComputeSelectorState? ComputeState { get; init; }
+    public ComputeSelectorState? ComputeState { get; set; }
 
     // Told true before the flattened table's words are evaluated and false after, so a reader
     // wrapper can tell the words only the table reads from those the descriptors depend on.

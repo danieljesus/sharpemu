@@ -266,9 +266,36 @@ public sealed class ShaderPipelineCacheTests : IDisposable
         executor.DrawAuto(1, Banks(), Auto(3));
         executor.DrawAuto(2, Banks(), Auto(3));
         executor.DrawAuto(3, Banks(PrimitiveTriangleStrip), Auto(4));
+        // The first pipeline is still found after the lookup key held another draw.
+        executor.DrawAuto(4, Banks(), Auto(3));
 
         Assert.Equal(2, guest.Host.GraphicsPipelines.Count);
         Assert.Equal(2, cache.GraphicsPipelineCount);
+        // Each pipeline was created with its own state, not the key the cache refills.
+        Assert.Equal(PrimitiveTopology.TriangleList, guest.Host.GraphicsPipelines[0].StaticParameters.Topology);
+        Assert.Equal(PrimitiveTopology.TriangleStrip, guest.Host.GraphicsPipelines[1].StaticParameters.Topology);
+    }
+
+    [Fact]
+    public void GraphicsPipelineKey_ClonesEveryPartOfItsState()
+    {
+        var description = Describe(banks => banks.Context.RasterMode.CullBack = true, withDepth: true);
+        var key = ShaderPipelineCache.KeyOf(description);
+        var clone = key.Clone();
+
+        Assert.Equal(key, clone);
+        Assert.NotSame(key.Rendering, clone.Rendering);
+        Assert.NotSame(key.VertexInput, clone.VertexInput);
+        Assert.NotSame(key.StaticParameters, clone.StaticParameters);
+
+        key.StaticParameters.Reset();
+        key.Rendering.Reset();
+        key.VertexInput.Reset();
+        Assert.NotEqual(key, clone);
+        Assert.True(clone.StaticParameters.CullBack);
+        Assert.True(clone.StaticParameters.WithDepth);
+        Assert.NotEqual(Format.Undefined, clone.Rendering.DepthFormat);
+        Assert.Equal(description.VertexInput.AttributeCount, clone.VertexInput.AttributeCount);
     }
 
     // Programs from the fixtures, pipelines from the real cache over the fake host.
