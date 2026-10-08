@@ -9,12 +9,12 @@ namespace SharpEmu.ShaderCompiler.Tests.Resources;
 
 public sealed class ResourceBranchTests
 {
-    private static Gen5ShaderProgram ConditionalBuffers(string branch = "SCbranchScc1", bool shared = false) => Program(
+    internal static Gen5ShaderProgram ConditionalBuffers(string branch = "SCbranchScc1", bool shared = false) => Program(
         Sopc(0, "SCmpEqU32", Gen5Operand.Scalar(8), Operand(1)),
         Branch(4, branch, 3), BufferLoad(8, 0), Branch(16, "SBranch", 2),
         BufferLoad(20, shared ? 0u : 4u), EndProgram(28));
 
-    private static uint[] UserData(uint condition) => [0x1000, 0, 256, 0, 0x2000, 0, 256, 0, condition];
+    internal static uint[] UserData(uint condition) => [0x1000, 0, 256, 0, 0x2000, 0, 256, 0, condition];
 
     private static bool CleanRead(ulong address, out uint word) { word = 0; return false; }
 

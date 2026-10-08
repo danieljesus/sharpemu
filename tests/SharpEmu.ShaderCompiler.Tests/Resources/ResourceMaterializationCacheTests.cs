@@ -12,7 +12,7 @@ public sealed class ResourceMaterializationCacheTests
     private const ulong HeapBase = 0x1000;
 
     // A mask word, a two-entry index table and six 32-byte image records.
-    private sealed class Heap
+    internal sealed class Heap
     {
         public readonly Dictionary<ulong, uint> Words = new();
         public int Reads;
