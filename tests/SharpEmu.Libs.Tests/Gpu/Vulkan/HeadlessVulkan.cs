@@ -45,6 +45,9 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
     public bool SupportsFragmentShaderBarycentric { get; private init; }
     public bool SupportsFillRectangle { get; private init; }
 
+    // shaderBufferInt64Atomics, enabled on the device when present.
+    public bool SupportsBufferInt64Atomics { get; private init; }
+
     private static readonly string[] RenderingExtensionNames =
     [
         "VK_KHR_push_descriptor",
@@ -318,7 +321,12 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             SType = StructureType.PhysicalDeviceTimelineSemaphoreFeatures,
             PNext = &addressFeatures,
         };
-        var features = new PhysicalDeviceFeatures2 { SType = StructureType.PhysicalDeviceFeatures2, PNext = &timelineFeatures };
+        var atomicInt64Features = new PhysicalDeviceShaderAtomicInt64Features
+        {
+            SType = StructureType.PhysicalDeviceShaderAtomicInt64Features,
+            PNext = &timelineFeatures,
+        };
+        var features = new PhysicalDeviceFeatures2 { SType = StructureType.PhysicalDeviceFeatures2, PNext = &atomicInt64Features };
         vk.GetPhysicalDeviceFeatures2(physical, &features);
         var dynamicRendering = vulkan13Features.DynamicRendering && vulkan13Features.Synchronization2 &&
             HasDeviceExtensions(vk, physical, RenderingExtensionNames);
@@ -362,6 +370,13 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
             PNext = &vulkan13Features,
         };
         timelineFeatures.PNext = &addressFeatures;
+        var bufferInt64Atomics = (bool)atomicInt64Features.ShaderBufferInt64Atomics;
+        atomicInt64Features = new PhysicalDeviceShaderAtomicInt64Features
+        {
+            SType = StructureType.PhysicalDeviceShaderAtomicInt64Features,
+            ShaderBufferInt64Atomics = bufferInt64Atomics,
+            PNext = &timelineFeatures,
+        };
         if (barycentric)
         {
             barycentricFeatures.PNext = vulkan13Features.PNext;
@@ -377,7 +392,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         var deviceInfo = new DeviceCreateInfo
         {
             SType = StructureType.DeviceCreateInfo,
-            PNext = &timelineFeatures,
+            PNext = &atomicInt64Features,
             QueueCreateInfoCount = 1,
             PQueueCreateInfos = &queueInfo,
             PEnabledFeatures = &enabledFeatures,
@@ -401,6 +416,7 @@ internal sealed unsafe class HeadlessVulkan : IDisposable
         {
             SupportsFragmentShaderBarycentric = barycentric,
             SupportsFillRectangle = fillRectangle,
+            SupportsBufferInt64Atomics = bufferInt64Atomics,
         };
         if (validation)
         {

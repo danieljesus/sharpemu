@@ -171,6 +171,7 @@ public static partial class Gen5SpirvTranslator
         private uint _gfx10BufferFormatTable;
         private uint _storageBlockPointer;
         private uint _storageUintPointer;
+        private uint _globalBuffers64;
         private uint _lds;
         private uint _ldsElementPointer;
         private uint _lds64ElementPointer;
@@ -3174,11 +3175,36 @@ public static partial class Gen5SpirvTranslator
                     var firstInRange = IsBufferWordInRange(bindingIndex, dwordAddress);
                     var secondAddress = IAdd(dwordAddress, UInt(1));
                     var secondInRange = IsBufferWordInRange(bindingIndex, secondAddress);
-                    EmitConditional(LogicalAnd(firstInRange, secondInRange), () =>
+                    var bothInRange = LogicalAnd(firstInRange, secondInRange);
+                    var atomicOp = instruction.Opcode == "BufferAtomicSwapX2"
+                        ? SpirvOp.AtomicExchange
+                        : SpirvOp.AtomicOr;
+                    if (_globalBuffers64 != 0)
                     {
-                        var atomicOp = instruction.Opcode == "BufferAtomicSwapX2"
-                            ? SpirvOp.AtomicExchange
-                            : SpirvOp.AtomicOr;
+                        // A qword-aligned pair is one 64-bit atomic: a look-back reader that
+                        // loads the pair with one 64-bit access sees either all of it or none.
+                        var aligned = IsQwordAligned(dwordAddress);
+                        EmitConditional(LogicalAnd(bothInRange, aligned), () =>
+                        {
+                            var original = EmitAtomic(
+                                atomicOp,
+                                _ulongType,
+                                BufferQwordPointer(bindingIndex, ShiftRightLogical(dwordAddress, UInt(1))),
+                                scope: 1,
+                                semantics: 0x48,
+                                value: () => Pair64(LoadV(control.VectorData), LoadV(control.VectorData + 1)),
+                                comparator: () => ULong(0));
+                            if (control.Glc)
+                            {
+                                StoreV(control.VectorData, Narrow(original));
+                                StoreV(control.VectorData + 1, Narrow(ShiftRightLogical64(original, ULong(32))));
+                            }
+                        });
+                        bothInRange = LogicalAnd(bothInRange, LogicalNot(aligned));
+                    }
+
+                    EmitConditional(bothInRange, () =>
+                    {
                         var first = EmitAtomic(
                             atomicOp,
                             _uintType,
@@ -3412,6 +3438,12 @@ public static partial class Gen5SpirvTranslator
                 }
             }
 
+            if (control.Glc && _globalBuffers64 != 0 && control.DwordCount >= 2)
+            {
+                EmitWideGlcBufferLoad(bindingIndex, dwordAddress, control);
+                return true;
+            }
+
             for (uint index = 0; index < control.DwordCount; index++)
             {
                 var indexedDwordAddress = index == 0
@@ -3424,6 +3456,50 @@ public static partial class Gen5SpirvTranslator
 
             return true;
         }
+
+        // A GLC load of two or more dwords reads each qword-aligned pair with one 64-bit
+        // atomic load, so it pairs with the 64-bit atomics of BUFFER_ATOMIC_SWAP_X2/OR_X2:
+        // a status word and its value published together are never seen half-updated.
+        private void EmitWideGlcBufferLoad(int bindingIndex, uint dwordAddress, Gen5BufferMemoryControl control)
+        {
+            var aligned = IsQwordAligned(dwordAddress);
+            for (uint index = 0; index < control.DwordCount; index++)
+            {
+                var lowAddress = index == 0 ? dwordAddress : IAdd(dwordAddress, UInt(index));
+                if (index + 1 >= control.DwordCount)
+                {
+                    StoreV(control.VectorData + index, LoadBufferWord(bindingIndex, lowAddress, coherent: true));
+                    continue;
+                }
+
+                var highAddress = IAdd(dwordAddress, UInt(index + 1));
+                var wide = LogicalAnd(aligned, IsBufferWordInRange(bindingIndex, highAddress));
+                var qword = _module.AddInstruction(SpirvOp.Select, _uintType, wide,
+                    ShiftRightLogical(lowAddress, UInt(1)), UInt(0));
+                var pair = _module.AddInstruction(SpirvOp.AtomicLoad, _ulongType,
+                    BufferQwordPointer(bindingIndex, qword), UInt(1), UInt(0));
+                var low = LoadBufferWord(bindingIndex, lowAddress, coherent: true);
+                var high = LoadBufferWord(bindingIndex, highAddress, coherent: true);
+                StoreV(control.VectorData + index,
+                    _module.AddInstruction(SpirvOp.Select, _uintType, wide, Narrow(pair), low));
+                StoreV(control.VectorData + index + 1,
+                    _module.AddInstruction(SpirvOp.Select, _uintType, wide,
+                        Narrow(ShiftRightLogical64(pair, ULong(32))), high));
+                index++;
+            }
+        }
+
+        private uint IsQwordAligned(uint dwordAddress) =>
+            _module.AddInstruction(SpirvOp.IEqual, _boolType, BitwiseAnd(dwordAddress, UInt(1)), UInt(0));
+
+        private uint BufferQwordPointer(int binding, uint qwordAddress) =>
+            _module.AddInstruction(
+                SpirvOp.AccessChain,
+                _storageUlongPointer,
+                _globalBuffers64,
+                UInt((uint)binding),
+                UInt(0),
+                qwordAddress);
 
         // BufferLoweringStrategy.BoundedCandidateTable: a runtime V# whose descriptors cannot
         // be reconstructed from its raw words. The runtime V# sits in the scalar resource

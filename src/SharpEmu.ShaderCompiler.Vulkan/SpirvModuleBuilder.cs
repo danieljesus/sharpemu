@@ -249,6 +249,7 @@ public enum SpirvExecutionMode : uint
 public enum SpirvDecoration : uint
 {
     Block = 2,
+    Aliased = 20,
     ArrayStride = 6,
     BuiltIn = 11,
     NoPerspective = 13,

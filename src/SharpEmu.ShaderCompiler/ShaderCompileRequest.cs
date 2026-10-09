@@ -171,6 +171,12 @@ public sealed class ShaderCompileRequest
     // 64-bit atomics are emitted as real 64-bit atomics instead of a pair of
     // 32-bit ones, which is not atomic as a pair.
     public bool SupportsSharedInt64Atomics { get; init; }
+
+    // The device supports 64-bit integer atomics on storage buffers
+    // (VkPhysicalDeviceShaderAtomicInt64Features.shaderBufferInt64Atomics). When set,
+    // BUFFER_ATOMIC_SWAP_X2/OR_X2 and GLC 64-bit buffer loads are single 64-bit atomics
+    // instead of two 32-bit accesses, so a reader never sees half of a 64-bit update.
+    public bool SupportsBufferInt64Atomics { get; init; }
     public bool ShaderSignedZeroInfNanPreserveFloat32Supported { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
 

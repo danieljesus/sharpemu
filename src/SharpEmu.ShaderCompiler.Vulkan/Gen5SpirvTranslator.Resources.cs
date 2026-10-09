@@ -269,6 +269,44 @@ public static partial class Gen5SpirvTranslator
             _module.AddDecoration(_globalBuffers, SpirvDecoration.DescriptorSet, 0);
             _module.AddDecoration(_globalBuffers, SpirvDecoration.Binding, bindingNumber);
             _interfaces.Add(_globalBuffers);
+            if (_request.SupportsBufferInt64Atomics && UsesWideBufferAtomics())
+            {
+                DeclareWideBufferArray(count, bindingNumber);
+            }
+        }
+
+        // A second view of the same descriptors as 64-bit words, for the accesses that must
+        // be one 64-bit atomic. Both views are Aliased: they name the same memory.
+        private void DeclareWideBufferArray(uint count, uint bindingNumber)
+        {
+            _module.AddCapability(SpirvCapability.Int64Atomics);
+            var block = _module.TypeStruct(AddressRuntimeArray());
+            _module.AddDecoration(block, SpirvDecoration.Block);
+            _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
+            var descriptors = _module.TypeArray(block, count);
+            var descriptorsPointer = _module.TypePointer(SpirvStorageClass.StorageBuffer, descriptors);
+            _globalBuffers64 = _module.AddGlobalVariable(descriptorsPointer, SpirvStorageClass.StorageBuffer);
+            _module.AddName(_globalBuffers64, "guestBuffers64");
+            _module.AddDecoration(_globalBuffers64, SpirvDecoration.DescriptorSet, 0);
+            _module.AddDecoration(_globalBuffers64, SpirvDecoration.Binding, bindingNumber);
+            _module.AddDecoration(_globalBuffers64, SpirvDecoration.Aliased);
+            _module.AddDecoration(_globalBuffers, SpirvDecoration.Aliased);
+            _interfaces.Add(_globalBuffers64);
+        }
+
+        private bool UsesWideBufferAtomics()
+        {
+            foreach (var instruction in _request.Program.Instructions)
+            {
+                if (instruction.Opcode is "BufferAtomicSwapX2" or "BufferAtomicOrX2" ||
+                    (instruction.Control is Gen5BufferMemoryControl { Glc: true, DwordCount: >= 2 } &&
+                     instruction.Opcode.StartsWith("BufferLoadDword", StringComparison.Ordinal)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         // One storage block holding a runtime array of dwords.
