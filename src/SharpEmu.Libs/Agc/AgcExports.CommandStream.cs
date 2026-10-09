@@ -251,7 +251,11 @@ public static partial class AgcExports
             state.ActiveVertexSnapshots = snapshots?.VertexSnapshots;
             _current = state;
             _currentQueueId = queueId;
+            if (queueId != 0 && _computeSubmitLogs++ < 200) Console.Error.WriteLine($"[AGC][SUBMIT] queue={queueId} name={state.QueueName} submission={submissionId}"); // [local]
         }
+
+        private int _computeSubmitLogs; // [local]
+        private int _computeDispatchLogs; // [local]
 
         private SubmittedDcbState GetQueueState(int queueId)
         {
@@ -358,6 +362,7 @@ public static partial class AgcExports
 
         public void Dispatch(ulong submitId, uint endX, uint endY, uint endZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
         {
+            if ((indirectArgumentsAddress != 0 || endX == 0 || endY == 0 || endZ == 0) && _computeDispatchLogs++ < 3000) Console.Error.WriteLine($"[AGC][DISPATCH] queue={_currentQueueId} groups={endX},{endY},{endZ} indirect=0x{indirectArgumentsAddress:X}"); // [local]
             var state = RequireCurrent();
             if (_executor is { } executor)
             {

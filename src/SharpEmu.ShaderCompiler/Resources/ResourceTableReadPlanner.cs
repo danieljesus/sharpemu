@@ -13,6 +13,8 @@ public sealed class ResourceTableReadPlanner
     private readonly ScalarValueGraph _graph;
     private readonly ShaderStage _stage;
     private readonly ulong _hash;
+    private static readonly HashSet<ulong> DeviceTableHashes = new((System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_TABLE_HASHES") ?? "")
+        .Split(',', System.StringSplitOptions.RemoveEmptyEntries).Select(h => System.Convert.ToUInt64(h, 16))); // [local]
     private readonly List<ResourceTableRead> _reads = [];
     private readonly List<ScalarValue> _dynamicReads = [];
     private readonly List<(ScalarValue Read, uint Slot)> _patches = [];
@@ -33,6 +35,8 @@ public sealed class ResourceTableReadPlanner
         IReadOnlyList<ScalarValue> DynamicReads,
         IReadOnlyDictionary<ScalarValue, ScalarValue> Replacements,
         IReadOnlyDictionary<int, uint> FlattenedSlotByMemoryIndex);
+
+    public static bool IsDeviceTableHash(ulong hash) => DeviceTableHashes.Contains(hash); // [local]
 
     public static Result Plan(ScalarValueGraph graph, ShaderStage stage, ulong hash) =>
         new ResourceTableReadPlanner(graph, stage, hash).Run();
@@ -125,7 +129,7 @@ public sealed class ResourceTableReadPlanner
         }
 
         _visiting.RemoveAt(_visiting.Count - 1);
-        if (!IsRawRead(value))
+        if (!IsRawRead(value) || DeviceTableHashes.Contains(_hash)) // [local] experiment: listed shaders read their tables on the device
         {
             return;
         }

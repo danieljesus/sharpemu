@@ -172,6 +172,12 @@ public sealed class ShaderCompileRequest
     // 32-bit ones, which is not atomic as a pair.
     public bool SupportsSharedInt64Atomics { get; init; }
 
+    // The device supports 64-bit integer atomics on storage buffers
+    // (VkPhysicalDeviceShaderAtomicInt64Features.shaderBufferInt64Atomics). When set,
+    // BUFFER_ATOMIC_SWAP_X2/OR_X2 and GLC 64-bit buffer loads are single 64-bit atomics
+    // instead of two 32-bit accesses, so a reader never sees half of a 64-bit update.
+    public bool SupportsBufferInt64Atomics { get; init; }
+
     // The device supports 16-bit floats with their float controls (shaderFloat16, and
     // denormals, signed zero/Inf/NaN and round-to-nearest-even preserved for 16-bit
     // results, settable independently of the other widths). When set, f16 <-> f32

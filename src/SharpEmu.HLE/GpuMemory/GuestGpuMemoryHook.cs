@@ -38,7 +38,26 @@ public static class GuestGpuMemoryHook
     public static bool TraceEnabled => _traceFirstDeviceFault || _tracePage != 0;
 
     public static bool Traces(ulong address, ulong size) =>
-        OverlapsTracePage(TraceAddress, address, size);
+        OverlapsTracePage(TraceAddress, address, size) || TracesExtra(address, size);
+
+    // [local] extra pages selected at runtime (BVH header pages); noisy per-shader lines are skipped for them.
+    public static readonly HashSet<ulong> ExtraPages = new();
+    public static bool TracesExtra(ulong address, ulong size)
+    {
+        if (size == 0) return false;
+        lock (ExtraPages)
+        {
+            if (ExtraPages.Count == 0) return false;
+            var first = address >> 12; var last = (address + size - 1) >> 12;
+            if (last - first > 4096)
+            {
+                foreach (var page in ExtraPages) if (page >= first && page <= last) return true;
+                return false;
+            }
+            for (var page = first; page <= last; page++) if (ExtraPages.Contains(page)) return true;
+            return false;
+        }
+    }
 
     internal static bool OverlapsTracePage(ulong page, ulong address, ulong size) =>
         page != 0 && size != 0 && (address <= page
@@ -46,6 +65,7 @@ public static class GuestGpuMemoryHook
 
     public static void Trace(ulong address, ulong size, string detail)
     {
+        if (!OverlapsTracePage(TraceAddress, address, size) && (detail.StartsWith("device-address-program", StringComparison.Ordinal) || detail.StartsWith("device-address-range", StringComparison.Ordinal) && !detail.Contains("written=True", StringComparison.Ordinal) || detail.StartsWith("device-address-preparation", StringComparison.Ordinal) || detail.StartsWith("device-address-touch", StringComparison.Ordinal))) return; // [local] (written device-address ranges are kept)
         if (Traces(address, size))
             Console.Error.WriteLine($"[GPU][MEMORY_TRACE] tid={Environment.CurrentManagedThreadId} addr=0x{address:X} size=0x{size:X} {detail}");
     }

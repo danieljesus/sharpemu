@@ -430,8 +430,29 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     }
 
     // Add the timeline signal to a copy. Keep the caller's submission bundle unchanged.
+    private static readonly bool SubmitProbe = Environment.GetEnvironmentVariable("SHARPEMU_SUBMIT_PROBE") == "1"; // [local]
+    private static readonly Dictionary<string, int> _submitSites = new();
+    private static long _submitReport = System.Diagnostics.Stopwatch.GetTimestamp();
+    private static void RecordSubmit()
+    {
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var site = string.Join(" < ", frames.Take(4).Select(f => f.GetMethod() is { } m ? $"{m.DeclaringType?.Name}.{m.Name}" : "?"));
+        lock (_submitSites)
+        {
+            _submitSites[site] = _submitSites.GetValueOrDefault(site) + 1;
+            if (System.Diagnostics.Stopwatch.GetElapsedTime(_submitReport).TotalSeconds >= 10)
+            {
+                foreach (var (key, value) in _submitSites.OrderByDescending(pair => pair.Value).Take(10))
+                    Console.Error.WriteLine($"[SUBMIT_PROBE] count={value} site={key}");
+                _submitSites.Clear();
+                _submitReport = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+        }
+    }
+
     public ulong Submit(SubmitBundle? bundle = null)
     {
+        if (SubmitProbe) RecordSubmit(); // [local]
         var submit = bundle == null ? new SubmitBundle() : new SubmitBundle(bundle);
         if (_command.IsInvalid)
         {

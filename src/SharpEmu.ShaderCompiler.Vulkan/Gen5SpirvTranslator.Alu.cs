@@ -4033,7 +4033,8 @@ public static partial class Gen5SpirvTranslator
             // Mask to guest wave size (32 or 64 lanes) — on Radeon hardware, DPP 
             // operations are limited to a single half-wave for some encodings, so we 
             // must not clamp wave64 lanes to 31; use the full lane mask instead.
-            safeTarget = BitwiseAnd(safeTarget, UInt(_waveLaneCount == 64 ? 63u : 31u));
+            // DPP never crosses a 32-lane half, so an emulated wave64 shuffles within its host subgroup.
+            safeTarget = BitwiseAnd(safeTarget, UInt(_waveLaneCount == 64 && !_emulateWave64 ? 63u : 31u));
             var shuffled = ShuffleLane(value, safeTarget);
 
             var sourceAvailable = inRange;
@@ -5163,7 +5164,8 @@ public static partial class Gen5SpirvTranslator
             // Mask to guest wave size — on Radeon hardware DPP is limited to a 
             // single half-wave for some encodings, but we must not clamp wave64 
             // lanes to 31; use the full lane mask instead.
-            targetLane = BitwiseAnd(targetLane, UInt(_waveLaneCount == 64 ? 63u : 31u));
+            // PERMLANE16 stays within a 32-lane half, so an emulated wave64 shuffles within its host subgroup.
+            targetLane = BitwiseAnd(targetLane, UInt(_waveLaneCount == 64 && !_emulateWave64 ? 63u : 31u));
             var shuffled = ShuffleLane(value, targetLane);
             var fetchInactive = (control.OperandSelect & 1) != 0;
             if (fetchInactive)

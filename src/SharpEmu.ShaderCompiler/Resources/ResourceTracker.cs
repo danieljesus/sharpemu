@@ -416,6 +416,7 @@ public sealed partial class ResourceTracker
 
     private bool IsHostBufferHandle(ScalarValue? handle) =>
         handle is { Kind: ScalarValueKind.BufferHandle, Operands.Length: 4 } &&
+        !(DeviceTables && handle.Operands.Any(DependsOnScalarBufferWord)) &&
         handle.Operands.All(dword => dword.Type == ScalarValueType.U32 && _plan.ValidateRuntimeValue(dword));
 
     private bool IsDeviceLoadedBufferHandle(ScalarValue? handle) =>
@@ -425,7 +426,11 @@ public sealed partial class ResourceTracker
             (_plan.ValidateRuntimeValue(dword) || DependsOnScalarBufferWord(dword))) &&
         handle.Operands.Any(DependsOnScalarBufferWord);
 
-    private static bool DependsOnScalarBufferWord(ScalarValue value)
+    // [local] experiment: in the listed shaders a descriptor read with S_LOAD through a pointer is
+    // read on the device too (ResourceTableReadPlanner leaves those reads unflattened).
+    private bool DeviceTables => ResourceTableReadPlanner.IsDeviceTableHash(_plan.Hash);
+
+    private bool DependsOnScalarBufferWord(ScalarValue value)
     {
         var pending = new Stack<ScalarValue>();
         var visited = new HashSet<ScalarValue>();
@@ -437,7 +442,7 @@ public sealed partial class ResourceTracker
                 continue;
             }
 
-            if (current.Kind == ScalarValueKind.ScalarBufferWord)
+            if (current.Kind == ScalarValueKind.ScalarBufferWord || (DeviceTables && current.Kind == ScalarValueKind.ScalarAddressWord))
             {
                 return true;
             }

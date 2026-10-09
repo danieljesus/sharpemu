@@ -103,6 +103,17 @@ public interface ICommandStreamHost
 
     void FillBuffer(ulong address, ulong size, uint value, bool isGds);
 
+    // Immediate data the command processor writes to memory (WRITE_DATA and the like). A host that
+    // keeps device copies of guest memory applies it to them in command order, so the dispatches
+    // recorded before the packet keep their view and the ones after it see the write.
+    void WriteCommandData(ulong address, ReadOnlySpan<byte> data)
+    {
+        if (!Memory.TryWrite(address, data))
+        {
+            throw Fatal($"The command stream cannot write guest memory: address=0x{address:X16} size={data.Length}.");
+        }
+    }
+
     void CopyBuffer(ulong destination, ulong source, ulong size, bool destinationIsGds, bool sourceIsGds);
 
     void ReadGds(Span<uint> destination, uint wordOffset, uint wordCount);

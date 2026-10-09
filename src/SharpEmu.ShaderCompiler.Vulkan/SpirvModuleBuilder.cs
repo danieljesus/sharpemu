@@ -145,6 +145,7 @@ public enum SpirvOp : ushort
     ControlBarrier = 224,
     MemoryBarrier = 225,
     AtomicLoad = 227,
+    AtomicStore = 228,
     AtomicExchange = 229,
     AtomicCompareExchange = 230,
     AtomicIIncrement = 232,
@@ -252,7 +253,9 @@ public enum SpirvExecutionMode : uint
 
 public enum SpirvDecoration : uint
 {
+    Coherent = 23, // [local]
     Block = 2,
+    Aliased = 20,
     ArrayStride = 6,
     BuiltIn = 11,
     NoPerspective = 13,

@@ -279,6 +279,7 @@ public sealed class GuestPageTracker
             uploadFunc();
             if (isWritten)
             {
+                GuestGpuMemoryHook.Trace(vaddr, size, "gpu-own written-binding"); // [local]
                 VisitRegions(vaddr, size, create: false, (region, offset, bytes) =>
                 {
                     region.ChangeState(WriteOrigin.Gpu, enable: true, region.BaseAddress + offset, bytes);

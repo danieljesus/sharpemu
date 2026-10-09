@@ -42,6 +42,10 @@ internal interface IShaderPipelineHost
     // emitted as real 64-bit atomics instead of a non-atomic 32-bit pair.
     bool SharedInt64AtomicsEnabled { get; }
 
+    // The device supports shaderBufferInt64Atomics, so 64-bit buffer atomics and GLC
+    // 64-bit buffer loads can be single 64-bit accesses.
+    bool BufferInt64AtomicsEnabled { get; }
+
     // The device supports native 16-bit float conversions with their float controls
     // (ShaderCompileRequest.SupportsFloat16Conversions).
     bool Float16ConversionsEnabled => false;

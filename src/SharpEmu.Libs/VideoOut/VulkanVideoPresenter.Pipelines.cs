@@ -87,6 +87,7 @@ internal static unsafe partial class VulkanVideoPresenter
         bool IShaderPipelineHost.GraphicsSubgroupOperationsEnabled => GraphicsSubgroupOperationsEnabled;
 
         bool IShaderPipelineHost.SharedInt64AtomicsEnabled => SharedInt64AtomicsEnabled;
+        bool IShaderPipelineHost.BufferInt64AtomicsEnabled => BufferInt64AtomicsEnabled;
         bool IShaderPipelineHost.Float16ConversionsEnabled => Float16ConversionsEnabled;
         bool IShaderPipelineHost.ShaderSignedZeroInfNanPreserveFloat32Supported =>
             _supportsShaderSignedZeroInfNanPreserveFloat32;
@@ -100,6 +101,22 @@ internal static unsafe partial class VulkanVideoPresenter
         SampleCountFlags IShaderPipelineHost.NoAttachmentSampleCounts => _noAttachmentSampleCounts;
 
         // A range the GPU wrote is downloaded first, so the word is what the guest CPU would read.
+        private static readonly bool FlushBeforeTableReads = Environment.GetEnvironmentVariable("SHARPEMU_FLUSH_TABLE_READS") == "1";
+        private int _flushedTableReads;
+        private static readonly int SpeculativeTableReads = int.Parse(Environment.GetEnvironmentVariable("SHARPEMU_SPECULATIVE_TABLE_READS") ?? "0"); // [local] 1 = read, 2 = verify
+        private long _speculativeReads, _speculativeMismatches, _speculativeReported; // [local]
+        private void ReportSpeculative()
+        {
+            if (_speculativeReads - _speculativeReported >= 2000)
+            {
+                _speculativeReported = _speculativeReads;
+                Console.Error.WriteLine($"[SPEC_READ] reads={_speculativeReads} mismatches={_speculativeMismatches}");
+            }
+        }
+        private static readonly bool NoSyncTableReads = Environment.GetEnvironmentVariable("SHARPEMU_NO_SYNC_TABLE_READS") == "1"; // [local]
+        internal static readonly HashSet<ulong> WatchedBounds = new(); // [local]
+        private int _watchLogs; // [local]
+
         public bool TryReadGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
@@ -125,13 +142,41 @@ internal static unsafe partial class VulkanVideoPresenter
                     return false;
                 }
 
-                if (_bufferCache.HasGpuDirtyBytes(address, sizeof(uint)))
+                if (SpeculativeTableReads != 0 && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) &&
+                    !_bufferCache.HasPreciseGpuDirtyBytes(address, sizeof(uint))) // [local] dirty only through a broad binding
+                {
+                    Span<byte> cpu = stackalloc byte[sizeof(uint)];
+                    if (_guestMemory.TryRead(address, cpu))
+                    {
+                        var cpuWord = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cpu);
+                        _speculativeReads++;
+                        if (SpeculativeTableReads == 1)
+                        {
+                            word = cpuWord;
+                            ReportSpeculative();
+                            return true;
+                        }
+
+                        if (_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint), SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead) &&
+                            _guestMemory.TryRead(address, cpu) && System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cpu) != cpuWord)
+                        {
+                            _speculativeMismatches++;
+                            if (_speculativeMismatches < 20) Console.Error.WriteLine($"[SPEC_READ] mismatch address=0x{address:X} cpu=0x{cpuWord:X8} gpu=0x{System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cpu):X8}");
+                        }
+
+                        ReportSpeculative();
+                    }
+                }
+
+                if (!NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint))) // [local] ceiling experiment: read the stale CPU copy instead of waiting
                 {
                     if (Diagnostics.GpuReadTrace.Enabled)
                     {
                         Diagnostics.GpuReadTrace.Record(address, ResourceMaterializationCache.ReadingTable);
                     }
 
+                    // [local experiment] the pending command buffer may hold the writes this word depends on
+                    if (FlushBeforeTableReads) { _flushedTableReads++; _scheduler.FlushAndWait(); }
                     if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
                             SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
                     {
@@ -153,6 +198,11 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            if (WatchedBounds.Count != 0 && _watchLogs < 400) // [local] reads of the bounds 0xF1D1 writes
+            {
+                bool watched; lock (WatchedBounds) watched = WatchedBounds.Contains(address & ~0x1FUL) || WatchedBounds.Contains((address - 0x10) & ~0x1FUL);
+                if (watched) { _watchLogs++; Console.Error.WriteLine($"[BOUNDS_READ] tick={_scheduler.CurrentTick} addr=0x{address:X} word=0x{word:X8} synchronized={synchronized} dirtyNow={_bufferCache.HasGpuDirtyBytes(address, 4)}"); }
+            }
             if (Diagnostics.GpuReadTrace.Enabled && synchronized)
             {
                 Diagnostics.GpuReadTrace.RecordValue(address, word);

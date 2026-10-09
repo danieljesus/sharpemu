@@ -153,8 +153,7 @@ internal sealed class ShaderProgramCache
     private readonly List<uint> _staticState = new(StageStaticKey.MaxWords);
     // Draws that re-bind unchanged resources reuse the last materialization.
     // SHARPEMU_RESOURCE_CACHE=0 materializes every draw, for A/B comparisons.
-    private readonly ResourceMaterializationCache? _materializations =
-        Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_CACHE") == "0" ? null : new();
+    private readonly ResourceMaterializationCache? _materializations = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZATION_CACHE") == "0" ? null : (Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_CACHE") == "0" ? null : new());
     private ulong _nextProgramId;
 
     public ResourceMaterializationCache? Materializations => _materializations;
@@ -207,9 +206,15 @@ internal sealed class ShaderProgramCache
         File.WriteAllBytes(Path.Combine(dumpDir, $"shader_{source.Hash:X16}.bin"), bytes.AsSpan(0, read).ToArray());
     }
 
+    private static readonly HashSet<ulong> DumpHashes = (Environment.GetEnvironmentVariable("LOCAL_DUMP_SHADER_HASHES") ?? "") // [local] shader binaries to dump on first decode
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(h => Convert.ToUInt64(h.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? h[2..] : h, 16)).ToHashSet();
+    private readonly HashSet<ulong> _dumpedHashes = new(); // [local]
+
     // The decoded instructions of a program, shared by every static variant of the same code.
     public Gen5ShaderProgram Decode(ShaderSource source)
     {
+        if (DumpHashes.Contains(source.Hash) && _dumpedHashes.Add(source.Hash)) { DumpFailedShader(source); Console.Error.WriteLine($"[DUMPHASH] hash=0x{source.Hash:X16} address=0x{source.Address:X} size={source.CodeSize}"); } // [local]
         var key = (source.Hash, source.CodeSize);
         if (_decoded.TryGetValue(key, out var program))
         {
@@ -231,6 +236,11 @@ internal sealed class ShaderProgramCache
         }
 
         _decoded.Add(key, program);
+        if (Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local] programs that store through global/flat addresses
+        {
+            var stores = program.Instructions.Where(static i => i.Opcode.StartsWith("GlobalStore", StringComparison.Ordinal) || i.Opcode.StartsWith("FlatStore", StringComparison.Ordinal) || i.Opcode.StartsWith("GlobalAtomic", StringComparison.Ordinal) || i.Opcode.StartsWith("FlatAtomic", StringComparison.Ordinal)).Select(static i => i.Opcode).Distinct().ToArray();
+            if (stores.Length != 0) Console.Error.WriteLine($"[GLOBAL_STORES] hash=0x{source.Hash:X16} stage={source.Label} instructions={program.Instructions.Count} ops={string.Join(",", stores)}");
+        }
         if (recording is not null)
         {
             _codeCaptures[key] = new ShaderCodeCapture
@@ -667,6 +677,7 @@ internal sealed class ShaderProgramCache
     {
         var enableGraphicsSubgroups = _host.GraphicsSubgroupOperationsEnabled;
         var sharedInt64Atomics = _host.SharedInt64AtomicsEnabled;
+        var bufferInt64Atomics = _host.BufferInt64AtomicsEnabled;
         var float16Conversions = _host.Float16ConversionsEnabled;
         var signedZeroInfNanPreserve = _host.ShaderSignedZeroInfNanPreserveFloat32Supported;
         switch (source.Stage)
@@ -681,6 +692,7 @@ internal sealed class ShaderProgramCache
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
+                    SupportsBufferInt64Atomics = bufferInt64Atomics,
                     ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
                     RequiredVertexOutputCount = options.RequiredVertexOutputCount,
                     VertexInputs = entry.VertexInputs,
@@ -709,6 +721,7 @@ internal sealed class ShaderProgramCache
                     ScratchDwords = info.ScratchDwords,
                     EnableGraphicsSubgroupOperations = enableGraphicsSubgroups,
                     SupportsSharedInt64Atomics = sharedInt64Atomics,
+                    SupportsBufferInt64Atomics = bufferInt64Atomics,
                     ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
                     PixelOutputs = options.PixelOutputs,
                     PixelInputEnable = options.PixelInputEnable,
@@ -721,7 +734,7 @@ internal sealed class ShaderProgramCache
 
             default:
                 return BuildComputeRequest(entry.Plan, resources, layout, options.ComputeInfo!, options.ComputeSystemRegisters,
-                    sharedInt64Atomics, float16Conversions, _host.ExecGuardElisionEnabled, signedZeroInfNanPreserve);
+                    sharedInt64Atomics, bufferInt64Atomics, float16Conversions, _host.ExecGuardElisionEnabled, signedZeroInfNanPreserve);
         }
     }
 
@@ -737,7 +750,7 @@ internal sealed class ShaderProgramCache
             usesDispatchThreadLimits: usesDispatchThreadLimits);
 
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
-        ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, bool sharedInt64Atomics, bool float16Conversions,
+        ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, bool sharedInt64Atomics, bool bufferInt64Atomics, bool float16Conversions,
         bool execGuardElision, bool signedZeroInfNanPreserve) =>
         new(plan, resources, layout)
         {
@@ -746,6 +759,7 @@ internal sealed class ShaderProgramCache
             TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
             ScratchDwords = info.ScratchDwords,
             SupportsSharedInt64Atomics = sharedInt64Atomics,
+            SupportsBufferInt64Atomics = bufferInt64Atomics,
             SupportsFloat16Conversions = float16Conversions,
             ShaderSignedZeroInfNanPreserveFloat32Supported = signedZeroInfNanPreserve,
             ComputeSystemRegisters = systemRegisters,
@@ -756,7 +770,7 @@ internal sealed class ShaderProgramCache
         };
 
     internal static bool TryCompilePrewarm(ComputePrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
-        bool sharedInt64Atomics, bool float16Conversions, bool execGuardElision, bool signedZeroInfNanPreserve,
+        bool sharedInt64Atomics, bool bufferInt64Atomics, bool float16Conversions, bool execGuardElision, bool signedZeroInfNanPreserve,
         out IGuestCompiledShader? compiled, out BindingLayout? layout, out string error)
     {
         compiled = null;
@@ -774,7 +788,7 @@ internal sealed class ShaderProgramCache
             layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor,
                 record.Info.DispatchThreadDimensions);
             var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
-                sharedInt64Atomics, float16Conversions, execGuardElision, signedZeroInfNanPreserve);
+                sharedInt64Atomics, bufferInt64Atomics, float16Conversions, execGuardElision, signedZeroInfNanPreserve);
             return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;
         }
         catch (Exception exception)

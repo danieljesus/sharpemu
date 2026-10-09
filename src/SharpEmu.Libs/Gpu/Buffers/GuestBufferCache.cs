@@ -47,6 +47,34 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly GpuBuffer _bdaPageTable;
     private readonly GuestBufferRegistry<GpuBuffer> _registry = new(CachingPageSize, PageOwnerTable.AddressSpaceSize);
     private readonly SpanSet _gpuModifiedRanges = new();
+    private static readonly ulong DirtyWatch = Convert.ToUInt64(Environment.GetEnvironmentVariable("SHARPEMU_DIRTY_WATCH") ?? "0", 16); // [local]
+    private int _dirtyWatchLogs; // [local]
+    internal static readonly HashSet<ulong> WatchedModified = new(); // [local] 32-byte-aligned addresses whose dirty-mark removal is logged
+    private static int _watchedRemovals; // [local]
+
+    private void RemoveGpuModified(ulong address, ulong size) // [local] logging wrapper
+    {
+        if (WatchedModified.Count != 0 && _watchedRemovals < 3000)
+        {
+            lock (WatchedModified)
+                foreach (var watched in WatchedModified)
+                    if (watched + 24 > address && watched < address + size && _gpuModifiedRanges.Overlaps(watched, 24))
+                    {
+                        _watchedRemovals++;
+                        Console.Error.WriteLine($"[DIRTY_REMOVE] watched=0x{watched:X} range=0x{address:X}+0x{size:X} at {Environment.StackTrace.Replace(Environment.NewLine, " | ")}");
+                        break;
+                    }
+        }
+
+        _gpuModifiedRanges.Remove(address, size);
+        _preciseGpuModifiedRanges.Remove(address, size); // [local]
+    }
+
+    // [local] experiment: writes through bindings of 16 MB or more are tracked as "broad";
+    // a word dirty only through broad bindings may be read speculatively by table reads.
+    private readonly SpanSet _preciseGpuModifiedRanges = new();
+    public const ulong BroadWriteBytes = 16UL * 1024 * 1024;
+    public bool HasPreciseGpuDirtyBytes(ulong guestAddress, ulong size) => _preciseGpuModifiedRanges.Overlaps(guestAddress, size);
     private long _gpuModifiedVersion;
     private readonly GuestPageTracker _tracker;
     private readonly GpuRingBuffer _staging;
@@ -77,6 +105,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _tracker = new GuestPageTracker(pages);
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
         _uploader = new GuestBufferUploader(device, scheduler, guest, _staging);
+        _guestMemory = guest; // [local]
         _stream = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Stream, 64 * MiB);
         _download = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Download, 32 * MiB);
         _deviceRing = new GpuRingBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 128 * MiB);
@@ -114,6 +143,83 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     public GpuBuffer GetBuffer(ResourceSlotIdentifier bufferIdentifier) => _registry.GetBuffer(bufferIdentifier);
+
+    // [local] The small BVH blob's header range, watched for command-processor and CPU-side writes.
+    public static ulong BvhWatchBase;
+    public static bool BvhWatch(ulong address, ulong size) => (BvhWatchBase != 0 && address < BvhWatchBase + 0x100 && address + size > BvhWatchBase) || (BvhWatchPages.Count != 0 && (BvhWatchPages.Contains(address >> 12) || BvhWatchPages.Contains((address + size - 1) >> 12)));
+    public static readonly HashSet<ulong> BvhWatchPages = new(); // [local] 4 KB pages of headers written by 0x56D6
+    public static Action? PostDispatchHook; // [local] run once right after the next dispatch is recorded
+    public static readonly List<Action> PostDispatchHooks = new(); // [local] run after the next dispatch (or draw) is recorded
+    public static readonly bool ForceBvhCounts = Environment.GetEnvironmentVariable("SHARPEMU_FORCE_BVH_COUNTS") == "1"; // [local]
+
+    // [local] writes dwords into the registered device buffer in the current command stream.
+    public void PatchDeviceDwords(ulong guestAddress, uint value0, ulong guestAddress1, uint value1)
+    {
+        var buffer = _registry.GetBuffer(FindBuffer(guestAddress, 256));
+        var command = _scheduler.Current;
+        command.EndRendering();
+        var native = new CommandBuffer(command.Handle);
+        var vk = _device.Vk;
+        var barrier = new BufferMemoryBarrier2
+        {
+            SType = StructureType.BufferMemoryBarrier2,
+            SrcAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit,
+            DstAccessMask = AccessFlags2.TransferWriteBit,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Buffer = buffer.Handle,
+            Offset = 0,
+            Size = buffer.Size,
+        };
+        VulkanSynchronization.PipelineBarrier(vk, native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit, 0, null, 1, &barrier, 0, null);
+        var v0 = value0; var v1 = value1;
+        vk.CmdUpdateBuffer(native, buffer.Handle, buffer.Offset(guestAddress), 4, &v0);
+        vk.CmdUpdateBuffer(native, buffer.Handle, buffer.Offset(guestAddress1), 4, &v1);
+        var after = barrier;
+        after.SrcAccessMask = AccessFlags2.TransferWriteBit;
+        after.DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit;
+        VulkanSynchronization.PipelineBarrier(vk, native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit, 0, null, 1, &after, 0, null);
+        buffer.NoteGpuWrite();
+    }
+    public static readonly System.Collections.Concurrent.ConcurrentQueue<(ulong Address, ulong Tick)> BvhHeaderWrites = new(); // [local]
+
+    // [local] Copies the device-side bytes of a guest range to a file once the current submission completes.
+    private readonly List<GpuBuffer> _dumpBuffers = new();
+    private readonly ICpuMemory _guestMemory; // [local]
+
+    // [local] guest (CPU-side) bytes of a range, for comparison with DumpDeviceRange.
+    public void DumpGuestRange(ulong guestAddress, ulong size, string path)
+    {
+        var bytes = new byte[size];
+        if (_guestMemory.TryRead(guestAddress, bytes)) File.WriteAllBytes(path, bytes);
+        else Console.Error.WriteLine($"[GPU][GUEST_DUMP] unreadable 0x{guestAddress:X}");
+    }
+
+    // [local] tracker state of a range.
+    public string DescribePage(ulong guestAddress, ulong size) =>
+        $"region={_tracker.HasRegion(guestAddress, size)} cpu_dirty={_tracker.HasCpuDirtyPages(guestAddress, size)} may_cpu_dirty={_tracker.MayHaveCpuDirtyPages(guestAddress, size)} gpu_dirty={_tracker.HasGpuDirtyPages(guestAddress, size)} may_gpu_dirty={_tracker.MayHaveGpuDirtyPages(guestAddress, size)} cpu_hot={_tracker.IsCpuWriteHotRange(guestAddress, size)} registered={IsRegionRegistered(guestAddress, size)}";
+
+    // [local] experiment: push the guest bytes of a range into the device copies (as a CP write would).
+    public bool RepairFromGuest(ulong guestAddress, ulong size)
+    {
+        var bytes = new byte[size];
+        if (!_guestMemory.TryRead(guestAddress, bytes)) return false;
+        WriteHostMemory(guestAddress, bytes);
+        return true;
+    }
+
+    public void DumpDeviceRange(ulong guestAddress, ulong size, string path)
+    {
+        var buffer = _registry.GetBuffer(FindBuffer(guestAddress, size));
+        var download = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, size);
+        _dumpBuffers.Add(download);
+        download.CopyFrom(_scheduler.Current, buffer, buffer.Offset(guestAddress), 0, size, destinationAfter: AccessFlags.HostReadBit);
+        _scheduler.QueueCompletionAction(() =>
+        {
+            download.Invalidate(0, size);
+            File.WriteAllBytes(path, download.Mapped.Slice(0, checked((int)size)).ToArray());
+        });
+    }
 
     public GpuRingBuffer GetUtilityBuffer(GpuBufferUsage usage) => usage switch
     {
@@ -246,6 +352,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 Diagnostics.DccWriterTrace.Record(RequireImageCache(), guestAddress, size);
             }
 
+            if (DirtyWatch != 0 && guestAddress <= DirtyWatch && DirtyWatch < guestAddress + size && _dirtyWatchLogs++ < 400) // [local]
+                Console.Error.WriteLine($"[DIRTY_WATCH] range=0x{guestAddress:X}+0x{size:X} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16} stage={Diagnostics.GpuReadTrace.CurrentStage} tick={_scheduler.CurrentTick} caller={(size >= 0x1000000 && _dirtyWatchLogs < 6 ? new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
+            if (size < BroadWriteBytes) _preciseGpuModifiedRanges.Add(guestAddress, size); // [local]
             if (!_gpuModifiedRanges.Contains(guestAddress, size))
             {
                 _gpuModifiedRanges.Add(guestAddress, size);
@@ -340,6 +449,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         // Registered buffers are ordered and disjoint: walk only the ones the write overlaps.
         var end = guestAddress + (ulong)data.Length;
+        ulong covered = 0; // [local]
         for (var index = _registry.FindFirstOverlappingIndex(guestAddress);
              index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end;
              index++)
@@ -356,8 +466,21 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
             WriteDataBuffer(buffer, begin, data.Slice((int)(begin - guestAddress), (int)(rangeEnd - begin)));
             TouchBuffer(bufferIdentifier);
+            covered += rangeEnd - begin;
+        }
+        if (covered < (ulong)data.Length) // [local] bytes only the guest copy received
+        {
+            HostWriteGaps++;
+            if (HostWriteGaps <= 40 || (HostWriteGaps & (HostWriteGaps - 1)) == 0)
+                Console.Error.WriteLine($"[GPU][HOSTWRITE_GAP] address=0x{guestAddress:X} size={data.Length} covered={covered} count={HostWriteGaps} tick={_scheduler.CurrentTick}");
+            if (HostWriteMarkDirty) _tracker.MarkCpuDirtyPages(guestAddress, (ulong)data.Length);
         }
     }
+
+    private static long HostWriteGaps; // [local]
+    // [local] experiment: a written binding over a GPU-modified range still uploads CPU-dirty pages first (SHARPEMU_WRITTEN_SYNC_CPU_DIRTY=1).
+    private static readonly bool WrittenSyncCpuDirty = Environment.GetEnvironmentVariable("SHARPEMU_WRITTEN_SYNC_CPU_DIRTY") == "1";
+    private static readonly bool HostWriteMarkDirty = Environment.GetEnvironmentVariable("SHARPEMU_HOSTWRITE_MARK_DIRTY") == "1"; // [local]
 
     public void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds)
     {
@@ -412,7 +535,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         destination.Fill(destinationOffset, size, value);
         if (images.OverlapsDccMetadata(guestAddress, size) && TryWriteFillToBacking(guestAddress, size, value))
         {
-            _gpuModifiedRanges.Remove(guestAddress, size);
+            RemoveGpuModified(guestAddress, size);
             var firstPage = guestAddress & ~(TrackerLayout.PageBytes - 1);
             for (var page = firstPage; page < guestAddress + size; page += TrackerLayout.PageBytes)
             {
@@ -589,6 +712,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("The resolved Vulkan copy ranges overlap.");
         }
 
+        if (dstMemory) GuestGpuMemoryHook.Trace(dstVaddr, size, $"host-copy src=0x{srcVaddr:X} src_memory={srcMemory} submission_tick={_scheduler.CurrentTick}"); // [local]
         dst.CopyFrom(command, src, srcOffset, dstOffset, size);
     }
 
@@ -890,6 +1014,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private bool ReadMemoryOrAwaitShutdown(ulong guestAddress, ulong size, bool isWrite,
         GuestMemoryProfile.ReadbackSource source = GuestMemoryProfile.ReadbackSource.ExplicitReadback)
     {
+        if (BvhWatch(guestAddress, size)) Console.Error.WriteLine($"[BVH_DOWNLOAD] address=0x{guestAddress:X} size=0x{size:X} write={isWrite} source={source} tick={_scheduler.CurrentTick}");
         if (!_relay.IsGpuQueueThread && SubmissionScheduler.InDeferredOperation)
         {
             throw SubmissionScheduler.Fatal(
@@ -953,9 +1078,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _hotWindows[guestAddress & ~(ReadbackWindowBytes - 1)] = new HotWindow(guestAddress, size, _batchSerial);
     }
 
+    private static readonly bool EagerReadbacks = Environment.GetEnvironmentVariable("SHARPEMU_EAGER_READBACK") == "1"; // [local] off by default: rt251noeager 6,26 -> 6,64 FPS
+
     private void NoteHotWindowWrite(ulong guestAddress, ulong size)
     {
-        if (_hotWindows.Count == 0 || size == 0)
+        if (!EagerReadbacks || _hotWindows.Count == 0 || size == 0)
         {
             return;
         }
@@ -1248,7 +1375,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             });
             foreach (var copy in copies)
             {
-                _gpuModifiedRanges.Remove(copy.Address, copy.Size);
+                RemoveGpuModified(copy.Address, copy.Size);
             }
 
             _tracker.ClearGpuDirtyPages(pending.WindowBegin, pending.WindowEnd - pending.WindowBegin);
@@ -1369,6 +1496,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private void WriteDataBuffer(GpuBuffer buffer, ulong address, ReadOnlySpan<byte> source)
     {
+        GuestGpuMemoryHook.Trace(address, (ulong)source.Length, $"host-write-data submission_tick={_scheduler.CurrentTick}"); // [local]
         while (!source.IsEmpty)
         {
             var chunk = (int)Math.Min((ulong)source.Length, _staging.Size);
@@ -1455,7 +1583,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             foreach (var copy in copies)
             {
-                _gpuModifiedRanges.Remove(copy.Address, copy.Size);
+                RemoveGpuModified(copy.Address, copy.Size);
             }
 
             return;
@@ -1491,7 +1619,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         foreach (var copy in copies)
         {
-            _gpuModifiedRanges.Remove(copy.Address, copy.Size);
+            RemoveGpuModified(copy.Address, copy.Size);
         }
     }
 
@@ -1664,6 +1792,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             newBuffer.AddStreamScore(overlap.StreamScore + 1);
         }
 
+        GuestGpuMemoryHook.Trace(overlap.CpuAddress, overlap.Size, $"host-merge-copy new={newBufferIdentifier} submission_tick={_scheduler.CurrentTick}"); // [local]
         newBuffer.CopyFrom(_scheduler.Current, overlap, 0, overlap.CpuAddress - newBuffer.CpuAddress, overlap.Size);
         DeleteBuffer(overlappingBufferIdentifier);
     }
@@ -1727,7 +1856,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferDirtySynchronization);
         var startedAt = BufferUploadProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if ((!preserveCpuWriteHotPages && !isWritten && !isTexelBuffer && !_tracker.MayHaveCpuDirtyPages(guestAddress, size)) ||
-            (isWritten && !isTexelBuffer && _gpuModifiedRanges.Contains(guestAddress, size)))
+            (isWritten && !isTexelBuffer && _gpuModifiedRanges.Contains(guestAddress, size) &&
+             (!WrittenSyncCpuDirty || !_tracker.MayHaveCpuDirtyPages(guestAddress, size))))
         {
             if (BufferUploadProfile.Enabled)
                 BufferUploadProfile.Record(guestAddress, size, 0, 0, 0, System.Diagnostics.Stopwatch.GetTimestamp() - startedAt);
@@ -1760,6 +1890,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
                 0, null, 1, &before, 0, null);
             var regions = CollectionsMarshal.AsSpan(copies);
+            if (GuestGpuMemoryHook.TraceEnabled) // [local]
+                foreach (var copy in regions)
+                    GuestGpuMemoryHook.Trace(buffer.CpuAddress + copy.DstOffset, copy.Size, $"host-upload-sync written={isWritten} preserve={preserveCpuWriteHotPages} binding=0x{guestAddress:X}+0x{size:X} submission_tick={_scheduler.CurrentTick}");
             fixed (BufferCopy* pointer = regions)
             {
                 vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)regions.Length, pointer);
@@ -1785,6 +1918,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (isTexelBuffer)
         {
             var copiedFromImage = RequireImageCache().TrySynchronizeBufferFromImage(buffer, guestAddress, size);
+            if (copiedFromImage) GuestGpuMemoryHook.Trace(guestAddress, size, $"host-copy-from-image submission_tick={_scheduler.CurrentTick}"); // [local]
             if (copiedFromImage)
             {
                 buffer.NoteGpuWrite();

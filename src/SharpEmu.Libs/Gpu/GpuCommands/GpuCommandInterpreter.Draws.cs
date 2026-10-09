@@ -225,8 +225,17 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
-        DispatchDirect(ReadDword(argumentsAddress), ReadDword(argumentsAddress + 4), ReadDword(argumentsAddress + 8), dispatchInitiator, argumentsAddress);
+        // [local] experiment: the arguments may have been written by a dispatch recorded ahead of the GPU;
+        // wait for the GPU before reading them (SHARPEMU_SYNC_INDIRECT_ARGS=1).
+        if (SyncIndirectArguments) _host.SynchronizeGpu();
+        var gx = ReadDword(argumentsAddress); var gy = ReadDword(argumentsAddress + 4); var gz = ReadDword(argumentsAddress + 8);
+        if ((gx == 0 || gy == 0 || gz == 0) && _zeroIndirectLogs++ < 200)
+            Console.Error.WriteLine($"[AGC][INDIRECT_ZERO] args=0x{argumentsAddress:X} threads={gx},{gy},{gz} initiator=0x{dispatchInitiator:X8}"); // [local]
+        DispatchDirect(gx, gy, gz, dispatchInitiator, argumentsAddress);
     }
+
+    private int _zeroIndirectLogs; // [local]
+    private static readonly bool SyncIndirectArguments = Environment.GetEnvironmentVariable("SHARPEMU_SYNC_INDIRECT_ARGS") == "1"; // [local]
 
     internal uint DrawIndexPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {

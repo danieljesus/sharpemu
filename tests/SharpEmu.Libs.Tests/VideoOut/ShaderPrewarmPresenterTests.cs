@@ -62,7 +62,7 @@ public sealed class ShaderPrewarmPresenterTests(HeadlessVulkanFixture fixture) :
         var prewarmed = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         presenter.SetField("_prewarmedShaderIdentities", prewarmed);
 
-        presenter.InvokeMethod("PrewarmComputePipeline", record, code, new FakeShaderCompiler(Compile), false, false, true);
+        presenter.InvokeMethod("PrewarmComputePipeline", record, code, new FakeShaderCompiler(Compile), false, false, false, true);
 
         Assert.Equal(0, presenter.GetField<int>("_shaderPrewarmFailed"));
         Assert.Equal(1, presenter.GetField<int>("_shaderPrewarmCompiled"));

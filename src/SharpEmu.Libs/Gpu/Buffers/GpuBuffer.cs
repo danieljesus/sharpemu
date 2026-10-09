@@ -272,6 +272,7 @@ public unsafe class GpuBuffer : IDisposable
         var command = _scheduler.Current;
         command.EndRendering();
         NoteGpuWrite();
+        SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(CpuAddress + offset, size, $"host-fill value=0x{value:X} submission_tick={_scheduler.CurrentTick}"); // [local]
         var vk = _device.Vk;
         var native = new CommandBuffer(command.Handle);
         var before = CreateBarrier(offset, size, MemoryAccess, AccessFlags.TransferWriteBit);

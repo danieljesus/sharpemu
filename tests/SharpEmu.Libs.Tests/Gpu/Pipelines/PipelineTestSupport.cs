@@ -46,6 +46,8 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
 
     public bool SharedInt64AtomicsEnabled => false;
 
+    public bool BufferInt64AtomicsEnabled => false;
+
     public ShaderPrewarmList? ShaderPrewarm { get; set; }
 
     public RenderHostLimits Limits => new(16384, 16384, 16384, 16384);

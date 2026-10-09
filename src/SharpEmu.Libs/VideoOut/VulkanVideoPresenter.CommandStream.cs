@@ -218,7 +218,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 SliceResult result;
                 using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.CommandStream))
                 {
-                    var aliasAccess = _guestBacking?.TryEnterBackingAliasAccess() == true;
+                    var aliasAccess = BackingAliasEnabled && _guestBacking?.TryEnterBackingAliasAccess() == true; // [local] SHARPEMU_BACKING_ALIAS=0 disables
                     _backingAliasAccess = aliasAccess;
                     try
                     {
@@ -378,12 +378,36 @@ internal static unsafe partial class VulkanVideoPresenter
                 null);
         }
 
+        private static readonly bool BackingAliasEnabled = Environment.GetEnvironmentVariable("SHARPEMU_BACKING_ALIAS") != "0"; // [local]
+
+        public void WriteCommandData(ulong address, ReadOnlySpan<byte> data)
+        {
+            if (data.IsEmpty) return;
+            // A range the buffer cache tracks gets the bytes in both copies, the device one through a
+            // copy recorded now; anything else is plain guest memory.
+            if (_bufferCache.IsRegionRegistered(address, (ulong)data.Length))
+            {
+                using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
+                _ = BeginBatchedGuestCommands();
+                if (Gpu.Buffers.GuestBufferCache.BvhWatch(address, (ulong)data.Length)) Console.Error.WriteLine($"[BVH_CPWRITE] seq={_bvhSeq++} device-order address=0x{address:X} size={data.Length} tick={_scheduler.CurrentTick} payload+8C=0x{(data.Length >= 0x94 ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(0x8C)) : 0):X} payload+90=0x{(data.Length >= 0x94 ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(0x90)) : 0):X}");
+                _bufferCache.WriteHostMemory(address, data);
+                if (Gpu.Buffers.GuestBufferCache.BvhWatch(address, (ulong)data.Length)) DumpBvhBuffer($"wr{_bvhSeq - 1:D4}_afterwrite_hdr", default(Gpu.Rendering.BufferDescriptorWords).WithAddress(address + 0x80), 32);
+                return;
+            }
+
+            if (!_guestMemory.TryWrite(address, data))
+            {
+                throw SubmissionScheduler.Fatal($"The command stream cannot write guest memory: address=0x{address:X16} size={data.Length}.");
+            }
+        }
+
         public void FillBuffer(ulong address, ulong size, uint value, bool isGds)
         {
             using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
             // Transfers the buffer cache completes in guest memory leave the rendering scope open;
             // its GPU paths end the scope before they record.
             _ = BeginBatchedGuestCommands();
+            if (Gpu.Buffers.GuestBufferCache.BvhWatch(address, size)) Console.Error.WriteLine($"[BVH_CPWRITE] fill address=0x{address:X} size=0x{size:X} value=0x{value:X} tick={_scheduler.CurrentTick}");
             _bufferCache.FillBuffer(address, size, value, isGds);
         }
 
@@ -393,6 +417,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // Transfers the buffer cache completes in guest memory leave the rendering scope open;
             // its GPU paths end the scope before they record.
             _ = BeginBatchedGuestCommands();
+            if (Gpu.Buffers.GuestBufferCache.BvhWatch(destination, size)) Console.Error.WriteLine($"[BVH_CPWRITE] copy destination=0x{destination:X} source=0x{source:X} size=0x{size:X} tick={_scheduler.CurrentTick}");
             _bufferCache.CopyBuffer(destination, source, size, destinationIsGds, sourceIsGds);
         }
 
@@ -404,6 +429,7 @@ internal static unsafe partial class VulkanVideoPresenter
             using var completionScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandEndOfPipe);
             _ = BeginBatchedGuestCommands();
             var buffer = _scheduler.Current;
+            if (Gpu.Buffers.GuestBufferCache.BvhWatch(write.Destination, 8)) Console.Error.WriteLine($"[BVH_CPWRITE] eop kind={write.Kind} destination=0x{write.Destination:X} value=0x{write.Value:X} tick={_scheduler.CurrentTick}");
             switch (write.Kind)
             {
                 case EndOfPipeWriteKind.Write32:

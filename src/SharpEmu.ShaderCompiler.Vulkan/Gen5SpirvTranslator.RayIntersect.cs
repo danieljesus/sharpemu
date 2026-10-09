@@ -34,6 +34,7 @@ public static partial class Gen5SpirvTranslator
 
         // [local] LOCAL_RAY_MISS=1 makes every node test miss, so traversal ends at once.
         private static readonly bool LocalRayMiss = Environment.GetEnvironmentVariable("LOCAL_RAY_MISS") == "1";
+        private static readonly bool TriangleRangeCheck = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRIANGLE_RANGE") != "0";
 
         private void EmitRayIntersect(Gen5RayIntersectControl ray, bool bvh64)
         {
@@ -92,7 +93,10 @@ public static partial class Gen5SpirvTranslator
             // A float32 box node spans two 64-byte units.
             var wideInRange = _module.AddInstruction(SpirvOp.ULessThan, _boolType, nodeIndex, lastNode);
             var valid = LogicalAnd(present, inRange);
-            var isTriangle = LogicalAnd(valid, _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, nodeType, UInt(NodeTypeTriangle1)));
+            // [local] experiment: GTA V derives the T# size from its node count, which leaves every triangle-pair
+            // node beyond it; let triangle nodes through on page validity alone (SHARPEMU_BVH_TRIANGLE_RANGE=0).
+            var triangleValid = TriangleRangeCheck ? valid : present;
+            var isTriangle = LogicalAnd(triangleValid, _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, nodeType, UInt(NodeTypeTriangle1)));
             var isBox16 = LogicalAnd(valid, _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeBoxFloat16)));
             var isBox32 = LogicalAnd(LogicalAnd(present, wideInRange),
                 _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeBoxFloat32)));

@@ -102,6 +102,8 @@ public static partial class Gen5SpirvTranslator
         public CompilationContext(ShaderCompileRequest request)
         {
             _request = request;
+            _maxDispatcherSteps = MaxDispatcherStepsFor(request.Hash); // [local]
+            if (request.Hash == 0x220AB61E9C35767C) Console.Error.WriteLine($"[220A_GUARD] steps={_maxDispatcherSteps} env={Environment.GetEnvironmentVariable("SHARPEMU_SHADER_MAX_STEPS_HASH")}"); // [local]
             _program = Ir.Gen5WaterfallMoveRelative.Collapse(request.Program);
             _stage = request.Stage switch
             {
@@ -119,7 +121,12 @@ public static partial class Gen5SpirvTranslator
             _localSizeY = Math.Max(request.LocalSizeY, 1);
             _localSizeZ = Math.Max(request.LocalSizeZ, 1);
             _physicalAxisOfLogical = ComputeWorkgroupAxisOrder(_localSizeX, _localSizeY, _localSizeZ);
-            _emulateWave64 = _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 && (ulong)_localSizeX * _localSizeY * _localSizeZ == 64;
+            var workgroupSize = (ulong)_localSizeX * _localSizeY * _localSizeZ;
+            _emulateWave64 = _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 &&
+                (workgroupSize == 64 ||
+                 (Wave64MultiWave && workgroupSize % 64 == 0 && workgroupSize <= 1024 && ReadsAFixedLane(request.Program)));
+            if (_emulateWave64 && workgroupSize > 64) Console.Error.WriteLine($"[WAVE64_MULTIWAVE] hash=0x{request.Hash:X16} local={_localSizeX}x{_localSizeY}x{_localSizeZ}"); // [local]
+            else if (_stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 && workgroupSize > 64) Console.Error.WriteLine($"[WAVE64_SPLIT] hash=0x{request.Hash:X16} local={_localSizeX}x{_localSizeY}x{_localSizeZ}"); // [local]
             _requiredVertexOutputCount = request.RequiredVertexOutputCount;
             _pixelInputEnable = request.PixelInputEnable;
             _pixelInputAddress = request.PixelInputAddress;
@@ -132,6 +139,19 @@ public static partial class Gen5SpirvTranslator
             }
 
         }
+
+        // A workgroup of several wave64 waves runs each 32-lane half as its own host subgroup,
+        // which serves every lane-local operation and the waterfalls over s_ff1(EXEC), whose
+        // lanes stay in their half. A V_READLANE of a fixed lane (a scan's carry from lane 31,
+        // a wave total from lane 63) reads the other half too, so only such programs pay for
+        // the bridge between the halves.
+        private static bool ReadsAFixedLane(Gen5ShaderProgram program) =>
+            program.Instructions.Any(static instruction =>
+                instruction.Opcode == "DsAddRtnU32" ||
+                (instruction.Opcode == "VReadlaneB32" &&
+                 instruction.Sources.Count > 1 &&
+                 instruction.Sources[1] is { Kind: Gen5OperandKind.LiteralConstant } or
+                     { Kind: Gen5OperandKind.EncodedConstant, Value: >= 128 and <= 208 }));
 
         // ---- declarations ----
 
@@ -270,8 +290,47 @@ public static partial class Gen5SpirvTranslator
             _globalBuffers = _module.AddGlobalVariable(descriptorsPointer, SpirvStorageClass.StorageBuffer);
             _module.AddName(_globalBuffers, "guestBuffers");
             _module.AddDecoration(_globalBuffers, SpirvDecoration.DescriptorSet, 0);
+            if (Environment.GetEnvironmentVariable("SHARPEMU_COHERENT_BUFFERS") == "1") _module.AddDecoration(_globalBuffers, SpirvDecoration.Coherent); // [local] experiment: cross-workgroup visibility of plain stores for look-back spins
             _module.AddDecoration(_globalBuffers, SpirvDecoration.Binding, bindingNumber);
             _interfaces.Add(_globalBuffers);
+            if (_request.SupportsBufferInt64Atomics && UsesWideBufferAtomics())
+            {
+                DeclareWideBufferArray(count, bindingNumber);
+            }
+        }
+
+        // A second view of the same descriptors as 64-bit words, for the accesses that must
+        // be one 64-bit atomic. Both views are Aliased: they name the same memory.
+        private void DeclareWideBufferArray(uint count, uint bindingNumber)
+        {
+            _module.AddCapability(SpirvCapability.Int64Atomics);
+            var block = _module.TypeStruct(AddressRuntimeArray());
+            _module.AddDecoration(block, SpirvDecoration.Block);
+            _module.AddMemberDecoration(block, 0, SpirvDecoration.Offset, 0);
+            var descriptors = _module.TypeArray(block, count);
+            var descriptorsPointer = _module.TypePointer(SpirvStorageClass.StorageBuffer, descriptors);
+            _globalBuffers64 = _module.AddGlobalVariable(descriptorsPointer, SpirvStorageClass.StorageBuffer);
+            _module.AddName(_globalBuffers64, "guestBuffers64");
+            _module.AddDecoration(_globalBuffers64, SpirvDecoration.DescriptorSet, 0);
+            _module.AddDecoration(_globalBuffers64, SpirvDecoration.Binding, bindingNumber);
+            _module.AddDecoration(_globalBuffers64, SpirvDecoration.Aliased);
+            _module.AddDecoration(_globalBuffers, SpirvDecoration.Aliased);
+            _interfaces.Add(_globalBuffers64);
+        }
+
+        private bool UsesWideBufferAtomics()
+        {
+            foreach (var instruction in _program.Instructions)
+            {
+                if (instruction.Opcode is "BufferAtomicSwapX2" or "BufferAtomicOrX2" ||
+                    (instruction.Control is Gen5BufferMemoryControl { Glc: true, DwordCount: >= 2 } &&
+                     instruction.Opcode.StartsWith("BufferLoadDword", StringComparison.Ordinal)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         // One storage block holding a runtime array of dwords.
@@ -510,6 +569,125 @@ public static partial class Gen5SpirvTranslator
         // Resolves a guest address through the page table. A missing page records a
         // fault and resolves to an invalid pointer; an address past the table reads as unmapped.
         private uint _deviceAddressInstructionPc;
+
+        // [local] Records which loop exhausted the step guard as a device-address fault record
+        // (address 0xFFFFFFFF_FFFFFFFF, the loop's pc, the site in the stage field) for the
+        // first-fault trace (SHARPEMU_TRACE_GPU_MEMORY_ADDRESS=auto).
+        // [local] traversal stack probe of GTA V's 0x8395…: counters in the fault buffer's stack area (16 words at length-48).
+        private uint StackWord(uint slot)
+        {
+            var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);
+            return BlockWordPointer(_faultBuffer, IAdd(_module.AddInstruction(SpirvOp.ISub, _uintType, length, UInt(64)), UInt(slot)));
+        }
+
+        private bool StackProbeActive => _request.Hash == 0x8395E43F382309DF && _request.TraceDeviceAddressFaults && _faultBuffer != 0;
+
+        private void StackProbe(uint slot, uint offset)
+        {
+            if (!StackProbeActive) return;
+            _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, StackWord(slot), UInt(1), UInt(0), UInt(1));
+            _module.AddInstruction(SpirvOp.AtomicUMax, _uintType, StackWord(8), UInt(1), UInt(0), offset);
+        }
+
+        private void StackPopProbe(bool scratch, uint value, uint offset)
+        {
+            if (!StackProbeActive) return;
+            var k = scratch ? 1u : 0u;
+            _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, StackWord(2 + k), UInt(1), UInt(0), UInt(1));
+            _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, StackWord(4 + k), UInt(1), UInt(0), SelectU(_module.AddInstruction(SpirvOp.IEqual, _boolType, value, UInt(0)), UInt(1), UInt(0)));
+            _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, StackWord(6 + k), UInt(1), UInt(0), SelectU(_module.AddInstruction(SpirvOp.IEqual, _boolType, value, UInt(0xFFFFFFFF)), UInt(1), UInt(0)));
+            _module.AddInstruction(SpirvOp.AtomicUMax, _uintType, StackWord(11), UInt(1), UInt(0), offset);
+        }
+
+        private void EmitGuardExhaustionRecord(uint pcValue, uint site, uint? a = null, uint? b = null, uint? c = null)
+        {
+            if (!_request.TraceDeviceAddressFaults || _faultBuffer == 0) return;
+            var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);
+            var recordStart = _module.AddInstruction(SpirvOp.ISub, _uintType, length, UInt(8));
+            var claim = _module.AddInstruction(SpirvOp.AtomicCompareExchange, _uintType,
+                BlockWordPointer(_faultBuffer, recordStart), UInt(1), UInt(0), UInt(0), UInt(1), UInt(0));
+            EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, claim, UInt(0)), () =>
+            {
+                uint[] values = [UInt((uint)_request.Hash), UInt((uint)(_request.Hash >> 32)), pcValue, a ?? UInt(0xFFFFFFFF), b ?? UInt(0xFFFFFFFF), UInt(site), c ?? UInt(0)];
+                for (var index = 0; index < values.Length; index++)
+                    Store(BlockWordPointer(_faultBuffer, IAdd(recordStart, UInt((uint)index + 1))), values[index]);
+            });
+        }
+
+        private void EmitTraceRecord(uint[] values)
+        {
+            if (!_request.TraceDeviceAddressFaults || _faultBuffer == 0) return;
+            var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);
+            var recordStart = _module.AddInstruction(SpirvOp.ISub, _uintType, length, UInt(16));
+            var claim = _module.AddInstruction(SpirvOp.AtomicCompareExchange, _uintType,
+                BlockWordPointer(_faultBuffer, recordStart), UInt(1), UInt(0), UInt(0), UInt(1), UInt(0));
+            EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, claim, UInt(0)), () =>
+            {
+                for (var index = 0; index < values.Length; index++)
+                    Store(BlockWordPointer(_faultBuffer, IAdd(recordStart, UInt((uint)index + 1))), values[index]);
+            });
+        }
+
+        // [local] At the refit's start, invocation (0,0) scans its node-index list (binding 0): the
+        // largest entry and how many entries reach past the node buffer (binding 1, 64-byte units).
+        private void EmitPairTableScan()
+        {
+            if (!_request.TraceDeviceAddressFaults || _faultBuffer == 0 || _request.Hash != 0x5981037B07E391D5) return;
+            Store(VectorPointer(123), LoadS(4));
+            if (true) return; // [local] slot reserved for site 10
+            var group = _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, Load(_uvec3Type, _workGroupIdInput), 0);
+            var local = _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, Load(_uvec3Type, _localInvocationIdInput), 0);
+            var first = LogicalAnd(_module.AddInstruction(SpirvOp.IEqual, _boolType, group, UInt(0)), _module.AddInstruction(SpirvOp.IEqual, _boolType, local, UInt(0)));
+            // only the big blobs (the small one always claimed the record)
+            var bigNodeBuffer = _module.AddInstruction(SpirvOp.AccessChain, _storageBlockPointer, _globalBuffers, UInt(1));
+            var big = _module.AddInstruction(SpirvOp.ULessThan, _boolType, _module.AddInstruction(SpirvOp.ArrayLength, _uintType, bigNodeBuffer, 0), UInt(5000u * 16));
+            // [local] the small blob's header as the refit's own binding sees it (site 7)
+            EmitConditional(LogicalAnd(first, big), () =>
+                EmitTraceRecord([UInt((uint)_request.Hash), UInt((uint)(_request.Hash >> 32)), LoadBufferWord(1, UInt(0x8C / 4)), LoadBufferWord(1, UInt(0x90 / 4)), LoadBufferWord(1, UInt(0x60 / 4)), LoadBufferWord(1, UInt(0x78 / 4)), UInt(7)]));
+            EmitConditional(_module.ConstantBool(false), () =>
+            {
+                var listBuffer = _module.AddInstruction(SpirvOp.AccessChain, _storageBlockPointer, _globalBuffers, UInt(0));
+                var listLength = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, listBuffer, 0);
+                var nodeBuffer = _module.AddInstruction(SpirvOp.AccessChain, _storageBlockPointer, _globalBuffers, UInt(1));
+                var nodeCount = ShiftRightLogical(_module.AddInstruction(SpirvOp.ArrayLength, _uintType, nodeBuffer, 0), UInt(4));
+                var limit = _module.AddInstruction(SpirvOp.ExtInst, _uintType, _glsl, 38, listLength, UInt(1u << 16));
+                var i = VectorPointer(120); var beyond = VectorPointer(121); var max = VectorPointer(122);
+                Store(i, UInt(0)); Store(beyond, UInt(0)); Store(max, UInt(0));
+                var headerLabel = _module.AllocateId(); var body = _module.AllocateId(); var cont = _module.AllocateId(); var merge = _module.AllocateId();
+                _module.AddStatement(SpirvOp.Branch, headerLabel);
+                _module.AddLabel(headerLabel);
+                _module.AddStatement(SpirvOp.LoopMerge, merge, cont, 0);
+                var index = Load(_uintType, i);
+                _module.AddStatement(SpirvOp.BranchConditional, _module.AddInstruction(SpirvOp.ULessThan, _boolType, index, limit), body, merge);
+                _module.AddLabel(body);
+                var entry = LoadBufferWord(0, index);
+                Store(max, _module.AddInstruction(SpirvOp.ExtInst, _uintType, _glsl, 41, Load(_uintType, max), entry));
+                EmitConditional(_module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, entry, nodeCount), () => Store(beyond, IAdd(Load(_uintType, beyond), UInt(1))));
+                _module.AddStatement(SpirvOp.Branch, cont);
+                _module.AddLabel(cont);
+                Store(i, IAdd(index, UInt(1)));
+                _module.AddStatement(SpirvOp.Branch, headerLabel);
+                _module.AddLabel(merge);
+                EmitTraceRecord([UInt((uint)_request.Hash), UInt((uint)(_request.Hash >> 32)), LoadBufferWord(1, UInt(0x700 * 16)), LoadBufferWord(1, UInt(0x700 * 16 + 1)), LoadBufferWord(1, UInt(0x700 * 16 + 2)), LoadBufferWord(1, UInt(0x700 * 16 + 3)), UInt(6)]);
+            });
+        }
+
+        private void EmitOutOfRangeStoreRecord(int binding, uint dwordAddress, uint site)
+        {
+            if (!_request.TraceDeviceAddressFaults || _faultBuffer == 0 || true) return; // [local] slot reserved for site 10
+            var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);
+            var recordStart = _module.AddInstruction(SpirvOp.ISub, _uintType, length, UInt(16));
+            var claim = _module.AddInstruction(SpirvOp.AtomicCompareExchange, _uintType,
+                BlockWordPointer(_faultBuffer, recordStart), UInt(1), UInt(0), UInt(0), UInt(1), UInt(0));
+            EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, claim, UInt(0)), () =>
+            {
+                var buffer = _module.AddInstruction(SpirvOp.AccessChain, _storageBlockPointer, _globalBuffers, UInt((uint)binding));
+                var bound = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, buffer, 0);
+                uint[] values = [UInt((uint)_request.Hash), UInt((uint)(_request.Hash >> 32)), UInt(_emittingPc ?? 0), UInt((uint)binding), dwordAddress, bound, UInt(site)];
+                for (var index = 0; index < values.Length; index++)
+                    Store(BlockWordPointer(_faultBuffer, IAdd(recordStart, UInt((uint)index + 1))), values[index]);
+            });
+        }
 
         private (uint Pointer, uint Valid) ResolveDeviceAddress(uint address64)
         {
@@ -1028,6 +1206,7 @@ public static partial class Gen5SpirvTranslator
 
             void Shared()
             {
+                StackProbe(0, offset);
                 for (uint index = 0; index < control.DwordCount; index++)
                 {
                     var pointer = LdsPointer(offset, index * sizeof(uint));
@@ -1040,6 +1219,7 @@ public static partial class Gen5SpirvTranslator
 
             void Private()
             {
+                StackProbe(1, offset);
                 for (uint index = 0; index < control.DwordCount; index++)
                 {
                     var pointer = ScratchPointer(offset, index * sizeof(uint));
@@ -1155,12 +1335,24 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
+        private static readonly bool ScratchSwizzle = !string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_SCRATCH_SWIZZLE"), "0", StringComparison.Ordinal);
+
         private uint ScratchPointer(uint byteAddress, uint offsetBytes = 0)
         {
             var address = offsetBytes == 0
                 ? byteAddress
                 : IAdd(byteAddress, UInt(offsetBytes));
             var dwordIndex = ShiftRightLogical(address, UInt(2));
+            if (ScratchSwizzle && _subgroupInvocationIdInput != 0)
+            {
+                // [local] wave-interleaved scratch: dword k of lane L lives at byte k * 256 + L * 4
+                // (wave64), so a byte address whose lane field matches this lane maps to element k.
+                var lane = GuestWaveLane();
+                var laneField = BitwiseAnd(dwordIndex, UInt(63));
+                var interleaved = _module.AddInstruction(SpirvOp.IEqual, _boolType, laneField, lane);
+                dwordIndex = SelectU(interleaved, ShiftRightLogical(dwordIndex, UInt(6)), dwordIndex);
+            }
             if (_scratchDwordCount > 1)
             {
                 dwordIndex = _module.AddInstruction(
@@ -1801,20 +1993,20 @@ public static partial class Gen5SpirvTranslator
             error = string.Empty;
             if (instruction.Opcode is "DsMinF32" or "DsMaxF32")
             {
-                if (instruction.Sources.Count < 3)
+                if (instruction.Sources.Count < 2)
                 {
                     error = $"missing GDS operands for {instruction.Opcode}";
                     return false;
                 }
 
                 var floatIndex = GlobalDataShareIndex(GetRawSource(instruction, 0), control.SingleOffsetBytes);
+                // DS_MIN/MAX_F32: mem = min/max(mem, DATA0); there is no DATA1 operand.
                 EmitExecConditional(() =>
                 {
                     EmitConditional(IsBlockWordInRange(_globalDataShare, floatIndex), () =>
-                        EmitDataShareFloatAtomic(
+                        EmitBufferFloatAtomic(
                             BlockWordPointer(_globalDataShare, floatIndex),
                             GetRawSource(instruction, 1),
-                            GetRawSource(instruction, 2),
                             instruction.Opcode == "DsMaxF32",
                             scope: 1,
                             semantics: 0x48));

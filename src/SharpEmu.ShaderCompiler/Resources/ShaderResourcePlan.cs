@@ -202,6 +202,7 @@ public sealed class ShaderResourcePlan
         plan.CleanFlatSlots = cleanSlots;
         plan.ResourceBranches = ResourceBranchBlock.Build(plan, Rewrite);
         plan.DeviceAddressRanges = DeviceAddressRangePlanner.Plan(plan);
+        plan.DeviceStoreTables = DeviceStoreTablePlanner.Plan(plan);
 
         // Each written handle owns three flattened slots after the table reads: base
         // low, base high and size, which the shader checks every store against.
@@ -215,6 +216,8 @@ public sealed class ShaderResourcePlan
         }
 
         plan.WrittenRangeSlotByHandle = writtenSlots;
+        if (hash == 0x35B85620669D35A4) plan.Info.UsesDeviceAddresses = true; // [local] gives the scan shader a fault buffer for trace records
+        if (hash == 0x220AB61E9C35767C && Environment.GetEnvironmentVariable("SHARPEMU_LOOKBACK_PROBE") == "1") plan.Info.UsesDeviceAddresses = true; // [local] fault buffer for the look-back probe
         return plan;
     }
 
@@ -222,6 +225,10 @@ public sealed class ShaderResourcePlan
 
     // Planned after tracking; optional, and never a reason for the plan to fail.
     public IReadOnlyList<DeviceAddressRangePlan> DeviceAddressRanges { get; private set; } = [];
+
+    // Tables of V#s that page-table buffer stores pick their descriptor from (a V# loaded with
+    // S_BUFFER_LOAD from one of these tables); every V# listed is a range the program may write.
+    public IReadOnlyList<ScalarValue> DeviceStoreTables { get; private set; } = [];
 
     public IReadOnlyDictionary<uint, uint> WrittenRangeSlotByHandle { get; private set; } = new Dictionary<uint, uint>();
 

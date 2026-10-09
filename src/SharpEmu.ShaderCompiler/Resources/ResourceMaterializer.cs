@@ -16,6 +16,7 @@ public static class ResourceMaterializer
 
     // Written to standard error like every specialization refusal; the host turns it
     // into its fatal.
+    private static readonly bool DeviceStoreTableRanges = Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES") != "0"; // [local] on: CPU-memory ranges filtered and ranges merged (rt247merge)
     public static Action<string> SpecializationFailed { get; set; } = message => Console.Error.WriteLine($"shader resource specialization failed: {message}");
 
     private sealed class IndirectImageTable
@@ -78,6 +79,12 @@ public static class ResourceMaterializer
         DeviceAddressRange[] ranges;
         using (ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.DeviceAddressRanges))
             ranges = DeviceAddressRangePlanner.Evaluate(plan, inputs);
+        if (plan.DeviceStoreTables.Count != 0 && DeviceStoreTableRanges) // [local] gate while measuring
+        {
+            var withTables = new List<DeviceAddressRange>(ranges);
+            DeviceStoreTablePlanner.Evaluate(plan, inputs, withTables);
+            ranges = withTables.ToArray();
+        }
         foreach (var range in ranges)
         {
             if (!plan.WrittenRangeSlotByHandle.TryGetValue(range.Handle, out var slot))

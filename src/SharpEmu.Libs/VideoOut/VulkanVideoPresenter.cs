@@ -91,6 +91,16 @@ internal static unsafe partial class VulkanVideoPresenter
     private static void SetSharedInt64AtomicsCapability(bool supported) =>
         Volatile.Write(ref _sharedInt64AtomicsSupported, supported ? 1 : 0);
 
+    private static int _bufferInt64AtomicsSupported;
+
+    // True when the device supports shaderBufferInt64Atomics, so 64-bit buffer
+    // atomics can be emitted as real 64-bit atomics.
+    internal static bool BufferInt64AtomicsEnabled =>
+        Volatile.Read(ref _bufferInt64AtomicsSupported) != 0;
+
+    private static void SetBufferInt64AtomicsCapability(bool supported) =>
+        Volatile.Write(ref _bufferInt64AtomicsSupported, supported ? 1 : 0);
+
     private static int _float16ConversionsSupported;
 
     // True when the device supports shaderFloat16 and the 16-bit float controls, so

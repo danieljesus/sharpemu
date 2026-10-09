@@ -546,10 +546,9 @@ public sealed partial class GpuCommandInterpreter
 
     internal void WriteBytes(ulong address, ReadOnlySpan<byte> source)
     {
-        if (!_host.Memory.TryWrite(address, source))
-        {
-            throw _host.Fatal($"The command stream cannot write guest memory: address=0x{address:X16} size={source.Length}.");
-        }
+        if (Gpu.Buffers.GuestBufferCache.BvhWatch(address, (ulong)source.Length))
+            Console.Error.WriteLine($"[BVH_CPWRITE] write_bytes address=0x{address:X} size={source.Length} value=0x{(source.Length >= 4 ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(source) : 0):X} packet={_packetSerial}");
+        _host.WriteCommandData(address, source);
         DropWindow();
         _lastWriteLength = 0;
         if (source.Length is sizeof(uint) or sizeof(ulong))

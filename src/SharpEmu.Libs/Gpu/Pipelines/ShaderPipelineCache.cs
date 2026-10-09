@@ -429,7 +429,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private bool TryPrepareProgram(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor,
         out ShaderProgram program, out ShaderStageResources stage)
     {
-        if (_programs.TryGetProgram(source, options, _strictShaders, ref pushDataCursor, out program, out stage, out var rejection))
+        if (_programs.TryGetProgram(source, options, _strictShaders && source.Hash != 0xD44EDA1B8D4FAA6B /* [local] GTA V Fidelity: heterogeneous image table, skip */, ref pushDataCursor, out program, out stage, out var rejection))
             return true;
 
         if (_reportedShaderSkips.Add((source.Stage, source.Hash, source.CodeSize)))

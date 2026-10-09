@@ -963,6 +963,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var supportsTimelineSemaphore = timelineSemaphoreFeatures.TimelineSemaphore;
             var supportsBufferDeviceAddress = addressFeatures.BufferDeviceAddress;
             var supportsSharedInt64Atomics = atomicInt64Features.ShaderSharedInt64Atomics;
+            var supportsBufferInt64Atomics = atomicInt64Features.ShaderBufferInt64Atomics;
             var supportsMaintenance8 = maintenance8Features.Maintenance8;
             var supportsRobustBufferAccess2 = robustness2Features.RobustBufferAccess2;
             var supportsRobustImageAccess2 = robustness2Features.RobustImageAccess2;
@@ -970,6 +971,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var supportsRobustness2 = supportsRobustImageAccess2 || supportsNullDescriptor;
             _canRequireComputeSubgroup32 &= vulkan13Features.SubgroupSizeControl;
             SetSharedInt64AtomicsCapability(supportsSharedInt64Atomics);
+            SetBufferInt64AtomicsCapability(supportsBufferInt64Atomics && Environment.GetEnvironmentVariable("SHARPEMU_BUFFER_INT64_ATOMICS") != "0"); // [local] A/B switch
             SetFloat16ConversionsCapability(supportsFloat16Conversions);
             if (!supportsFloat16Conversions)
             {
@@ -1114,12 +1116,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     PNext = &timelineSemaphoreFeatures,
                 };
                 void* renderingChain = &addressFeatures;
-                if (supportsSharedInt64Atomics)
+                if (supportsSharedInt64Atomics || supportsBufferInt64Atomics)
                 {
                     atomicInt64Features = new PhysicalDeviceShaderAtomicInt64Features
                     {
                         SType = StructureType.PhysicalDeviceShaderAtomicInt64Features,
-                        ShaderSharedInt64Atomics = true,
+                        ShaderSharedInt64Atomics = supportsSharedInt64Atomics,
+                        ShaderBufferInt64Atomics = supportsBufferInt64Atomics,
                         PNext = renderingChain,
                     };
                     renderingChain = &atomicInt64Features;

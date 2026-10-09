@@ -14,6 +14,7 @@ public readonly record struct ComputeImageClear(BufferDescriptorWords Descriptor
 public sealed partial class RenderExecutor
 {
     private const uint DispatchInitiatorUseThreadDimensions = 1u << 5;
+    private int _dimsLogs; // [local]
     private const uint DispatchInitiatorBaseBits = 0x41;
     private const uint DispatchInitiatorModifierBits = 0xA038;
     private const uint DispatchInitiatorKnownMask = DispatchInitiatorBaseBits | DispatchInitiatorModifierBits;
@@ -113,6 +114,7 @@ public sealed partial class RenderExecutor
             return;
         }
 
+        var dimsLine = $"[DISPATCH_DIMS] shader=0x{compute.Address:X} thread_dims={useThreadDimensions} dims={groupsX}x{groupsY}x{groupsZ} local={compute.ThreadsX}x{compute.ThreadsY}x{compute.ThreadsZ} indirect=0x{indirectArgumentsAddress:X} initiator=0x{dispatchInitiator:X}"; // [local]
         if (useThreadDimensions)
         {
             // The indirect buffer carries thread counts in this mode, while Vulkan indirect
@@ -195,17 +197,24 @@ public sealed partial class RenderExecutor
                 physicalGroups[axisOrder[logical]] = logicalGroups[logical];
             }
 
+            if (physicalGroups[0] == 1 && physicalGroups[1] == 1 && physicalGroups[2] == 1 && _hdrDispatchLogs++ < 600) Console.Error.WriteLine($"[DISPATCH_EXEC] shader=0x{compute.Address:X} groups=1,1,1 indirect=0x{indirectArgumentsAddress:X}"); // [local]
             if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
             {
                 _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
             }
             _host.ShaderAccessBarrier();
+            if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0 || (useThreadDimensions && _dimsLogs++ < 3000)) Console.Error.WriteLine(dimsLine + $" groups={physicalGroups[0]}x{physicalGroups[1]}x{physicalGroups[2]}"); // [local]
+            var hook = Gpu.Buffers.GuestBufferCache.PostDispatchHook; // [local]
+            if (hook != null) { Gpu.Buffers.GuestBufferCache.PostDispatchHook = null; hook(); }
+            if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0) { var hooks = Gpu.Buffers.GuestBufferCache.PostDispatchHooks.ToArray(); Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Clear(); foreach (var h in hooks) h(); }
         }
 
         _host.ResetBindings();
     }
 
     // The dispatch counts threads; the host counts groups of the shader's thread size.
+    private int _hdrDispatchLogs; // [local]
+
     public static uint GroupsFromThreads(uint threads, uint groupSize)
     {
         if (threads == 0)
