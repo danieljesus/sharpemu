@@ -138,6 +138,7 @@ internal static unsafe partial class VulkanVideoPresenter
         [ThreadStatic] private static bool _backReading;
         private static readonly bool FrontSyncedReads = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SYNCED_READS") != "0";
         internal long FrontSyncedReadCount;
+        private readonly Dictionary<string, long> _frontReadSites = new(); // [local]
 
         internal bool NeedsFrontCommandSync(ulong address, ulong size) => NeedsBackRead(address, size);
 
@@ -150,7 +151,19 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private T RunBackRead<T>(Func<T> read)
         {
-            Interlocked.Increment(ref FrontSyncedReadCount);
+            FrontSyncStats.Note(0);
+            if ((Interlocked.Increment(ref FrontSyncedReadCount) & 63) == 0) // [local] sampled call sites
+            {
+                var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+                var site = string.Join(" < ", frames.Take(5).Select(f => f.GetMethod() is { } m ? $"{m.DeclaringType?.Name}.{m.Name}" : "?"));
+                lock (_frontReadSites)
+                {
+                    _frontReadSites[site] = _frontReadSites.GetValueOrDefault(site) + 64;
+                    if (FrontSyncedReadCount % (64 * 64) == 0)
+                        foreach (var (key, value) in _frontReadSites.OrderByDescending(pair => pair.Value).Take(6))
+                            Console.Error.WriteLine($"[FRONT_SYNC_READ] total={FrontSyncedReadCount} count~{value} site={key}");
+                }
+            }
             return _back!.Run(() =>
             {
                 _backReading = true;

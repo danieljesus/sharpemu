@@ -76,25 +76,36 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     public const ulong BroadWriteBytes = 16UL * 1024 * 1024;
     public bool HasPreciseGpuDirtyBytes(ulong guestAddress, ulong size) => _preciseGpuModifiedRanges.Overlaps(guestAddress, size);
 
-    // [local] 64 KB blocks a GPU binding has ever written. Sticky and safe to read from any
+    // [local] Ranges a GPU binding has ever written (exact binding ranges). Sticky and safe to read from any
     // thread: a front thread that interprets ahead cannot see dirty state the render thread
     // has not recorded yet, so it treats every block here as possibly GPU-written.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, byte> _everGpuWritten = new();
+    private readonly SpanSet _everGpuWritten = new();
+    private readonly ReaderWriterLockSlim _everGpuWrittenLock = new();
 
     private void NoteEverGpuWritten(ulong guestAddress, ulong size)
     {
-        if (size > 64UL * 1024 * 1024)
+        if (size == 0)
             return;
-        for (var block = guestAddress >> 16; block <= (guestAddress + size - 1) >> 16; block++)
-            _everGpuWritten.TryAdd(block, 0);
+        _everGpuWrittenLock.EnterUpgradeableReadLock();
+        try
+        {
+            if (_everGpuWritten.Contains(guestAddress, size))
+                return;
+            _everGpuWrittenLock.EnterWriteLock();
+            try { _everGpuWritten.Add(guestAddress, size); }
+            finally { _everGpuWrittenLock.ExitWriteLock(); }
+        }
+        finally
+        {
+            _everGpuWrittenLock.ExitUpgradeableReadLock();
+        }
     }
 
     public bool EverGpuWritten(ulong guestAddress, ulong size)
     {
-        for (var block = guestAddress >> 16; block <= (guestAddress + size - 1) >> 16; block++)
-            if (_everGpuWritten.ContainsKey(block))
-                return true;
-        return false;
+        _everGpuWrittenLock.EnterReadLock();
+        try { return _everGpuWritten.Overlaps(guestAddress, size); }
+        finally { _everGpuWrittenLock.ExitReadLock(); }
     }
     private long _gpuModifiedVersion;
     private readonly GuestPageTracker _tracker;

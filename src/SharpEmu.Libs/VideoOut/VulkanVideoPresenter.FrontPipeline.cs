@@ -23,6 +23,22 @@ internal static unsafe partial class VulkanVideoPresenter
     // The work the front queues for the render thread, in order. The front blocks when the
     // queue is full; the render thread runs the items between its other duties. An item that
     // fails fails the queue, and the front sees the failure on its next call.
+    // [local] How often the front waits on the render thread, by reason.
+    internal static class FrontSyncStats
+    {
+        private static readonly long[] Counts = new long[4];
+        private static long _report = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        public static void Note(int kind)
+        {
+            Interlocked.Increment(ref Counts[kind]);
+            if (System.Diagnostics.Stopwatch.GetElapsedTime(Volatile.Read(ref _report)).TotalSeconds < 5)
+                return;
+            Volatile.Write(ref _report, System.Diagnostics.Stopwatch.GetTimestamp());
+            Console.Error.WriteLine($"[FRONT_SYNC] word_reads={Interlocked.Exchange(ref Counts[0], 0)} command_reads={Interlocked.Exchange(ref Counts[1], 0)} write_now={Interlocked.Exchange(ref Counts[2], 0)} flush_wait={Interlocked.Exchange(ref Counts[3], 0)}");
+        }
+    }
+
     private sealed class BackQueue(Action wake, int capacity)
     {
         private readonly object _gate = new();
@@ -226,6 +242,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (presenter.NeedsFrontCommandSync(address, (ulong)destination.Length))
             {
                 var buffer = new byte[destination.Length];
+                FrontSyncStats.Note(1);
                 var ok = queue.Run(() => presenter.TryReadGuest(address, buffer), _pauseAlias, _resumeAlias);
                 buffer.CopyTo(destination);
                 return ok;
@@ -246,7 +263,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void Flush() => queue.Enqueue(_flush, _pauseAlias, _resumeAlias);
 
-        public void FlushAndWait() => queue.Run(() => { presenter.FlushAndWait(); return true; }, _pauseAlias, _resumeAlias);
+        public void FlushAndWait() { FrontSyncStats.Note(3); queue.Run(() => { presenter.FlushAndWait(); return true; }, _pauseAlias, _resumeAlias); }
 
         public void SynchronizeGpu() => queue.Run(() => { presenter.SynchronizeGpu(); return true; }, _pauseAlias, _resumeAlias);
 
@@ -393,6 +410,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             // [local] The write records device copies, so it runs on the render thread, in order.
             var bytes = source.ToArray();
+            FrontSyncStats.Note(2);
             queue.Run(() => { presenter.WriteGuest(address, bytes); return true; }, _pauseAlias, _resumeAlias);
         }
 
