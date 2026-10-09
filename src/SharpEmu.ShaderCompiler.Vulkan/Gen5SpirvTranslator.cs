@@ -2746,6 +2746,69 @@ public static partial class Gen5SpirvTranslator
             EmitConditional(active, () => Store(pointer, value));
         }
 
+        private uint _orderedAddOld;
+
+        // DS_ADD_RTN_U32 returns what the guest's lane order gives: a wave64 runs its lower
+        // half, then its upper half, and inside a half the lanes from the lowest. Host atomics
+        // carry no order, so each lane's rank among the lanes adding to the same word is taken
+        // from the lower lanes of its host subgroup, one leader per word adds the subgroup's
+        // total, and an emulated wave64's lower half adds before its upper half. Radix sorts
+        // rank their keys this way; an unordered rank reorders equal keys between passes.
+        private void EmitOrderedDataShareAdd(Gen5ShaderInstruction instruction, Gen5DataShareControl control)
+        {
+            const uint HostLanes = 32;
+            var address = GetRawSource(instruction, 0);
+            var value = GetRawSource(instruction, 1);
+            var key = IAdd(address, UInt(control.SingleOffsetBytes));
+            var active = Load(_boolType, _exec);
+            var activeBit = SelectU(active, UInt(1), UInt(0));
+            var hostLane = BitwiseAnd(Load(_uintType, _subgroupInvocationIdInput), UInt(HostLanes - 1));
+            var prefix = UInt(0);
+            var total = UInt(0);
+            var leader = UInt(0);
+            var found = _module.ConstantBool(false);
+            for (uint lane = 0; lane < HostLanes; lane++)
+            {
+                var otherKey = ShuffleLane(key, UInt(lane));
+                var otherValue = ShuffleLane(value, UInt(lane));
+                var otherActive = ShuffleLane(activeBit, UInt(lane));
+                var same = LogicalAnd(
+                    _module.AddInstruction(SpirvOp.INotEqual, _boolType, otherActive, UInt(0)),
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, otherKey, key));
+                var lower = LogicalAnd(same, _module.AddInstruction(SpirvOp.ULessThan, _boolType, UInt(lane), hostLane));
+                prefix = IAdd(prefix, SelectU(lower, otherValue, UInt(0)));
+                total = IAdd(total, SelectU(same, otherValue, UInt(0)));
+                leader = SelectU(LogicalAnd(same, LogicalNot(found)), UInt(lane), leader);
+                found = _module.AddInstruction(SpirvOp.LogicalOr, _boolType, found, same);
+            }
+
+            if (_orderedAddOld == 0)
+            {
+                _orderedAddOld = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _interfaces.Add(_orderedAddOld);
+            }
+
+            var isLeader = LogicalAnd(active, _module.AddInstruction(SpirvOp.IEqual, _boolType, leader, hostLane));
+            var pointer = LdsPointer(address, control.SingleOffsetBytes);
+            Store(_orderedAddOld, UInt(0));
+            void Add(uint condition) => EmitConditional(condition, () =>
+                Store(_orderedAddOld, _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, pointer, UInt(2), UInt(0x108), total)));
+            if (_emulateWave64)
+            {
+                var lowerHalf = _module.AddInstruction(SpirvOp.IEqual, _boolType, ShiftRightLogical(GuestWaveLane(), UInt(5)), UInt(0));
+                Add(LogicalAnd(isLeader, lowerHalf));
+                EmitWave64Barrier();
+                Add(LogicalAnd(isLeader, LogicalNot(lowerHalf)));
+            }
+            else
+            {
+                Add(isLeader);
+            }
+
+            var original = IAdd(ShuffleLane(Load(_uintType, _orderedAddOld), leader), prefix);
+            EmitConditional(active, () => StoreV(instruction.Destinations[0].Value, original));
+        }
+
         private bool TryEmitDataShareAtomic(
             Gen5ShaderInstruction instruction,
             Gen5DataShareControl control,
@@ -2804,6 +2867,13 @@ public static partial class Gen5SpirvTranslator
                         instruction.Opcode == "DsMaxF32",
                         scope: 2,
                         semantics: 0x108));
+                return true;
+            }
+
+            if (instruction.Opcode == "DsAddRtnU32" && _subgroupInvocationIdInput != 0 &&
+                instruction.Destinations.Count > 0 && (_waveLaneCount == 32 || _emulateWave64))
+            {
+                EmitOrderedDataShareAdd(instruction, control);
                 return true;
             }
 
@@ -8595,7 +8665,8 @@ public static partial class Gen5SpirvTranslator
              UsesSubgroupBroadcast() ||
              UsesWaveControl() ||
              _request.Program.Instructions.Any(static instruction =>
-                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32" or "DsWriteAddtidB32" or "DsReadAddtidB32"));
+                 instruction.Opcode is "VMbcntLoU32B32" or "VMbcntHiU32B32" or "DsWriteAddtidB32" or "DsReadAddtidB32" or
+                     "DsAddRtnU32"));
 
         private static bool IsWaveMaskOperand(Gen5Operand operand) =>
             operand.Kind == Gen5OperandKind.ScalarRegister &&

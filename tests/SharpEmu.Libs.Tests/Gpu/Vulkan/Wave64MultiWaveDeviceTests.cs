@@ -134,4 +134,35 @@ public sealed class Wave64MultiWaveDeviceTests(HeadlessVulkanFixture fixture) : 
             Assert.True((thread & ~63u) + 5 == values[thread], $"thread {thread}: {values[thread]}");
         }
     }
+
+    // A returning LDS add counts in lane order on the guest: the lower half of a wave64 before
+    // the upper one, and inside a half from the lowest lane. A radix sort's ranks rely on it.
+    [Theory]
+    [InlineData(64u)]
+    [InlineData(256u)]
+    public void AReturningLdsAdd_RanksLanesInOrder(uint threads)
+    {
+        if (!Ready()) return;
+        // v2 = lane in wave, v3 = 4 * (lane % 4) (the LDS word), v6 = 1 << (8 * wave), v7 = 8 * wave.
+        Add(Vop2(0, "VAndB32", 2, Operand(63), Gen5Operand.Vector(0)));
+        Add(Vop2(0, "VAndB32", 3, Operand(3), Gen5Operand.Vector(0)));
+        Add(Vop2(0, "VLshlrevB32", 3, Operand(2), Gen5Operand.Vector(3)));
+        Add(Vop2(0, "VLshrrevB32", 7, Operand(6), Gen5Operand.Vector(0)));
+        Add(Vop2(0, "VLshlrevB32", 7, Operand(3), Gen5Operand.Vector(7)));
+        Add(Vop2(0, "VLshlrevB32", 6, Gen5Operand.Vector(7), Operand(1)));
+        Add(MoveVector(0, 8, 0));
+        Add(DataShare(0, "DsWriteB32", false, [Gen5Operand.Vector(3), Gen5Operand.Vector(8)], []));
+        Add(Sop0Barrier());
+        Add(DataShare(0, "DsAddRtnU32", false, [Gen5Operand.Vector(3), Gen5Operand.Vector(6)], [9]));
+        Add(Vop3(0, "VBfeU32", 4, Gen5Operand.Vector(9), Gen5Operand.Vector(7), Operand(8)));
+
+        var values = Run(threads);
+        for (uint thread = 0; thread < threads; thread++)
+        {
+            Assert.True(((thread & 63) >> 2) == values[thread], $"thread {thread}: rank {values[thread]}");
+        }
+    }
+
+    private static Gen5ShaderInstruction Sop0Barrier() =>
+        new(0, Gen5ShaderEncoding.Sopp, "SBarrier", [0u], [], [], null);
 }

@@ -136,10 +136,11 @@ public static partial class Gen5SpirvTranslator
         // A workgroup of several wave64 waves runs each 32-lane half as its own host subgroup,
         // which serves every lane-local operation and the waterfalls over s_ff1(EXEC), whose
         // lanes stay in their half. A V_READLANE of a fixed lane (a scan's carry from lane 31,
-        // a wave total from lane 63) reads the other half too, so only such programs pay for
-        // the bridge between the halves.
+        // a wave total from lane 63) reads the other half too, and a returning LDS add ranks
+        // the lower half before the upper one, so only such programs pay for the bridge.
         private static bool ReadsAFixedLane(Gen5ShaderProgram program) =>
             program.Instructions.Any(static instruction =>
+                instruction.Opcode == "DsAddRtnU32" ||
                 instruction.Opcode == "VReadlaneB32" &&
                 instruction.Sources.Count > 1 &&
                 instruction.Sources[1] is { Kind: Gen5OperandKind.LiteralConstant } or
