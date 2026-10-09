@@ -3419,7 +3419,7 @@ public static partial class Gen5SpirvTranslator
                     : IAdd(dwordAddress, UInt(index));
                 StoreV(
                     control.VectorData + index,
-                    LoadBufferWord(bindingIndex, indexedDwordAddress));
+                    LoadBufferWord(bindingIndex, indexedDwordAddress, coherent: control.Glc));
             }
 
             return true;
@@ -7408,7 +7408,11 @@ public static partial class Gen5SpirvTranslator
                 _ => _vec4Type,
             };
 
-        private uint LoadBufferWord(int binding, uint dwordAddress)
+        // A GLC load reads past the non-coherent caches: another workgroup may have just stored
+        // the word, as in a decoupled look-back that spins on its predecessor's status. A plain
+        // (or Volatile) load can keep returning a stale cached copy on the host, so a coherent
+        // load is a device-scope atomic load, which reads the level every workgroup shares.
+        private uint LoadBufferWord(int binding, uint dwordAddress, bool coherent = false)
         {
             var inRange = IsBufferWordInRange(binding, dwordAddress);
             var safeAddress = _module.AddInstruction(
@@ -7417,7 +7421,10 @@ public static partial class Gen5SpirvTranslator
                 inRange,
                 dwordAddress,
                 UInt(0));
-            var value = Load(_uintType, BufferWordPointer(binding, safeAddress));
+            var pointer = BufferWordPointer(binding, safeAddress);
+            var value = coherent
+                ? _module.AddInstruction(SpirvOp.AtomicLoad, _uintType, pointer, UInt(1), UInt(0))
+                : Load(_uintType, pointer);
             return _module.AddInstruction(
                 SpirvOp.Select,
                 _uintType,
