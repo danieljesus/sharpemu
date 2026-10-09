@@ -1306,6 +1306,8 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 Store(_programActive, invocationInBounds);
+                EmitComputeExecMask(workGroupId, invocationInBounds);
+                EmitWave64ExchangeReset();
 
                 if (_request.ComputeSystemRegisters is { } registers)
                 {
@@ -7953,6 +7955,97 @@ public static partial class Gen5SpirvTranslator
                     _boolType,
                     UInt(3),
                     condition);
+
+        // A compute wave starts with EXEC set only for the invocations the dispatch asked
+        // for: the last wave of a thread-count dispatch (or of a workgroup the dispatch
+        // does not fill) has its trailing bits clear. The host workgroup still runs an
+        // invocation per lane, so the guest-visible EXEC pair must drop those lanes too,
+        // or wave reductions on a saved EXEC (s_bcnt1 for an append counter, s_ff1 for
+        // the elected lane) count invocations that do not exist on the hardware.
+        private void EmitComputeExecMask(uint workGroupId, uint invocationInBounds)
+        {
+            if (_subgroupInvocationIdInput == 0)
+            {
+                return;
+            }
+
+            if (_localSizeY == 1 && _localSizeZ == 1 && _localInvocationIndexInput != 0)
+            {
+                // One-dimensional wave: the in-bounds lanes are a prefix of the wave, so the
+                // mask follows from the thread limit without a subgroup ballot (which only
+                // sees the host subgroup, half of an emulated wave64).
+                var laneCount = (uint)_waveLaneCount;
+                var localIndex = Load(_uintType, _localInvocationIndexInput);
+                var waveStart = BitwiseAnd(localIndex, UInt(~(laneCount - 1)));
+                var groupX = _module.AddInstruction(
+                    SpirvOp.CompositeExtract, _uintType, workGroupId, (uint)_physicalAxisOfLogical[0]);
+                var globalWaveStart = IAdd(
+                    _module.AddInstruction(SpirvOp.IMul, _uintType, groupX, UInt(_localSizeX)),
+                    waveStart);
+                var limit = ComputeThreadLimit(0);
+                var pastStart = _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, limit, globalWaveStart);
+                var remaining = _module.AddInstruction(
+                    SpirvOp.Select, _uintType, pastStart,
+                    _module.AddInstruction(SpirvOp.ISub, _uintType, limit, globalWaveStart), UInt(0));
+                var inGroup = _module.AddInstruction(SpirvOp.ISub, _uintType, UInt(_localSizeX), waveStart);
+                var available = _module.AddInstruction(
+                    SpirvOp.Select, _uintType,
+                    _module.AddInstruction(SpirvOp.ULessThan, _boolType, remaining, inGroup), remaining, inGroup);
+                var full = _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, available, UInt(laneCount));
+                if (laneCount == 64)
+                {
+                    var partial = _module.AddInstruction(
+                        SpirvOp.ISub, _ulongType,
+                        ShiftLeftLogical64(_module.Constant64(_ulongType, 1), Widen(available)),
+                        _module.Constant64(_ulongType, 1));
+                    StoreS64(126, _module.AddInstruction(
+                        SpirvOp.Select, _ulongType, full, _module.Constant64(_ulongType, ulong.MaxValue), partial));
+                }
+                else
+                {
+                    var partial = _module.AddInstruction(
+                        SpirvOp.ISub, _uintType, ShiftLeftLogical(UInt(1), available), UInt(1));
+                    StoreS(126, _module.AddInstruction(SpirvOp.Select, _uintType, full, UInt(uint.MaxValue), partial));
+                }
+
+                return;
+            }
+
+            if (_emulateWave64)
+            {
+                StoreS64(126, BothHalvesOfOwnBallot(invocationInBounds));
+            }
+            else
+            {
+                StoreWaveMask(126, invocationInBounds);
+            }
+        }
+
+        // An emulated wave64 composes its masks from the two host subgroups through a
+        // shared exchange. A half whose invocations all lie past the dispatch's thread
+        // count never runs the program, so it never writes its word: the other half
+        // would read whatever the slot held. Every invocation still runs this entry, so
+        // each half's leader clears its words here, before the first exchange.
+        private void EmitWave64ExchangeReset()
+        {
+            if (!_emulateWave64 || _wave64Exchange == 0 || _subgroupInvocationIdInput == 0)
+            {
+                return;
+            }
+
+            var lane = GuestWaveLane();
+            var half = ShiftRightLogical(lane, UInt(5));
+            var baseOffset = UInt(_wave64ExchangeOffset);
+            EmitConditional(IsHalfWaveLeader(lane), () =>
+            {
+                for (uint parity = 0; parity < 2; parity++)
+                {
+                    var exchange = IAdd(baseOffset, UInt(parity * Wave64ExchangeSlotCount));
+                    Store(Wave64ExchangePointer(exchange, half), UInt(0));
+                }
+            });
+            EmitWave64Barrier();
+        }
 
         private uint GuestWaveLane()
         {
