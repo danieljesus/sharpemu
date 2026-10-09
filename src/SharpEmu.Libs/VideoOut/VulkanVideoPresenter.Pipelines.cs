@@ -149,8 +149,60 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool NeedsBackRead(ulong address, ulong size) =>
             FrontSyncedReads && size != 0 && _bufferCache.EverGpuWritten(address, size);
 
+        // [local] While the front prepares a program, a read of GPU-written data does not wait
+        // for the render thread: the preparation is dropped and the render thread prepares the
+        // program itself when it executes the draw or dispatch, in stream order.
+        private sealed class DeferPreparationException : Exception;
+        [ThreadStatic] private static bool _preparingOnFront;
+        private static readonly bool DeferFrontPreparation = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_DEFER_PREP") != "0";
+        internal long DeferredPreparations;
+
+        internal GraphicsPrograms? TryPrepareOnFront(Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare, out RenderExecutor.DrawProgramInputs inputs)
+        {
+            _preparingOnFront = true;
+            try
+            {
+                var (programs, prepared) = prepare();
+                inputs = prepared;
+                return programs;
+            }
+            catch (DeferPreparationException)
+            {
+                Interlocked.Increment(ref DeferredPreparations);
+                inputs = default;
+                return null;
+            }
+            finally
+            {
+                _preparingOnFront = false;
+            }
+        }
+
+        internal ComputeProgram? TryPrepareComputeOnFront(Func<ComputeProgram?> prepare)
+        {
+            _preparingOnFront = true;
+            try
+            {
+                return prepare();
+            }
+            catch (DeferPreparationException)
+            {
+                Interlocked.Increment(ref DeferredPreparations);
+                return null;
+            }
+            finally
+            {
+                _preparingOnFront = false;
+            }
+        }
+
         private T RunBackRead<T>(Func<T> read)
         {
+            if (DeferFrontPreparation && _preparingOnFront)
+            {
+                throw new DeferPreparationException();
+            }
+
             FrontSyncStats.Note(0);
             if ((Interlocked.Increment(ref FrontSyncedReadCount) & 63) == 0) // [local] sampled call sites
             {

@@ -339,7 +339,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DrawIndexed(ulong submitId, in DrawIndexedArguments arguments)
         {
             var snapshot = Snapshot();
-            var prepared = presenter.Translation.PrepareGraphicsPrograms(snapshot, out var inputs);
+            var prepared = presenter.TryPrepareOnFront(() => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
             var copy = arguments;
             queue.Enqueue(() =>
             {
@@ -357,7 +357,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DrawAuto(ulong submitId, in DrawAutoArguments arguments)
         {
             var snapshot = Snapshot();
-            var prepared = presenter.Translation.PrepareGraphicsPrograms(snapshot, out var inputs);
+            var prepared = presenter.TryPrepareOnFront(() => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
             var copy = arguments;
             queue.Enqueue(() =>
             {
@@ -376,7 +376,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var snapshot = Snapshot();
             var prepared = indirectArgumentsAddress == 0
-                ? presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator)
+                ? presenter.TryPrepareComputeOnFront(() => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator))
                 : null;
             queue.Enqueue(() =>
             {
