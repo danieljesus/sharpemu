@@ -29,6 +29,24 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly long[] Counts = new long[4];
         private static long _report = System.Diagnostics.Stopwatch.GetTimestamp();
 
+        private static readonly Dictionary<string, int> Sites = new();
+        private static int _siteSamples;
+
+        public static void NoteSite(ulong address, int size)
+        {
+            if ((Interlocked.Increment(ref _siteSamples) & 15) != 0)
+                return;
+            var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+            var site = string.Join(" < ", frames.Take(4).Select(f => f.GetMethod() is { } m ? $"{m.DeclaringType?.Name}.{m.Name}" : "?")) + $" size={size}";
+            lock (Sites)
+            {
+                Sites[site] = Sites.GetValueOrDefault(site) + 16;
+                if (_siteSamples % 4096 == 0)
+                    foreach (var (key, value) in Sites.OrderByDescending(pair => pair.Value).Take(6))
+                        Console.Error.WriteLine($"[FRONT_CMD_READ] count~{value} site={key}");
+            }
+        }
+
         public static void Note(int kind)
         {
             Interlocked.Increment(ref Counts[kind]);
@@ -36,6 +54,57 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             Volatile.Write(ref _report, System.Diagnostics.Stopwatch.GetTimestamp());
             Console.Error.WriteLine($"[FRONT_SYNC] word_reads={Interlocked.Exchange(ref Counts[0], 0)} command_reads={Interlocked.Exchange(ref Counts[1], 0)} write_now={Interlocked.Exchange(ref Counts[2], 0)} flush_wait={Interlocked.Exchange(ref Counts[3], 0)}");
+        }
+    }
+
+    // [local] Bytes the front wrote with WriteGuestNow that the render thread has not applied
+    // yet, per dword. The front patches its reads with them; the render thread retires each
+    // entry once it applied the write (unless a newer write to the dword is pending).
+    internal sealed class PendingWriteOverlay
+    {
+        private readonly Dictionary<ulong, (byte Value, long Serial)> _bytes = new();
+        private long _serial;
+        private int _count;
+
+        public bool IsEmpty => Volatile.Read(ref _count) == 0;
+
+        public long Add(ulong address, byte[] bytes)
+        {
+            lock (_bytes)
+            {
+                var serial = ++_serial;
+                for (var index = 0; index < bytes.Length; index++)
+                    _bytes[address + (ulong)index] = (bytes[index], serial);
+                Volatile.Write(ref _count, _bytes.Count);
+                return serial;
+            }
+        }
+
+        public void Retire(ulong address, int length, long serial)
+        {
+            lock (_bytes)
+            {
+                for (var index = 0; index < length; index++)
+                {
+                    var key = address + (ulong)index;
+                    if (_bytes.TryGetValue(key, out var entry) && entry.Serial == serial)
+                        _bytes.Remove(key);
+                }
+
+                Volatile.Write(ref _count, _bytes.Count);
+            }
+        }
+
+        public void Apply(ulong address, Span<byte> destination)
+        {
+            if (IsEmpty)
+                return;
+            lock (_bytes)
+            {
+                for (var index = 0; index < destination.Length; index++)
+                    if (_bytes.TryGetValue(address + (ulong)index, out var entry))
+                        destination[index] = entry.Value;
+            }
         }
     }
 
@@ -243,13 +312,20 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var buffer = new byte[destination.Length];
                 FrontSyncStats.Note(1);
+                FrontSyncStats.NoteSite(address, destination.Length);
                 var ok = queue.Run(() => presenter.TryReadGuest(address, buffer), _pauseAlias, _resumeAlias);
                 buffer.CopyTo(destination);
                 return ok;
             }
 
             using var readScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryRead);
-            return presenter.GuestMemory.TryRead(address, destination);
+            if (!presenter.GuestMemory.TryRead(address, destination))
+            {
+                return false;
+            }
+
+            presenter.FrontOverlay.Apply(address, destination);
+            return true;
         }
 
         // Commands other threads post run on the render thread, between queued items.
@@ -393,6 +469,37 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool ResolvesIndirectDispatchOnGpu => presenter.ResolvesIndirectDispatchOnGpu;
 
+        // [local] The counts are read on the render thread when the dispatch runs, so the front
+        // does not wait for the queue to drain to read memory an earlier dispatch writes.
+        private static readonly bool DeferIndirect = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_DEFER_INDIRECT") != "0";
+
+        public bool DefersIndirectThreadDispatch => DeferIndirect;
+
+        public void DispatchIndirectDeferred(ulong submitId, ulong argumentsAddress, uint dispatchInitiator)
+        {
+            var snapshot = Snapshot();
+            queue.Enqueue(() =>
+            {
+                try
+                {
+                    Span<byte> counts = stackalloc byte[12];
+                    if (!presenter.TryReadGuest(argumentsAddress, counts))
+                    {
+                        throw SubmissionScheduler.Fatal($"The indirect dispatch arguments cannot be read: address=0x{argumentsAddress:X16}.");
+                    }
+
+                    var groupsX = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(counts);
+                    var groupsY = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(counts[4..]);
+                    var groupsZ = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(counts[8..]);
+                    presenter.ExecuteQueuedDispatch(submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, argumentsAddress, null);
+                }
+                finally
+                {
+                    _snapshots.Push(snapshot);
+                }
+            }, _pauseAlias, _resumeAlias);
+        }
+
         public bool ResolvesIndirectDrawOnGpu => presenter.ResolvesIndirectDrawOnGpu;
 
         public void OnQueueReset(int queueId) => queue.Enqueue(() => presenter.OnQueueReset(queueId), _pauseAlias, _resumeAlias);
@@ -409,10 +516,25 @@ internal static unsafe partial class VulkanVideoPresenter
         public void WriteGuestNow(ulong address, ReadOnlySpan<byte> source)
         {
             // [local] The write records device copies, so it runs on the render thread, in order.
+            // The front does not wait for it: until the render thread applies it, the front's own
+            // reads see the new bytes through the pending-write overlay.
             var bytes = source.ToArray();
-            FrontSyncStats.Note(2);
-            queue.Run(() => { presenter.WriteGuest(address, bytes); return true; }, _pauseAlias, _resumeAlias);
+            if (!WriteOverlay)
+            {
+                FrontSyncStats.Note(2);
+                queue.Run(() => { presenter.WriteGuest(address, bytes); return true; }, _pauseAlias, _resumeAlias);
+                return;
+            }
+
+            var serial = presenter.FrontOverlay.Add(address, bytes);
+            queue.Enqueue(() =>
+            {
+                presenter.WriteGuest(address, bytes);
+                presenter.FrontOverlay.Retire(address, bytes.Length, serial);
+            }, _pauseAlias, _resumeAlias);
         }
+
+        private static readonly bool WriteOverlay = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY") == "1";
 
         public void RunAfterFlush(Action work) => queue.Enqueue(work, _pauseAlias, _resumeAlias);
 
@@ -427,6 +549,7 @@ internal static unsafe partial class VulkanVideoPresenter
     private sealed partial class Presenter
     {
         private FrontCommandStreamHost? _front;
+        internal readonly PendingWriteOverlay FrontOverlay = new(); // [local]
         private BackQueue? _back;
         private long _frontBusyTicks;
         private long _frontSlices;

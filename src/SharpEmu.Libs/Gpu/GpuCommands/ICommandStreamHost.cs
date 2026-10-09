@@ -144,6 +144,13 @@ public interface ICommandStreamHost
     // GPU, so the interpreter need not wait for the GPU to read them back first.
     bool ResolvesIndirectDispatchOnGpu => false;
 
+    // [local] True when the host reads a thread-unit indirect dispatch's counts itself, in
+    // stream order on its executor, so the interpreter need not read them ahead of the GPU.
+    bool DefersIndirectThreadDispatch => false;
+
+    void DispatchIndirectDeferred(ulong submitId, ulong argumentsAddress, uint dispatchInitiator) =>
+        throw new NotSupportedException("The host does not defer indirect dispatches.");
+
     // True when an indexed indirect draw may be handed over with its arguments still in
     // guest memory (DrawIndexedArguments.IndirectArgumentsAddress).
     bool ResolvesIndirectDrawOnGpu => false;

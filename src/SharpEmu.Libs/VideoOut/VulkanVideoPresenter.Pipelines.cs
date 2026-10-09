@@ -288,7 +288,17 @@ internal static unsafe partial class VulkanVideoPresenter
                     return ok;
                 }
 
-                return TryReadGuestWordDirect(address, out word);
+                if (!TryReadGuestWordDirect(address, out word))
+                    return false;
+                if (!FrontOverlay.IsEmpty)
+                {
+                    Span<byte> patched = stackalloc byte[sizeof(uint)];
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(patched, word);
+                    FrontOverlay.Apply(address, patched);
+                    word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(patched);
+                }
+
+                return true;
             }
 
             word = 0;

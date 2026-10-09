@@ -225,6 +225,12 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
+        if (_host.DefersIndirectThreadDispatch) // [local]
+        {
+            _host.DispatchIndirectDeferred(SubmitId, argumentsAddress, dispatchInitiator);
+            return;
+        }
+
         // [local] experiment: the arguments may have been written by a dispatch recorded ahead of the GPU;
         // wait for the GPU before reading them (SHARPEMU_SYNC_INDIRECT_ARGS=1).
         if (SyncIndirectArguments) _host.SynchronizeGpu();
