@@ -75,6 +75,27 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly SpanSet _preciseGpuModifiedRanges = new();
     public const ulong BroadWriteBytes = 16UL * 1024 * 1024;
     public bool HasPreciseGpuDirtyBytes(ulong guestAddress, ulong size) => _preciseGpuModifiedRanges.Overlaps(guestAddress, size);
+
+    // [local] 64 KB blocks a GPU binding has ever written. Sticky and safe to read from any
+    // thread: a front thread that interprets ahead cannot see dirty state the render thread
+    // has not recorded yet, so it treats every block here as possibly GPU-written.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, byte> _everGpuWritten = new();
+
+    private void NoteEverGpuWritten(ulong guestAddress, ulong size)
+    {
+        if (size > 64UL * 1024 * 1024)
+            return;
+        for (var block = guestAddress >> 16; block <= (guestAddress + size - 1) >> 16; block++)
+            _everGpuWritten.TryAdd(block, 0);
+    }
+
+    public bool EverGpuWritten(ulong guestAddress, ulong size)
+    {
+        for (var block = guestAddress >> 16; block <= (guestAddress + size - 1) >> 16; block++)
+            if (_everGpuWritten.ContainsKey(block))
+                return true;
+        return false;
+    }
     private long _gpuModifiedVersion;
     private readonly GuestPageTracker _tracker;
     private readonly GpuRingBuffer _staging;
@@ -355,6 +376,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (DirtyWatch != 0 && guestAddress <= DirtyWatch && DirtyWatch < guestAddress + size && _dirtyWatchLogs++ < 400) // [local]
                 Console.Error.WriteLine($"[DIRTY_WATCH] range=0x{guestAddress:X}+0x{size:X} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16} stage={Diagnostics.GpuReadTrace.CurrentStage} tick={_scheduler.CurrentTick} caller={(size >= 0x1000000 && _dirtyWatchLogs < 6 ? new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
             if (size < BroadWriteBytes) _preciseGpuModifiedRanges.Add(guestAddress, size); // [local]
+            NoteEverGpuWritten(guestAddress, size); // [local]
             if (!_gpuModifiedRanges.Contains(guestAddress, size))
             {
                 _gpuModifiedRanges.Add(guestAddress, size);

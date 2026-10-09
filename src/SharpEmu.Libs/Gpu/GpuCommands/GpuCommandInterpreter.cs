@@ -544,11 +544,36 @@ public sealed partial class GpuCommandInterpreter
         WriteBytes(address, bytes);
     }
 
+    // A label or event store: the host applies it in stream order.
     internal void WriteBytes(ulong address, ReadOnlySpan<byte> source)
     {
-        if (Gpu.Buffers.GuestBufferCache.BvhWatch(address, (ulong)source.Length))
-            Console.Error.WriteLine($"[BVH_CPWRITE] write_bytes address=0x{address:X} size={source.Length} value=0x{(source.Length >= 4 ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(source) : 0):X} packet={_packetSerial}");
-        _host.WriteCommandData(address, source);
+        _host.WriteGuest(address, source);
+        NoteOwnWrite(address, source);
+    }
+
+    internal void WriteDwordNow(ulong address, uint value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
+        WriteBytesNow(address, bytes);
+    }
+
+    internal void WriteQwordNow(ulong address, ulong value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, value);
+        WriteBytesNow(address, bytes);
+    }
+
+    // Data the stream itself may read back: the host applies it before the next packet runs.
+    internal void WriteBytesNow(ulong address, ReadOnlySpan<byte> source)
+    {
+        _host.WriteGuestNow(address, source);
+        NoteOwnWrite(address, source);
+    }
+
+    private void NoteOwnWrite(ulong address, ReadOnlySpan<byte> source)
+    {
         DropWindow();
         _lastWriteLength = 0;
         if (source.Length is sizeof(uint) or sizeof(ulong))

@@ -150,6 +150,51 @@ public static partial class AgcExports
         private int _currentQueueId;
         private readonly ShaderPipelineCache? _pipelines;
         private readonly RenderExecutor? _executor;
+        // [pipeline] Draws and dispatches run on a copy of the banks, as they will when the
+        // interpreter runs ahead of the executor; SHARPEMU_RENDER_SNAPSHOT=1 enables it.
+        private static readonly bool SnapshotDraws = Environment.GetEnvironmentVariable("SHARPEMU_RENDER_SNAPSHOT") == "1";
+        private RegisterBanks? _snapshot;
+        private IRenderHost? _renderHost;
+
+        private RegisterBanks Snapshot(RegisterBanks banks)
+        {
+            _snapshot ??= new RegisterBanks(banks.Fatal);
+            _snapshot.CopyFrom(banks);
+            return _snapshot;
+        }
+
+        // The draw's programs from its registers alone, before the executor runs it; null when
+        // the provider cannot prepare them, which the executor then does itself (and reports).
+        internal GraphicsPrograms? PrepareGraphicsPrograms(RegisterBanks banks, out RenderExecutor.DrawProgramInputs inputs)
+        {
+            inputs = default;
+            if (_pipelines is null || _renderHost is null) return null;
+            try
+            {
+                inputs = RenderExecutor.ResolveProgramInputs(banks, _renderHost.FormatSupport, _renderHost.Limits, _renderHost.Fatal);
+                return _pipelines.GetGraphicsPrograms(banks.Shader.Vertex, banks.Shader.Pixel, banks.Context.ShaderInterface, banks.Context,
+                    inputs.ExportMapping, inputs.PixelActive, inputs.DepthBound);
+            }
+            catch (Exception)
+            {
+                // A draw the executor skips (a metadata operation, a copy, a resolve) may have
+                // registers the provider rejects; the executor decides, as it does today.
+                return null;
+            }
+        }
+
+        internal ComputeProgram? PrepareComputeProgram(RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator)
+        {
+            if (_pipelines is null || banks.Shader.Compute.Address == 0) return null;
+            try
+            {
+                return _pipelines.GetComputeProgram(banks.Shader.Compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
 
         internal CommandStreamTranslation(ICpuMemory memory, ICommandStreamHost host)
         {
@@ -160,6 +205,7 @@ public static partial class AgcExports
             {
                 _pipelines = new ShaderPipelineCache(_context, pipelineHost, GuestGpu.Current, CreateShaderHeaderRegistry(_context));
                 _executor = new RenderExecutor(renderHost, _pipelines);
+                _renderHost = renderHost;
             }
         }
 
@@ -198,12 +244,59 @@ public static partial class AgcExports
 
         private bool TryRunExecutorDraw(ulong submitId, SubmittedDcbState state, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments)
         {
-            if (_executor is not { } executor)
+            if (_executor is null)
             {
                 return false;
             }
 
             var banks = RequireTypedRegisters(state);
+            GraphicsPrograms? prepared = null;
+            RenderExecutor.DrawProgramInputs preparedInputs = default;
+            if (SnapshotDraws)
+            {
+                banks = Snapshot(banks);
+                prepared = PrepareGraphicsPrograms(banks, out preparedInputs);
+            }
+
+            return TryRunExecutorDraw(submitId, state, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs);
+        }
+
+        // Runs a draw on the executor from the given banks, which a host interpreting ahead
+        // captured when the packet ran, with the programs it prepared from them.
+        internal void ExecuteDraw(ulong submitId, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments,
+            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs)
+        {
+            if (indexed) RecordIndexedDrawState(in indexedArguments);
+            else RecordAutoDrawState(in autoArguments);
+            if (!TryRunExecutorDraw(submitId, RequireCurrent(), banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs))
+                throw _host.Fatal("The command stream has no render executor.");
+        }
+
+        internal void ExecuteDispatch(ulong submitId, RegisterBanks banks, uint endX, uint endY, uint endZ, uint dispatchInitiator, ulong indirectArgumentsAddress,
+            ComputeProgram? prepared)
+        {
+            var state = RequireCurrent();
+            if (_executor is not { } executor) throw _host.Fatal("The command stream has no render executor.");
+            state.FrameDispatchCount++;
+            var executorStarted = DcbParseProfile.Begin();
+            try
+            {
+                executor.Dispatch(submitId, banks, endX, endY, endZ, dispatchInitiator, indirectArgumentsAddress, prepared);
+            }
+            finally
+            {
+                DcbParseProfile.RecordDispatch(executorStarted);
+            }
+        }
+
+        private bool TryRunExecutorDraw(ulong submitId, SubmittedDcbState state, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments,
+            in DrawAutoArguments autoArguments, GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs)
+        {
+            if (_executor is not { } executor)
+            {
+                return false;
+            }
+
             RecordKnownColorTargets(state, banks);
             state.FrameDrawCount++;
             state.SawIndexedDraw |= indexed;
@@ -212,11 +305,11 @@ public static partial class AgcExports
             {
                 if (indexed)
                 {
-                    executor.DrawIndexed(submitId, banks, in indexedArguments);
+                    executor.DrawIndexed(submitId, banks, in indexedArguments, prepared, in preparedInputs);
                 }
                 else
                 {
-                    executor.DrawAuto(submitId, banks, in autoArguments);
+                    executor.DrawAuto(submitId, banks, in autoArguments, prepared, in preparedInputs);
                 }
             }
             finally
@@ -367,11 +460,18 @@ public static partial class AgcExports
             if (_executor is { } executor)
             {
                 var banks = RequireTypedRegisters(state);
+                ComputeProgram? prepared = null;
+                if (SnapshotDraws)
+                {
+                    banks = Snapshot(banks);
+                    if (indirectArgumentsAddress == 0) prepared = PrepareComputeProgram(banks, endX, endY, endZ, dispatchInitiator);
+                }
+
                 state.FrameDispatchCount++;
                 var executorStarted = DcbParseProfile.Begin();
                 try
                 {
-                    executor.Dispatch(submitId, banks, endX, endY, endZ, dispatchInitiator, indirectArgumentsAddress);
+                    executor.Dispatch(submitId, banks, endX, endY, endZ, dispatchInitiator, indirectArgumentsAddress, prepared);
                 }
                 finally
                 {

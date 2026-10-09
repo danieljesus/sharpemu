@@ -181,6 +181,9 @@ internal static class RenderPhaseProfile
     private static long _lastSubmissionTimestamp;
     private static long _submissionCount;
 
+    // Set by a presenter that interprets on a front thread; its line joins the window report.
+    internal static Func<string>? FrontReport;
+
     internal static void RecordSubmissionArrival()
     {
         if (!FrameTraceEnabled) return;
@@ -488,9 +491,12 @@ internal static class RenderPhaseProfile
             $"[PERF][RENDER_ALLOC] window_s={seconds:F1} frames={frames} total_kb={allocations.Sum(part => part.Bytes) / 1024} " +
             string.Join(" ", allocations.Select(part => $"{part.Phase}={part.Bytes / 1024}kb")));
 
+        if (FrontReport?.Invoke() is { Length: > 0 } frontReport) Console.Error.WriteLine(frontReport);
         ReportImageUploads();
         BufferUploadProfile.Report();
         Console.Error.WriteLine(SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.TakeReport());
+        Console.Error.WriteLine(FormattableString.Invariant(
+            $"[PERF][PREPARED_PROGRAMS] used={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsUsed, 0)} rejected={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsRejected, 0)} dynamic_state_rebuilt={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedDynamicStateMismatches, 0)}"));
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.GuestBufferCache.TakeAsyncReadbackReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeLookupReport());
         SharpEmu.ShaderCompiler.Resources.ResourceMaterializationProfile.WriteReport();

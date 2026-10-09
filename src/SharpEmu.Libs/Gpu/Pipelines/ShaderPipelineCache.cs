@@ -30,6 +30,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private readonly GraphicsPipelineKey _graphicsLookup = new() { Rendering = new(), VertexInput = new(), StaticParameters = new() };
     private readonly Dictionary<ComputePipelineKey, PipelineHandle> _computePipelines = new();
     private readonly object _gate = new();
+    // The pipeline tables have their own gate: a host that prepares programs on another
+    // thread holds the program gate through a materialization while this thread looks a
+    // pipeline up.
+    private readonly object _pipelineGate = new();
+    // Called before the masked-copy adaptation writes guest memory.
+    internal static Action? BeforeGuestWrite;
     // One per stage, refilled under the gate for every lookup.
     private readonly StageCompileOptions _vertexOptions = new();
     private readonly StageCompileOptions _pixelOptions = new();
@@ -486,7 +492,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderProgram pixelProgram)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineCreation);
-        lock (_gate)
+        lock (_pipelineGate)
         {
             var lookup = _graphicsLookup;
             FillStaticState(lookup.Rendering, lookup.VertexInput, lookup.StaticParameters,
@@ -740,7 +746,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         var stage = input.Stage.Program ?? throw SubmissionScheduler.Fatal("The compute stage has no program.");
         var key = new ComputePipelineKey(program.Id);
-        lock (_gate)
+        lock (_pipelineGate)
         {
             if (_computePipelines.TryGetValue(key, out var cached))
             {
@@ -770,7 +776,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         var stage = input.Stage.Program ?? throw SubmissionScheduler.Fatal("The compute stage has no program.");
         var key = new ComputePipelineKey(program.Id);
-        lock (_gate)
+        lock (_pipelineGate)
         {
             if (_computePipelines.TryGetValue(key, out var cached))
             {

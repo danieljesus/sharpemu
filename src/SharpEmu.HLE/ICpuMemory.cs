@@ -36,5 +36,9 @@ public interface ICpuMemory
     // True when the whole range is mapped guest memory; no bytes are copied.
     bool CanRead(ulong address, ulong size) => false;
 
+    // Changes whenever a mapping or protection changes; long.MinValue when the memory does not
+    // keep one, in which case nothing derived from CanRead may be memoised.
+    long MappingGeneration => long.MinValue;
+
     string DescribeReadRange(ulong address, ulong size) => "Memory mapping details are unavailable.";
 }

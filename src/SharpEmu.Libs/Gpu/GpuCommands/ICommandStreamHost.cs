@@ -151,5 +151,20 @@ public interface ICommandStreamHost
     // Called when a queue reset packet clears the processor.
     void OnQueueReset(int queueId);
 
+    // Writes guest memory in stream order. A host that interprets ahead of its executor
+    // applies it after the work queued before it, so the guest cannot reuse memory a queued
+    // draw still has to capture; the interpreter answers its own last write itself.
+    void WriteGuest(ulong address, ReadOnlySpan<byte> source) => WriteCommandData(address, source);
+
+    // Writes guest memory the stream reads back at once (write-data, copies, dumps): a host
+    // that interprets ahead first lets the queued work capture what the write replaces.
+    void WriteGuestNow(ulong address, ReadOnlySpan<byte> source) => WriteGuest(address, source);
+
+    // Runs work once the flush just requested has run on the host's queue.
+    void RunAfterFlush(Action work) => work();
+
+    // Runs an ordered control change on the host's queue.
+    void RunControlBarrier(Action work) => work();
+
     Exception Fatal(string message);
 }

@@ -292,7 +292,7 @@ public sealed partial class RenderExecutor
             _host.BindIndexBuffer(indexBuffer.Binding, indexBuffer.Type);
         }
 
-        _host.SetDynamicState(BuildDynamicState(context, in state));
+        _host.SetDynamicState(DynamicStateOf(context, ref state));
         if (setAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x400);

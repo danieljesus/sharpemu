@@ -117,6 +117,8 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             try
             {
+                // The front stops first; the drain below then runs its remaining slices here.
+                StopFrontThread();
                 // Drain accepted submissions before closing the relay.
                 // Cancel blocked submissions if a full retry cycle makes no progress.
                 _commandStream.StopAccepting();

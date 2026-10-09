@@ -34,11 +34,11 @@ public sealed partial class GpuCommandInterpreter
 
         if (writeOneAddress)
         {
-            WriteDword(destination, source[^1]);
+            WriteDwordNow(destination, source[^1]);
             return;
         }
 
-        WriteBytes(destination, MemoryMarshal.AsBytes(source));
+        WriteBytesNow(destination, MemoryMarshal.AsBytes(source));
     }
 
     internal void WriteReferenceClock(ulong destination, uint byteCount)
@@ -51,11 +51,11 @@ public sealed partial class GpuCommandInterpreter
         var clock = EndOfPipe.ReadReferenceClock();
         if (byteCount == sizeof(uint))
         {
-            WriteDword(destination, (uint)clock);
+            WriteDwordNow(destination, (uint)clock);
         }
         else
         {
-            WriteQword(destination, clock);
+            WriteQwordNow(destination, clock);
         }
     }
 
@@ -150,7 +150,7 @@ public sealed partial class GpuCommandInterpreter
         source.CopyTo(_constantRam.AsSpan((int)(byteOffset / 4)));
 
     internal void DumpConstantRam(ulong destination, uint byteOffset, uint dwordCount) =>
-        WriteBytes(destination, MemoryMarshal.AsBytes(_constantRam.AsSpan((int)(byteOffset / 4), (int)dwordCount)));
+        WriteBytesNow(destination, MemoryMarshal.AsBytes(_constantRam.AsSpan((int)(byteOffset / 4), (int)dwordCount)));
 
     internal uint WriteDataPacket(in PacketContext packet, ReadOnlySpan<uint> payload)
     {
@@ -257,7 +257,7 @@ public sealed partial class GpuCommandInterpreter
         if (dmaSource == 2 && byteCount == 8)
         {
             // An 8-byte immediate is a plain label store, not a 32-bit fill.
-            WriteQword(destination, source);
+            WriteQwordNow(destination, source);
             return 5;
         }
 
@@ -287,7 +287,7 @@ public sealed partial class GpuCommandInterpreter
             case 5:
                 if (byteCount == 8)
                 {
-                    WriteQword(destination, source);
+                    WriteQwordNow(destination, source);
                     return;
                 }
 
@@ -318,11 +318,11 @@ public sealed partial class GpuCommandInterpreter
         var data = usePfp ? AtomicReturnPfpData : AtomicReturnMeData;
         if (byteCount == 8)
         {
-            WriteQword(destination, data);
+            WriteQwordNow(destination, data);
         }
         else
         {
-            WriteDword(destination, (uint)data);
+            WriteDwordNow(destination, (uint)data);
         }
     }
 
@@ -371,10 +371,10 @@ public sealed partial class GpuCommandInterpreter
         {
             var report = new byte[bufferSize];
             var hasCounters = MipStatistics.Shared.TryWriteReport(report);
-            WriteBytes(destination, report);
+            WriteBytesNow(destination, report);
             if (bufferSize >= sizeof(uint))
             {
-                WriteDword(destination, hasCounters ? MipStatistics.FirstCounterOffset : LodStatsWithoutCounters);
+                WriteDwordNow(destination, hasCounters ? MipStatistics.FirstCounterOffset : LodStatsWithoutCounters);
             }
         }
 

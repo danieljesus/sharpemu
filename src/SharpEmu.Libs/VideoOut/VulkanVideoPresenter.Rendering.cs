@@ -213,7 +213,42 @@ internal static unsafe partial class VulkanVideoPresenter
         public ulong ClampMappedSize(ulong address, ulong size)
             => ClampMappedSize(address, size, null, -1);
 
+        // The same ranges are checked several times per frame (16,900 checks for 3,100 ranges in
+        // GTA V); the answer only changes with the guest mapping, so it is kept per frame.
+        private Dictionary<(ulong Address, ulong Size), ulong>? _mappedSizes;
+        private long _mappedSizesGeneration = long.MinValue;
+
+        private void ResetMappedSizes()
+        {
+            _mappedSizes?.Clear();
+            _mappedSizesGeneration = _guestMemory.MappingGeneration;
+        }
+
         private ulong ClampMappedSize(ulong address, ulong size, PreparedStageBindings? prepared, int bufferIndex)
+        {
+            var generation = _guestMemory.MappingGeneration;
+            if (generation == long.MinValue)
+            {
+                return ClampMappedSizeCore(address, size, prepared, bufferIndex);
+            }
+
+            if (generation != _mappedSizesGeneration)
+            {
+                ResetMappedSizes();
+            }
+
+            var sizes = _mappedSizes ??= new Dictionary<(ulong Address, ulong Size), ulong>();
+            if (sizes.TryGetValue((address, size), out var mapped))
+            {
+                return mapped;
+            }
+
+            mapped = ClampMappedSizeCore(address, size, prepared, bufferIndex);
+            sizes[(address, size)] = mapped;
+            return mapped;
+        }
+
+        private ulong ClampMappedSizeCore(ulong address, ulong size, PreparedStageBindings? prepared, int bufferIndex)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferMappedRangeValidation);
             if (address == 0 || size == 0 || size > ulong.MaxValue - address || !_guestMemory.CanRead(address, 1))

@@ -26,15 +26,26 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool LegacyShaderGroups =
             Environment.GetEnvironmentVariable("SHARPEMU_VK_PIPELINE_CACHE_LEGACY_SHARDS") == "1";
 
+        private bool TryGetModuleIdentity(ulong module, out string identity)
+        {
+            lock (_shaderModuleGate)
+            {
+                return _shaderModuleCacheIdentities.TryGetValue(module, out identity!);
+            }
+        }
+
         private string ComputeCacheKey(ulong guestHash, ulong module) =>
-            !LegacyShaderGroups && _shaderModuleCacheIdentities.TryGetValue(module, out var identity)
+            !LegacyShaderGroups && TryGetModuleIdentity(module, out var identity)
                 ? $"c2-{identity}" : $"c-{guestHash:X16}";
 
         private string GraphicsCacheKey(ulong vertexHash, ulong pixelHash, ulong vertexModule, ulong pixelModule)
         {
-            if (!LegacyShaderGroups && _shaderModuleCacheIdentities.TryGetValue(vertexModule, out var vertex) &&
-                (pixelModule == 0 || _shaderModuleCacheIdentities.ContainsKey(pixelModule)))
-                return $"g2-{vertex}-{(pixelModule == 0 ? "none" : _shaderModuleCacheIdentities[pixelModule])}";
+            if (!LegacyShaderGroups && TryGetModuleIdentity(vertexModule, out var vertex))
+            {
+                if (pixelModule == 0) return $"g2-{vertex}-none";
+                if (TryGetModuleIdentity(pixelModule, out var pixel)) return $"g2-{vertex}-{pixel}";
+            }
+
             return $"g-{vertexHash:X16}-{pixelHash:X16}";
         }
 

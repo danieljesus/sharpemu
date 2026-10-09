@@ -432,7 +432,7 @@ public sealed class CommandStreamQueue
         {
             try
             {
-                control.Work();
+                _host.RunControlBarrier(control.Work);
             }
             catch (Exception exception)
             {
@@ -492,12 +492,6 @@ public sealed class CommandStreamQueue
             }
             else
             {
-                if (submission.Kind == CommandSubmissionKind.FrameBoundary)
-                {
-                    _pendingBoundaries--;
-                    _doneCount++;
-                }
-
                 foreach (var queue in _queues)
                 {
                     if (queue.First is { } head)
@@ -530,6 +524,8 @@ public sealed class CommandStreamQueue
         {
             SlicesRun++;
             _host.Flush();
+            // The boundary counts as done once that flush ran on the host's queue.
+            _host.RunAfterFlush(CompleteFrameBoundary);
             return true;
         }
 
@@ -569,6 +565,16 @@ public sealed class CommandStreamQueue
         }
 
         return complete;
+    }
+
+    private void CompleteFrameBoundary()
+    {
+        lock (_gate)
+        {
+            _pendingBoundaries--;
+            _doneCount++;
+            Monitor.PulseAll(_gate);
+        }
     }
 
     public void StopAccepting()

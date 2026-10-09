@@ -129,10 +129,103 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool NoSyncTableReads = Environment.GetEnvironmentVariable("SHARPEMU_NO_SYNC_TABLE_READS") == "1"; // [local]
         internal static readonly HashSet<ulong> WatchedBounds = new(); // [local]
         private int _watchLogs; // [local]
+        // On the front thread the buffer and image caches belong to the render thread, so the
+        // readers take guest memory as it is: a word the GPU is still writing is not observed
+        // ([TEMP] measured none in GTA V; the cache then rebuilds the next time).
+        // [local] A front thread that interprets ahead cannot see dirty state the render thread
+        // has not recorded yet. A range the GPU has ever written is read on the render thread,
+        // in stream order and through the synchronized path, so planning never uses stale data.
+        [ThreadStatic] private static bool _backReading;
+        private static readonly bool FrontSyncedReads = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SYNCED_READS") != "0";
+        internal long FrontSyncedReadCount;
+
+        internal bool NeedsFrontCommandSync(ulong address, ulong size) => NeedsBackRead(address, size);
+
+        // [local] Only the front thread may take the unsynchronized readers; the render thread
+        // also runs with a front attached and must keep the synchronized ones.
+        private bool OnFrontThread => _frontThread is { } front && front.ManagedThreadId == Environment.CurrentManagedThreadId;
+
+        private bool NeedsBackRead(ulong address, ulong size) =>
+            FrontSyncedReads && size != 0 && _bufferCache.EverGpuWritten(address, size);
+
+        private T RunBackRead<T>(Func<T> read)
+        {
+            Interlocked.Increment(ref FrontSyncedReadCount);
+            return _back!.Run(() =>
+            {
+                _backReading = true;
+                try
+                {
+                    return read();
+                }
+                finally
+                {
+                    _backReading = false;
+                }
+            });
+        }
+
+        private bool TryReadGuestWordDirect(ulong address, out uint word)
+        {
+            // A page read before through its alias: no mapping check, no copy.
+            if (IsCleanReadPage(address, sizeof(uint)) && TryGetAliasPointer(address, sizeof(uint), out var alias))
+            {
+                word = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<uint>(alias);
+                return true;
+            }
+
+            word = 0;
+            if (!_guestMemory.CanRead(address, sizeof(uint)))
+            {
+                return false;
+            }
+
+            Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            if (!_guestMemory.TryRead(address, bytes))
+            {
+                return false;
+            }
+
+            NoteFrontReadPage(address, sizeof(uint));
+            word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            return true;
+        }
+
+        // The front's clean-page note: the buffer cache's dirty state belongs to the render
+        // thread, so only the mapping is checked.
+        private void NoteFrontReadPage(ulong address, ulong size)
+        {
+            if (!TryGetCleanReadPage(address, size, out var page, out var slot) || !_guestMemory.CanRead(page, CleanReadPageBytes))
+            {
+                return;
+            }
+
+            var pages = _cleanReadPages ??= new CleanReadPages();
+            if (pages.Tags[slot] != page + 1)
+            {
+                pages.Tags[slot] = page + 1;
+                pages.Aliases[slot] = 0;
+                pages.Snapshots[slot] = null;
+            }
+
+            pages.Versions[slot] = _bufferCache.GpuModifiedVersion;
+        }
 
         public bool TryReadGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
+            if (OnFrontThread)
+            {
+                if (NeedsBackRead(address, sizeof(uint)))
+                {
+                    var (ok, value) = RunBackRead(() => (TryReadGuestWord(address, out var synced), synced));
+                    word = value;
+                    return ok;
+                }
+
+                return TryReadGuestWordDirect(address, out word);
+            }
+
             word = 0;
             var synchronized = false;
             if (IsCleanReadPage(address, sizeof(uint)))
@@ -235,6 +328,18 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
+            if (OnFrontThread)
+            {
+                if (NeedsBackRead(address, sizeof(uint)))
+                {
+                    var (ok, value) = RunBackRead(() => (TryReadGuestWord(address, out var clean), clean)); // the front always answered clean reads; now with the synced value
+                    word = value;
+                    return ok;
+                }
+
+                return TryReadGuestWordDirect(address, out word);
+            }
+
             word = 0;
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
@@ -262,6 +367,31 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
             var size = (ulong)destination.Length;
+            if (OnFrontThread && NeedsBackRead(address, size))
+            {
+                var buffer = new byte[destination.Length];
+                var ok = RunBackRead(() => TryReadResidentGuestBytes(address, buffer, false));
+                buffer.CopyTo(destination);
+                return ok;
+            }
+
+            if (OnFrontThread)
+            {
+                if (IsCleanReadPage(address, size) && TryGetAliasPointer(address, size, out var frontAlias))
+                {
+                    new ReadOnlySpan<byte>(frontAlias, destination.Length).CopyTo(destination);
+                    return true;
+                }
+
+                if (!_guestMemory.CanRead(address, size) || !_guestMemory.TryRead(address, destination))
+                {
+                    return false;
+                }
+
+                NoteFrontReadPage(address, size);
+                return true;
+            }
+
             if (clean || !IsCleanReadPage(address, size))
             {
                 if (!_guestMemory.CanRead(address, size) ||
@@ -358,15 +488,23 @@ internal static unsafe partial class VulkanVideoPresenter
             pages.Versions[slot] = version;
         }
 
+        // The front thread creates modules while the render thread creates pipelines from them.
+        // Static: a test harness may build the presenter without running its initializers.
+        private static readonly object _shaderModuleGate = new();
+
         public ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCompile);
             var module = CreateShaderModule(shader.Payload);
             SetDebugName(ObjectType.ShaderModule, module.Handle, $"SharpEmu {stage} 0x{hash:X16}");
-            _shaderModules.Add(programId, module);
-            _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
             var identity = VulkanPipelineCacheStorage.CompiledShaderIdentity(shader.Payload);
-            _shaderModuleCacheIdentities[module.Handle] = identity;
+            lock (_shaderModuleGate)
+            {
+                _shaderModules.Add(programId, module);
+                _shaderModuleSpirvBytes[module.Handle] = shader.Payload.Length;
+                _shaderModuleCacheIdentities[module.Handle] = identity;
+            }
+
             if (stage == ShaderStage.Compute)
             {
                 NoteRuntimeComputeModule(identity);
@@ -380,8 +518,13 @@ internal static unsafe partial class VulkanVideoPresenter
         // the SPIR-V size that produced it.
         private const long SlowPipelineCreationMilliseconds = 250;
 
-        private int SpirvBytesOf(ulong moduleHandle) =>
-            _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
+        private int SpirvBytesOf(ulong moduleHandle)
+        {
+            lock (_shaderModuleGate)
+            {
+                return _shaderModuleSpirvBytes.TryGetValue(moduleHandle, out var bytes) ? bytes : -1;
+            }
+        }
 
         private void ReportPipelineCreation(long elapsedMilliseconds, string kind, string stages, string spirv)
         {
