@@ -1158,6 +1158,19 @@ public static partial class Gen5SpirvTranslator
                 ? byteAddress
                 : IAdd(byteAddress, UInt(offsetBytes));
             var dwordIndex = ShiftRightLogical(address, UInt(2));
+            if (_subgroupInvocationIdInput != 0)
+            {
+                // Scratch is addressed through the wave's backing layout, which interleaves the
+                // lanes per dword (element k of lane L at byte k * waveSize * 4 + L * 4; LLVM's
+                // AMDGPUUsage "private address to backing memory address"). A byte address whose
+                // lane field is this lane maps to element k of the lane's private storage; other
+                // addresses keep the per-lane linear mapping.
+                var lane = GuestWaveLane();
+                var laneField = BitwiseAnd(dwordIndex, UInt(_waveLaneCount - 1));
+                var interleaved = _module.AddInstruction(SpirvOp.IEqual, _boolType, laneField, lane);
+                var shift = _waveLaneCount == 64 ? 6u : 5u;
+                dwordIndex = SelectU(interleaved, ShiftRightLogical(dwordIndex, UInt(shift)), dwordIndex);
+            }
             if (_scratchDwordCount > 1)
             {
                 dwordIndex = _module.AddInstruction(
