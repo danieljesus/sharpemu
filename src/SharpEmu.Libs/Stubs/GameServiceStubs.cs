@@ -64,14 +64,6 @@ public static class GameServiceStubs
         Target = Generation.Gen5, LibraryName = "libSceNpGameIntent")]
     public static int NpGameIntentTerminate(CpuContext ctx) => Ok(ctx);
 
-    [SysAbiExport(Nid = "jqb7HntFQFc", ExportName = "sceWebBrowserDialogInitialize",
-        Target = Generation.Gen5, LibraryName = "libSceWebBrowserDialog")]
-    public static int WebBrowserDialogInitialize(CpuContext ctx) => Ok(ctx);
-
-    [SysAbiExport(Nid = "ocHtyBwHfys", ExportName = "sceWebBrowserDialogTerminate",
-        Target = Generation.Gen5, LibraryName = "libSceWebBrowserDialog")]
-    public static int WebBrowserDialogTerminate(CpuContext ctx) => Ok(ctx);
-
     [SysAbiExport(Nid = "mlYGfmqE3fQ", ExportName = "sceSigninDialogInitialize",
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libSceSigninDialog")]
     public static int SigninDialogInitialize(CpuContext ctx) => Ok(ctx);
@@ -113,6 +105,14 @@ public static class GameServiceStubs
         Target = Generation.Gen5, LibraryName = "libSceTextToSpeech2")]
     public static int TextToSpeech2Open(CpuContext ctx) =>
         ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_IMPLEMENTED);
+
+    [SysAbiExport(Nid = "2jiIxUmcsGo", ExportName = "sceTextToSpeech2Cancel",
+        Target = Generation.Gen5, LibraryName = "libSceTextToSpeech2")]
+    public static int TextToSpeech2Cancel(CpuContext ctx) => Ok(ctx);
+
+    [SysAbiExport(Nid = "08JSg9p6bgQ", ExportName = "sceTextToSpeech2GetSpeechStatus",
+        Target = Generation.Gen5, LibraryName = "libSceTextToSpeech2")]
+    public static int TextToSpeech2GetSpeechStatus(CpuContext ctx) => Ok(ctx);
 
     [SysAbiExport(Nid = "kvYEw2lBndk", ExportName = "sceGameLiveStreamingInitialize",
         Target = Generation.Gen5, LibraryName = "libSceGameLiveStreaming")]

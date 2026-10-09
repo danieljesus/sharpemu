@@ -164,8 +164,8 @@ internal static unsafe partial class VulkanVideoPresenter
             bool execGuardElision)
         {
             if (!ShaderProgramCache.TryCompilePrewarm(
-                    record, code, compiler, sharedInt64Atomics, float16Conversions, execGuardElision, out var compiled, out var layout,
-                    out var error))
+                    record, code, compiler, sharedInt64Atomics, float16Conversions, execGuardElision,
+                    _supportsShaderSignedZeroInfNanPreserveFloat32, out var compiled, out var layout, out var error))
             {
                 NoteShaderPrewarmFailure(record, error);
                 return;

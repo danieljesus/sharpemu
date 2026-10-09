@@ -45,6 +45,7 @@ internal interface IShaderPipelineHost
     // The device supports native 16-bit float conversions with their float controls
     // (ShaderCompileRequest.SupportsFloat16Conversions).
     bool Float16ConversionsEnabled => false;
+    bool ShaderSignedZeroInfNanPreserveFloat32Supported => false;
     bool ExecGuardElisionEnabled => true;
     ShaderPrewarmList? ShaderPrewarm => null;
     bool PerVertexPixelInputsSupported => true;

@@ -178,6 +178,7 @@ public sealed class ShaderCompileRequest
     // conversions use OpFConvert under those execution modes instead of the explicit
     // integer sequences, which are bit-exact but about forty instructions each.
     public bool SupportsFloat16Conversions { get; init; }
+    public bool ShaderSignedZeroInfNanPreserveFloat32Supported { get; init; }
     public Gen5ComputeSystemRegisters? ComputeSystemRegisters { get; init; }
 
     public IReadOnlyList<Gen5PixelOutputBinding> PixelOutputs { get; init; } = [];
