@@ -41,9 +41,14 @@ public sealed partial class GpuCommandInterpreter
 
         if (!satisfied)
         {
+            if (WaitProbe && (++_waitMisses & 0x7FF) == 0) // [local]
+                Console.Error.WriteLine($"[WAIT_MEM] misses={_waitMisses} address=0x{address:X} value=0x{value:X} reference=0x{reference:X} mask=0x{mask:X} compare={compareFunction} queue_wait_op=0x{waitOperation:X}");
             Suspend();
         }
     }
+
+    private static readonly bool WaitProbe = Environment.GetEnvironmentVariable("SHARPEMU_WAIT_MEM_PROBE") == "1"; // [local]
+    private long _waitMisses;
 
     // The wait bit is PredicationZPassWaitOp: 0 (kWaitForQueryResults) stalls the command
     // processor until the results arrive, 1 (kDoNotPredicateIfQueryResultsNotReady) never
