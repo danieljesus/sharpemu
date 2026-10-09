@@ -116,7 +116,10 @@ public static partial class Gen5SpirvTranslator
             _localSizeY = Math.Max(request.LocalSizeY, 1);
             _localSizeZ = Math.Max(request.LocalSizeZ, 1);
             _physicalAxisOfLogical = ComputeWorkgroupAxisOrder(_localSizeX, _localSizeY, _localSizeZ);
-            _emulateWave64 = _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 && (ulong)_localSizeX * _localSizeY * _localSizeZ == 64;
+            var workgroupSize = (ulong)_localSizeX * _localSizeY * _localSizeZ;
+            _emulateWave64 = _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 &&
+                (workgroupSize == 64 ||
+                 (workgroupSize % 64 == 0 && workgroupSize <= 1024 && ReadsAFixedLane(request.Program)));
             _requiredVertexOutputCount = request.RequiredVertexOutputCount;
             _pixelInputEnable = request.PixelInputEnable;
             _pixelInputAddress = request.PixelInputAddress;
@@ -129,6 +132,18 @@ public static partial class Gen5SpirvTranslator
             }
 
         }
+
+        // A workgroup of several wave64 waves runs each 32-lane half as its own host subgroup,
+        // which serves every lane-local operation and the waterfalls over s_ff1(EXEC), whose
+        // lanes stay in their half. A V_READLANE of a fixed lane (a scan's carry from lane 31,
+        // a wave total from lane 63) reads the other half too, so only such programs pay for
+        // the bridge between the halves.
+        private static bool ReadsAFixedLane(Gen5ShaderProgram program) =>
+            program.Instructions.Any(static instruction =>
+                instruction.Opcode == "VReadlaneB32" &&
+                instruction.Sources.Count > 1 &&
+                instruction.Sources[1] is { Kind: Gen5OperandKind.LiteralConstant } or
+                    { Kind: Gen5OperandKind.EncodedConstant, Value: >= 128 and <= 208 });
 
         // ---- declarations ----
 

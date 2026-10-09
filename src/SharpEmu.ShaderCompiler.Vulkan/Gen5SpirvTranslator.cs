@@ -19,6 +19,9 @@ public static partial class Gen5SpirvTranslator
     private const uint RdnaWaveLaneCount = 32;
     private const uint Wave64ExchangeSlotCount = 4;
     private const uint Wave64ExchangeDwordCount = Wave64ExchangeSlotCount * 2;
+    // A workgroup of several guest waves pairs the two halves of each wave through two
+    // arrival counters after the wave's exchange slots, instead of a workgroup barrier.
+    private const uint Wave64ArrivalDwordCount = 2;
 
     internal static SpirvImageFormat DecodeStorageImageFormat(
         uint dataFormat,
@@ -198,6 +201,12 @@ public static partial class Gen5SpirvTranslator
         private uint _wave64Exchange;
         private uint _wave64ExchangeElementPointer;
         private uint _wave64ExchangeOffset;
+        // Multi-wave groups: the rendezvous count so far, the running lanes of each half and
+        // the bounded wait of the current rendezvous.
+        private uint _wave64Arrivals;
+        private uint _wave64HalfLanes;
+        private uint _wave64OtherHalfLanes;
+        private uint _wave64Spins;
         private uint _wave64ExchangeParity;
         private Ir.Gen5Wave64HalfMaskPlan? _halfMaskPlan;
         private uint? _emittingPc;
@@ -628,6 +637,17 @@ public static partial class Gen5SpirvTranslator
                 _wave64ExchangeParity = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
                 _interfaces.Add(_wave64ExchangeParity);
                 _module.AddName(_wave64ExchangeParity, "wave64ExchangeParity");
+                if (Wave64WavesPerWorkgroup > 1)
+                {
+                    _wave64Arrivals = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                    _wave64HalfLanes = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                    _wave64OtherHalfLanes = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                    _wave64Spins = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                    _interfaces.Add(_wave64Arrivals);
+                    _interfaces.Add(_wave64HalfLanes);
+                    _interfaces.Add(_wave64OtherHalfLanes);
+                    _interfaces.Add(_wave64Spins);
+                }
             }
             if (_maxDispatcherSteps > 0)
             {
@@ -712,17 +732,20 @@ public static partial class Gen5SpirvTranslator
             // bounds guest LDS accesses to this fixed allocation; keeping the
             // bridge inside it preserves the host limit and still provides the
             // cross-subgroup rendezvous needed to model one 64-lane guest wave.
+            // Every guest wave of the workgroup has its own slots: the half leaders of two
+            // waves would otherwise overwrite each other's words.
+            var exchangeDwords = Wave64ExchangeStride * Wave64WavesPerWorkgroup;
             if (_lds != 0)
             {
                 _wave64Exchange = _lds;
                 _wave64ExchangeElementPointer = _ldsElementPointer;
-                _wave64ExchangeOffset = _ldsDwordMask + 1 < LdsDwordCount
+                _wave64ExchangeOffset = _ldsDwordMask + 1 + exchangeDwords <= LdsDwordCount
                     ? _ldsDwordMask + 1
-                    : LdsDwordCount - Wave64ExchangeDwordCount;
+                    : LdsDwordCount - exchangeDwords;
                 return;
             }
 
-            var exchangeArrayType = _module.TypeArray(_uintType, Wave64ExchangeDwordCount);
+            var exchangeArrayType = _module.TypeArray(_uintType, exchangeDwords);
             _wave64ExchangeElementPointer = _module.TypePointer(SpirvStorageClass.Workgroup, _uintType);
             _wave64Exchange = _module.AddGlobalVariable(
                 _module.TypePointer(SpirvStorageClass.Workgroup, exchangeArrayType),
@@ -733,6 +756,29 @@ public static partial class Gen5SpirvTranslator
         }
 
         private bool UsesWave64Exchange() => _emulateWave64 && UsesSubgroupOperations();
+
+        // Guest waves per workgroup: compute groups hold several; graphics stages model one.
+        private uint Wave64WavesPerWorkgroup =>
+            _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64
+                ? Math.Max(1u, (checked(_localSizeX * _localSizeY * _localSizeZ) + 63) / 64)
+                : 1u;
+
+        // Dwords per guest wave in the exchange area: the slots, then the arrival counters.
+        private uint Wave64ExchangeStride =>
+            Wave64WavesPerWorkgroup > 1 ? Wave64ExchangeDwordCount + Wave64ArrivalDwordCount : Wave64ExchangeDwordCount;
+
+        // The exchange slots of this invocation's guest wave.
+        private uint Wave64ExchangeBase()
+        {
+            var offset = UInt(_wave64ExchangeOffset);
+            if (_waveLaneCount == 64 && _localInvocationIndexInput != 0 && Wave64WavesPerWorkgroup > 1)
+            {
+                var wave = ShiftRightLogical(Load(_uintType, _localInvocationIndexInput), UInt(6));
+                offset = IAdd(offset, _module.AddInstruction(SpirvOp.IMul, _uintType, wave, UInt(Wave64ExchangeStride)));
+            }
+
+            return offset;
+        }
 
         private uint ComputeLdsGuestDwordCount()
         {
@@ -764,8 +810,9 @@ public static partial class Gen5SpirvTranslator
                 ? ComputeLdsGuestDwordCount()
                 : PrivateLdsDwordCount;
             _ldsDwordMask = dwordCount - 1;
-            var arrayDwordCount = UsesWave64Exchange() && dwordCount < LdsDwordCount
-                ? dwordCount + Wave64ExchangeDwordCount
+            var exchangeDwords = Wave64ExchangeStride * Wave64WavesPerWorkgroup;
+            var arrayDwordCount = UsesWave64Exchange() && dwordCount + exchangeDwords <= LdsDwordCount
+                ? dwordCount + exchangeDwords
                 : dwordCount;
 
             var ldsArrayType = _module.TypeArray(_uintType, arrayDwordCount);
@@ -8035,7 +8082,8 @@ public static partial class Gen5SpirvTranslator
 
             var lane = GuestWaveLane();
             var half = ShiftRightLogical(lane, UInt(5));
-            var baseOffset = UInt(_wave64ExchangeOffset);
+            var baseOffset = Wave64ExchangeBase();
+            var multiWave = Wave64WavesPerWorkgroup > 1;
             EmitConditional(IsHalfWaveLeader(lane), () =>
             {
                 for (uint parity = 0; parity < 2; parity++)
@@ -8043,8 +8091,57 @@ public static partial class Gen5SpirvTranslator
                     var exchange = IAdd(baseOffset, UInt(parity * Wave64ExchangeSlotCount));
                     Store(Wave64ExchangePointer(exchange, half), UInt(0));
                 }
+
+                if (multiWave)
+                {
+                    Store(Wave64ExchangePointer(baseOffset, IAdd(UInt(Wave64ExchangeDwordCount), half)), UInt(0));
+                }
             });
-            EmitWave64Barrier();
+            if (!multiWave)
+            {
+                EmitWave64Barrier();
+                return;
+            }
+
+            // Every invocation runs the entry, so this is the one rendezvous a workgroup barrier
+            // can serve. Later ones pair only the two halves of a wave: the waves of a group
+            // take different paths between the guest's own barriers.
+            var (ownLanes, otherLanes) = Wave64HalfLaneCounts(half);
+            Store(_wave64HalfLanes, ownLanes);
+            Store(_wave64OtherHalfLanes, otherLanes);
+            var workgroup = UInt(2);
+            _module.AddStatement(SpirvOp.ControlBarrier, workgroup, workgroup, UInt(0x108));
+        }
+
+        // The invocations of each half of this guest wave that run the program. A one-dimensional
+        // dispatch runs a prefix of its threads; other shapes end on whole groups.
+        private (uint Own, uint Other) Wave64HalfLaneCounts(uint half)
+        {
+            var full = UInt(32);
+            if (_localSizeY != 1 || _localSizeZ != 1 || _localInvocationIndexInput == 0 || _workGroupIdInput == 0)
+            {
+                return (full, full);
+            }
+
+            var localIndex = Load(_uintType, _localInvocationIndexInput);
+            var waveStart = BitwiseAnd(localIndex, UInt(~63u));
+            var groupX = _module.AddInstruction(
+                SpirvOp.CompositeExtract, _uintType, Load(_uvec3Type, _workGroupIdInput), (uint)_physicalAxisOfLogical[0]);
+            var globalWaveStart = IAdd(_module.AddInstruction(SpirvOp.IMul, _uintType, groupX, UInt(_localSizeX)), waveStart);
+            var limit = ComputeThreadLimit(0);
+            var remaining = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, limit, globalWaveStart),
+                _module.AddInstruction(SpirvOp.ISub, _uintType, limit, globalWaveStart), UInt(0));
+            var lower = Ext(38, _uintType, remaining, full);
+            var upperRemaining = _module.AddInstruction(
+                SpirvOp.Select, _uintType,
+                _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, remaining, full),
+                _module.AddInstruction(SpirvOp.ISub, _uintType, remaining, full), UInt(0));
+            var upper = Ext(38, _uintType, upperRemaining, full);
+            var isUpper = _module.AddInstruction(SpirvOp.IEqual, _boolType, half, UInt(1));
+            return (_module.AddInstruction(SpirvOp.Select, _uintType, isUpper, upper, lower),
+                _module.AddInstruction(SpirvOp.Select, _uintType, isUpper, lower, upper));
         }
 
         private uint GuestWaveLane()
@@ -8232,7 +8329,7 @@ public static partial class Gen5SpirvTranslator
             var parity = Load(_uintType, _wave64ExchangeParity);
             Store(_wave64ExchangeParity, BitwiseXor(parity, UInt(1)));
             return IAdd(
-                UInt(_wave64ExchangeOffset),
+                Wave64ExchangeBase(),
                 _module.AddInstruction(SpirvOp.IMul, _uintType, parity, UInt(Wave64ExchangeSlotCount)));
         }
 
@@ -8318,11 +8415,63 @@ public static partial class Gen5SpirvTranslator
         private void EmitWave64Barrier()
         {
             var workgroup = UInt(2);
+            if (Wave64WavesPerWorkgroup > 1 && _wave64Arrivals != 0)
+            {
+                EmitWave64HalfRendezvous();
+                return;
+            }
+
             _module.AddStatement(
                 SpirvOp.ControlBarrier,
                 workgroup,
                 workgroup,
                 UInt(0x108));
+        }
+
+        // The two halves of one guest wave meet without the other waves of the group: each
+        // running invocation counts its arrival on its half's counter, then waits until both
+        // counters hold every running lane of the half for each rendezvous so far. Both halves
+        // of a wave take the same path, so they meet the same rendezvous in the same order.
+        // The wait is bounded so that a mismatch degrades a result instead of hanging the device.
+        private void EmitWave64HalfRendezvous()
+        {
+            var workgroup = UInt(2);
+            var lane = GuestWaveLane();
+            var half = ShiftRightLogical(lane, UInt(5));
+            var baseOffset = Wave64ExchangeBase();
+            var ownCounter = Wave64ExchangePointer(baseOffset, IAdd(UInt(Wave64ExchangeDwordCount), half));
+            var otherCounter = Wave64ExchangePointer(baseOffset, IAdd(UInt(Wave64ExchangeDwordCount), BitwiseXor(half, UInt(1))));
+            var arrivals = IAdd(Load(_uintType, _wave64Arrivals), UInt(1));
+            Store(_wave64Arrivals, arrivals);
+            var ownTarget = _module.AddInstruction(SpirvOp.IMul, _uintType, arrivals, Load(_uintType, _wave64HalfLanes));
+            var otherTarget = _module.AddInstruction(SpirvOp.IMul, _uintType, arrivals, Load(_uintType, _wave64OtherHalfLanes));
+            _module.AddStatement(SpirvOp.MemoryBarrier, workgroup, UInt(0x108));
+            _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, ownCounter, workgroup, UInt(0x104), UInt(1));
+
+            Store(_wave64Spins, UInt(0));
+            var header = _module.AllocateId();
+            var body = _module.AllocateId();
+            var next = _module.AllocateId();
+            var merge = _module.AllocateId();
+            _module.AddStatement(SpirvOp.Branch, header);
+            _module.AddLabel(header);
+            _module.AddStatement(SpirvOp.LoopMerge, merge, next, 0);
+            _module.AddStatement(SpirvOp.Branch, body);
+            _module.AddLabel(body);
+            var own = _module.AddInstruction(SpirvOp.AtomicLoad, _uintType, ownCounter, workgroup, UInt(0x102));
+            var other = _module.AddInstruction(SpirvOp.AtomicLoad, _uintType, otherCounter, workgroup, UInt(0x102));
+            var spins = IAdd(Load(_uintType, _wave64Spins), UInt(1));
+            Store(_wave64Spins, spins);
+            var met = LogicalAnd(
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, own, ownTarget),
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, other, otherTarget));
+            var done = _module.AddInstruction(SpirvOp.LogicalOr, _boolType, met,
+                _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, spins, UInt(1u << 22)));
+            _module.AddStatement(SpirvOp.BranchConditional, done, merge, next);
+            _module.AddLabel(next);
+            _module.AddStatement(SpirvOp.Branch, header);
+            _module.AddLabel(merge);
+            _module.AddStatement(SpirvOp.MemoryBarrier, workgroup, UInt(0x108));
         }
 
         // A wave-mask SGPR (VCC/EXEC) consumed as a per-lane predicate — the
