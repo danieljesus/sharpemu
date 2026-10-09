@@ -105,6 +105,19 @@ internal static unsafe partial class VulkanVideoPresenter
         private int _flushedTableReads;
         private static readonly int SpeculativeTableReads = int.Parse(Environment.GetEnvironmentVariable("SHARPEMU_SPECULATIVE_TABLE_READS") ?? "0"); // [local] 1 = read, 2 = verify
         private long _speculativeReads, _speculativeMismatches, _speculativeReported; // [local]
+        private uint _auditPre; private bool _auditArmed; // [local]
+        private readonly Dictionary<ulong, (long Reads, long Changed)> _auditByShader = new(); // [local]
+        private long _auditTotal;
+        private void AuditTableRead(bool changed)
+        {
+            var shader = Diagnostics.GpuReadTrace.CurrentShader;
+            var entry = _auditByShader.GetValueOrDefault(shader);
+            _auditByShader[shader] = (entry.Reads + 1, entry.Changed + (changed ? 1 : 0));
+            if (++_auditTotal % 3000 == 0)
+                foreach (var (key, value) in _auditByShader.OrderByDescending(pair => pair.Value.Reads).Take(12))
+                    Console.Error.WriteLine($"[TABLE_AUDIT] shader=0x{key:X16} dirty_reads={value.Reads} changed={value.Changed}");
+        }
+
         private void ReportSpeculative()
         {
             if (_speculativeReads - _speculativeReported >= 2000)
@@ -168,6 +181,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                 }
 
+                if (SpeculativeTableReads == 3 && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint))) // [local] mode 3: per-shader change audit
+                {
+                    Span<byte> pre = stackalloc byte[sizeof(uint)];
+                    if (_guestMemory.TryRead(address, pre)) { _auditPre = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(pre); _auditArmed = true; }
+                }
+
                 if (!NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint))) // [local] ceiling experiment: read the stale CPU copy instead of waiting
                 {
                     if (Diagnostics.GpuReadTrace.Enabled)
@@ -198,6 +217,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+            if (_auditArmed) { _auditArmed = false; AuditTableRead(_auditPre != word); } // [local]
             if (WatchedBounds.Count != 0 && _watchLogs < 400) // [local] reads of the bounds 0xF1D1 writes
             {
                 bool watched; lock (WatchedBounds) watched = WatchedBounds.Contains(address & ~0x1FUL) || WatchedBounds.Contains((address - 0x10) & ~0x1FUL);

@@ -3304,6 +3304,7 @@ public static partial class KernelMemoryCompatExports
             ReplaceMappedRegionRangeLocked(new MappedRegion(address, length, protection,
                 false, true, directMemoryStart, directMemoryStart));
             GuestGpuMemoryHook.NoteMapped(address, length, mode);
+            GuestGpuMemoryHook.NoteGpuWritable(address, length, (protection & OrbisProtGpuWrite) != 0); // [local]
             if (!ctx.TryWriteUInt64(inOutAddressPointer, address))
                 return MemoryFault;
             GuestWriteWatch.OnDirectMapping(address, length, protection);
@@ -3361,6 +3362,7 @@ public static partial class KernelMemoryCompatExports
                 ReplaceMappedRegionRangeLocked(new MappedRegion(block.Address, block.Size, protection,
                     true, false, 0, block.Offset));
             GuestGpuMemoryHook.NoteMapped(address, length, mode);
+            GuestGpuMemoryHook.NoteGpuWritable(address, length, (protection & OrbisProtGpuWrite) != 0); // [local]
             return ctx.TryWriteUInt64(pointer, address) ? 0 : MemoryFault;
         }
     }

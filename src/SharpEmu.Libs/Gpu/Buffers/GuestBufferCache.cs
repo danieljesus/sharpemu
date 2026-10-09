@@ -1011,8 +1011,40 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     // False only when the store closed and its drain failed; the caller then declines the fault.
+    private static readonly bool ReadbackAudit = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_AUDIT") == "1"; // [local]
+    private static readonly Dictionary<(GuestMemoryProfile.ReadbackSource, ulong, ulong), (long Calls, double Ms)> _readbackAudit = new();
+    private static long _readbackAuditReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
     private bool ReadMemoryOrAwaitShutdown(ulong guestAddress, ulong size, bool isWrite,
         GuestMemoryProfile.ReadbackSource source = GuestMemoryProfile.ReadbackSource.ExplicitReadback)
+    {
+        if (!ReadbackAudit)
+        {
+            return ReadMemoryOrAwaitShutdownCore(guestAddress, size, isWrite, source);
+        }
+
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var result = ReadMemoryOrAwaitShutdownCore(guestAddress, size, isWrite, source);
+        var ms = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        lock (_readbackAudit)
+        {
+            var key = (source, Diagnostics.GpuReadTrace.CurrentShader, guestAddress & ~0xFFFFUL);
+            var entry = _readbackAudit.GetValueOrDefault(key);
+            _readbackAudit[key] = (entry.Calls + 1, entry.Ms + ms);
+            if (System.Diagnostics.Stopwatch.GetElapsedTime(_readbackAuditReport).TotalSeconds >= 20)
+            {
+                foreach (var (k, v) in _readbackAudit.OrderByDescending(pair => pair.Value.Ms).Take(15))
+                    Console.Error.WriteLine($"[READBACK_AUDIT] ms={v.Ms:F0} calls={v.Calls} source={k.Item1} shader=0x{k.Item2:X16} block=0x{k.Item3:X}");
+                _readbackAudit.Clear();
+                _readbackAuditReport = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+        }
+
+        return result;
+    }
+
+    private bool ReadMemoryOrAwaitShutdownCore(ulong guestAddress, ulong size, bool isWrite,
+        GuestMemoryProfile.ReadbackSource source)
     {
         if (BvhWatch(guestAddress, size)) Console.Error.WriteLine($"[BVH_DOWNLOAD] address=0x{guestAddress:X} size=0x{size:X} write={isWrite} source={source} tick={_scheduler.CurrentTick}");
         if (!_relay.IsGpuQueueThread && SubmissionScheduler.InDeferredOperation)

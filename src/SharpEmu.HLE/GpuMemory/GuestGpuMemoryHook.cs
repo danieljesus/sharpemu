@@ -81,6 +81,26 @@ public static class GuestGpuMemoryHook
 
     public static GuestGpuMemory? Current => _current;
 
+    // [local] Guest mappings whose protection lets the GPU write (ORBIS GPU_WRITE).
+    private static readonly SpanSet _gpuWritable = new();
+
+    public static void NoteGpuWritable(ulong address, ulong size, bool writable)
+    {
+        lock (_gpuWritable)
+        {
+            if (writable)
+                _gpuWritable.Add(address, size);
+            else
+                _gpuWritable.Remove(address, size);
+        }
+    }
+
+    public static bool IsGpuWritable(ulong address, ulong size)
+    {
+        lock (_gpuWritable)
+            return _gpuWritable.Contains(address, size);
+    }
+
     public static void Attach(GuestGpuMemory? memory)
     {
         if (memory != null && _current != null)

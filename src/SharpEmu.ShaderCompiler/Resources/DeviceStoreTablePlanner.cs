@@ -13,6 +13,7 @@ namespace SharpEmu.ShaderCompiler.Resources;
 public static class DeviceStoreTablePlanner
 {
     public const int MaxEntries = 1 << 17;
+    private static readonly bool FilterGpuWritable = System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_FILTER") == "gpu"; // [local]
     private static readonly ulong MergeGap = System.Convert.ToUInt64(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_MERGE") ?? "10000", 16); // [local]
     private static readonly ulong TableMaxAddress = System.Convert.ToUInt64(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_MAXADDR") ?? "1000000000", 16); // [local]
     private static readonly bool TableRangesWritten = System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_WRITTEN") != "0"; // [local]
@@ -116,7 +117,7 @@ public static class DeviceStoreTablePlanner
                     readable = read(address + (ulong)dword * 4, out words[dword]);
                 }
 
-                if (readable && TryDecode(words, out var entryBase, out var entryBytes) && entryBytes <= MaxEntryBytes && entryBase + entryBytes <= TableMaxAddress)
+                if (readable && TryDecode(words, out var entryBase, out var entryBytes) && entryBytes <= MaxEntryBytes && (FilterGpuWritable ? SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.IsGpuWritable(entryBase, entryBytes) : entryBase + entryBytes <= TableMaxAddress))
                 {
                     ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, entryBase, entryBytes, Planned: true, Written: TableRangesWritten)); // [local]
                 }
@@ -130,7 +131,7 @@ public static class DeviceStoreTablePlanner
                 var end = found[0].Base + found[0].Size;
                 foreach (var range in found)
                 {
-                    if (range.Base <= end + MergeGap)
+                    if (range.Base <= end + MergeGap && (!FilterGpuWritable || SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.IsGpuWritable(start, System.Math.Max(end, range.Base + range.Size) - start)))
                     {
                         end = System.Math.Max(end, range.Base + range.Size);
                         continue;
