@@ -51,7 +51,7 @@ public static partial class Gen5SpirvTranslator
         private static NativeTlasMode ReadNativeTlasMode() =>
             (Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_TLAS_LOOP") ?? string.Empty).Trim().ToLowerInvariant() switch
             {
-                "1" or "on" or "native" => NativeTlasMode.Native,
+                "" or "1" or "on" or "native" => NativeTlasMode.Native, // on by default (rt433: bit-exact; rt434)
                 "2" or "verify" => NativeTlasMode.Verify,
                 _ => NativeTlasMode.Off,
             };
