@@ -44,7 +44,7 @@ public static class GuestGpuMemoryHook
     public static readonly HashSet<ulong> ExtraPages = new();
     public static bool TracesExtra(ulong address, ulong size)
     {
-        if (size == 0) return false;
+        if (size == 0 || ExtraPages.Count == 0) return false; // [local] no lock while nothing is watched
         lock (ExtraPages)
         {
             if (ExtraPages.Count == 0) return false;
