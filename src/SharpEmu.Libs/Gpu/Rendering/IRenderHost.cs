@@ -195,6 +195,10 @@ public interface IRenderHost
 
     bool TryFillDccMetadata(ulong address, ulong size, uint fillValue);
 
+    // [local] A fill applied in stream order like a command-processor fill: guest memory and
+    // the device copies hold the value without a shader writing it.
+    bool TryFillGuestBuffer(ulong address, ulong size, uint fillValue) => false;
+
     bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words);
 
     Exception Fatal(string message);

@@ -481,12 +481,28 @@ public sealed partial class RenderExecutor
     // record per thread through the V# in s0..s3 (a DCC metadata fill). With four equal words
     // it is a 32-bit fill the image cache absorbs, or writes into both copies of the metadata,
     // so the CPU never has to wait for the GPU to read it back.
-    private static readonly bool RecordFills = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_FILLS") == "1";
+    private static readonly bool RecordFills = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_FILLS") != "0";
     private long _recordFills, _recordFillsRefused;
+    private static readonly bool RecordFillLog = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_FILL_LOG") == "1";
+    private readonly Dictionary<string, int> _recordFillShapes = new();
+    private long _recordFillCensus;
 
     private bool TryConsumeRecordFill(ComputeInputInfo input, uint groupsX, uint groupsY, uint groupsZ, bool threadDimensions)
     {
         var program = input.Stage.Program!;
+        if (program.Hash == 0x83D3765B559BF084 && RecordFillLog) // [local] census of the fill shapes
+        {
+            var ud = input.Stage.Resources.UserData;
+            var shape = $"w1=0x{ud[1]:X8} w3=0x{ud[3]:X8} records={ud[2]} values={ud[4]:X8},{ud[5]:X8},{ud[6]:X8},{ud[7]:X8} groups={groupsX} local={input.ThreadsX} threadDims={threadDimensions}";
+            lock (_recordFillShapes)
+            {
+                _recordFillShapes[shape] = _recordFillShapes.GetValueOrDefault(shape) + 1;
+                if (++_recordFillCensus % 2000 == 0)
+                    foreach (var (key, count) in _recordFillShapes.OrderByDescending(pair => pair.Value).Take(10))
+                        Console.Error.WriteLine($"[RECORD_FILL_SHAPE] count={count} {key}");
+            }
+        }
+
         if (!RecordFills || program.Hash != 0x83D3765B559BF084 || program.UserDataBase != 0)
         {
             return false;
@@ -502,7 +518,9 @@ public sealed partial class RenderExecutor
         var threads = threadDimensions ? (ulong)groupsX : (ulong)groupsX * Math.Max(input.ThreadsX, 1u);
         var records = Math.Min(threads, (ulong)destination.RecordCount);
         var value = userData[4];
-        if (destination.Stride != 16 || records == 0 || userData[5] != value || userData[6] != value || userData[7] != value)
+        // 32_32_32_32 UINT (unified format 75) with the identity swizzle stores the raw words.
+        if (destination.Stride != 16 || records == 0 || ((userData[3] >> 12) & 0x7F) != 75 || (userData[3] & 0xFFF) != 0xFAC ||
+            destination.AddThreadId || userData[5] != value || userData[6] != value || userData[7] != value)
         {
             if (_recordFillsRefused++ < 20)
                 Console.Error.WriteLine($"[RECORD_FILL] refused stride={destination.Stride} records={destination.RecordCount} threads={threads} words={userData[4]:X8},{userData[5]:X8},{userData[6]:X8},{userData[7]:X8}");
@@ -510,7 +528,7 @@ public sealed partial class RenderExecutor
         }
 
         var size = records * 16;
-        var consumed = _host.TryAbsorbDccFill(destination.Address, size, value) || _host.TryFillDccMetadata(destination.Address, size, value);
+        var consumed = _host.TryAbsorbDccFill(destination.Address, size, value) || _host.TryFillGuestBuffer(destination.Address, size, value);
         if (consumed && _recordFills++ % 500 == 0)
             Console.Error.WriteLine($"[RECORD_FILL] consumed={_recordFills} refused={_recordFillsRefused} address=0x{destination.Address:X} size=0x{size:X} value=0x{value:X8}");
         return consumed;
