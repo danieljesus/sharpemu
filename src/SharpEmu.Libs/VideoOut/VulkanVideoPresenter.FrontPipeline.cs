@@ -597,7 +597,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void WriteGuest(ulong address, ReadOnlySpan<byte> source)
         {
             var bytes = source.ToArray();
-            queue.Enqueue(() => presenter.WriteGuest(address, bytes), _pauseAlias, _resumeAlias);
+            queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
         }
 
         // Data the stream reads back at once: the queued work captures what it replaces first.
@@ -610,7 +610,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!WriteOverlay)
             {
                 FrontSyncStats.Note(2);
-                queue.Run(() => { presenter.WriteGuest(address, bytes); return true; }, _pauseAlias, _resumeAlias);
+                queue.Run(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(); return true; }, _pauseAlias, _resumeAlias);
                 return;
             }
 
@@ -618,6 +618,7 @@ internal static unsafe partial class VulkanVideoPresenter
             queue.Enqueue(() =>
             {
                 presenter.WriteGuest(address, bytes);
+                presenter.NoteGuestWriteApplied();
                 presenter.FrontOverlay.Retire(address, bytes.Length, serial);
             }, _pauseAlias, _resumeAlias);
         }
@@ -826,5 +827,16 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // Applied on the render thread in stream order, through the device-ordered command write.
         internal void WriteGuest(ulong address, ReadOnlySpan<byte> source) => WriteCommandData(address, source);
+
+        // [local] SHARPEMU_RETRY_ON_GUEST_WRITE=1: a command-processor write the render thread just applied
+        // (a label, WRITE_DATA) can satisfy a blocked memory wait on the front; retry it now instead of at
+        // the next completed GPU tick or the 100 ms timer.
+        private static readonly bool RetryOnGuestWrite = Environment.GetEnvironmentVariable("SHARPEMU_RETRY_ON_GUEST_WRITE") == "1";
+
+        internal void NoteGuestWriteApplied()
+        {
+            if (RetryOnGuestWrite)
+                _commandStream.RetryBlocked();
+        }
     }
 }

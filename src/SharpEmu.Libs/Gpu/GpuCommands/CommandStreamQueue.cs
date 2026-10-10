@@ -32,8 +32,9 @@ public sealed class CommandStreamQueue
     public const int QueueCount = 1 + ComputeQueueCount;
     public const int AllBlockedRetryMilliseconds = 100;
     // One boundary may run ahead; explicit zero keeps the synchronous diagnostic mode.
+    // [local] SHARPEMU_SUSPEND_POINTS_IN_FLIGHT=<n> lets the guest run n boundaries ahead (default 1).
     public static readonly int DefaultBoundariesInFlight =
-        Environment.GetEnvironmentVariable("SHARPEMU_SUSPEND_POINTS_IN_FLIGHT") == "0" ? 0 : 1;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SUSPEND_POINTS_IN_FLIGHT"), out var inFlight) && inFlight >= 0 ? inFlight : 1;
 
     private readonly ICommandStreamHost _host;
     private readonly object _gate = new();
@@ -317,16 +318,17 @@ public sealed class CommandStreamQueue
     {
         lock (_gate)
         {
-            var deadline = Environment.TickCount64 + intervalMilliseconds;
+            // [local] Stopwatch, not TickCount64: its ~15.6 ms steps stretched a 1 ms retry wait.
+            var deadline = System.Diagnostics.Stopwatch.GetTimestamp() + intervalMilliseconds * System.Diagnostics.Stopwatch.Frequency / 1000;
             while (!HasRunnableWorkLocked())
             {
-                var remaining = deadline - Environment.TickCount64;
+                var remaining = (deadline - System.Diagnostics.Stopwatch.GetTimestamp()) * 1000 / System.Diagnostics.Stopwatch.Frequency;
                 if (remaining <= 0)
                 {
                     return false;
                 }
 
-                Monitor.Wait(_gate, (int)remaining);
+                Monitor.Wait(_gate, (int)Math.Max(1, remaining));
             }
 
             return true;
