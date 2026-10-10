@@ -24,6 +24,20 @@ public sealed partial class RenderExecutor
     private const uint ImageClearStride = 16;
     private const uint ImageClearUserDataCount = 8;
 
+    // [local] The thread-unit indirect path needs the limits in an uploaded shader-data buffer
+    // and the logical axes on the physical ones (the counts go straight to vkCmdDispatchIndirect).
+    private bool CanDispatchThreadsOnGpu(ComputeInputInfo input)
+    {
+        if (input.Stage.Program?.Bindings is not { UsesDispatchThreadLimits: true } layout ||
+            layout.Find(SharpEmu.ShaderCompiler.Resources.DescriptorBindingKind.ShaderData) is null || !_host.SupportsIndirectThreadDispatch)
+        {
+            return false;
+        }
+
+        var order = Gen5SpirvTranslator.ComputeWorkgroupAxisOrder(input.ThreadsX, input.ThreadsY, input.ThreadsZ);
+        return order[0] == 0 && order[1] == 1 && order[2] == 2;
+    }
+
     public void Dispatch(ulong submitId, RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0,
         ComputeProgram? preparedProgram = null)
     {
@@ -53,7 +67,25 @@ public sealed partial class RenderExecutor
         }
 
         var useThreadDimensions = (dispatchInitiator & DispatchInitiatorUseThreadDimensions) != 0;
+        // [local] Thread counts left in GPU memory: handed over as zero counts with the address.
+        var gpuThreadIndirect = useThreadDimensions && indirectArgumentsAddress != 0 && groupsX == 0 && groupsY == 0 && groupsZ == 0;
         var computeProgram = preparedProgram ?? _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+        if (gpuThreadIndirect && computeProgram.Available && !computeProgram.Consumed &&
+            !CanDispatchThreadsOnGpu(computeProgram.Input))
+        {
+            // The stage cannot take its limits from the GPU: read the counts and prepare again.
+            Span<byte> counts = stackalloc byte[12];
+            if (!_host.TryReadGuest(indirectArgumentsAddress, counts))
+            {
+                throw _host.Fatal($"The indirect dispatch arguments cannot be read: address=0x{indirectArgumentsAddress:X16}.");
+            }
+
+            groupsX = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(counts);
+            groupsY = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(counts[4..]);
+            groupsZ = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(counts[8..]);
+            gpuThreadIndirect = false;
+            computeProgram = _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+        }
         if (computeProgram.Consumed)
         {
             return;
@@ -116,7 +148,7 @@ public sealed partial class RenderExecutor
         }
 
         var dimsLine = $"[DISPATCH_DIMS] shader=0x{compute.Address:X} thread_dims={useThreadDimensions} dims={groupsX}x{groupsY}x{groupsZ} local={compute.ThreadsX}x{compute.ThreadsY}x{compute.ThreadsZ} indirect=0x{indirectArgumentsAddress:X} initiator=0x{dispatchInitiator:X}"; // [local]
-        if (useThreadDimensions)
+        if (useThreadDimensions && !gpuThreadIndirect)
         {
             // The indirect buffer carries thread counts in this mode, while Vulkan indirect
             // dispatch consumes workgroup counts. Use the CPU-resolved counts after conversion.
@@ -199,7 +231,14 @@ public sealed partial class RenderExecutor
             }
 
             if (physicalGroups[0] == 1 && physicalGroups[1] == 1 && physicalGroups[2] == 1 && _hdrDispatchLogs++ < 600) Console.Error.WriteLine($"[DISPATCH_EXEC] shader=0x{compute.Address:X} groups=1,1,1 indirect=0x{indirectArgumentsAddress:X}"); // [local]
-            if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
+            if (gpuThreadIndirect)
+            {
+                if (!_host.TryDispatchIndirectThreads(indirectArgumentsAddress, bindings))
+                {
+                    throw _host.Fatal($"The thread-unit indirect dispatch could not be recorded: shader=0x{compute.Address:X16}.");
+                }
+            }
+            else if (indirectArgumentsAddress == 0 || !_host.TryDispatchIndirect(indirectArgumentsAddress))
             {
                 _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
             }

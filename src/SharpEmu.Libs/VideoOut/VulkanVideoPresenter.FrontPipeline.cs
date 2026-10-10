@@ -469,6 +469,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool ResolvesIndirectDispatchOnGpu => presenter.ResolvesIndirectDispatchOnGpu;
 
+        public bool ResolvesIndirectThreadDispatchOnGpu => presenter.ResolvesIndirectThreadDispatchOnGpu;
+
         // [local] The counts are read on the render thread when the dispatch runs, so the front
         // does not wait for the queue to drain to read memory an earlier dispatch writes.
         private static readonly bool DeferIndirect = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_DEFER_INDIRECT") != "0";

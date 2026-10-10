@@ -1116,6 +1116,65 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        public bool SupportsIndirectThreadDispatch => true; // [local]
+
+        // [local] The thread counts become the stage's dispatch thread limits (a copy into the
+        // uploaded shader data) and the indirect group counts; groups past the counts' real
+        // ceiling hold only threads beyond the limits, which the translated shader skips.
+        public bool TryDispatchIndirectThreads(ulong argumentsAddress, IPreparedBindings bindings)
+        {
+            if (bindings is not PreparedStageBindings prepared || prepared.Layout is not { UsesDispatchThreadLimits: true } layout ||
+                prepared.Descriptors.ShaderData.Buffer.Handle == 0)
+            {
+                return false;
+            }
+
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            var (buffer, offset) = _bufferCache.ObtainBuffer(argumentsAddress, 3u * sizeof(uint), false);
+            var shaderData = prepared.Descriptors.ShaderData;
+            var command = BeginBatchedGuestCommands();
+            var before = new BufferMemoryBarrier2
+            {
+                SType = StructureType.BufferMemoryBarrier2,
+                SrcStageMask = PipelineStageFlags2.AllCommandsBit,
+                SrcAccessMask = AccessFlags2.ShaderWriteBit | AccessFlags2.TransferWriteBit | AccessFlags2.MemoryWriteBit,
+                DstStageMask = PipelineStageFlags2.CopyBit | PipelineStageFlags2.DrawIndirectBit,
+                DstAccessMask = AccessFlags2.TransferReadBit | AccessFlags2.IndirectCommandReadBit,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Buffer = buffer.Handle,
+                Offset = offset,
+                Size = 3u * sizeof(uint),
+            };
+            var beforeInfo = new DependencyInfo { SType = StructureType.DependencyInfo, BufferMemoryBarrierCount = 1, PBufferMemoryBarriers = &before };
+            _vk.CmdPipelineBarrier2(command, &beforeInfo);
+            var region = new BufferCopy
+            {
+                SrcOffset = offset,
+                DstOffset = shaderData.Offset + layout.DispatchThreadLimitsDword * sizeof(uint),
+                Size = 3u * sizeof(uint),
+            };
+            _vk.CmdCopyBuffer(command, buffer.Handle, shaderData.Buffer, 1, &region);
+            var after = new BufferMemoryBarrier2
+            {
+                SType = StructureType.BufferMemoryBarrier2,
+                SrcStageMask = PipelineStageFlags2.CopyBit,
+                SrcAccessMask = AccessFlags2.TransferWriteBit,
+                DstStageMask = PipelineStageFlags2.ComputeShaderBit,
+                DstAccessMask = AccessFlags2.UniformReadBit | AccessFlags2.ShaderStorageReadBit,
+                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                Buffer = shaderData.Buffer,
+                Offset = region.DstOffset,
+                Size = 3u * sizeof(uint),
+            };
+            var afterInfo = new DependencyInfo { SType = StructureType.DependencyInfo, BufferMemoryBarrierCount = 1, PBufferMemoryBarriers = &after };
+            _vk.CmdPipelineBarrier2(command, &afterInfo);
+            _vk.CmdDispatchIndirect(command, buffer.Handle, offset);
+            CountDraw();
+            return true;
+        }
+
         private void RecordMemoryBarrier(PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, AccessFlags sourceAccess, AccessFlags destinationAccess)
         {
             EndRendering();

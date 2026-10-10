@@ -555,6 +555,11 @@ internal static unsafe partial class VulkanVideoPresenter
         // SHARPEMU_CPU_INDIRECT_DISPATCH=1 reads the counts back on the CPU as before.
         public bool ResolvesIndirectDispatchOnGpu => !_cpuIndirectDispatch;
 
+        // [local]
+        private static readonly bool GpuThreadIndirect = Environment.GetEnvironmentVariable("SHARPEMU_GPU_THREAD_INDIRECT") != "0";
+
+        public bool ResolvesIndirectThreadDispatchOnGpu => GpuThreadIndirect && !_cpuIndirectDispatch;
+
         // RenderExecutor records indexed indirect draws with vkCmdDrawIndexedIndirect.
         // SHARPEMU_CPU_INDIRECT_DRAW=1 reads the arguments back on the CPU as before.
         public bool ResolvesIndirectDrawOnGpu => !_cpuIndirectDraw;

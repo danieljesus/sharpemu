@@ -159,6 +159,13 @@ public interface IRenderHost
     // consume the guest buffer directly. Backends without native indirect dispatch return false.
     bool TryDispatchIndirect(ulong argumentsAddress);
 
+    // [local] A thread-unit indirect dispatch: copies the three thread counts into the stage's
+    // dispatch thread limits and dispatches them as group counts. False when the stage keeps
+    // no thread limits in an uploaded shader-data buffer.
+    bool TryDispatchIndirectThreads(ulong argumentsAddress, IPreparedBindings bindings) => false;
+
+    bool SupportsIndirectThreadDispatch => false;
+
     // Orders the buffer writes of the given shader stages before every later access.
     void ShaderWriteBarrier(PipelineStageFlags sourceStages);
 

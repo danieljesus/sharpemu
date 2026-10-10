@@ -148,6 +148,11 @@ public interface ICommandStreamHost
     // stream order on its executor, so the interpreter need not read them ahead of the GPU.
     bool DefersIndirectThreadDispatch => false;
 
+    // [local] True when a thread-unit indirect dispatch may be handed over with zero counts and
+    // its arguments address: the executor copies the thread counts into the shader's thread
+    // limits and dispatches them as group counts on the GPU (the extra groups exit at the limit).
+    bool ResolvesIndirectThreadDispatchOnGpu => false;
+
     void DispatchIndirectDeferred(ulong submitId, ulong argumentsAddress, uint dispatchInitiator) =>
         throw new NotSupportedException("The host does not defer indirect dispatches.");
 

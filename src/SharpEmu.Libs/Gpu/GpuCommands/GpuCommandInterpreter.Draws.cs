@@ -225,6 +225,12 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
+        if (_host.ResolvesIndirectThreadDispatchOnGpu) // [local]
+        {
+            DispatchDirect(0, 0, 0, dispatchInitiator, argumentsAddress);
+            return;
+        }
+
         if (_host.DefersIndirectThreadDispatch) // [local]
         {
             _host.DispatchIndirectDeferred(SubmitId, argumentsAddress, dispatchInitiator);
