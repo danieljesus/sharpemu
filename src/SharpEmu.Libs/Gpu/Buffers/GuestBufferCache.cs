@@ -513,6 +513,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private static long HostWriteGaps; // [local]
+    private static readonly bool FillLog = Environment.GetEnvironmentVariable("SHARPEMU_FILL_LOG") == "1"; // [local]
+    private readonly long[] _fillBuckets = new long[12];
+    private int _fillBigLogs;
+    private long _fillGpu, _fillGpuBytes, _fillCpu, _fillInvalidate, _fillObtain, _fillRecord, _fillReport, _fillClearMeta, _fillQuery, _fillImageInvalidate, _fillImageCount, _fillWrite;
+    private static readonly ulong FillOnGpuMin = Convert.ToUInt64(Environment.GetEnvironmentVariable("SHARPEMU_FILL_ON_GPU_MIN") ?? "0", 16); // [local]
+    private static readonly bool FastFill = Environment.GetEnvironmentVariable("SHARPEMU_FAST_FILL") == "1"; // [local]
     // [local] experiment: a written binding over a GPU-modified range still uploads CPU-dirty pages first (SHARPEMU_WRITTEN_SYNC_CPU_DIRTY=1).
     private static readonly bool WrittenSyncCpuDirty = Environment.GetEnvironmentVariable("SHARPEMU_WRITTEN_SYNC_CPU_DIRTY") == "1";
     private static readonly bool HostWriteMarkDirty = Environment.GetEnvironmentVariable("SHARPEMU_HOSTWRITE_MARK_DIRTY") == "1"; // [local]
@@ -541,19 +547,79 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var images = RequireImageCache();
+        var t0 = FillLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
         _ = images.ClearMetadata(guestAddress);
+        var t1 = FillLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var region = images.QueryRegion(guestAddress, size);
-        if (!HasGpuDirtyBytes(guestAddress, size) && !region.GpuImageBytes)
+        var t2 = FillLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (FillLog) { _fillClearMeta += t1 - t0; _fillQuery += t2 - t1; }
+        // [local experiment] SHARPEMU_FILL_ON_GPU_MIN=<hex bytes>: a fill at least this large over a range a single
+        // registered buffer covers goes down the GPU path (device fill, range GPU-owned) instead of a CPU memset of
+        // the guest copy plus an upload (rt410/rt411: ~21 MB/frame of clears in GTA V, ~170 ms per 5 s of memset).
+        var fillOnGpu = FillOnGpuMin != 0 && size >= FillOnGpuMin && _registry.FindContainingBuffer(guestAddress, size).IsValid;
+        if (!fillOnGpu && !HasGpuDirtyBytes(guestAddress, size) && !region.GpuImageBytes)
         {
             if (region.ImageBytes)
             {
+                var t3 = FillLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 images.InvalidateMemory(guestAddress, size);
+                if (FillLog) { _fillImageInvalidate += System.Diagnostics.Stopwatch.GetTimestamp() - t3; _fillImageCount++; }
             }
 
+            if (FillLog) // [local]
+            {
+                _fillCpu++;
+                var bucket = size <= 4096 ? 0 : size <= 65536 ? 1 : size <= (1 << 20) ? 2 : 3;
+                var contained = _registry.FindContainingBuffer(guestAddress, size).IsValid;
+                var overlapIndex = _registry.FindFirstOverlappingIndex(guestAddress);
+                var overlaps = overlapIndex < _registry.RegisteredCount && _registry.GetRegisteredAddress(overlapIndex) < guestAddress + size;
+                _fillBuckets[bucket * 3 + (contained ? 0 : overlaps ? 1 : 2)] += (long)size;
+                if (size > (1 << 20) && _fillBigLogs++ < 40)
+                    Console.Error.WriteLine($"[FILL_BIG] address=0x{guestAddress:X} size=0x{size:X} value=0x{value:X} contained={contained} overlaps={overlaps} imageBytes={region.ImageBytes}");
+            }
+            var tw = FillLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            try {
             // Labels and small clears dominate; fill a stack chunk once and repeat it.
             Span<uint> values = stackalloc uint[(int)Math.Min(size / sizeof(uint), 1024UL)];
             values.Fill(value);
             var bytes = MemoryMarshal.AsBytes(values);
+            if (FastFill && size > (ulong)bytes.Length)
+            {
+                // [local] A large fill: the guest copy by memset, each registered buffer by one GPU fill,
+                // instead of a staged copy per 4 KB chunk (rt406: ~21 MB/frame of fills in GTA V).
+                for (ulong offset = 0; offset < size;)
+                {
+                    var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
+                    if (!_backing.TryWriteBacking(guestAddress + offset, bytes[..chunk]))
+                    {
+                        throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress + offset:X16} size=0x{chunk:X}");
+                    }
+
+                    offset += (ulong)chunk;
+                }
+
+                var end = guestAddress + size;
+                for (var index = _registry.FindFirstOverlappingIndex(guestAddress);
+                     index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end;
+                     index++)
+                {
+                    var fillIdentifier = _registry.GetRegisteredIdentifier(index);
+                    var fillBuffer = _registry.GetBuffer(fillIdentifier);
+                    var begin = Math.Max(guestAddress, fillBuffer.CpuAddress);
+                    var rangeEnd = Math.Min(end, fillBuffer.CpuAddress + fillBuffer.Size);
+                    if (begin >= rangeEnd)
+                    {
+                        continue;
+                    }
+
+                    GuestGpuMemoryHook.Trace(begin, rangeEnd - begin, $"host-fill-data submission_tick={_scheduler.CurrentTick}");
+                    fillBuffer.Fill(fillBuffer.Offset(begin), rangeEnd - begin, value);
+                    TouchBuffer(fillIdentifier);
+                }
+
+                return;
+            }
+
             for (ulong offset = 0; offset < size;)
             {
                 var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
@@ -562,12 +628,28 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             }
 
             return;
+            } finally { if (FillLog) _fillWrite += System.Diagnostics.Stopwatch.GetTimestamp() - tw; }
         }
 
+        var fillStarted = FillLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
         images.InvalidateMemoryFromGpu(guestAddress, size);
+        var afterInvalidate = FillLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         var bufferIdentifier = FindBuffer(guestAddress, size);
         var (destination, destinationOffset) = ObtainBuffer(guestAddress, size, true, true, bufferIdentifier);
+        var afterObtain = FillLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         destination.Fill(destinationOffset, size, value);
+        if (FillLog)
+        {
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            _fillGpu++; _fillGpuBytes += (long)size; _fillInvalidate += afterInvalidate - fillStarted; _fillObtain += afterObtain - afterInvalidate; _fillRecord += now - afterObtain;
+            if (now - _fillReport > 5 * System.Diagnostics.Stopwatch.Frequency)
+            {
+                _fillReport = now;
+                double Ms(long ticks) => ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                Console.Error.WriteLine(FormattableString.Invariant($"[FILL_GPU] count={_fillGpu} bytes={_fillGpuBytes} invalidate_ms={Ms(_fillInvalidate):F0} obtain_ms={Ms(_fillObtain):F0} record_ms={Ms(_fillRecord):F0} cpu_path={_fillCpu} clear_meta_ms={Ms(_fillClearMeta):F0} query_ms={Ms(_fillQuery):F0} image_invalidate_ms={Ms(_fillImageInvalidate):F0}/{_fillImageCount} cpu_write_ms={Ms(_fillWrite):F0} bytes_by_size(<=4K,<=64K,<=1M,>1M)x(contained,overlap,none)=[{string.Join(",", _fillBuckets.Select(b => (b >> 20).ToString()))}]MB"));
+                _fillGpu = _fillGpuBytes = _fillCpu = 0; _fillInvalidate = _fillObtain = _fillRecord = 0; _fillClearMeta = _fillQuery = _fillImageInvalidate = _fillImageCount = _fillWrite = 0; Array.Clear(_fillBuckets);
+            }
+        }
         if (images.OverlapsDccMetadata(guestAddress, size) && TryWriteFillToBacking(guestAddress, size, value))
         {
             RemoveGpuModified(guestAddress, size);

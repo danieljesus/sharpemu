@@ -381,6 +381,35 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private static readonly bool BackingAliasEnabled = Environment.GetEnvironmentVariable("SHARPEMU_BACKING_ALIAS") != "0"; // [local]
 
+        // [local] SHARPEMU_CMDMEM_LOG=1: per 5 s, count, bytes and ms of command-processor writes into
+        // registered buffers (0), fills (1) and copies (2) applied on the render thread.
+        private static class CommandMemoryStats
+        {
+            private static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_CMDMEM_LOG") == "1";
+            private static readonly long[] Counts = new long[3], Bytes = new long[3], Ticks = new long[3];
+            private static long _report = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            public readonly struct Scope(int kind, ulong bytes, long started) : IDisposable
+            {
+                public void Dispose()
+                {
+                    if (started == 0) return;
+                    Counts[kind]++;
+                    Bytes[kind] += (long)bytes;
+                    Ticks[kind] += System.Diagnostics.Stopwatch.GetTimestamp() - started;
+                    var now = System.Diagnostics.Stopwatch.GetTimestamp();
+                    if (now - _report < 5 * System.Diagnostics.Stopwatch.Frequency) return;
+                    _report = now;
+                    Console.Error.WriteLine(FormattableString.Invariant(
+                        $"[CMDMEM] write={Counts[0]}/{Bytes[0]}B/{Ticks[0] * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0}ms fill={Counts[1]}/{Bytes[1]}B/{Ticks[1] * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0}ms copy={Counts[2]}/{Bytes[2]}B/{Ticks[2] * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F0}ms"));
+                    Array.Clear(Counts); Array.Clear(Bytes); Array.Clear(Ticks);
+                }
+            }
+
+            public static Scope Measure(int kind, ulong bytes) =>
+                new(kind, bytes, Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0);
+        }
+
         public void WriteCommandData(ulong address, ReadOnlySpan<byte> data)
         {
             if (data.IsEmpty) return;
@@ -390,6 +419,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (_bufferCache.IsRegionRegistered(address, (ulong)data.Length))
             {
                 using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
+                using var stat = CommandMemoryStats.Measure(0, (ulong)data.Length); // [local]
                 _ = BeginBatchedGuestCommands();
                 if (Gpu.Buffers.GuestBufferCache.BvhWatch(address, (ulong)data.Length)) Console.Error.WriteLine($"[BVH_CPWRITE] seq={_bvhSeq++} device-order address=0x{address:X} size={data.Length} tick={_scheduler.CurrentTick} payload+8C=0x{(data.Length >= 0x94 ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(0x8C)) : 0):X} payload+90=0x{(data.Length >= 0x94 ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(0x90)) : 0):X}");
                 _bufferCache.WriteHostMemory(address, data);
@@ -406,6 +436,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void FillBuffer(ulong address, ulong size, uint value, bool isGds)
         {
             using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
+            using var stat = CommandMemoryStats.Measure(1, size); // [local]
             // Transfers the buffer cache completes in guest memory leave the rendering scope open;
             // its GPU paths end the scope before they record.
             _ = BeginBatchedGuestCommands();
@@ -417,6 +448,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void CopyBuffer(ulong destination, ulong source, ulong size, bool destinationIsGds, bool sourceIsGds)
         {
             using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
+            using var stat = CommandMemoryStats.Measure(2, size); // [local]
             // Transfers the buffer cache completes in guest memory leave the rendering scope open;
             // its GPU paths end the scope before they record.
             _ = BeginBatchedGuestCommands();
