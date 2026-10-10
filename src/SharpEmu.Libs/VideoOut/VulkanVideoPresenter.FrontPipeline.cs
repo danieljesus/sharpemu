@@ -534,7 +534,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }, _pauseAlias, _resumeAlias);
         }
 
-        private static readonly bool WriteOverlay = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY") == "1";
+        private static readonly bool WriteOverlay = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY") != "0";
 
         public void RunAfterFlush(Action work) => queue.Enqueue(work, _pauseAlias, _resumeAlias);
 

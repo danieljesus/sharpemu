@@ -412,7 +412,17 @@ internal static unsafe partial class VulkanVideoPresenter
                     return ok;
                 }
 
-                return TryReadGuestWordDirect(address, out word);
+                if (!TryReadGuestWordDirect(address, out word))
+                    return false;
+                if (!FrontOverlay.IsEmpty) // [local]
+                {
+                    Span<byte> patched = stackalloc byte[sizeof(uint)];
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(patched, word);
+                    FrontOverlay.Apply(address, patched);
+                    word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(patched);
+                }
+
+                return true;
             }
 
             word = 0;
@@ -455,6 +465,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (IsCleanReadPage(address, size) && TryGetAliasPointer(address, size, out var frontAlias))
                 {
                     new ReadOnlySpan<byte>(frontAlias, destination.Length).CopyTo(destination);
+                    FrontOverlay.Apply(address, destination); // [local]
                     return true;
                 }
 
@@ -464,6 +475,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 NoteFrontReadPage(address, size);
+                FrontOverlay.Apply(address, destination); // [local]
                 return true;
             }
 
