@@ -180,6 +180,64 @@ public unsafe class GpuBuffer : IDisposable
         {
             LastGpuWriteTick = tick;
         }
+
+        if (tick > _wholeWriteTick)
+        {
+            _wholeWriteTick = tick;
+        }
+    }
+
+    // [local] Last writer tick per 16 KB block (SHARPEMU_RANGE_WRITE_TICKS=0 keeps one tick per buffer), so a readback of bytes
+    // written in an earlier, finished batch does not wait for the batch being recorded (rt418: ~70 % of the
+    // readbacks that waited for the current batch read blocks last written in a completed one).
+    public static readonly bool RangeWriteTicks = Environment.GetEnvironmentVariable("SHARPEMU_RANGE_WRITE_TICKS") != "0"; // on by default (rt420)
+    private const int WriteTickBlockShift = 14;
+    private ulong[]? _blockWriteTicks;
+    private ulong _wholeWriteTick;
+
+    public void NoteGpuWrite(ulong offset, ulong size)
+    {
+        if (!RangeWriteTicks || size == 0)
+        {
+            NoteGpuWrite();
+            return;
+        }
+
+        var tick = _scheduler.CurrentTick;
+        if (tick > LastGpuWriteTick)
+        {
+            LastGpuWriteTick = tick;
+        }
+
+        _blockWriteTicks ??= new ulong[(int)((Size + (1UL << WriteTickBlockShift) - 1) >> WriteTickBlockShift)];
+        var first = (int)(offset >> WriteTickBlockShift);
+        var last = (int)(Math.Min(offset + size - 1, Size - 1) >> WriteTickBlockShift);
+        for (var block = first; block <= last; block++)
+        {
+            _blockWriteTicks[block] = tick;
+        }
+    }
+
+    // The tick a readback of [offset, offset + size) has to wait for.
+    public ulong GpuWriteTick(ulong offset, ulong size)
+    {
+        if (!RangeWriteTicks || _blockWriteTicks is not { } ticks || size == 0)
+        {
+            return LastGpuWriteTick;
+        }
+
+        var tick = _wholeWriteTick;
+        var first = (int)(offset >> WriteTickBlockShift);
+        var last = (int)(Math.Min(offset + size - 1, Size - 1) >> WriteTickBlockShift);
+        for (var block = first; block <= last; block++)
+        {
+            if (ticks[block] > tick)
+            {
+                tick = ticks[block];
+            }
+        }
+
+        return tick;
     }
 
     public void Write(ulong offset, ReadOnlySpan<byte> source)
@@ -243,7 +301,7 @@ public unsafe class GpuBuffer : IDisposable
         }
 
         command.EndRendering();
-        NoteGpuWrite();
+        NoteGpuWrite(destinationOffset, size);
         var vk = _device.Vk;
         var native = new CommandBuffer(command.Handle);
         var before = stackalloc BufferMemoryBarrier2[2];
@@ -271,7 +329,7 @@ public unsafe class GpuBuffer : IDisposable
 
         var command = _scheduler.Current;
         command.EndRendering();
-        NoteGpuWrite();
+        NoteGpuWrite(offset, size);
         SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(CpuAddress + offset, size, $"host-fill value=0x{value:X} submission_tick={_scheduler.CurrentTick}"); // [local]
         var vk = _device.Vk;
         var native = new CommandBuffer(command.Handle);

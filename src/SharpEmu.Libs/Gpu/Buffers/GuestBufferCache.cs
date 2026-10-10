@@ -211,7 +211,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         after.SrcAccessMask = AccessFlags2.TransferWriteBit;
         after.DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit;
         VulkanSynchronization.PipelineBarrier(vk, native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit, 0, null, 1, &after, 0, null);
-        buffer.NoteGpuWrite();
+        buffer.NoteGpuWrite(buffer.Offset(guestAddress), 4);
+        buffer.NoteGpuWrite(buffer.Offset(guestAddress1), 4);
     }
     public static readonly System.Collections.Concurrent.ConcurrentQueue<(ulong Address, ulong Tick)> BvhHeaderWrites = new(); // [local]
 
@@ -380,7 +381,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _ = SynchronizeBuffer(buffer, guestAddress, size, isWritten, isTexelBuffer, preserveCpuWriteHotPages: false);
         if (isWritten)
         {
-            buffer.NoteGpuWrite();
+            buffer.NoteGpuWrite(buffer.Offset(guestAddress), size);
             if (Diagnostics.DccWriterTrace.Enabled)
             {
                 Diagnostics.DccWriterTrace.Record(RequireImageCache(), guestAddress, size);
@@ -390,6 +391,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 Console.Error.WriteLine($"[DIRTY_WATCH] range=0x{guestAddress:X}+0x{size:X} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16} stage={Diagnostics.GpuReadTrace.CurrentStage} tick={_scheduler.CurrentTick} caller={(_dirtyWatchLogs < 6 ? new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
             if (size < BroadWriteBytes) _preciseGpuModifiedRanges.Add(guestAddress, size); // [local]
             NoteEverGpuWritten(guestAddress, size); // [local]
+            if (ReadbackTickLog) // [local] diagnostic: last writer tick per 4 KB page
+                for (var page = guestAddress >> 12; page <= (guestAddress + size - 1) >> 12; page++)
+                    _pageWriteTicks[page] = _scheduler.CurrentTick;
             if (!_gpuModifiedRanges.Contains(guestAddress, size))
             {
                 _gpuModifiedRanges.Add(guestAddress, size);
@@ -1563,7 +1567,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         for (var index = 0; index < pending.Copies.Count; index++)
         {
             var copy = pending.Copies[index];
-            if (copy.Buffer.LastGpuWriteTick != pending.WriteTicks[index] ||
+            if (copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size) != pending.WriteTicks[index] ||
                 !_gpuModifiedRanges.Contains(copy.Address, copy.Size) ||
                 !ReferenceEquals(FindOwner(copy.Address, copy.Size), copy.Buffer))
             {
@@ -1798,7 +1802,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var ticks = new ulong[copies.Count];
         for (var index = 0; index < copies.Count; index++)
         {
-            var written = copies[index].Buffer.LastGpuWriteTick;
+            var written = copies[index].Buffer.GpuWriteTick(copies[index].SourceOffset, copies[index].Size);
             if (written == 0)
             {
                 return false;
@@ -1837,6 +1841,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     // Copies the pieces on the readback queue after only the tick that last wrote their
     // buffers, instead of appending the copy to the main queue and draining all of it.
+    private static readonly bool ReadbackTickLog = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_TICK_LOG") == "1"; // [local]
+    private readonly long[] _readbackTickKinds = new long[3], _readbackTickLag = new long[3], _readbackPageKinds = new long[4];
+    private readonly Dictionary<ulong, ulong> _pageWriteTicks = new();
+    private long _readbackTickReport;
+
     private bool TryDownloadAsync(List<DownloadPiece> copies)
     {
         if (AsyncReadback is not { } readback || copies.Count == 0)
@@ -1848,7 +1857,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var total = 0UL;
         foreach (var copy in copies)
         {
-            var written = copy.Buffer.LastGpuWriteTick;
+            var written = copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size);
             // A GPU-modified range with no recorded writer: keep the conservative path.
             if (written == 0)
             {
@@ -1862,6 +1871,28 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (total > AsyncReadbackLimit)
         {
             return false;
+        }
+
+        if (ReadbackTickLog) // [local] where the writer tick of a readback stands
+        {
+            var completed = _scheduler.Timeline.CompletedTick;
+            var kind = waitTick >= _scheduler.CurrentTick ? 0 : waitTick > completed ? 1 : 2;
+            var pageTick = 0UL;
+            foreach (var copy in copies)
+                for (var page = copy.Address >> 12; page <= (copy.Address + copy.Size - 1) >> 12; page++)
+                    if (_pageWriteTicks.TryGetValue(page, out var t) && t > pageTick) pageTick = t;
+            _readbackPageKinds[pageTick == 0 ? 3 : pageTick >= _scheduler.CurrentTick ? 0 : pageTick > completed ? 1 : 2]++;
+            _readbackTickKinds[kind]++;
+            _readbackTickLag[kind] += (long)(_scheduler.CurrentTick - Math.Min(waitTick, _scheduler.CurrentTick));
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now - _readbackTickReport > 5 * System.Diagnostics.Stopwatch.Frequency)
+            {
+                _readbackTickReport = now;
+                Console.Error.WriteLine($"[READBACK_PAGE_TICK] current_batch={_readbackPageKinds[0]} in_flight={_readbackPageKinds[1]} completed={_readbackPageKinds[2]} unknown={_readbackPageKinds[3]}");
+                Array.Clear(_readbackPageKinds);
+                Console.Error.WriteLine($"[READBACK_TICK] current_batch={_readbackTickKinds[0]} in_flight={_readbackTickKinds[1]} completed={_readbackTickKinds[2]} lag_in_flight={(_readbackTickKinds[1] == 0 ? 0 : _readbackTickLag[1] / _readbackTickKinds[1])} lag_completed={(_readbackTickKinds[2] == 0 ? 0 : _readbackTickLag[2] / _readbackTickKinds[2])}");
+                Array.Clear(_readbackTickKinds); Array.Clear(_readbackTickLag);
+            }
         }
 
         // The last writer is still in the buffer being recorded; submit it (without
@@ -2068,7 +2099,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var source = CollectUploadRanges(buffer, guestAddress, size, isWritten, preserveCpuWriteHotPages, out var copies, out var totalSize);
         if (source != null)
         {
-            buffer.NoteGpuWrite();
+            foreach (var copy in copies)
+                buffer.NoteGpuWrite(copy.DstOffset, copy.Size);
             var command = _scheduler.Current;
             command.EndRendering();
             var native = new CommandBuffer(command.Handle);
@@ -2119,7 +2151,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (copiedFromImage) GuestGpuMemoryHook.Trace(guestAddress, size, $"host-copy-from-image submission_tick={_scheduler.CurrentTick}"); // [local]
             if (copiedFromImage)
             {
-                buffer.NoteGpuWrite();
+                buffer.NoteGpuWrite(buffer.Offset(guestAddress), size);
             }
 
             return copiedFromImage;
