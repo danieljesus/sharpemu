@@ -65,8 +65,29 @@ public static partial class Gen5SpirvTranslator
             return result;
         }
 
+        // [local] Node tests per invocation for the [GPU][STEPS] statistics (fault tracing only).
+        private uint _bvhTestCount;
+
+        internal uint BvhTestCounter()
+        {
+            if (_bvhTestCount == 0)
+            {
+                _bvhTestCount = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _module.AddName(_bvhTestCount, "bvhTestCount");
+                _interfaces.Add(_bvhTestCount);
+            }
+
+            return _bvhTestCount;
+        }
+
         private void EmitRayIntersectActive(Gen5RayIntersectControl ray, bool bvh64)
         {
+            if (_request.TraceDeviceAddressFaults)
+            {
+                var counter = BvhTestCounter();
+                Store(counter, IAdd(Load(_uintType, counter), UInt(1)));
+            }
+
             var result = _rayResult!;
             var nodeLow = LoadV(ray.GetAddressRegister(0));
             var nodePointer = bvh64 ? Pair64(nodeLow, LoadV(ray.GetAddressRegister(1))) : Widen(nodeLow);

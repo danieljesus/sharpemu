@@ -365,7 +365,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                 if (stack[0] != 0 || stack[2] != 0 || stack[3] != 0)
                     Console.Error.WriteLine($"[GPU][STACK] scan_tick={scanTick} push_lds={stack[0]} push_scr={stack[1]} pop_lds={stack[2]} pop_scr={stack[3]} lds_zero={stack[4]} scr_zero={stack[5]} lds_m1={stack[6]} scr_m1={stack[7]} max_push_off=0x{stack[8]:X} lds_dwords={stack[9]} scratch_dwords={stack[10]} max_pop_off=0x{stack[11]:X}");
                 if (stats[2] != 0)
-                    Console.Error.WriteLine($"[GPU][STEPS] scan_tick={scanTick} max={stats[0]} over1k={stats[3]} over10k={stats[1]} over30k={stats[4]} over90k={stats[5]} total={stats[2]}");
+                    Console.Error.WriteLine($"[GPU][STEPS] scan_tick={scanTick} max={stats[0]} over1k={stats[3]} over10k={stats[1]} over30k={stats[4]} over90k={stats[5]} total={stats[2]} bvh_tests={stats[6]} bvh_tests_per_ray={(stats[2] == 0 ? 0 : (double)stats[6] / stats[2]):F1} bvh_tests_max={stats[7]}");
                 if (oob[0] != 0)
                     Console.Error.WriteLine($"[GPU][OOB_STORE] scan_tick={scanTick} hash=0x{((ulong)oob[2] << 32 | oob[1]):X16} pc=0x{oob[3]:X} binding={oob[4]} dword=0x{oob[5]:X} bound_dwords=0x{oob[6]:X} site={oob[7]}");
                 if (record[0] != 0)

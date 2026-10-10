@@ -502,6 +502,9 @@ public static partial class Gen5SpirvTranslator
                         _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, BlockWordPointer(_faultBuffer, IAdd(statsStart, UInt(slot))), UInt(1), UInt(0),
                             threshold == 0 ? UInt(1) : SelectU(_module.AddInstruction(SpirvOp.UGreaterThan, _boolType, stepsTaken, UInt(threshold)), UInt(1), UInt(0)));
                     Count(1, 10000); Count(2, 0); Count(3, 1000); Count(4, 30000); Count(5, 90000);
+                    var bvhTests = Load(_uintType, BvhTestCounter()); // [local] node tests of this invocation
+                    _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, BlockWordPointer(_faultBuffer, IAdd(statsStart, UInt(6))), UInt(1), UInt(0), bvhTests);
+                    _module.AddInstruction(SpirvOp.AtomicUMax, _uintType, BlockWordPointer(_faultBuffer, IAdd(statsStart, UInt(7))), UInt(1), UInt(0), bvhTests);
                     _module.AddInstruction(SpirvOp.AtomicUMax, _uintType, StackWord(9), UInt(1), UInt(0), UInt(_ldsDwordMask + 1));
                     _module.AddInstruction(SpirvOp.AtomicUMax, _uintType, StackWord(10), UInt(1), UInt(0), UInt(_scratchDwordCount));
                     EmitConditional(_module.AddInstruction(SpirvOp.UGreaterThan, _boolType, stepsTaken, UInt((uint)(_maxDispatcherSteps * 9 / 10))), () =>
