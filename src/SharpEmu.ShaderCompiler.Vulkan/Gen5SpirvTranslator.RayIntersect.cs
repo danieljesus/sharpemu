@@ -211,8 +211,48 @@ public static partial class Gen5SpirvTranslator
         private NodeUnit ResolveNodeUnit(uint nodeAddress, uint unit)
         {
             var address = unit == 0 ? nodeAddress : IAdd64(nodeAddress, ULong(unit * NodeUnitDwords * 4ul));
-            var (pointer, valid) = ResolveDeviceAddress(address);
-            return new NodeUnit(pointer, valid);
+            if (!BvhPageCache)
+            {
+                var (pointer, directValid) = ResolveDeviceAddress(address);
+                return new NodeUnit(pointer, directValid);
+            }
+
+            // [local] One page-table entry cached per invocation: consecutive node tests of a
+            // traversal mostly stay in one 16 KB page, so the dependent page-table load is skipped.
+            DeclareBvhPageCache();
+            var masked = And64(address, ULong(DeviceAddressMask));
+            var page = ShiftRightLogical64(masked, ULong(DeviceAddressPageBits));
+            var offset = And64(masked, ULong(DeviceAddressPageSize - 1));
+            var hit = _module.AddInstruction(SpirvOp.IEqual, _boolType, page, Load(_ulongType, _bvhCachedPage));
+            EmitConditional(LogicalNot(hit), () =>
+            {
+                var (resolved, mapped) = ResolveDeviceAddress(address);
+                Store(_bvhCachedEntry, ISub64(resolved, offset));
+                Store(_bvhCachedPage, _module.AddInstruction(SpirvOp.Select, _ulongType, mapped, page, ULong(ulong.MaxValue)));
+                Store(_bvhCachedMapped, _module.AddInstruction(SpirvOp.Select, _uintType, mapped, UInt(1), UInt(0)));
+            });
+            var entry = Load(_ulongType, _bvhCachedEntry);
+            var valid = _module.AddInstruction(SpirvOp.INotEqual, _boolType, Load(_uintType, _bvhCachedMapped), UInt(0));
+            return new NodeUnit(IAdd64(entry, offset), valid);
+        }
+
+        private static readonly bool BvhPageCache = Environment.GetEnvironmentVariable("SHARPEMU_BVH_PAGE_CACHE") == "1"; // [local]
+        private uint _bvhCachedPage, _bvhCachedEntry, _bvhCachedMapped;
+
+        private void DeclareBvhPageCache()
+        {
+            if (_bvhCachedPage != 0)
+                return;
+            var privateUlongPointer = _module.TypePointer(SpirvStorageClass.Private, _ulongType);
+            _bvhCachedPage = _module.AddGlobalVariable(privateUlongPointer, SpirvStorageClass.Private, _module.Constant64(_ulongType, ulong.MaxValue));
+            _bvhCachedEntry = _module.AddGlobalVariable(privateUlongPointer, SpirvStorageClass.Private, _module.Constant64(_ulongType, 0));
+            _bvhCachedMapped = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+            _module.AddName(_bvhCachedPage, "bvhCachedPage");
+            _module.AddName(_bvhCachedEntry, "bvhCachedEntry");
+            _module.AddName(_bvhCachedMapped, "bvhCachedMapped");
+            _interfaces.Add(_bvhCachedPage);
+            _interfaces.Add(_bvhCachedEntry);
+            _interfaces.Add(_bvhCachedMapped);
         }
 
         private uint LoadNodeDword(NodeUnit unit, uint dword) =>
