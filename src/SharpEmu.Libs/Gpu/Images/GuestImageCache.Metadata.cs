@@ -404,6 +404,8 @@ public sealed partial class GuestImageCache
         return true;
     }
 
+    private static readonly bool SkipDccSync = Environment.GetEnvironmentVariable("SHARPEMU_SKIP_DCC_SYNC") == "1"; // [local]
+
     public void SynchronizeGuestDccMetadata(ulong metadataAddress, ulong sliceSize, uint baseLayer, uint layerCount)
     {
         if (metadataAddress == 0 || sliceSize == 0 || layerCount == 0 ||
@@ -414,7 +416,7 @@ public sealed partial class GuestImageCache
 
         var address = metadataAddress + (ulong)baseLayer * sliceSize;
         var size = (ulong)layerCount * sliceSize;
-        if (IsValidRange(address, size) && _bufferCache.HasGpuDirtyBytes(address, size))
+        if (!SkipDccSync && IsValidRange(address, size) && _bufferCache.HasGpuDirtyBytes(address, size)) // [local] A/B switch
         {
             _ = _bufferCache.TrySynchronizeCpuRead(address, size);
         }
