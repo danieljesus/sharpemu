@@ -52,7 +52,7 @@ public static partial class Gen5SpirvTranslator
         private static NativeBlasMode ReadNativeBlasMode() =>
             (Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_BLAS_LOOP") ?? string.Empty).Trim().ToLowerInvariant() switch
             {
-                "1" or "on" or "native" => NativeBlasMode.Native,
+                "" or "1" or "on" or "native" => NativeBlasMode.Native, // on by default (rt425, rt426: bit-exact)
                 "2" or "verify" => NativeBlasMode.Verify,
                 _ => NativeBlasMode.Off,
             };
