@@ -383,6 +383,19 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                         Console.Error.WriteLine($"[GPU][NATIVE_BLAS_FIRST] scan_tick={scanTick} lane={nativeBlas[7]} guest/native: {registers} | root=0x{nativeBlas[26]:X} tmax_in=0x{nativeBlas[27]:X} v29_in=0x{nativeBlas[28]:X} blas=0x{((ulong)nativeBlas[30] << 32) | nativeBlas[29]:X} instance=0x{((ulong)nativeBlas[32] << 32) | nativeBlas[31]:X} native_iterations={nativeBlas[33]}");
                     }
                 }
+                if (nativeBlas[34] != 0 || nativeBlas[60] != 0) // [local] SHARPEMU_8395_PROFILE: region clocks per subgroup and counters
+                {
+                    string[] regions = ["setup", "raygen", "pretrav", "traversal", "instance", "blas", "alpha", "tlasnode", "hitshade", "hitlist", "reduction"];
+                    var words = nativeBlas.Slice(34, 30).ToArray();
+                    ulong Sum(int word) => ((ulong)words[word - 33] << 32) | words[word - 34];
+                    var total = Sum(35);
+                    var parts = string.Join(" ", regions.Select((name, region) =>
+                    {
+                        var cycles = Sum(37 + 2 * region);
+                        return $"{name}={(total == 0 ? 0 : 100.0 * cycles / total):F1}%";
+                    }));
+                    Console.Error.WriteLine($"[GPU][RT_PROFILE] scan_tick={scanTick} subgroups={words[0]} clock={(words[29] & 1) != 0} cycles_per_subgroup={(words[0] == 0 ? 0 : (double)total / words[0]):F0} {parts} alpha_tests={words[25]} blas_iterations={words[26]} tlas_node_visits={words[27]} instance_entries={words[28]}");
+                }
                 if (oob[0] != 0)
                     Console.Error.WriteLine($"[GPU][OOB_STORE] scan_tick={scanTick} hash=0x{((ulong)oob[2] << 32 | oob[1]):X16} pc=0x{oob[3]:X} binding={oob[4]} dword=0x{oob[5]:X} bound_dwords=0x{oob[6]:X} site={oob[7]}");
                 if (record[0] != 0)

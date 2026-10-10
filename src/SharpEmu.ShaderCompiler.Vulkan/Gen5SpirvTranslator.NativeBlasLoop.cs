@@ -327,7 +327,13 @@ public static partial class Gen5SpirvTranslator
 
                 Store(_nativeCapped, UInt(0));
                 Store(_nativeSteps, UInt(0));
+                BeginRtProfileRegion(RtProfileBlas);
                 EmitConditional(Load(_boolType, _exec), () => EmitNativeBlasLoop(plan));
+                EndRtProfileRegion(RtProfileBlas);
+                if (RtProfileActive)
+                {
+                    CountRtProfile(1, Load(_uintType, _nativeSteps));
+                }
                 if (verify)
                 {
                     _nativeResults ??= NativeBlasLiveOuts.Select(register => NativeVariable($"nativeBlasResult_v{register}")).ToArray();
@@ -429,6 +435,8 @@ public static partial class Gen5SpirvTranslator
                     var alphaTested = EmitNativeCompare(plan, 0x1204);
                     EmitConditional(alphaTested, () =>
                     {
+                        BeginRtProfileRegion(RtProfileAlpha);
+                        CountRtProfile(0, UInt(1));
                         foreach (var pc in plan.Instructions.Keys)
                         {
                             if (pc is >= NativeBlasAlphaFirst and <= NativeBlasAlphaLast && !NativeBlasAlphaSkipped.Contains(pc))
@@ -436,6 +444,8 @@ public static partial class Gen5SpirvTranslator
                                 EmitNativeGuest(plan, pc);
                             }
                         }
+
+                        EndRtProfileRegion(RtProfileAlpha);
                     });
                     var accepted = EmitNativeCompare(plan, 0x1518);
                     EmitConditional(accepted, () =>

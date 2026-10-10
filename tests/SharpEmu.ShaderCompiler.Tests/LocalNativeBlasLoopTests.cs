@@ -49,6 +49,30 @@ public sealed class LocalNativeBlasLoopTests(ITestOutputHelper output)
         {
             Environment.SetEnvironmentVariable("SHARPEMU_NATIVE_BLAS_LOOP", previous);
         }
+
+        // The region profile, with and without subgroup clocks.
+        var previousProfile = Environment.GetEnvironmentVariable("SHARPEMU_8395_PROFILE");
+        var previousClock = Gen5SpirvTranslator.ShaderClockEnabled;
+        try
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_8395_PROFILE", "1");
+            foreach (var clock in new[] { false, true })
+            {
+                Gen5SpirvTranslator.ShaderClockEnabled = clock;
+                var spirv = Compile(trace: true);
+                output.WriteLine($"profile clock={clock} bytes={spirv.Length}");
+                if (Environment.GetEnvironmentVariable("LOCAL_SPV_OUT") is { Length: > 0 } directory)
+                {
+                    Directory.CreateDirectory(directory);
+                    File.WriteAllBytes(Path.Combine(directory, $"8395_profile_clock{(clock ? 1 : 0)}.spv"), spirv);
+                }
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_8395_PROFILE", previousProfile);
+            Gen5SpirvTranslator.ShaderClockEnabled = previousClock;
+        }
     }
 
     private static byte[] Compile(bool trace)

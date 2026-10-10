@@ -320,6 +320,7 @@ public static partial class Gen5SpirvTranslator
                 // next-block guard, with natural loops as structured loops.
                 var structuredForward = StructuredForwardBlocks && blocks.Count != 0 && TryBuildLoopRegions(blocks, out _loopLatchByHeader);
                 _nativeBlas = structuredForward ? PrepareNativeBlasLoop(blocks) : null; // [local]
+                if (structuredForward) PrepareRtProfile(blocks); // [local]
                 DeclareModule();
                 if (blocks.Count == 0)
                 {
@@ -400,6 +401,7 @@ public static partial class Gen5SpirvTranslator
                     // what the dispatcher loop would. The driver then sees ifs and loops and can
                     // keep only the live guest registers in hardware registers, where the
                     // dispatcher keeps nearly all of them live and pays a switch per block.
+                    BeginRtProfileProgram(); // [local]
                     if (!TryEmitStructuredRange(blocks, 0, blocks.Count - 1, -1, out error))
                     {
                         return false;
@@ -485,6 +487,7 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 _module.AddLabel(loopMerge);
+                if (structuredForward) FlushRtProfile(); // [local]
                 // [local] step histogram of the BVH traversal shader in the fault buffer's stats area.
                 if (_request.Hash is 0x5981037B07E391D5 && _maxDispatcherSteps > 0 && _request.Bindings is not null && Environment.GetEnvironmentVariable("SHARPEMU_REFIT_STEPS") == "1") // [local] refit: into the BLAS header padding through binding 1: max steps (+0xE0), lanes past 90 % of the guard (+0xE4), lanes (+0xE8)
                 {
@@ -677,6 +680,7 @@ public static partial class Gen5SpirvTranslator
             }
             _module.AddCapability(SpirvCapability.Int64);
             _module.AddCapability(SpirvCapability.ImageQuery);
+            DeclareRtProfileCapability(); // [local]
             if (_request.SupportsFloat16Conversions)
             {
                 _module.AddCapability(SpirvCapability.Float16);
@@ -2491,8 +2495,11 @@ public static partial class Gen5SpirvTranslator
         private bool TryEmitStructuredRange(IReadOnlyList<ShaderBlock> blocks, int first, int last, int enclosingHeader, out string error)
         {
             error = string.Empty;
+            var profiled = new List<int>(); // [local] SHARPEMU_8395_PROFILE regions open in this range
             for (var index = first; index <= last;)
             {
+                CloseRtProfileRegions(index, profiled);
+                OpenRtProfileRegions(index, enclosingHeader, profiled);
                 if (_nativeBlas is { } nativeBlas && index != enclosingHeader) // [local]
                 {
                     if (index == nativeBlas.Header)
@@ -2542,6 +2549,7 @@ public static partial class Gen5SpirvTranslator
                 index++;
             }
 
+            CloseRtProfileRegions(last + 1, profiled); // [local]
             return true;
         }
 

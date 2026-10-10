@@ -1026,9 +1026,14 @@ internal static unsafe partial class VulkanVideoPresenter
             var maintenance5Extension = (byte*)SilkMarshal.StringToPtr(Maintenance5ExtensionName);
             var imageViewMinLodExtension = (byte*)SilkMarshal.StringToPtr(ImageViewMinLodExtensionName);
             var fillRectangleExtension = (byte*)SilkMarshal.StringToPtr(FillRectangleExtensionName);
+            // [local] SHARPEMU_8395_PROFILE=1: subgroup clocks for the RT pass's region profile.
+            var shaderClockExtension = (byte*)SilkMarshal.StringToPtr("VK_KHR_shader_clock");
+            var enableShaderClock = Environment.GetEnvironmentVariable("SHARPEMU_8395_PROFILE") == "1" &&
+                IsDeviceExtensionAvailable("VK_KHR_shader_clock");
+            var shaderClockFeatures = default(PhysicalDeviceShaderClockFeaturesKHR);
             try
             {
-                var extensions = stackalloc byte*[15];
+                var extensions = stackalloc byte*[16];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 extensions[extensionCount++] = pushDescriptorExtension;
@@ -1078,6 +1083,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (supportsRobustness2)
                 {
                     extensions[extensionCount++] = robustness2Extension;
+                }
+
+                if (enableShaderClock)
+                {
+                    extensions[extensionCount++] = shaderClockExtension;
                 }
 
                 if (IsDeviceExtensionAvailable(PortabilitySubsetExtensionName))
@@ -1198,6 +1208,17 @@ internal static unsafe partial class VulkanVideoPresenter
                     renderingChain = &colorWriteEnableFeatures;
                 }
 
+                if (enableShaderClock)
+                {
+                    shaderClockFeatures = new PhysicalDeviceShaderClockFeaturesKHR
+                    {
+                        SType = StructureType.PhysicalDeviceShaderClockFeaturesKhr,
+                        ShaderSubgroupClock = true,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &shaderClockFeatures;
+                }
+
                 vulkan13Features = new PhysicalDeviceVulkan13Features
                 {
                     SType = StructureType.PhysicalDeviceVulkan13Features,
@@ -1223,9 +1244,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 };
 
                 Check(_vk.CreateDevice(_physicalDevice, &createInfo, null, out _device), "vkCreateDevice");
+                SharpEmu.ShaderCompiler.Vulkan.Gen5SpirvTranslator.ShaderClockEnabled = enableShaderClock; // [local]
+                if (Environment.GetEnvironmentVariable("SHARPEMU_8395_PROFILE") == "1")
+                    Console.Error.WriteLine($"[LOADER][INFO] VK_KHR_shader_clock for the 0x8395 profile: {(enableShaderClock ? "enabled" : "unavailable, counters only")}");
             }
             finally
             {
+                SilkMarshal.Free((nint)shaderClockExtension);
                 SilkMarshal.Free((nint)swapchainExtension);
                 SilkMarshal.Free((nint)maintenance8Extension);
                 SilkMarshal.Free((nint)maintenance5Extension);

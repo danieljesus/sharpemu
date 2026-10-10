@@ -181,6 +181,7 @@ public enum SpirvOp : ushort
     GroupNonUniformShuffleXor = 346,
     GroupNonUniformShuffleUp = 347,
     GroupNonUniformShuffleDown = 348,
+    ReadClockKhr = 5056,
 }
 
 public enum SpirvCapability : uint
@@ -188,6 +189,7 @@ public enum SpirvCapability : uint
     Shader = 1,
     InterpolationFunction = 52,
     FragmentBarycentricKhr = 5284,
+    ShaderClockKhr = 5055,
     ClipDistance = 32,
     CullDistance = 33,
     SampledImageArrayDynamicIndexing = 29,
