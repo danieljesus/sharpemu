@@ -523,6 +523,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private long _fillGpu, _fillGpuBytes, _fillCpu, _fillInvalidate, _fillObtain, _fillRecord, _fillReport, _fillClearMeta, _fillQuery, _fillImageInvalidate, _fillImageCount, _fillWrite;
     private static readonly ulong FillOnGpuMin = Convert.ToUInt64(Environment.GetEnvironmentVariable("SHARPEMU_FILL_ON_GPU_MIN") ?? "0", 16); // [local]
     private uint[]? _fillPattern; // [local]
+    private static readonly bool ParallelFill = Environment.GetEnvironmentVariable("SHARPEMU_PARALLEL_FILL") != "0"; // [local] on by default (rt421)
+    private const ulong ParallelFillMin = 2UL << 20;
     private uint _fillPatternValue;
     private static readonly bool FastFill = Environment.GetEnvironmentVariable("SHARPEMU_FAST_FILL") != "0"; // [local] on by default (rt415: CommandMemoryTransfer 5.1 -> 3.4 ms/frame)
     // [local] experiment: a written binding over a GPU-modified range still uploads CPU-dirty pages first (SHARPEMU_WRITTEN_SYNC_CPU_DIRTY=1).
@@ -601,16 +603,38 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     _fillPatternValue = value;
                 }
 
-                var pattern = MemoryMarshal.AsBytes(_fillPattern.AsSpan());
-                for (ulong offset = 0; offset < size;)
+                var patternArray = _fillPattern;
+                var pieceBytes = (ulong)patternArray.Length * sizeof(uint);
+                if (ParallelFill && size >= ParallelFillMin)
                 {
-                    var chunk = (int)Math.Min(size - offset, (ulong)pattern.Length);
-                    if (!_backing.TryWriteBacking(guestAddress + offset, pattern[..chunk]))
+                    // [local] Large clears spread over cores: the backing writes take a shared lock.
+                    var pieces = (long)((size + pieceBytes - 1) / pieceBytes);
+                    var failed = 0;
+                    Parallel.For(0, pieces, piece =>
                     {
-                        throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress + offset:X16} size=0x{chunk:X}");
+                        var offset = (ulong)piece * pieceBytes;
+                        var chunk = (int)Math.Min(size - offset, pieceBytes);
+                        if (!_backing.TryWriteBacking(guestAddress + offset, MemoryMarshal.AsBytes(patternArray.AsSpan())[..chunk]))
+                            Interlocked.Exchange(ref failed, 1);
+                    });
+                    if (failed != 0)
+                    {
+                        throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress:X16} size=0x{size:X}");
                     }
+                }
+                else
+                {
+                    var pattern = MemoryMarshal.AsBytes(patternArray.AsSpan());
+                    for (ulong offset = 0; offset < size;)
+                    {
+                        var chunk = (int)Math.Min(size - offset, (ulong)pattern.Length);
+                        if (!_backing.TryWriteBacking(guestAddress + offset, pattern[..chunk]))
+                        {
+                            throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress + offset:X16} size=0x{chunk:X}");
+                        }
 
-                    offset += (ulong)chunk;
+                        offset += (ulong)chunk;
+                    }
                 }
 
                 var end = guestAddress + size;
