@@ -16,6 +16,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private const int MaxPendingFaults = 8;
     private const uint MaxPageFaults = 1024;
     private const ulong PageFaultAreaSize = MaxPageFaults * sizeof(ulong);
+    // [local] Trace tail after the fault bitmap: shaders address it from the buffer's end. The last
+    // 256 bytes hold the probe words ([GPU][STACK]/[STEPS]/records), the 256 before them the native
+    // BLAS loop's verify record ([GPU][NATIVE_BLAS]).
+    private const ulong TraceTailBytes = 512;
+    private const int ProbeAreaOffset = 256;
 
     private static long _reportedFaults;
     private readonly GpuDeviceInfo _device;
@@ -81,9 +86,9 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         _pageCount = pageCount;
         _faultBufferSize = pageCount / 8;
         _faultBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags,
-            _faultBufferSize + (GuestGpuMemoryHook.TraceEnabled ? 256UL : 0UL));
+            _faultBufferSize + (GuestGpuMemoryHook.TraceEnabled ? TraceTailBytes : 0UL));
         if (GuestGpuMemoryHook.TraceEnabled)
-            _traceDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * 256);
+            _traceDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * TraceTailBytes);
         _downloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
 
         var vk = device.Vk;
@@ -208,7 +213,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         {
             if (_traceDownloadBuffer is not null && !_traceInitialized)
             {
-                _faultBuffer.Fill(_faultBufferSize, 256, 0);
+                _faultBuffer.Fill(_faultBufferSize, TraceTailBytes, 0);
                 _traceInitialized = true;
             }
             return _faultBuffer;
@@ -272,19 +277,20 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         }
         if (_traceDownloadBuffer is not null)
         {
-            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, _faultBufferSize, area * 256UL, 256,
+            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, _faultBufferSize, area * TraceTailBytes, TraceTailBytes,
                 destinationAfter: AccessFlags.HostReadBit);
-            _faultBuffer.Fill(_faultBufferSize, 256, 0);
+            _faultBuffer.Fill(_faultBufferSize, TraceTailBytes, 0);
         }
         _scheduler.QueueCompletionAction(() =>
         {
             if (_traceDownloadBuffer is not null)
             {
-                _traceDownloadBuffer.Invalidate(area * 256UL, 256);
-                var stack = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)area * 256, 128));
-                var stats = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)area * 256 + 160, 32));
-                var oob = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)area * 256 + 224, 32));
-                var record = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)area * 256 + 192, 32));
+                _traceDownloadBuffer.Invalidate(area * TraceTailBytes, TraceTailBytes);
+                var stack = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset, 128));
+                var stats = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 160, 32));
+                var oob = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 224, 32));
+                var record = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 192, 32));
+                var nativeBlas = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes), 256)); // [local]
                 if (stack[20] != 0)
                 {
                     var table = (ulong)stack[30] << 32 | stack[29];
@@ -356,8 +362,8 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                     Console.Error.WriteLine($"[GPU][TLASHIST] scan_tick={scanTick} active_spinning={stack[21]} iters={stack[30]} ring={stack[30] & 3} e0: s12=0x{stack[13]:X} s96={stack[14]} v0=0x{stack[15]:X} | e1: s12=0x{stack[16]:X} s96={stack[17]} v0=0x{stack[18]:X} | e2: s12=0x{stack[19]:X} s96={stack[24]} v0=0x{stack[25]:X} | e3: s12=0x{stack[26]:X} s96={stack[27]} v0=0x{stack[29]:X}");
                 if (stack[28] != 0)
                     Console.Error.WriteLine($"[GPU][SPIN_BVH] scan_tick={scanTick} spinning={stack[28]} v8_samples=0x{stack[24]:X},0x{stack[25]:X},0x{stack[26]:X},0x{stack[27]:X} v0=0x{stack[29]:X} v1=0x{stack[30]:X} v42=0x{stack[31]:X} ");
-                var hw = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)area * 256 + 128, 32)); // [local]
-                var wf = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)area * 256 + 176, 16)); // [local] words 44..47
+                var hw = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 128, 32)); // [local]
+                var wf = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 176, 16)); // [local] words 44..47
                 if (wf[2] != 0)
                     Console.Error.WriteLine($"[GPU][GUARD5981] scan_tick={scanTick} max_steps={wf[0]} lanes_past_90pct={wf[1]} lanes={wf[2]}");
                 if (hw[0] != 0)
@@ -366,6 +372,17 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                     Console.Error.WriteLine($"[GPU][STACK] scan_tick={scanTick} push_lds={stack[0]} push_scr={stack[1]} pop_lds={stack[2]} pop_scr={stack[3]} lds_zero={stack[4]} scr_zero={stack[5]} lds_m1={stack[6]} scr_m1={stack[7]} max_push_off=0x{stack[8]:X} lds_dwords={stack[9]} scratch_dwords={stack[10]} max_pop_off=0x{stack[11]:X}");
                 if (stats[2] != 0)
                     Console.Error.WriteLine($"[GPU][STEPS] scan_tick={scanTick} max={stats[0]} over1k={stats[3]} over10k={stats[1]} over30k={stats[4]} over90k={stats[5]} total={stats[2]} bvh_tests={stats[6]} bvh_tests_per_ray={(stats[2] == 0 ? 0 : (double)stats[6] / stats[2]):F1} bvh_tests_max={stats[7]}");
+                if (nativeBlas[0] != 0 || nativeBlas[2] != 0) // [local] SHARPEMU_NATIVE_BLAS_LOOP: verify record (2), capped lanes (1 and 2)
+                {
+                    Console.Error.WriteLine($"[GPU][NATIVE_BLAS] scan_tick={scanTick} compared={nativeBlas[0]} mismatches={nativeBlas[1]} capped={nativeBlas[2]} mask=0x{nativeBlas[3]:X} iterations={nativeBlas[5]} iterations_per_exit={(nativeBlas[0] == 0 ? 0 : (double)nativeBlas[5] / nativeBlas[0]):F1} iterations_max={nativeBlas[6]}");
+                    if (nativeBlas[1] != 0)
+                    {
+                        string[] names = ["v23", "v29", "v31", "v21", "v22", "v6", "v7", "v9", "v43"];
+                        var values = nativeBlas.Slice(8, 18).ToArray();
+                        var registers = string.Join(" ", names.Select((name, index) => $"{name}=0x{values[index]:X}/0x{values[9 + index]:X}"));
+                        Console.Error.WriteLine($"[GPU][NATIVE_BLAS_FIRST] scan_tick={scanTick} lane={nativeBlas[7]} guest/native: {registers} | root=0x{nativeBlas[26]:X} tmax_in=0x{nativeBlas[27]:X} v29_in=0x{nativeBlas[28]:X} blas=0x{((ulong)nativeBlas[30] << 32) | nativeBlas[29]:X} instance=0x{((ulong)nativeBlas[32] << 32) | nativeBlas[31]:X} native_iterations={nativeBlas[33]}");
+                    }
+                }
                 if (oob[0] != 0)
                     Console.Error.WriteLine($"[GPU][OOB_STORE] scan_tick={scanTick} hash=0x{((ulong)oob[2] << 32 | oob[1]):X16} pc=0x{oob[3]:X} binding={oob[4]} dword=0x{oob[5]:X} bound_dwords=0x{oob[6]:X} site={oob[7]}");
                 if (record[0] != 0)

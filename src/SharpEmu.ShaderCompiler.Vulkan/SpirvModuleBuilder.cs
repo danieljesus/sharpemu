@@ -832,10 +832,26 @@ public sealed class SpirvModuleBuilder
         return id;
     }
 
-    public uint AddInstruction(SpirvOp opcode, uint resultType, params uint[] operands) =>
-        TryFold(opcode, resultType, operands, out var folded)
+    public uint AddInstruction(SpirvOp opcode, uint resultType, params uint[] operands)
+    {
+        RejectWaveOperation(opcode);
+        return TryFold(opcode, resultType, operands, out var folded)
             ? folded
             : EmitResult(_functions, opcode, resultType, operands);
+    }
+
+    // [local] Set while code that runs on one lane alone (divergent, no reconvergence) is
+    // emitted: a subgroup operation or a workgroup barrier there would be a translator bug.
+    public bool ForbidWaveOperations { get; set; }
+
+    private void RejectWaveOperation(SpirvOp opcode)
+    {
+        if (ForbidWaveOperations &&
+            (opcode == SpirvOp.ControlBarrier || opcode is >= SpirvOp.GroupNonUniformElect and <= SpirvOp.GroupNonUniformShuffleDown))
+        {
+            throw new InvalidOperationException($"{opcode} inside a lane-local region");
+        }
+    }
 
     private bool IsInt32Type(uint type) =>
         (_integerTypes.TryGetValue((32, false), out var unsignedType) && unsignedType == type) ||
@@ -974,8 +990,11 @@ public sealed class SpirvModuleBuilder
         return true;
     }
 
-    public void AddStatement(SpirvOp opcode, params uint[] operands) =>
+    public void AddStatement(SpirvOp opcode, params uint[] operands)
+    {
+        RejectWaveOperation(opcode);
         Emit(_functions, opcode, operands);
+    }
 
     public void EndFunction() => Emit(_functions, SpirvOp.FunctionEnd);
 

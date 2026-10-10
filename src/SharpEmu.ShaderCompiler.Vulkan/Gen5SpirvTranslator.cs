@@ -319,6 +319,7 @@ public static partial class Gen5SpirvTranslator
                 // The fallback when the full structurer declines: blocks in program order behind a
                 // next-block guard, with natural loops as structured loops.
                 var structuredForward = StructuredForwardBlocks && blocks.Count != 0 && TryBuildLoopRegions(blocks, out _loopLatchByHeader);
+                _nativeBlas = structuredForward ? PrepareNativeBlasLoop(blocks) : null; // [local]
                 DeclareModule();
                 if (blocks.Count == 0)
                 {
@@ -2492,6 +2493,23 @@ public static partial class Gen5SpirvTranslator
             error = string.Empty;
             for (var index = first; index <= last;)
             {
+                if (_nativeBlas is { } nativeBlas && index != enclosingHeader) // [local]
+                {
+                    if (index == nativeBlas.Header)
+                    {
+                        EmitNativeBlasRegion(nativeBlas);
+                        if (_nativeBlasMode == NativeBlasMode.Native)
+                        {
+                            index = nativeBlas.Latch + 1;
+                            continue;
+                        }
+                    }
+                    else if (index == nativeBlas.Exit && _nativeBlasMode == NativeBlasMode.Verify)
+                    {
+                        EmitNativeBlasVerifyCompare(nativeBlas);
+                    }
+                }
+
                 if (index != enclosingHeader && _loopLatchByHeader.TryGetValue(index, out var latch))
                 {
                     if (!TryEmitStructuredLoop(blocks, index, latch, out error))
@@ -8505,6 +8523,11 @@ public static partial class Gen5SpirvTranslator
 
         private void StoreS(uint register, uint value)
         {
+            if (_nativeLaneEmit && register is 126 or 127)
+            {
+                throw new InvalidOperationException("EXEC write inside a lane-local region");
+            }
+
             Store(ScalarPointer(register), value);
             if (register is 106 or 107)
             {
@@ -9004,7 +9027,7 @@ public static partial class Gen5SpirvTranslator
 
         private uint BooleanToWaveMask(uint condition)
         {
-            if (_subgroupInvocationIdInput == 0)
+            if (_subgroupInvocationIdInput == 0 || _nativeLaneEmit)
             {
                 return BooleanToLaneMask(condition);
             }
@@ -9270,6 +9293,12 @@ public static partial class Gen5SpirvTranslator
         // That includes VCC and EXEC: compilers use VCC_HI (s107) as an ordinary SGPR.
         private void StoreWaveMask(uint register, uint condition)
         {
+            if (_nativeLaneEmit)
+            {
+                StoreNativeLaneMask(register, condition);
+                return;
+            }
+
             if (_waveLaneCount == 32)
             {
                 StoreS(register, Narrow(BooleanToWaveMask(condition)));

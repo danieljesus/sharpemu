@@ -58,7 +58,7 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 var value = GetRawSource(instruction, 0);
-                if (_subgroupInvocationIdInput != 0)
+                if (_subgroupInvocationIdInput != 0 && !_nativeLaneEmit)
                 {
                     if (_emulateWave64)
                     {
@@ -2595,6 +2595,15 @@ public static partial class Gen5SpirvTranslator
                     IsDppWriteEnabled(compareDpp),
                     activeCondition,
                     Load(_boolType, _vcc));
+            }
+
+            if (_nativeLaneEmit) // [local] the native BLAS loop branches on the lane's own result
+            {
+                _nativeCompareResult = activeCondition;
+                if (opcode.StartsWith("VCmpx", StringComparison.Ordinal))
+                {
+                    return true;
+                }
             }
 
             if (opcode.StartsWith("VCmpx", StringComparison.Ordinal))
