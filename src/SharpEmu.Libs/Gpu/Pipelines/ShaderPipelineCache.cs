@@ -25,10 +25,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private readonly IShaderPipelineHost _host;
     private readonly ShaderHeaderRegistry _registry;
     private readonly ShaderProgramCache _programs;
-    private readonly Dictionary<GraphicsPipelineKey, PipelineHandle> _graphicsPipelines = new();
+    // [local] Hits are looked up without the pipeline lock: creating a pipeline can take
+    // milliseconds under it, and every draw on every thread looks its pipeline up.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<GraphicsPipelineKey, PipelineHandle> _graphicsPipelines = new();
     // Filled for every draw under the gate; a pipeline is inserted under a copy of it.
-    private readonly GraphicsPipelineKey _graphicsLookup = new() { Rendering = new(), VertexInput = new(), StaticParameters = new() };
-    private readonly Dictionary<ComputePipelineKey, PipelineHandle> _computePipelines = new();
+    [ThreadStatic] private static GraphicsPipelineKey? _threadGraphicsLookup;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ComputePipelineKey, PipelineHandle> _computePipelines = new(); // [local] lock-free hits
     private readonly object _gate = new();
     // The pipeline tables have their own gate: a host that prepares programs on another
     // thread holds the program gate through a materialization while this thread looks a
@@ -492,14 +494,19 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderProgram pixelProgram)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineCreation);
+        var lookup = _threadGraphicsLookup ??= new GraphicsPipelineKey { Rendering = new(), VertexInput = new(), StaticParameters = new() };
+        FillStaticState(lookup.Rendering, lookup.VertexInput, lookup.StaticParameters,
+            colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending,
+            vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts, out var vertexStage, out var pixelStage);
+        lookup.VertexProgramId = vertexProgram.Id;
+        lookup.PixelProgramId = pixelInput is not null ? pixelProgram.Id : 0;
+        if (_graphicsPipelines.TryGetValue(lookup, out var hit))
+        {
+            return hit;
+        }
+
         lock (_pipelineGate)
         {
-            var lookup = _graphicsLookup;
-            FillStaticState(lookup.Rendering, lookup.VertexInput, lookup.StaticParameters,
-                colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending,
-                vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts, out var vertexStage, out var pixelStage);
-            lookup.VertexProgramId = vertexProgram.Id;
-            lookup.PixelProgramId = pixelInput is not null ? pixelProgram.Id : 0;
             if (_graphicsPipelines.TryGetValue(lookup, out var cached))
             {
                 return cached;
@@ -527,7 +534,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             }
 
             var created = _host.CreateGraphicsPipeline(description);
-            _graphicsPipelines.Add(key, created);
+            _graphicsPipelines[key] = created;
             ShaderCacheCounters.CountGraphicsPipeline();
             return created;
         }
@@ -746,6 +753,11 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         var stage = input.Stage.Program ?? throw SubmissionScheduler.Fatal("The compute stage has no program.");
         var key = new ComputePipelineKey(program.Id);
+        if (_computePipelines.TryGetValue(key, out var hit))
+        {
+            return hit;
+        }
+
         lock (_pipelineGate)
         {
             if (_computePipelines.TryGetValue(key, out var cached))
@@ -759,7 +771,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             }
 
             var created = _host.CreateComputePipeline(new ComputePipelineDescription { Input = input, Program = program, Stage = stage });
-            _computePipelines.Add(key, created);
+            _computePipelines[key] = created;
             ShaderCacheCounters.CountComputePipeline();
             return created;
         }
@@ -776,6 +788,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         var stage = input.Stage.Program ?? throw SubmissionScheduler.Fatal("The compute stage has no program.");
         var key = new ComputePipelineKey(program.Id);
+        if (_computePipelines.TryGetValue(key, out var hit))
+        {
+            handle = hit;
+            return true;
+        }
+
         lock (_pipelineGate)
         {
             if (_computePipelines.TryGetValue(key, out var cached))
@@ -791,7 +809,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 return false;
             }
 
-            _computePipelines.Add(key, created);
+            _computePipelines[key] = created;
             ShaderCacheCounters.CountComputePipeline();
             handle = created;
             return true;

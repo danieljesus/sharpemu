@@ -48,7 +48,7 @@ public enum SamplerBorderColor : uint
 public sealed unsafe class SamplerStore : IDisposable
 {
     private readonly GpuDeviceInfo _device;
-    private readonly Dictionary<(uint, uint, uint, uint, bool), Sampler> _samplers = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(uint, uint, uint, uint, bool), Sampler> _samplers = new();
     private readonly object _gate = new();
 
     public SamplerStore(GpuDeviceInfo device) => _device = device;
@@ -57,16 +57,23 @@ public sealed unsafe class SamplerStore : IDisposable
 
     public Sampler GetSampler(in SamplerDescriptorWords words, bool integerView)
     {
+        // A hit needs no lock: draws on every thread look samplers up, and a created
+        // sampler is never replaced.
+        var key = (words[0], words[1], words[2], words[3], integerView);
+        if (_samplers.TryGetValue(key, out var found))
+        {
+            return found;
+        }
+
         lock (_gate)
         {
-            var key = (words[0], words[1], words[2], words[3], integerView);
             if (_samplers.TryGetValue(key, out var existing))
             {
                 return existing;
             }
 
             var sampler = CreateSampler(words, integerView);
-            _samplers.Add(key, sampler);
+            _samplers[key] = sampler;
             return sampler;
         }
     }
