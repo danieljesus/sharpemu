@@ -117,6 +117,7 @@ public static partial class Gen5SpirvTranslator
                 var unit = ResolveNodeUnit(nodeAddress, 0);
                 EmitConditional(unit.Valid, () =>
                 {
+                    PrefetchNodeUnit(unit);
                     var values = EmitRayTriangle(unit, nodeType, barycentrics, origin, direction);
                     for (var component = 0; component < values.Length; component++)
                         Store(result[component], values[component]);
@@ -130,6 +131,9 @@ public static partial class Gen5SpirvTranslator
                 var readable = fp16 ? first.Valid : LogicalAnd(first.Valid, second.Valid);
                 EmitConditional(readable, () =>
                 {
+                    PrefetchNodeUnit(first);
+                    if (!fp16)
+                        PrefetchNodeUnit(second);
                     var children = EmitRayBoxes(first, second, fp16, boxGrow, boxSort, extent, origin, inverseDirection);
                     for (var component = 0; component < children.Length; component++)
                         Store(result[component], children[component]);
@@ -169,7 +173,38 @@ public static partial class Gen5SpirvTranslator
 
         // A node is 64-byte aligned, so each 64-byte unit lies on one page: the page table
         // is consulted once per unit and every dword of the unit reads through that pointer.
-        private readonly record struct NodeUnit(uint Pointer, uint Valid);
+        private sealed class NodeUnit(uint pointer, uint valid)
+        {
+            public uint Pointer => pointer;
+            public uint Valid => valid;
+
+            // [local] The unit's sixteen dwords, loaded as four 16-byte vectors once the unit is
+            // known to be readable; null while every dword is loaded on its own.
+            public uint[]? Dwords;
+        }
+
+        private static readonly bool BvhVectorLoads = Environment.GetEnvironmentVariable("SHARPEMU_BVH_VECTOR_LOADS") != "0"; // [local]
+        private uint _physicalUvec4Pointer;
+
+        // Emitted inside the block where the unit is valid, so every later use is dominated.
+        private void PrefetchNodeUnit(NodeUnit unit)
+        {
+            if (!BvhVectorLoads || unit.Dwords is not null)
+                return;
+            if (_physicalUvec4Pointer == 0)
+                _physicalUvec4Pointer = _module.TypePointer(SpirvStorageClass.PhysicalStorageBuffer, _uvec4Type);
+            var dwords = new uint[NodeUnitDwords];
+            for (uint quad = 0; quad < NodeUnitDwords / 4; quad++)
+            {
+                var address = quad == 0 ? unit.Pointer : IAdd64(unit.Pointer, ULong(quad * 16ul));
+                var pointer = _module.AddInstruction(SpirvOp.ConvertUToPtr, _physicalUvec4Pointer, address);
+                var vector = _module.AddInstruction(SpirvOp.Load, _uvec4Type, pointer, 2u, 16u);
+                for (uint lane = 0; lane < 4; lane++)
+                    dwords[quad * 4 + lane] = _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, vector, lane);
+            }
+
+            unit.Dwords = dwords;
+        }
 
         private const uint NodeUnitDwords = 16;
 
@@ -181,7 +216,7 @@ public static partial class Gen5SpirvTranslator
         }
 
         private uint LoadNodeDword(NodeUnit unit, uint dword) =>
-            _module.AddInstruction(SpirvOp.Load, _uintType,
+            unit.Dwords is { } cached ? cached[dword] : _module.AddInstruction(SpirvOp.Load, _uintType,
                 DeviceWordPointer(dword == 0 ? unit.Pointer : IAdd64(unit.Pointer, ULong(dword * 4ul))), 2u, 4u);
 
         private uint LoadNodeDword(NodeUnit first, NodeUnit second, uint dword) =>
