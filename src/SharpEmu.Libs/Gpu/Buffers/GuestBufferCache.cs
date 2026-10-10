@@ -518,7 +518,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private int _fillBigLogs;
     private long _fillGpu, _fillGpuBytes, _fillCpu, _fillInvalidate, _fillObtain, _fillRecord, _fillReport, _fillClearMeta, _fillQuery, _fillImageInvalidate, _fillImageCount, _fillWrite;
     private static readonly ulong FillOnGpuMin = Convert.ToUInt64(Environment.GetEnvironmentVariable("SHARPEMU_FILL_ON_GPU_MIN") ?? "0", 16); // [local]
-    private static readonly bool FastFill = Environment.GetEnvironmentVariable("SHARPEMU_FAST_FILL") == "1"; // [local]
+    private uint[]? _fillPattern; // [local]
+    private uint _fillPatternValue;
+    private static readonly bool FastFill = Environment.GetEnvironmentVariable("SHARPEMU_FAST_FILL") != "0"; // [local] on by default (rt415: CommandMemoryTransfer 5.1 -> 3.4 ms/frame)
     // [local] experiment: a written binding over a GPU-modified range still uploads CPU-dirty pages first (SHARPEMU_WRITTEN_SYNC_CPU_DIRTY=1).
     private static readonly bool WrittenSyncCpuDirty = Environment.GetEnvironmentVariable("SHARPEMU_WRITTEN_SYNC_CPU_DIRTY") == "1";
     private static readonly bool HostWriteMarkDirty = Environment.GetEnvironmentVariable("SHARPEMU_HOSTWRITE_MARK_DIRTY") == "1"; // [local]
@@ -587,10 +589,19 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             {
                 // [local] A large fill: the guest copy by memset, each registered buffer by one GPU fill,
                 // instead of a staged copy per 4 KB chunk (rt406: ~21 MB/frame of fills in GTA V).
+                // 256 KB pieces: per-call overhead of the backing write dominated the 4 KB loop.
+                if (_fillPattern is null || _fillPatternValue != value)
+                {
+                    _fillPattern ??= new uint[64 * 1024];
+                    _fillPattern.AsSpan().Fill(value);
+                    _fillPatternValue = value;
+                }
+
+                var pattern = MemoryMarshal.AsBytes(_fillPattern.AsSpan());
                 for (ulong offset = 0; offset < size;)
                 {
-                    var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
-                    if (!_backing.TryWriteBacking(guestAddress + offset, bytes[..chunk]))
+                    var chunk = (int)Math.Min(size - offset, (ulong)pattern.Length);
+                    if (!_backing.TryWriteBacking(guestAddress + offset, pattern[..chunk]))
                     {
                         throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress + offset:X16} size=0x{chunk:X}");
                     }
