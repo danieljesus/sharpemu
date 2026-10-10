@@ -270,8 +270,12 @@ public sealed class GuestSpaceOwner : IDisposable
         }
     }
 
-    private const int ProtectionLockCount = 256;
-    private const int ProtectionBlockShift = 22;
+    // [local] SHARPEMU_PROTECTION_BLOCK_SHIFT / SHARPEMU_PROTECTION_LOCKS: finer address locks so guest
+    // write faults and render-thread protection changes in the same 4 MB stop serializing.
+    private static readonly int ProtectionLockCount =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PROTECTION_LOCKS"), out var locks) && locks > 0 ? locks : 256;
+    private static readonly int ProtectionBlockShift =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PROTECTION_BLOCK_SHIFT"), out var shift) && shift is >= 12 and <= 30 ? shift : 22;
 
     private static object[] CreateProtectionLocks()
     {

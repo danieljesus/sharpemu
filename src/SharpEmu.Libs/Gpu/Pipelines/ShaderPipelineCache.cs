@@ -203,6 +203,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderProgram pixelProgramHandle = default;
         ShaderStageResources vertexStage;
         ShaderStageResources pixelStage = default;
+        SharpEmu.HLE.LockProbe.Probe(_gate, 24 + 1, "pipelines.gate_1");
         lock (_gate)
         {
             var pushDataCursor = 0u;
@@ -418,6 +419,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         ShaderProgram handle;
         ShaderStageResources stage;
+        SharpEmu.HLE.LockProbe.Probe(_gate, 24 + 2, "pipelines.gate_2");
         lock (_gate)
         {
             var pushDataCursor = 0u;

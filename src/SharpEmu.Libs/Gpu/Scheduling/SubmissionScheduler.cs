@@ -106,6 +106,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     private void DisposeDeviceOnceClosed()
     {
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 1, "scheduler.op_1");
         lock (_operationLock)
         {
             if (_state != OperationState.Closed || _deviceDisposed)
@@ -121,6 +122,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     public void Shutdown()
     {
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 2, "scheduler.op_2");
         lock (_operationLock)
         {
             if (_state == OperationState.Closed)
@@ -160,6 +162,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _timeline.Wait(CurrentTick - 1);
         RunCompletedOperations();
         WaitForAllPriorityOperations();
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 3, "scheduler.op_3");
         lock (_operationLock)
         {
             _stopRequested = true;
@@ -167,6 +170,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
 
         _priorityThread.Join();
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 4, "scheduler.op_4");
         lock (_operationLock)
         {
             if (_pending.Count != 0 || _priority.Count != 0 || _priorityActive)
@@ -186,6 +190,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     public void Begin(SubmissionContext context)
     {
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 5, "scheduler.op_5");
         lock (_operationLock)
         {
             if (_state != OperationState.Open)
@@ -254,6 +259,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             throw Fatal("Cannot finish memory access from a GPU completion callback.");
         }
 
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 6, "scheduler.op_6");
         lock (_operationLock)
         {
             // Reuse a completed drain only while its next command buffer and callback queues stay unused.
@@ -303,6 +309,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         for (;;)
         {
             TickWork operation;
+            SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 7, "scheduler.op_7");
             lock (_operationLock)
             {
                 if (_pending.Count == 0 || !_timeline.IsTickComplete(_pending.Peek().Tick))
@@ -321,6 +328,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     public void QueueCompletionAction(Action operation)
     {
         RequireActiveScheduler();
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 8, "scheduler.op_8");
         lock (_operationLock)
         {
             if (_state == OperationState.Open)
@@ -344,6 +352,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     public void QueuePriorityCompletionAction(Action operation)
     {
         RequireActiveScheduler();
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 9, "scheduler.op_9");
         lock (_operationLock)
         {
             if (_state == OperationState.Open)
@@ -372,6 +381,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             throw Fatal("Cannot drain priority operations from the scheduler's own deferred callback.");
         }
 
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 10, "scheduler.op_10");
         lock (_operationLock)
         {
             while (_priority.Count != 0 || _priorityActive)
@@ -388,6 +398,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             throw Fatal("Cannot wait for priority operations from the scheduler's own deferred callback.");
         }
 
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 11, "scheduler.op_11");
         lock (_operationLock)
         {
             while ((_priorityActive && _priorityActiveTick <= tick) ||
@@ -471,6 +482,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         string failure;
         ulong tick;
         // Keep completion notifications before callbacks for the next recording tick.
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 12, "scheduler.op_12");
         lock (_operationLock)
         {
             lock (_device.QueueGate)
@@ -523,6 +535,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         for (;;)
         {
             TickWork operation;
+            SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 13, "scheduler.op_13");
             lock (_operationLock)
             {
                 while (!_stopRequested && _priority.Count == 0)
@@ -546,6 +559,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                 RunDeferredCallback(operation.Callback);
             }
 
+            SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 14, "scheduler.op_14");
             lock (_operationLock)
             {
                 _priorityActive = false;

@@ -39,6 +39,7 @@ public sealed class GpuRingBuffer : GpuBuffer
         {
             var owner = Interlocked.Exchange(ref _owner, null);
             if (owner is null) return;
+            SharpEmu.HLE.LockProbe.Probe(owner._allocationRetentions, 0, "ring.retention_dispose");
             lock (owner._allocationRetentions)
             {
                 owner.RecordRetainedAllocationUse(StartingReservation);
@@ -77,6 +78,7 @@ public sealed class GpuRingBuffer : GpuBuffer
     internal IDisposable RetainUpcomingAllocations()
     {
         var retention = new AllocationRetention(this, _committedReservations);
+        SharpEmu.HLE.LockProbe.Probe(_allocationRetentions, 1, "ring.retain_1");
         lock (_allocationRetentions)
         {
             _allocationRetentions.Add(retention);
@@ -87,6 +89,7 @@ public sealed class GpuRingBuffer : GpuBuffer
     private bool HasRetainedContents()
     {
         if (Volatile.Read(ref _retainedContents) != 0) return true;
+        SharpEmu.HLE.LockProbe.Probe(_allocationRetentions, 2, "ring.retain_2");
         lock (_allocationRetentions)
         {
             foreach (var retention in _allocationRetentions)

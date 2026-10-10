@@ -166,6 +166,7 @@ internal static class HostMovieBridge
             return false;
         }
 
+        SharpEmu.HLE.LockProbe.Probe(Gate, 3, "movie.decode");
         lock (Gate)
         {
             pixels = [];
