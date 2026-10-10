@@ -6,8 +6,16 @@ namespace SharpEmu.HLE.GpuMemory;
 // The guest's own page permissions, written only by map and mprotect events.
 public sealed class GuestPermissionLedger
 {
+    // Lookups run on every tracked page and inside the fault handler; they read an immutable snapshot
+    // without locking. Map and mprotect events are rare and republish it.
+    internal static readonly bool LockFreeLookup =
+        Environment.GetEnvironmentVariable("SHARPEMU_LEDGER_SNAPSHOT") != "0";
+
+    private sealed record Snapshot(ulong[] Starts, ulong[] Ends, GuestPageProtection[] Protections);
+
     private readonly object _gate = new();
     private readonly SortedList<ulong, (ulong End, GuestPageProtection Protection)> _spans = new();
+    private Snapshot _snapshot = new([], [], []);
 
     public void Set(ulong address, ulong size, GuestPageProtection protection)
     {
@@ -15,6 +23,7 @@ public sealed class GuestPermissionLedger
         {
             RemoveRangeRecords(address, address + size);
             _spans[address] = (address + size, protection);
+            Publish();
         }
     }
 
@@ -23,12 +32,37 @@ public sealed class GuestPermissionLedger
         lock (_gate)
         {
             RemoveRangeRecords(address, address + size);
+            Publish();
         }
     }
 
     // A span without a record is read-write: every caller is gated by a registered span first.
     public GuestPageProtection Lookup(ulong address)
     {
+        if (LockFreeLookup)
+        {
+            var snapshot = Volatile.Read(ref _snapshot);
+            var starts = snapshot.Starts;
+            var low = 0;
+            var high = starts.Length;
+            while (low < high)
+            {
+                var mid = (low + high) / 2;
+                if (starts[mid] <= address)
+                {
+                    low = mid + 1;
+                }
+                else
+                {
+                    high = mid;
+                }
+            }
+
+            return low > 0 && snapshot.Ends[low - 1] > address
+                ? snapshot.Protections[low - 1]
+                : GuestPageProtection.Read | GuestPageProtection.Write;
+        }
+
         lock (_gate)
         {
             var index = FindFirstStartAfter(address) - 1;
@@ -36,6 +70,26 @@ public sealed class GuestPermissionLedger
                 ? _spans.Values[index].Protection
                 : GuestPageProtection.Read | GuestPageProtection.Write;
         }
+    }
+
+    private void Publish()
+    {
+        if (!LockFreeLookup)
+        {
+            return;
+        }
+
+        var count = _spans.Count;
+        var starts = new ulong[count];
+        var ends = new ulong[count];
+        var protections = new GuestPageProtection[count];
+        for (var index = 0; index < count; index++)
+        {
+            starts[index] = _spans.Keys[index];
+            (ends[index], protections[index]) = _spans.Values[index];
+        }
+
+        Volatile.Write(ref _snapshot, new Snapshot(starts, ends, protections));
     }
 
     private void RemoveRangeRecords(ulong start, ulong end)
