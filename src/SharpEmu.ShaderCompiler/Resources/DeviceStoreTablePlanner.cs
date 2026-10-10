@@ -18,6 +18,8 @@ public static class DeviceStoreTablePlanner
     private static readonly ulong TableMaxAddress = System.Convert.ToUInt64(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_MAXADDR") ?? "1000000000", 16); // [local]
     private static readonly bool TableRangesWritten = System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_WRITTEN") != "0"; // [local]
     private static readonly Dictionary<(ulong, ulong), List<DeviceAddressRange>> Cache = new(); // [local]
+    private static readonly int RescanEvery = int.Parse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_RESCAN") ?? "0"); // [local]
+    private static long _uses;
     private static int _logs; // [local]
     public const ulong MaxEntryBytes = 64UL * 1024 * 1024;
 
@@ -100,7 +102,8 @@ public static class DeviceStoreTablePlanner
             }
 
             // [local experiment] the whole table, scanned once per table address and cached.
-            if (Cache.TryGetValue((tableBase, tableBytes), out var cached))
+            if (Cache.TryGetValue((tableBase, tableBytes), out var cached) &&
+                (RescanEvery == 0 || ++_uses % RescanEvery != 0)) // [local] periodic rescan
             {
                 ranges.AddRange(cached);
                 continue;
