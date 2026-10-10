@@ -143,7 +143,8 @@ internal static class HostMovieBridge
         // The render thread asks before every draw and dispatch. With no movie attached
         // it must not queue on Gate behind guest file reads (Demon's Souls: ~15 % of the
         // render thread blocked here). A movie attached meanwhile is picked up next call.
-        if (Volatile.Read(ref _playback) is null && Volatile.Read(ref _presentedFrame) is { } presented)
+        if (Volatile.Read(ref _playback) is null && Volatile.Read(ref _presentedFrame) is { } presented &&
+            ReferenceEquals(presented.Pixels, Volatile.Read(ref _frameBuffer)) && Volatile.Read(ref _frameBufferPresented))
         {
             pixels = presented.Pixels;
             width = presented.Width;
