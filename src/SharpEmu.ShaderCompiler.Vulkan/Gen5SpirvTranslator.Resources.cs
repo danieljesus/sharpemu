@@ -1348,9 +1348,14 @@ public static partial class Gen5SpirvTranslator
             {
                 // [local] wave-interleaved scratch: dword k of lane L lives at byte k * 256 + L * 4
                 // (wave64), so a byte address whose lane field matches this lane maps to element k.
+                // An index inside the lane's own scratch is a per-lane address (FLAT private and
+                // scratch_* offsets are per lane on GFX10) and is taken as is: matching its low bits
+                // against the lane aliased GTA V's traversal stack, entry 14 + L of lane L onto entry 14.
                 var lane = GuestWaveLane();
                 var laneField = BitwiseAnd(dwordIndex, UInt(63));
-                var interleaved = _module.AddInstruction(SpirvOp.IEqual, _boolType, laneField, lane);
+                var interleaved = LogicalAnd(
+                    _module.AddInstruction(SpirvOp.IEqual, _boolType, laneField, lane),
+                    _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, dwordIndex, UInt(Math.Max(_scratchDwordCount, 64u))));
                 dwordIndex = SelectU(interleaved, ShiftRightLogical(dwordIndex, UInt(6)), dwordIndex);
             }
             if (_scratchDwordCount > 1)
