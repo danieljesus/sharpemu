@@ -156,8 +156,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw new DeferPreparationException();
         }
 
-        private bool NeedsBackRead(ulong address, ulong size) =>
-            FrontSyncedReads && size != 0 && _bufferCache.EverGpuWritten(address, size);
+        private bool NeedsBackRead(ulong address, ulong size)
+        {
+            if (!FrontSyncedReads || size == 0)
+                return false;
+            // [local] A read of bytes a queued WriteGuestNow has not applied yet (overlay mode 2):
+            // it runs on the render thread after the write, also while preparing (no deferral).
+            _backReadForPendingWrite = PendingWriteOverlay.Mode == 2 && FrontOverlay.Overlaps(address, size);
+            return _backReadForPendingWrite || _bufferCache.EverGpuWritten(address, size);
+        }
+
+        private bool _backReadForPendingWrite;
 
         // [local] While the front prepares a program, a read of GPU-written data does not wait
         // for the render thread: the preparation is dropped and the render thread prepares the
@@ -215,7 +224,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private T RunBackRead<T>(Func<T> read)
         {
-            if (DeferFrontPreparation && _preparingOnFront)
+            if (DeferFrontPreparation && _preparingOnFront && !_backReadForPendingWrite)
             {
                 throw new DeferPreparationException();
             }

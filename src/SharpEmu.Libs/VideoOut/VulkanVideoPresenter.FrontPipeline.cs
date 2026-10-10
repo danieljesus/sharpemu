@@ -63,8 +63,29 @@ internal static unsafe partial class VulkanVideoPresenter
     internal sealed class PendingWriteOverlay
     {
         private readonly Dictionary<ulong, (byte Value, long Serial)> _bytes = new();
+        private readonly List<(ulong Address, int Length, long Serial)> _ranges = new();
         private long _serial;
         private int _count;
+
+        // [local] SHARPEMU_FRONT_WRITE_OVERLAY: 0 (default) the front blocks on each WriteGuestNow;
+        // 1 the front patches its reads with the pending bytes (BLAS builds come out with cycles, rt340–rt367);
+        // 2 (experiment, hangs the intro: rt376) the front does not block, and a read that touches a pending write runs on the render thread
+        // after it (neither the stale nor the command-processor value is what the GPU will have written).
+        internal static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY"), out var mode) ? mode : 0;
+
+        public bool Overlaps(ulong address, ulong size)
+        {
+            if (IsEmpty || size == 0)
+                return false;
+            lock (_bytes)
+            {
+                foreach (var (start, length, _) in _ranges)
+                    if (address < start + (ulong)length && start < address + size)
+                        return true;
+            }
+
+            return false;
+        }
 
         public bool IsEmpty => Volatile.Read(ref _count) == 0;
 
@@ -77,6 +98,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var serial = ++_serial;
                 for (var index = 0; index < bytes.Length; index++)
                     _bytes[address + (ulong)index] = (bytes[index], serial);
+                _ranges.Add((address, bytes.Length, serial));
                 Volatile.Write(ref _count, _bytes.Count);
                 return serial;
             }
@@ -95,6 +117,15 @@ internal static unsafe partial class VulkanVideoPresenter
                         _bytes.Remove(key);
                 }
 
+                for (var index = 0; index < _ranges.Count; index++)
+                {
+                    if (_ranges[index].Serial == serial)
+                    {
+                        _ranges.RemoveAt(index);
+                        break;
+                    }
+                }
+
                 Volatile.Write(ref _count, _bytes.Count);
             }
         }
@@ -103,7 +134,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public int Apply(ulong address, Span<byte> destination)
         {
-            if (IsEmpty)
+            if (IsEmpty || Mode == 2)
                 return 0;
             if (SkipRanges.Length != 0) // [local experiment] SHARPEMU_OVERLAY_APPLY_SKIP=<start>-<end>,...: no patching there
             {
@@ -590,7 +621,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }, _pauseAlias, _resumeAlias);
         }
 
-        private static readonly bool WriteOverlay = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY") == "1"; // [local] off by default: with it the BLAS builds come out with cycles (rt340–rt367)
+        private static bool WriteOverlay => PendingWriteOverlay.Mode != 0;
 
         public void RunAfterFlush(Action work) => queue.Enqueue(work, _pauseAlias, _resumeAlias);
 
