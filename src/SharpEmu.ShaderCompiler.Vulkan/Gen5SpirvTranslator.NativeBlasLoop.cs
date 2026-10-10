@@ -125,7 +125,7 @@ public static partial class Gen5SpirvTranslator
             var plan = TryBuildNativeBlasPlan(blocks, out var reason);
             Console.Error.WriteLine(plan is null
                 ? $"[NATIVE_BLAS] hash=0x{_request.Hash:X16} not applied: {reason}"
-                : $"[NATIVE_BLAS] hash=0x{_request.Hash:X16} mode={_nativeBlasMode} blocks={plan.Header}..{plan.Latch} exit={plan.Exit} instructions={plan.Instructions.Count}");
+                : $"[NATIVE_BLAS] hash=0x{_request.Hash:X16} mode={_nativeBlasMode} prepared: blocks={plan.Header}..{plan.Latch} exit={plan.Exit} instructions={plan.Instructions.Count}");
             if (plan is null)
             {
                 _nativeBlasMode = NativeBlasMode.Off;
@@ -302,7 +302,7 @@ public static partial class Gen5SpirvTranslator
             if (HalfMaskPlan() is { } halfMasks)
             {
                 bool InLoop(uint pc) => pc is >= NativeBlasHeaderPc and <= NativeBlasLatchPc;
-                Console.Error.WriteLine("[NATIVE_BLAS] half-mask plan inside the loop:" +
+                Console.Error.WriteLine($"[NATIVE_BLAS] hash=0x{_request.Hash:X16} mode={_nativeBlasMode} emitted; half-mask plan inside the loop:" +
                     $" exact=[{string.Join(" ", halfMasks.ExactPairsBefore.Where(pair => InLoop(pair.Key)).Select(pair => $"0x{pair.Key:X}:s{string.Join("/s", pair.Value)}"))}]" +
                     $" half=[{string.Join(" ", halfMasks.HalfMaskWrites.Where(pair => InLoop(pair.Key)).Select(pair => $"0x{pair.Key:X}:s{pair.Value}"))}]" +
                     $" barriers=[{string.Join(" ", halfMasks.SharedMemoryBarriersBefore.Where(InLoop).Select(pc => $"0x{pc:X}"))}]");
