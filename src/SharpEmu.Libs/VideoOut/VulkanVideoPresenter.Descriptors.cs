@@ -456,6 +456,17 @@ internal static unsafe partial class VulkanVideoPresenter
         private int _bvhBindLogs;
         private int _bvhHeaderLogs;
         private int _bvhBlockDumps;
+        // [local] Slot dumps of one shader without the other BVH probes (SHARPEMU_SLOT_DUMP_AFTER_TICK delays them).
+        private static readonly ulong SlotDumpAfterTick = ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SLOT_DUMP_AFTER_TICK"), out var after) ? after : 0;
+        private void DumpSlotIfRequested(ulong hash, int index, BufferDescriptorWords descriptor, ulong requested)
+        {
+            if (SlotDumpHash == 0 || hash != SlotDumpHash || _slotDumps >= SlotDumpLimit || _scheduler.CurrentTick < SlotDumpAfterTick)
+                return;
+            _slotDumps++;
+            var tick = _scheduler.CurrentTick; var slotAddress = descriptor.Address; var slotSize = Math.Min(requested, 0x400000UL);
+            try { _bufferCache.DumpDeviceRange(slotAddress, slotSize, $"C:/Users/danyy/AppData/Local/Temp/gta/slot_{hash:X16}_s{index}_pre_{slotAddress:X}_{slotSize:X}_{tick}.gpu.bin"); } catch (Exception e) { Console.Error.WriteLine($"[SLOT_DUMP] {e.Message}"); }
+        }
+
         private void ProbeBvhWriter(PreparedStageBindings prepared, int index, BufferDescriptorWords descriptor, ulong requested)
         {
             if (!BvhProbes) return; // [local]
@@ -514,7 +525,7 @@ internal static unsafe partial class VulkanVideoPresenter
         }
         private void ProbeBvhRefitBuffer(ulong hash, int index, BufferDescriptorWords descriptor, ulong requested, ulong size, PreparedStageBindings prepared)
         {
-            if (!BvhProbes) return; // [local]
+            if (!BvhProbes) { DumpSlotIfRequested(hash, index, descriptor, requested); return; } // [local]
             if (!_buildTracked && Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1") // [local] follow the roots of one small and one large dynamic BLAS from the start (addresses stable across runs)
             {
                 _buildTracked = true;
