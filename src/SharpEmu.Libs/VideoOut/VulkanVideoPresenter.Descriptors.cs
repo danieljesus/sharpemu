@@ -813,8 +813,18 @@ internal static unsafe partial class VulkanVideoPresenter
             if (traceAddress != 0 && !memory.Covers(traceAddress, 1))
                 GuestGpuMemoryHook.Trace(traceAddress, 1,
                     $"device-address-mapping-check readable={_guestMemory.CanRead(traceAddress, 1)} backed={_guestBacking.IsBackedView(traceAddress)}");
+            // [local] One CPU-dirty sweep per guest submission (SHARPEMU_BDA_SWEEP_PER_SUBMIT=0 sweeps per dispatch).
+            // The data a submission reads is what the CPU wrote before submitting it; later CPU
+            // writes belong to the next submission, so a second sweep inside one only re-protects.
+            if (BdaSweepPerSubmit && _currentSubmitId != 0 && _currentSubmitId == _bdaSweepSubmitId && _bdaSpanMapping == _bdaSweepSubmitMapping)
+                return;
+            _bdaSweepSubmitId = _currentSubmitId;
+            _bdaSweepSubmitMapping = _bdaSpanMapping;
             _bufferCache.PrepareBda(spans, _bdaSpanMapping);
         }
+
+        private static readonly bool BdaSweepPerSubmit = Environment.GetEnvironmentVariable("SHARPEMU_BDA_SWEEP_PER_SUBMIT") != "0"; // on by default: rt375 9,15 → 9,94 FPS
+        private ulong _bdaSweepSubmitId, _bdaSweepSubmitMapping;
 
         private List<GuestSpan>? _bdaSpans;
         private GuestGpuMemory? _bdaSpanMemory;

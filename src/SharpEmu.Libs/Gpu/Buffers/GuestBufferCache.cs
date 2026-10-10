@@ -1910,12 +1910,49 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             {
                 collected.Add(new BufferCopy(collectedSize, buffer.Offset(address), bytes));
                 collectedSize += bytes;
+                if (UploadDupCheck) NoteUploadContent(address, bytes); // [local]
             },
             () => source = _uploader.PrepareSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(collected), collectedSize, guestAddress, size),
             preserveCpuWriteHotPages);
         copies = collected;
         totalSize = collectedSize;
         return source;
+    }
+
+    // [local experiment] SHARPEMU_UPLOAD_DUP_CHECK=1: per 4 KB page, how many uploaded bytes equal what
+    // the previous upload of that page carried (a shadow copy per page), reported every 5 s.
+    private static readonly bool UploadDupCheck = Environment.GetEnvironmentVariable("SHARPEMU_UPLOAD_DUP_CHECK") == "1";
+    private readonly Dictionary<ulong, byte[]> _uploadShadow = new();
+    private long _dupBytes, _uploadBytes, _dupPages, _uploadPages, _dupReport;
+
+    private void NoteUploadContent(ulong address, ulong bytes)
+    {
+        const ulong Page = 4096;
+        var end = address + bytes;
+        Span<byte> current = stackalloc byte[(int)Page];
+        for (var page = address & ~(Page - 1); page < end; page += Page)
+        {
+            var begin = Math.Max(page, address);
+            var stop = Math.Min(page + Page, end);
+            var length = (int)(stop - begin);
+            var slice = current[..length];
+            if (!_guestMemory.TryRead(begin, slice)) continue;
+            if (!_uploadShadow.TryGetValue(page, out var shadow))
+                _uploadShadow[page] = shadow = new byte[Page];
+            var offset = (int)(begin - page);
+            var same = slice.SequenceEqual(shadow.AsSpan(offset, length));
+            if (same) { _dupBytes += length; _dupPages++; }
+            _uploadBytes += length; _uploadPages++;
+            slice.CopyTo(shadow.AsSpan(offset, length));
+        }
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (now - _dupReport > 5 * System.Diagnostics.Stopwatch.Frequency)
+        {
+            _dupReport = now;
+            Console.Error.WriteLine($"[UPLOAD_DUP] bytes={_uploadBytes} dup_bytes={_dupBytes} pages={_uploadPages} dup_pages={_dupPages} shadow_pages={_uploadShadow.Count}");
+            _dupBytes = _uploadBytes = _dupPages = _uploadPages = 0;
+        }
     }
 
     private bool SynchronizeBuffer(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer,

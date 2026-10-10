@@ -62,7 +62,9 @@ public static class DeviceStoreTablePlanner
         lock (AllCaches) caches = AllCaches.ToArray();
         foreach (var cache in caches)
         {
-            foreach (var key in cache.Entries.Keys)
+            if (cache.Entries.IsEmpty)
+                continue;
+            foreach (var (key, _) in cache.Entries) // the enumerator takes no locks, unlike Keys
             {
                 if (address < key.Base + key.Bytes && key.Base < address + size)
                 {

@@ -206,8 +206,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        public void SetDebugInformation(RecordedOperation operation, ulong submitId, uint argument0, uint argument1, uint argument2, uint argument3, ulong argument4) =>
+        public void SetDebugInformation(RecordedOperation operation, ulong submitId, uint argument0, uint argument1, uint argument2, uint argument3, ulong argument4)
+        {
+            _currentSubmitId = submitId; // [local] for the per-submission device-address sweep
             _scheduler.Current.SetDebugInfo((uint)operation, submitId, argument0, argument1, argument2, argument3, argument4);
+        }
+
+        private ulong _currentSubmitId; // [local]
 
         // The part of the range that is mapped from its start; unmapped starts are fatal as the executor cannot bind them.
         public ulong ClampMappedSize(ulong address, ulong size)
