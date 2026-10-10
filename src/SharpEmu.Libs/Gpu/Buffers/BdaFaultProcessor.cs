@@ -22,6 +22,34 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private readonly SubmissionScheduler _scheduler;
     private readonly GuestBufferCache _cache;
     private int _inst0Dumps;
+    private int _spinBlobDumps; // [local]
+    private bool _regionsDumped; // [local]
+
+    // [local] SHARPEMU_REGION_DUMP=<tick>:<start hex>-<end hex>[,<start>-<end>...]: one device-copy dump in 1 MB chunks
+    private void DumpRegionsIfRequested(ulong scanTick)
+    {
+        if (_regionsDumped) return;
+        var spec = Environment.GetEnvironmentVariable("SHARPEMU_REGION_DUMP");
+        if (string.IsNullOrEmpty(spec)) { _regionsDumped = true; return; }
+        var parts = spec.Split(':', 2);
+        if (scanTick < ulong.Parse(parts[0])) return;
+        _regionsDumped = true;
+        const ulong Chunk = 1UL << 20;
+        foreach (var range in parts[1].Split(','))
+        {
+            var bounds = range.Split('-');
+            var start = Convert.ToUInt64(bounds[0], 16);
+            var end = Convert.ToUInt64(bounds[1], 16);
+            var dumped = 0;
+            for (var address = start; address < end; address += Chunk)
+            {
+                try { _cache.DumpDeviceRange(address, Chunk, $"C:/Users/danyy/AppData/Local/Temp/gta/region/{address:X}.gpu.bin"); dumped++; }
+                catch (Exception) { }
+            }
+            Console.Error.WriteLine($"[GPU][REGION_DUMP] scan_tick={scanTick} range=0x{start:X}-0x{end:X} chunks={dumped}");
+        }
+    }
+    private static readonly bool SpinBlobDump = Environment.GetEnvironmentVariable("SHARPEMU_SPIN_BLOB_DUMP") == "1"; // [local]
     private readonly HashSet<ulong> _hdrSnap1 = new(); private readonly HashSet<ulong> _hdrSnap2 = new();
     private ulong _traceArmed;
     private int _armedDumps;
@@ -231,6 +259,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
 
         var area = _currentArea;
         var scanTick = _scheduler.CurrentTick;
+        DumpRegionsIfRequested(scanTick); // [local]
         foreach (var (hdrAddress, hdrTick) in GuestBufferCache.BvhHeaderWrites) // [local] header snapshots at +2 and +40 ticks
         {
             var age = scanTick - hdrTick;
@@ -314,9 +343,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                         catch (Exception e) { Console.Error.WriteLine($"[GPU][SPIN_INST] dump failed: {e.Message}"); }
                     }
                 }
-                if (false && stack[20] != 0 && _tlasDumped.Count < 3 && _tlasDumped.Add(stack[20]))
+                // [local] full dump of the BLAS a spinning ray is in (SHARPEMU_SPIN_BLOB_DUMP=1)
+                if (SpinBlobDump && scanTick > 25000 && stack[20] != 0 && stack[23] != 0xFFFFFFFF && _spinBlobDumps < 3)
                 {
-                    var tlasBase = (ulong)stack[20] << 8; var tlasBytes = Math.Min(((ulong)stack[23] + 1) * 64, 8UL << 20);
+                    _spinBlobDumps++;
+                    var tlasBase = (ulong)stack[20] << 8; var tlasBytes = 4UL << 20;
                     Console.Error.WriteLine($"[GPU][BLAS0] scan_tick={scanTick} base=0x{tlasBase:X} last_node=0x{stack[23]:X} bytes={tlasBytes}");
                     try { _cache.DumpDeviceRange(tlasBase, tlasBytes, $"C:/Users/danyy/AppData/Local/Temp/gta/blas0_{scanTick}_{tlasBase:X}.gpu.bin"); }
                     catch (Exception e) { Console.Error.WriteLine($"[GPU][TLAS] dump failed: {e.Message}"); }
