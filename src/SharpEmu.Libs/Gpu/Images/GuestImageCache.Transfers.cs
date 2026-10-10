@@ -462,6 +462,15 @@ public sealed unsafe partial class GuestImageCache
             return;
         }
 
+        if (RefreshLog && _refreshLogs < 300) // [local] how much of the refreshed image is not zero
+        {
+            var range = image.Description.Data;
+            var buffer = new byte[(int)Math.Min(range.Size, 64UL << 20)];
+            var nonZero = 0L;
+            if (_backing.TryReadBacking(range.Address, buffer))
+                foreach (var b in buffer) if (b != 0) nonZero++;
+            Console.Error.WriteLine($"[IMAGE_REFRESH_CONTENT] address=0x{range.Address:X} size=0x{range.Size:X} nonzero_bytes={nonZero} first16={Convert.ToHexString(buffer, 0, 16)}");
+        }
         if (RefreshLog && _refreshLogs++ < 300) // [local]
             Console.Error.WriteLine($"[IMAGE_REFRESH] address=0x{image.Description.Data.Address:X} size=0x{image.Description.Data.Size:X} format={image.Description.PixelFormat} bufferModified={image.IsBufferModified} cpuDirty={image.IsDefinitelyCpuDirty} edges=0x{image.HashGuestEdges():X16}{(_refreshLogs <= 4 ? " at=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
         PopulateFromGuest(imageIdentifier, request, "refresh");
