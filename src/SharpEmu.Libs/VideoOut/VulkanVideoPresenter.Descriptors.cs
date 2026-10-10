@@ -113,6 +113,43 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _tracedTextureBindings = new();
 
         // Render-state discovery for one shader image; the view is acquired later with the draw.
+        // [local, from #1077] The last lookup of one image of one program. A draw binds the same descriptor as
+        // the previous draw of its program most of the time; while no image the lookup could find has changed
+        // (the cache's lookup generation), the request and the image found are the same.
+        private struct ImageBindingMemo
+        {
+            public uint[]? Words;
+            public ulong Generation;
+            public TextureRequestResolution Resolution;
+            public ResourceSlotIdentifier Found;
+
+            public readonly bool Matches(uint[] words, ulong generation) =>
+                Words is not null && Generation == generation && words.AsSpan().SequenceEqual(Words);
+        }
+
+        private static readonly bool ImageBindingMemoEnabled = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_BINDING_MEMO") == "1";
+        private Dictionary<ShaderProgramInfo, ImageBindingMemo[]>? _imageBindingMemos;
+        private ShaderProgramInfo? _lastMemoProgram;
+        private ImageBindingMemo[] _lastMemos = [];
+
+        private ref ImageBindingMemo ImageBindingMemoOf(ShaderProgramInfo program, int index)
+        {
+            if (!ReferenceEquals(program, _lastMemoProgram) || index >= _lastMemos.Length)
+            {
+                var all = _imageBindingMemos ??= new Dictionary<ShaderProgramInfo, ImageBindingMemo[]>(ReferenceEqualityComparer.Instance);
+                if (!all.TryGetValue(program, out var memos) || index >= memos.Length)
+                {
+                    Array.Resize(ref memos, Math.Max(index + 1, program.Resources?.Info.Images.Count ?? 0));
+                    all[program] = memos;
+                }
+
+                _lastMemoProgram = program;
+                _lastMemos = memos;
+            }
+
+            return ref _lastMemos[index];
+        }
+
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
             if (words.Length < 4)
@@ -121,11 +158,38 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var storage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage;
-            var resolution = ImageRequestBuilders.Texture(words, ShapeOf(image));
             _ = BeginBatchedGuestCommands();
+            TextureRequestResolution resolution;
+            ResourceSlotIdentifier imageIdentifier;
+            if (ImageBindingMemoEnabled && ImageBindingMemoOf(program, index) is var cachedMemo &&
+                cachedMemo.Matches(words, _imageCache.LookupGeneration) && _imageCache.TryTouchRemembered(cachedMemo.Found))
+            {
+                resolution = cachedMemo.Resolution;
+                imageIdentifier = cachedMemo.Found;
+            }
+            else
+            {
+                resolution = ImageRequestBuilders.Texture(words, ShapeOf(image));
+                var lookupRequest = resolution.Request;
+                imageIdentifier = _imageCache.FindImage(ref lookupRequest, resolution.ExactFormat);
+                resolution = resolution with { Request = lookupRequest };
+                if (ImageBindingMemoEnabled)
+                {
+                    // An empty range or DCC metadata needs the full lookup on every draw.
+                    ImageBindingMemoOf(program, index) = !ImageDescription.IsEmptyRange(lookupRequest.Description.Data) &&
+                        _imageCache.GetImage(imageIdentifier).Description.DccSliceSize == 0
+                        ? new ImageBindingMemo
+                        {
+                            Words = (uint[])words.Clone(),
+                            Generation = _imageCache.LookupGeneration,
+                            Resolution = resolution,
+                            Found = imageIdentifier,
+                        }
+                        : default;
+                }
+            }
+
             var request = resolution.Request;
-            var imageIdentifier = _imageCache.FindImage(ref request, resolution.ExactFormat);
-            resolution = resolution with { Request = request };
             imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, resolution);
             BindImage(imageIdentifier, storage);
             var descriptor = new TextureDescriptorWords(words);
