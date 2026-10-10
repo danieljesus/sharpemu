@@ -72,7 +72,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // 2 (experiment, hangs the intro: rt376) the front does not block, and a read that touches a pending write runs on the render thread
         // after it (neither the stale nor the command-processor value is what the GPU will have written).
         // 3 as 2, but a preparation on the front that touches a pending write is deferred to the render thread.
-        internal static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY"), out var mode) ? mode : 0;
+        internal static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY"), out var mode) ? mode : 3; // default 3 (rt377/rt378)
 
         public bool Overlaps(ulong address, ulong size)
         {

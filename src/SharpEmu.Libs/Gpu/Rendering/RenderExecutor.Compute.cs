@@ -26,6 +26,9 @@ public sealed partial class RenderExecutor
 
     // [local] The thread-unit indirect path needs the limits in an uploaded shader-data buffer
     // and the logical axes on the physical ones (the counts go straight to vkCmdDispatchIndirect).
+    private static readonly bool IndirectReadLog = Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_READ_LOG") == "1"; // [local]
+    private readonly HashSet<ulong> _indirectReadLogged = new();
+
     private bool CanDispatchThreadsOnGpu(ComputeInputInfo input)
     {
         if (input.Stage.Program?.Bindings is not { UsesDispatchThreadLimits: true } layout ||
@@ -74,6 +77,12 @@ public sealed partial class RenderExecutor
             !CanDispatchThreadsOnGpu(computeProgram.Input))
         {
             // The stage cannot take its limits from the GPU: read the counts and prepare again.
+            if (IndirectReadLog && _indirectReadLogged.Add(computeProgram.Input.Stage.Program?.Hash ?? 0)) // [local]
+            {
+                var layout = computeProgram.Input.Stage.Program?.Bindings;
+                var axes = Gen5SpirvTranslator.ComputeWorkgroupAxisOrder(computeProgram.Input.ThreadsX, computeProgram.Input.ThreadsY, computeProgram.Input.ThreadsZ);
+                Console.Error.WriteLine($"[INDIRECT_READ] hash=0x{computeProgram.Input.Stage.Program?.Hash:X16} limits={layout?.UsesDispatchThreadLimits} shaderData={layout?.Find(SharpEmu.ShaderCompiler.Resources.DescriptorBindingKind.ShaderData) is not null} host={_host.SupportsIndirectThreadDispatch} threads={computeProgram.Input.ThreadsX}x{computeProgram.Input.ThreadsY}x{computeProgram.Input.ThreadsZ} axes={axes[0]}{axes[1]}{axes[2]}");
+            }
             Span<byte> counts = stackalloc byte[12];
             if (!_host.TryReadGuest(indirectArgumentsAddress, counts))
             {

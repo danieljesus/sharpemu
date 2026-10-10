@@ -331,6 +331,10 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public const uint ShaderBaseDwordCount = 2;
     private const int ScalarRegisterCount = 256;
 
+    // [local experiment] SHARPEMU_LIMITS_IN_SHADER_DATA=1: a program with dispatch thread limits keeps its shader
+    // data in the ShaderData buffer (not push constants), so an indirect thread dispatch takes its counts on the GPU.
+    internal static readonly bool LimitsInShaderData = Environment.GetEnvironmentVariable("SHARPEMU_LIMITS_IN_SHADER_DATA") == "1";
+
     public uint PushDataStartDword { get; init; } = PushData.NoStart;
     public uint AllocationCursor { get; init; }
     public uint ShaderBaseDword { get; init; } = NoShaderBase;
@@ -568,6 +572,8 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         var memoryOffsetCount = (uint)info.Buffers.Count;
         var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 + (usesDispatchThreadLimits ? 3u : 0u);
         var pushStart = PushData.StartFor(pushDataStartDword, shaderDataDwords);
+        if (usesDispatchThreadLimits && LimitsInShaderData) // [local] the GPU can write the limits of an indirect thread dispatch
+            pushStart = PushData.NoStart;
         var descriptors = new List<DescriptorBinding>();
         if (info.Buffers.Count != 0)
         {
