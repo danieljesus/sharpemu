@@ -45,6 +45,9 @@ public sealed class ResourceMaterializationCache
     [ThreadStatic]
     private static bool _readingTable;
 
+    [ThreadStatic]
+    public static ulong CurrentPlanHash; // [local]
+
     public static bool ReadingTable
     {
         get => _readingTable;
@@ -78,6 +81,7 @@ public sealed class ResourceMaterializationCache
         ref ResourceSpecialization specialization,
         out ResourceMaterializationFailure failure)
     {
+        CurrentPlanHash = plan.Hash; // [local] for overlay diagnostics
         var key = KeyOf(plan, inputs);
         var found = TryFind(key, plan, inputs, out var cached);
         if (found)

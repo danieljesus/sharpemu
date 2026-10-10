@@ -384,6 +384,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void WriteCommandData(ulong address, ReadOnlySpan<byte> data)
         {
             if (data.IsEmpty) return;
+            SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(address, (ulong)data.Length); // [local] applied on the render thread
             // A range the buffer cache tracks gets the bytes in both copies, the device one through a
             // copy recorded now; anything else is plain guest memory.
             if (_bufferCache.IsRegionRegistered(address, (ulong)data.Length))
@@ -409,6 +410,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // its GPU paths end the scope before they record.
             _ = BeginBatchedGuestCommands();
             if (Gpu.Buffers.GuestBufferCache.BvhWatch(address, size)) Console.Error.WriteLine($"[BVH_CPWRITE] fill address=0x{address:X} size=0x{size:X} value=0x{value:X} tick={_scheduler.CurrentTick}");
+            SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(address, size); // [local] applied on the render thread
             _bufferCache.FillBuffer(address, size, value, isGds);
         }
 
@@ -419,6 +421,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // its GPU paths end the scope before they record.
             _ = BeginBatchedGuestCommands();
             if (Gpu.Buffers.GuestBufferCache.BvhWatch(destination, size)) Console.Error.WriteLine($"[BVH_CPWRITE] copy destination=0x{destination:X} source=0x{source:X} size=0x{size:X} tick={_scheduler.CurrentTick}");
+            SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(destination, size); // [local] applied on the render thread
             _bufferCache.CopyBuffer(destination, source, size, destinationIsGds, sourceIsGds);
         }
 

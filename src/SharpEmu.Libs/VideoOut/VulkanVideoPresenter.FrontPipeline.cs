@@ -70,6 +70,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public long Add(ulong address, byte[] bytes)
         {
+            if (LogChanges && Interlocked.Increment(ref _loggedAdds) <= 20000) // [local] experiment
+                Console.Error.WriteLine($"[OVERLAY_ADD] address=0x{address:X} length={bytes.Length} data={Convert.ToHexString(bytes, 0, Math.Min(bytes.Length, 32))}");
             lock (_bytes)
             {
                 var serial = ++_serial;
@@ -82,6 +84,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void Retire(ulong address, int length, long serial)
         {
+            if (LogChanges && Interlocked.Increment(ref _loggedRetires) <= 3000) // [local] experiment
+                Console.Error.WriteLine($"[OVERLAY_RETIRE] address=0x{address:X} length={length} serial={serial}");
             lock (_bytes)
             {
                 for (var index = 0; index < length; index++)
@@ -95,17 +99,58 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        public void Apply(ulong address, Span<byte> destination)
+        private static readonly bool ApplyEnabled = Environment.GetEnvironmentVariable("SHARPEMU_OVERLAY_APPLY") != "0"; // [local] experiment
+
+        public int Apply(ulong address, Span<byte> destination)
         {
             if (IsEmpty)
-                return;
+                return 0;
+            if (SkipRanges.Length != 0) // [local experiment] SHARPEMU_OVERLAY_APPLY_SKIP=<start>-<end>,...: no patching there
+            {
+                foreach (var (start, end) in SkipRanges)
+                    if (address < end && start < address + (ulong)destination.Length)
+                        return 0;
+            }
+            if (!ApplyEnabled) // [local experiment] count and log what would have been patched
+            {
+                var would = 0;
+                lock (_bytes)
+                {
+                    for (var index = 0; index < destination.Length; index++)
+                        if (_bytes.TryGetValue(address + (ulong)index, out var pending) && destination[index] != pending.Value) would++;
+                }
+
+                if (would != 0 && LogChanges && Interlocked.Increment(ref _logged) <= 20000)
+                    Console.Error.WriteLine($"[OVERLAY_HIT] hash=0x{SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.CurrentPlanHash:X16} address=0x{address:X} length={destination.Length} changed={would} unapplied");
+                return 0;
+            }
+            var changed = 0;
+            var raw = LogChanges && destination.Length <= 16 ? Convert.ToHexString(destination) : null; // [local]
             lock (_bytes)
             {
                 for (var index = 0; index < destination.Length; index++)
                     if (_bytes.TryGetValue(address + (ulong)index, out var entry))
+                    {
+                        if (destination[index] != entry.Value) changed++;
                         destination[index] = entry.Value;
+                    }
             }
+
+            if (changed != 0) Interlocked.Increment(ref ChangedReads); // [local]
+            if (changed != 0 && LogChanges && Interlocked.Increment(ref _logged) <= 20000) // [local] experiment
+                Console.Error.WriteLine($"[OVERLAY_HIT] hash=0x{SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.CurrentPlanHash:X16} address=0x{address:X} length={destination.Length} changed={changed} raw={raw} patched={(destination.Length <= 16 ? Convert.ToHexString(destination) : "-")}");
+            return changed;
         }
+
+        private static readonly (ulong Start, ulong End)[] SkipRanges = (Environment.GetEnvironmentVariable("SHARPEMU_OVERLAY_APPLY_SKIP") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(range => range.Split('-'))
+            .Select(bounds => (Convert.ToUInt64(bounds[0], 16), Convert.ToUInt64(bounds[1], 16)))
+            .ToArray(); // [local]
+        private static readonly bool LogChanges = Environment.GetEnvironmentVariable("SHARPEMU_OVERLAY_LOG") == "1"; // [local]
+        private static int _logged, _loggedAdds, _loggedRetires;
+        internal static long ChangedReads; // [local]
+        public int Count => Volatile.Read(ref _count);
     }
 
     private sealed class BackQueue(Action wake, int capacity)
@@ -324,9 +369,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            presenter.FrontOverlay.Apply(address, destination);
+            if (CommandApply) // [local experiment] SHARPEMU_OVERLAY_APPLY_CMD=0
+            {
+                var raw = OverlayCmdLog ? Convert.ToHexString(destination[..Math.Min(destination.Length, 16)]) : null;
+                if (presenter.FrontOverlay.Apply(address, destination) != 0 && OverlayCmdLog && Interlocked.Increment(ref _cmdLogged) <= 400)
+                    Console.Error.WriteLine($"[OVERLAY_CMD] address=0x{address:X} length={destination.Length} raw={raw} patched={Convert.ToHexString(destination[..Math.Min(destination.Length, 16)])}");
+            }
             return true;
         }
+
+        private static readonly bool CommandApply = Environment.GetEnvironmentVariable("SHARPEMU_OVERLAY_APPLY_CMD") != "0";
+        private static readonly bool OverlayCmdLog = Environment.GetEnvironmentVariable("SHARPEMU_OVERLAY_CMD_LOG") == "1";
+        private static int _cmdLogged;
 
         // Commands other threads post run on the render thread, between queued items.
         public bool RunPendingCommands() => false;
@@ -536,7 +590,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }, _pauseAlias, _resumeAlias);
         }
 
-        private static readonly bool WriteOverlay = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY") != "0";
+        private static readonly bool WriteOverlay = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY") == "1"; // [local] off by default: with it the BLAS builds come out with cycles (rt340–rt367)
 
         public void RunAfterFlush(Action work) => queue.Enqueue(work, _pauseAlias, _resumeAlias);
 
@@ -567,7 +621,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var syncWait = Interlocked.Exchange(ref _back.SyncWaitTicks, 0);
             var depth = Interlocked.Exchange(ref _back.MaxDepth, 0);
             return FormattableString.Invariant(
-                $"[PERF][FRONT] busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
+                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
         }
 
         internal ICpuMemory GuestMemory => _guestMemory;

@@ -574,6 +574,7 @@ public sealed partial class GpuCommandInterpreter
 
     private void NoteOwnWrite(ulong address, ReadOnlySpan<byte> source)
     {
+        SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(address, (ulong)source.Length); // [local]
         DropWindow();
         _lastWriteLength = 0;
         if (source.Length is sizeof(uint) or sizeof(ulong))

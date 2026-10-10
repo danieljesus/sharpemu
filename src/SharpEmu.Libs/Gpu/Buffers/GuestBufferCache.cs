@@ -265,6 +265,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // A CPU write fault: true when the range is tracked and any GPU data reached guest memory.
     bool IGuestBufferStore.MarkCpuWrite(ulong address, ulong size)
     {
+        SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(address, size); // [local]
         var tracked = _tracker.InvalidateRegion(address, size, out var needsGpuFlush);
         var completed = !needsGpuFlush || ReadMemoryOrAwaitShutdown(address, size, isWrite: true,
             GuestMemoryProfile.ReadbackSource.CpuWriteInvalidation);

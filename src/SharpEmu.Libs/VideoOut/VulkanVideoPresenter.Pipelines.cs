@@ -146,6 +146,16 @@ internal static unsafe partial class VulkanVideoPresenter
         // also runs with a front attached and must keep the synchronized ones.
         private bool OnFrontThread => _frontThread is { } front && front.ManagedThreadId == Environment.CurrentManagedThreadId;
 
+        // [local experiment] SHARPEMU_DEFER_PATCHED=1: a preparation that reads bytes only the
+        // pending-write overlay supplies moves to the render thread.
+        private static readonly bool DeferPatched = Environment.GetEnvironmentVariable("SHARPEMU_DEFER_PATCHED") == "1";
+
+        private void ApplyFrontOverlay(ulong address, Span<byte> destination)
+        {
+            if (FrontOverlay.Apply(address, destination) != 0 && DeferPatched && DeferFrontPreparation && _preparingOnFront)
+                throw new DeferPreparationException();
+        }
+
         private bool NeedsBackRead(ulong address, ulong size) =>
             FrontSyncedReads && size != 0 && _bufferCache.EverGpuWritten(address, size);
 
@@ -178,12 +188,19 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        private static readonly bool FrontPrepLog = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_LOG") == "1"; // [local]
+        private static int _frontPrepLogs;
+
         internal ComputeProgram? TryPrepareComputeOnFront(Func<ComputeProgram?> prepare)
         {
             _preparingOnFront = true;
             try
             {
-                return prepare();
+                SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.CurrentPlanHash = 0; // [local]
+                var program = prepare();
+                if (FrontPrepLog && Interlocked.Increment(ref _frontPrepLogs) <= 20000)
+                    Console.Error.WriteLine($"[FRONT_PREP] hash=0x{SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.CurrentPlanHash:X16} prepared={(program is null ? "no" : program.Available ? "yes" : "unavailable")} overlay={FrontOverlay.Count}");
+                return program;
             }
             catch (DeferPreparationException)
             {
@@ -294,7 +311,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     Span<byte> patched = stackalloc byte[sizeof(uint)];
                     System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(patched, word);
-                    FrontOverlay.Apply(address, patched);
+                    ApplyFrontOverlay(address, patched);
                     word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(patched);
                 }
 
@@ -418,7 +435,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     Span<byte> patched = stackalloc byte[sizeof(uint)];
                     System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(patched, word);
-                    FrontOverlay.Apply(address, patched);
+                    ApplyFrontOverlay(address, patched);
                     word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(patched);
                 }
 
@@ -465,7 +482,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (IsCleanReadPage(address, size) && TryGetAliasPointer(address, size, out var frontAlias))
                 {
                     new ReadOnlySpan<byte>(frontAlias, destination.Length).CopyTo(destination);
-                    FrontOverlay.Apply(address, destination); // [local]
+                    ApplyFrontOverlay(address, destination); // [local]
                     return true;
                 }
 
@@ -475,7 +492,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 NoteFrontReadPage(address, size);
-                FrontOverlay.Apply(address, destination); // [local]
+                ApplyFrontOverlay(address, destination); // [local]
                 return true;
             }
 

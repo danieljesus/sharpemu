@@ -110,6 +110,7 @@ public sealed partial class GpuCommandInterpreter
             throw _host.Fatal($"The DMA destination selector is not supported: selector=0x{destinationSelect:X2} destination=0x{destination:X16}.");
         }
 
+        SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(destination, byteCount); // [local]
         if (sourceSelect == 2)
         {
             _host.FillBuffer(destination, byteCount, (uint)sourceOrImmediate, destinationIsGds);

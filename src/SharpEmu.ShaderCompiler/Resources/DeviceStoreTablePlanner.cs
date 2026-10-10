@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Generic;
+using System.Linq;
 
 namespace SharpEmu.ShaderCompiler.Resources;
 
@@ -17,11 +18,60 @@ public static class DeviceStoreTablePlanner
     private static readonly ulong MergeGap = System.Convert.ToUInt64(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_MERGE") ?? "10000", 16); // [local]
     private static readonly ulong TableMaxAddress = System.Convert.ToUInt64(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_MAXADDR") ?? "1000000000", 16); // [local]
     private static readonly bool TableRangesWritten = System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_WRITTEN") != "0"; // [local]
-    private static readonly Dictionary<(ulong, ulong), List<DeviceAddressRange>> Cache = new(); // [local]
+    // [local] Ranges per table, scanned once; a command-processor, DMA or CPU write into a
+    // table drops its entry (InvalidateTables), so a table refilled for the next build is rescanned.
+    // One cache per thread: with the render pipeline the front sees queued command-processor
+    // writes before the render thread applies them, so the two threads must not share scans.
+    private sealed class TableCache
+    {
+        public readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Base, ulong Bytes), List<DeviceAddressRange>> Entries = new();
+        public long Generation;
+    }
+
+    [System.ThreadStatic]
+    private static TableCache? _threadCache;
+    private static readonly List<TableCache> AllCaches = new();
+
+    private static TableCache Cache
+    {
+        get
+        {
+            if (_threadCache is { } cache)
+                return cache;
+            cache = new TableCache();
+            lock (AllCaches) AllCaches.Add(cache);
+            return _threadCache = cache;
+        }
+    }
     private static readonly int RescanEvery = int.Parse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_RESCAN") ?? "0"); // [local]
     private static long _uses;
     private static int _logs; // [local]
     public const ulong MaxEntryBytes = 64UL * 1024 * 1024;
+
+    private static readonly bool TableLog = System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_LOG") == "1"; // [local]
+    private static int _tableLogs;
+
+    private static string Describe(List<DeviceAddressRange> ranges) =>
+        ranges.Count == 0 ? "0" : $"{ranges.Count}:" + string.Join(",", ranges.Take(6).Select(range => $"0x{range.Base:X}+0x{range.Size:X}")) + (ranges.Count > 6 ? ",..." : "");
+
+    public static void InvalidateTables(ulong address, ulong size) // [local]
+    {
+        if (size == 0)
+            return;
+        TableCache[] caches;
+        lock (AllCaches) caches = AllCaches.ToArray();
+        foreach (var cache in caches)
+        {
+            foreach (var key in cache.Entries.Keys)
+            {
+                if (address < key.Base + key.Bytes && key.Base < address + size)
+                {
+                    Interlocked.Increment(ref cache.Generation);
+                    cache.Entries.TryRemove(key, out _);
+                }
+            }
+        }
+    }
 
     public static IReadOnlyList<ScalarValue> Plan(ShaderResourcePlan plan)
     {
@@ -102,10 +152,14 @@ public static class DeviceStoreTablePlanner
             }
 
             // [local experiment] the whole table, scanned once per table address and cached.
-            if (Cache.TryGetValue((tableBase, tableBytes), out var cached) &&
+            var tableCache = Cache;
+            var generation = Interlocked.Read(ref tableCache.Generation);
+            if (tableCache.Entries.TryGetValue((tableBase, tableBytes), out var cached) &&
                 (RescanEvery == 0 || ++_uses % RescanEvery != 0)) // [local] periodic rescan
             {
                 ranges.AddRange(cached);
+                if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
+                    System.Console.Error.WriteLine($"[STORE_TABLE_USE] hash=0x{plan.Hash:X16} thread={System.Environment.CurrentManagedThreadId} table=0x{tableBase:X} bytes=0x{tableBytes:X} hit ranges={Describe(cached)}");
                 continue;
             }
 
@@ -148,7 +202,10 @@ public static class DeviceStoreTablePlanner
                 ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, start, end - start, Planned: true, Written: TableRangesWritten));
             }
 
-            lock (Cache) Cache[(tableBase, tableBytes)] = ranges.GetRange(before, ranges.Count - before);
+            if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
+                System.Console.Error.WriteLine($"[STORE_TABLE_USE] hash=0x{plan.Hash:X16} thread={System.Environment.CurrentManagedThreadId} table=0x{tableBase:X} bytes=0x{tableBytes:X} scan ranges={Describe(ranges.GetRange(before, ranges.Count - before))}");
+            if (Interlocked.Read(ref tableCache.Generation) == generation) // a write that landed during the scan keeps it out
+                tableCache.Entries[(tableBase, tableBytes)] = ranges.GetRange(before, ranges.Count - before);
             if (_logs++ < 40 && System.Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local]
                 System.Console.Error.WriteLine($"[STORE_TABLE] hash=0x{plan.Hash:X16} table=0x{tableBase:X} bytes=0x{tableBytes:X} ranges={ranges.Count - before} first={(ranges.Count > before ? $"0x{ranges[before].Base:X}+0x{ranges[before].Size:X}" : "-")}");
         }
