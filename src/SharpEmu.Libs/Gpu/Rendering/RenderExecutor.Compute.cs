@@ -26,6 +26,10 @@ public sealed partial class RenderExecutor
 
     // [local] The thread-unit indirect path needs the limits in an uploaded shader-data buffer
     // and the logical axes on the physical ones (the counts go straight to vkCmdDispatchIndirect).
+    // [local experiment] SHARPEMU_DISPATCH_BARRIERS=0: no barrier before and after every dispatch; the
+    // game's own sync points (CS/CB flush events, ACQUIRE_MEM) emit the global barrier instead.
+    internal static readonly bool DispatchBarriers = Environment.GetEnvironmentVariable("SHARPEMU_DISPATCH_BARRIERS") != "0";
+
     private static readonly bool IndirectReadLog = Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_READ_LOG") == "1"; // [local]
     private readonly HashSet<ulong> _indirectReadLogged = new();
 
@@ -222,7 +226,7 @@ public sealed partial class RenderExecutor
                 hasStorageWrites |= image.Written && image.Class == ImageResourceClass.Storage;
             }
 
-            if (hasStorageWrites)
+            if (hasStorageWrites && DispatchBarriers)
             {
                 // Every earlier read of the written resources completes before this dispatch writes.
                 _host.ShaderWriteHazardBarrier();
@@ -257,7 +261,8 @@ public sealed partial class RenderExecutor
             {
                 _host.Dispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2]);
             }
-            _host.ShaderAccessBarrier();
+            if (DispatchBarriers)
+                _host.ShaderAccessBarrier();
             if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0 || (useThreadDimensions && _dimsLogs++ < 3000)) Console.Error.WriteLine(dimsLine + $" groups={physicalGroups[0]}x{physicalGroups[1]}x{physicalGroups[2]}"); // [local]
             var hook = Gpu.Buffers.GuestBufferCache.PostDispatchHook; // [local]
             if (hook != null) { Gpu.Buffers.GuestBufferCache.PostDispatchHook = null; hook(); }

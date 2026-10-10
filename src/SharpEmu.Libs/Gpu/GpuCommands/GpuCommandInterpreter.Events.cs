@@ -134,11 +134,13 @@ public sealed partial class GpuCommandInterpreter
     {
         if (packet.Header == PacketHeader.Make(8, PacketOpcode.Nop, PacketCustomCode.AcquireMemory))
         {
+            if (!Rendering.RenderExecutor.DispatchBarriers) _host.EmitGlobalBarrier(); // [local]
             return 7;
         }
 
         if (packet.Header == PacketHeader.Make(7, PacketOpcode.AcquireMemory))
         {
+            if (!Rendering.RenderExecutor.DispatchBarriers) _host.EmitGlobalBarrier(); // [local]
             return 6;
         }
 

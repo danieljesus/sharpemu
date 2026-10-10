@@ -679,7 +679,7 @@ internal sealed class ShaderProgramCache
         var sharedInt64Atomics = _host.SharedInt64AtomicsEnabled;
         var bufferInt64Atomics = _host.BufferInt64AtomicsEnabled;
         var float16Conversions = _host.Float16ConversionsEnabled;
-        var signedZeroInfNanPreserve = _host.ShaderSignedZeroInfNanPreserveFloat32Supported;
+        var signedZeroInfNanPreserve = _host.ShaderSignedZeroInfNanPreserveFloat32Supported && Environment.GetEnvironmentVariable("SHARPEMU_SIGNED_ZERO_INF_NAN") != "0"; // [local] A/B switch
         switch (source.Stage)
         {
             case ShaderStage.Vertex:
