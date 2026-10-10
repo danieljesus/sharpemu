@@ -333,7 +333,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
 
     // [local experiment] SHARPEMU_LIMITS_IN_SHADER_DATA=1: a program with dispatch thread limits keeps its shader
     // data in the ShaderData buffer (not push constants), so an indirect thread dispatch takes its counts on the GPU.
-    internal static readonly bool LimitsInShaderData = Environment.GetEnvironmentVariable("SHARPEMU_LIMITS_IN_SHADER_DATA") == "1";
+    internal static readonly bool LimitsInShaderDataAll = Environment.GetEnvironmentVariable("SHARPEMU_LIMITS_IN_SHADER_DATA") == "1";
 
     public uint PushDataStartDword { get; init; } = PushData.NoStart;
     public uint AllocationCursor { get; init; }
@@ -341,6 +341,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public uint MemoryOffsetDword { get; init; }
     public uint MemoryOffsetCount { get; init; }
     public bool UsesDispatchThreadLimits { get; init; }
+    public bool LimitsInShaderData { get; init; } // [local]
     public IReadOnlyList<uint> UserDataRegisters { get; init; } = [];
     public IReadOnlyList<DescriptorBinding> Descriptors { get; init; } = [];
 
@@ -565,14 +566,15 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         bool usesFlattenedTable,
         bool usesShaderBase,
         uint pushDataStartDword = 0,
-        bool usesDispatchThreadLimits = false)
+        bool usesDispatchThreadLimits = false,
+        bool limitsInShaderData = false)
     {
         var shaderBaseDword = usesShaderBase ? (uint)userDataRegisters.Count : NoShaderBase;
         var memoryOffsetDword = (uint)userDataRegisters.Count + (usesShaderBase ? ShaderBaseDwordCount : 0);
         var memoryOffsetCount = (uint)info.Buffers.Count;
         var shaderDataDwords = memoryOffsetDword + (memoryOffsetCount + 3) / 4 + (usesDispatchThreadLimits ? 3u : 0u);
         var pushStart = PushData.StartFor(pushDataStartDword, shaderDataDwords);
-        if (usesDispatchThreadLimits && LimitsInShaderData) // [local] the GPU can write the limits of an indirect thread dispatch
+        if (usesDispatchThreadLimits && (LimitsInShaderDataAll || limitsInShaderData)) // [local] the GPU can write the limits of an indirect thread dispatch
             pushStart = PushData.NoStart;
         var descriptors = new List<DescriptorBinding>();
         if (info.Buffers.Count != 0)
@@ -650,6 +652,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
             MemoryOffsetDword = memoryOffsetDword,
             MemoryOffsetCount = memoryOffsetCount,
             UsesDispatchThreadLimits = usesDispatchThreadLimits,
+            LimitsInShaderData = usesDispatchThreadLimits && (LimitsInShaderDataAll || limitsInShaderData),
             UserDataRegisters = userDataRegisters,
             Descriptors = descriptors,
         };
@@ -663,6 +666,7 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
         MemoryOffsetDword == other.MemoryOffsetDword &&
         MemoryOffsetCount == other.MemoryOffsetCount &&
         UsesDispatchThreadLimits == other.UsesDispatchThreadLimits &&
+        LimitsInShaderData == other.LimitsInShaderData &&
         UserDataRegisters.SequenceEqual(other.UserDataRegisters) &&
         Descriptors.Count == other.Descriptors.Count &&
         Descriptors.Zip(other.Descriptors).All(pair => pair.First.Kind == pair.Second.Kind && pair.First.Resources.SequenceEqual(pair.Second.Resources));
@@ -691,7 +695,7 @@ public static class BindingLayoutValidator
             throw new ResourcePlanException("Only a compute shader can use dispatch thread limits.");
         }
 
-        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits);
+        var expected = BindingLayout.Allocate(info, userDataRegisters, usesGlobalDataShare, usesFlattenedTable, usesShaderBase, layout.AllocationCursor, layout.UsesDispatchThreadLimits, layout.LimitsInShaderData);
         if (!expected.Equals(layout))
         {
             throw new ResourcePlanException(

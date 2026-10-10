@@ -363,7 +363,7 @@ internal sealed class ShaderProgramCache
             foreach (var candidate in entry.Permutations)
             {
                 var layout = candidate.Bindings;
-                if (layout.PushDataStartDword == PushData.StartFor(pushDataCursor, layout.ShaderDataDwordCount) && candidate.Specialization.Equals(specialization))
+                if (layout.PushDataStartDword == (layout.LimitsInShaderData ? PushData.NoStart : PushData.StartFor(pushDataCursor, layout.ShaderDataDwordCount)) && candidate.Specialization.Equals(specialization)) // [local] a layout forced to ShaderData has no push start
                 {
                     stage = CreateStageResources(candidate.Program, snapshot, source, options);
                     layout.AdvancePushData(ref pushDataCursor);
@@ -747,7 +747,15 @@ internal sealed class ShaderProgramCache
             ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
             BindingLayout.ReadsShaderBase(program),
             pushDataCursor,
-            usesDispatchThreadLimits: usesDispatchThreadLimits);
+            usesDispatchThreadLimits: usesDispatchThreadLimits,
+            limitsInShaderData: LimitsInShaderDataHashes.Contains(plan.Hash));
+
+    // [local experiment] SHARPEMU_LIMITS_IN_SHADER_DATA_HASHES=<hex>,...: these programs keep their shader data
+    // in the ShaderData buffer, so their indirect thread dispatches take the counts on the GPU.
+    private static readonly HashSet<ulong> LimitsInShaderDataHashes = new(
+        (Environment.GetEnvironmentVariable("SHARPEMU_LIMITS_IN_SHADER_DATA_HASHES") ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(hash => Convert.ToUInt64(hash.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? hash[2..] : hash, 16)));
 
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, bool sharedInt64Atomics, bool bufferInt64Atomics, bool float16Conversions,
