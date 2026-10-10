@@ -289,6 +289,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     {
         var tracked = _tracker.HasRegion(address, size);
         var dirty = tracked && _tracker.HasGpuDirtyPages(address, size);
+        if (dirty && ReadbackAudit && _storeDownloadLogs++ < 40) Console.Error.WriteLine($"[STORE_DOWNLOAD] address=0x{address:X} size=0x{size:X}"); // [local]
         var completed = tracked && (!dirty || ReadMemoryOrAwaitShutdown(address, size, isWrite: false,
             GuestMemoryProfile.ReadbackSource.StoreDownload));
         if (GuestGpuMemoryHook.Traces(address, size))
@@ -1044,6 +1045,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     // False only when the store closed and its drain failed; the caller then declines the fault.
+    private int _storeDownloadLogs; // [local]
     private static readonly bool ReadbackAudit = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_AUDIT") == "1"; // [local]
     private static readonly Dictionary<(GuestMemoryProfile.ReadbackSource, ulong, ulong), (long Calls, double Ms)> _readbackAudit = new();
     private static long _readbackAuditReport = System.Diagnostics.Stopwatch.GetTimestamp();
