@@ -358,7 +358,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 _ = _bufferCache.FindBuffer(range.Base, ClampMappedSize(range.Base, range.Size));
-                if (_bvhWriterCount < 400 && InBvhBlob(range.Base))
+                if (BvhProbes && _bvhWriterCount < 400 && InBvhBlob(range.Base))
                 {
                     _bvhWriterCount++;
                     Console.Error.WriteLine($"[BVH_WRITER] hash=0x{prepared.Program.Hash:X16} stage={prepared.Program.Stage} range base=0x{range.Base:X} size=0x{range.Size:X} written={range.Written}");
@@ -446,6 +446,8 @@ internal static unsafe partial class VulkanVideoPresenter
             return false;
         }
         private int _bvhListDumps;
+        // [local] The BVH investigation probes (writer/bind logs, dumps, trace pages); off by default.
+        internal static readonly bool BvhProbes = Environment.GetEnvironmentVariable("SHARPEMU_BVH_PROBES") == "1";
         private int _bvhRebuildSeenAt;
         private readonly List<(ulong Address, ulong Size)> _bvhScanTables = new();
         private ulong _bvhSmallBlob;
@@ -454,6 +456,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private int _bvhBlockDumps;
         private void ProbeBvhWriter(PreparedStageBindings prepared, int index, BufferDescriptorWords descriptor, ulong requested)
         {
+            if (!BvhProbes) return; // [local]
             var listProducer = prepared.Program.Hash is 0xF6F2D6298F2771AD or 0x35B85620669D35A4 or 0x4F1F0F92FE39EC8B or 0x4505F72A09CC1B12 or 0xF05BBF883D986FC9 or 0xCA99120EAF300BFD;
             if (prepared.Program.Hash is 0x5981037B07E391D5 or 0xAACC3636B355E928 or 0xF43B5FF6DD312D34 || _bvhWriterCount >= 40000 || (!listProducer && !InBvhBlob(descriptor.Address))) return;
             _bvhWriterCount++;
@@ -509,6 +512,7 @@ internal static unsafe partial class VulkanVideoPresenter
         }
         private void ProbeBvhRefitBuffer(ulong hash, int index, BufferDescriptorWords descriptor, ulong requested, ulong size, PreparedStageBindings prepared)
         {
+            if (!BvhProbes) return; // [local]
             if (!_buildTracked && Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1") // [local] follow the roots of one small and one large dynamic BLAS from the start (addresses stable across runs)
             {
                 _buildTracked = true;
