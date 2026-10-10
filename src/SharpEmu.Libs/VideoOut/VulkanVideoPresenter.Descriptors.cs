@@ -446,6 +446,8 @@ internal static unsafe partial class VulkanVideoPresenter
             return false;
         }
         private int _bvhListDumps;
+        private static readonly ulong BindWatch = Convert.ToUInt64(Environment.GetEnvironmentVariable("SHARPEMU_BIND_WATCH") ?? "0", 16); // [local]
+        private int _bindWatchLogs;
         // [local] The BVH investigation probes (writer/bind logs, dumps, trace pages); off by default.
         internal static readonly bool BvhProbes = Environment.GetEnvironmentVariable("SHARPEMU_BVH_PROBES") == "1";
         private int _bvhRebuildSeenAt;
@@ -883,6 +885,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal($"A storage buffer range or the device alignment is unsupported: buffer={slot} size=0x{size:X} alignment={alignment} hash=0x{program.Hash:X16}.");
             }
 
+            if (BindWatch != 0 && resource.Written && address <= BindWatch && BindWatch < address + size && _bindWatchLogs++ < 60) Console.Error.WriteLine($"[BIND_WATCH] hash=0x{program.Hash:X16} slot={slot} address=0x{address:X} size=0x{size:X} stride={descriptor.Stride} records={descriptor.RecordCount}"); // [local]
             if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TracesExtra(address, size)) SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(address, size, $"bind hash=0x{program.Hash:X16} slot={slot} written={resource.Written} formatted={resource.Formatted} submission_tick={_scheduler.CurrentTick}"); // [local]
             if (program.Hash == 0x743E8AE5A36889D2 && !resource.Written && _hdrAges.Count != 0 && _refitInDumps < 600 && _scheduler.CurrentTick < 20000)
             {
