@@ -42,6 +42,10 @@ internal static class HostMovieBridge
     private static Bink2MovieInfo _activeInfo;
     private static byte[]? _frameBuffer;
     private static bool _frameBufferPresented;
+    // [local] The already presented still frame, read without Gate on every draw (GTA V keeps a dummy
+    // movie frame attached after its intro: every draw and dispatch locked Gate, contended with file reads).
+    private sealed record PresentedFrame(byte[] Pixels, uint Width, uint Height, long Serial, string Path);
+    private static PresentedFrame? _presentedFrame;
     private static MediaFramePlayback? _playback;
     private static Timer? _playbackWatchdog;
     private static long _frameSerial;
@@ -139,6 +143,17 @@ internal static class HostMovieBridge
         // The render thread asks before every draw and dispatch. With no movie attached
         // it must not queue on Gate behind guest file reads (Demon's Souls: ~15 % of the
         // render thread blocked here). A movie attached meanwhile is picked up next call.
+        if (Volatile.Read(ref _playback) is null && Volatile.Read(ref _presentedFrame) is { } presented)
+        {
+            pixels = presented.Pixels;
+            width = presented.Width;
+            height = presented.Height;
+            advanced = false;
+            frameSerial = presented.Serial;
+            hostPath = presented.Path;
+            return true;
+        }
+
         if (Volatile.Read(ref _playback) is null && Volatile.Read(ref _frameBuffer) is null)
         {
             pixels = [];
@@ -199,6 +214,11 @@ internal static class HostMovieBridge
             if (advanced)
             {
                 frameSerial = ++_frameSerial;
+            }
+            else
+            {
+                // [local] Nothing changes until a movie attaches or closes: later calls skip Gate.
+                Volatile.Write(ref _presentedFrame, new PresentedFrame(_frameBuffer, width, height, frameSerial, hostPath));
             }
             return true;
         }
@@ -305,6 +325,7 @@ internal static class HostMovieBridge
             HostMovieYuv420.FrameLength(info.Width, info.Height));
         HostMovieYuv420.ConvertFromBgra(bgra, info.Width, info.Height, _frameBuffer);
         _frameBufferPresented = false;
+        Volatile.Write(ref _presentedFrame, null); // [local]
         ArmPlaybackWatchdogLocked(hostPath);
         Console.Error.WriteLine(
             "[LOADER][INFO] Bink dummy attached: " + Path.GetFileName(hostPath) + " " +
@@ -320,6 +341,7 @@ internal static class HostMovieBridge
         _activePath = hostPath;
         _activeInfo = info;
         _playback = new MediaFramePlayback(decoder);
+        Volatile.Write(ref _presentedFrame, null); // [local]
         ArmPlaybackWatchdogLocked(hostPath);
     }
 
@@ -425,6 +447,7 @@ internal static class HostMovieBridge
         _activeInfo = default;
         _frameBuffer = null;
         _frameBufferPresented = false;
+        Volatile.Write(ref _presentedFrame, null); // [local]
 
         // Wake any guest _read() blocked in WaitForHostPlaybackToFinish: its
         // movie either just finished or is being pre-empted by a new attach.

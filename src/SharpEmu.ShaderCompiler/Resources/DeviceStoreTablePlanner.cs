@@ -60,16 +60,18 @@ public static class DeviceStoreTablePlanner
     private static string Describe(List<DeviceAddressRange> ranges) =>
         ranges.Count == 0 ? "0" : $"{ranges.Count}:" + string.Join(",", ranges.Take(6).Select(range => $"0x{range.Base:X}+0x{range.Size:X}")) + (ranges.Count > 6 ? ",..." : "");
 
+    private static ulong _tableBegin = ulong.MaxValue, _tableEnd; // [local] bounds of every table ever cached
+
     public static void InvalidateTables(ulong address, ulong size) // [local]
     {
-        if (size == 0)
+        // Cheap reject first: this runs on every command-processor write, and IsEmpty/Keys on a
+        // ConcurrentDictionary take all its locks (rt429: ~2 ms per frame of lock waits).
+        if (size == 0 || address >= Volatile.Read(ref _tableEnd) || address + size <= Volatile.Read(ref _tableBegin))
             return;
         TableCache[] caches;
         lock (AllCaches) caches = AllCaches.ToArray();
         foreach (var cache in caches)
         {
-            if (cache.Entries.IsEmpty)
-                continue;
             foreach (var (key, _) in cache.Entries) // the enumerator takes no locks, unlike Keys
             {
                 if (address < key.Base + key.Bytes && key.Base < address + size)
@@ -213,7 +215,15 @@ public static class DeviceStoreTablePlanner
             if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
                 System.Console.Error.WriteLine($"[STORE_TABLE_USE] hash=0x{plan.Hash:X16} thread={System.Environment.CurrentManagedThreadId} table=0x{tableBase:X} bytes=0x{tableBytes:X} scan ranges={Describe(ranges.GetRange(before, ranges.Count - before))}");
             if (Interlocked.Read(ref tableCache.Generation) == generation) // a write that landed during the scan keeps it out
+            {
+                lock (AllCaches) // bounds before the entry, so an invalidation never misses it
+                {
+                    if (tableBase < _tableBegin) Volatile.Write(ref _tableBegin, tableBase);
+                    if (tableBase + tableBytes > _tableEnd) Volatile.Write(ref _tableEnd, tableBase + tableBytes);
+                }
+
                 tableCache.Entries[(tableBase, tableBytes)] = ranges.GetRange(before, ranges.Count - before);
+            }
             if (_logs++ < 40 && System.Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local]
                 System.Console.Error.WriteLine($"[STORE_TABLE] hash=0x{plan.Hash:X16} table=0x{tableBase:X} bytes=0x{tableBytes:X} ranges={ranges.Count - before} first={(ranges.Count > before ? $"0x{ranges[before].Base:X}+0x{ranges[before].Size:X}" : "-")}");
         }
