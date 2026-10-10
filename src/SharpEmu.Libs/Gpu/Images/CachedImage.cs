@@ -476,6 +476,27 @@ public sealed unsafe partial class CachedImage : IDisposable
         return XxHash3.HashToUInt64(bytes);
     }
 
+    // [local] Pages inside the watched range that a CPU write unwatched one by one, each with the
+    // hash of its content before the first write (taken at fault time): at refresh the image is
+    // only dirty if one of them changed.
+    public const int MaxWatchHoles = 8;
+    public readonly List<(ulong Page, ulong Hash)> WatchHoles = new(0);
+
+    public ulong HashGuestPage(ulong page)
+    {
+        Span<byte> bytes = stackalloc byte[(int)TrackerLayout.PageBytes];
+        var range = Description.Data;
+        var begin = Math.Max(page, range.Address);
+        var end = Math.Min(page + TrackerLayout.PageBytes, range.End);
+        var slice = bytes[..(int)(end - begin)];
+        if (!_guestBacking.TryReadBacking(begin, slice))
+        {
+            throw SubmissionScheduler.Fatal($"The guest backing of the image page could not be read: address=0x{begin:X16}.");
+        }
+
+        return XxHash3.HashToUInt64(slice);
+    }
+
     internal bool SupportsViewType(in ImageViewDescription view) => IsValidViewType(Backing, view);
 
     private static bool IsValidViewType(ImageBacking image, in ImageViewDescription view)

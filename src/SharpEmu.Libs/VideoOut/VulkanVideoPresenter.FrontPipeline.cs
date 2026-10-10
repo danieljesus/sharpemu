@@ -663,7 +663,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private volatile bool _frontStop;
         private bool _frontAliasAccess;
 
-        private const int BackQueueCapacity = 16384;
+        private static readonly int BackQueueCapacity = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BACK_QUEUE_CAPACITY"), out var capacity) && capacity > 0 ? capacity : 16384; // [local] #1077 measured 64 as the sweet spot
 
         private void CreateFrontPipeline()
         {

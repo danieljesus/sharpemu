@@ -248,6 +248,7 @@ public sealed partial class GuestImageCache
             return;
         }
 
+        RestoreWatchHoles(image); // [local]
         var address = image.WatchBegin;
         var size = image.WatchEnd - image.WatchBegin;
         image.WatchBegin = 0;
@@ -261,6 +262,7 @@ public sealed partial class GuestImageCache
     private void UnwatchImageHead(ResourceSlotIdentifier imageIdentifier)
     {
         var image = _slots[imageIdentifier];
+        RestoreWatchHoles(image); // [local]
         var begin = image.Description.Data.Address;
         if (!image.IsWatched || begin < image.WatchBegin)
         {
@@ -284,6 +286,7 @@ public sealed partial class GuestImageCache
     private void UnwatchImageTail(ResourceSlotIdentifier imageIdentifier)
     {
         var image = _slots[imageIdentifier];
+        RestoreWatchHoles(image); // [local]
         var end = image.Description.Data.End;
         if (!image.IsWatched || image.WatchEnd < end)
         {
@@ -418,6 +421,55 @@ public sealed partial class GuestImageCache
 
     // A byte overlap makes an image definitely dirty; a page-only overlap unwatches an edge page
     // or makes the image maybe dirty. Returns whether any image shares a page with the range.
+    // [local] SHARPEMU_IMAGE_HEAD_PAGE_WRITES=1 turns on the watch-hole check (rt390: GTA V writes
+    // the same 8 bytes at the start of nine stencil images every frame, each forcing a 2-8 MB reload).
+    private static readonly bool HeadPageWrites = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_HEAD_PAGE_WRITES") == "1"; // opt-in: GTA V writes many pages of those images (rt393), no gain
+
+    private static readonly bool HeadPageLog = Environment.GetEnvironmentVariable("SHARPEMU_HEAD_PAGE_LOG") == "1"; // [local]
+    private int _headPageLogs;
+
+    // [local] A CPU write inside one page of a clean, watched image: hash the page before the write
+    // lands and stop watching only that page.
+    private bool TryOpenWatchHole(CachedImage owner, ulong address, ulong size)
+    {
+        var page = address & ~(TrackerLayout.PageBytes - 1);
+        var inOnePage = (address + size - 1 & ~(TrackerLayout.PageBytes - 1)) == page;
+        var ok = HeadPageWrites && inOnePage && !owner.IsCpuDirty && owner.IsWatched &&
+            page >= owner.WatchBegin && page + TrackerLayout.PageBytes <= owner.WatchEnd &&
+            owner.WatchHoles.Count < CachedImage.MaxWatchHoles && !owner.WatchHoles.Exists(hole => hole.Page == page);
+        if (HeadPageLog && _headPageLogs++ < 200)
+            Console.Error.WriteLine($"[WATCH_HOLE] image=0x{owner.Description.Data.Address:X} write=0x{address:X}+{size} opened={ok} holes={owner.WatchHoles.Count} cpuDirty={owner.IsCpuDirty} watch=0x{owner.WatchBegin:X}-0x{owner.WatchEnd:X}");
+        if (!ok)
+        {
+            return false;
+        }
+
+        owner.WatchHoles.Add((page, owner.HashGuestPage(page)));
+        _pages.RemoveWatch(page, TrackerLayout.PageBytes, blockReads: false);
+        return true;
+    }
+
+    // Watches the holes again; a hole whose content changed makes the image dirty.
+    private void RestoreWatchHoles(CachedImage owner)
+    {
+        if (owner.WatchHoles.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var (page, hash) in owner.WatchHoles)
+        {
+            if (owner.HashGuestPage(page) != hash)
+            {
+                owner.InvalidateCpuWrite(page, 8);
+            }
+
+            _pages.AddWatch(page, TrackerLayout.PageBytes, blockReads: false);
+        }
+
+        owner.WatchHoles.Clear();
+    }
+
     private bool InvalidateAliases(ulong address, ulong size)
     {
         var pageBegin = address & ~(TrackerLayout.PageBytes - 1);
@@ -434,6 +486,12 @@ public sealed partial class GuestImageCache
             covered = true;
             if (owner.Overlaps(address, size))
             {
+                if (TryOpenWatchHole(owner, address, size))
+                {
+                    continue;
+                }
+
+                RestoreWatchHoles(owner);
                 owner.InvalidateCpuWrite(address, size);
                 UnwatchImage(imageIdentifier);
                 continue;

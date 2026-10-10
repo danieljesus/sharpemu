@@ -425,11 +425,15 @@ public sealed unsafe partial class GuestImageCache
     }
 
     // A maybe-dirty image resolves through its edge hash first; a dirty one is populated again.
+    private static readonly bool RefreshLog = Environment.GetEnvironmentVariable("SHARPEMU_REFRESH_LOG") == "1"; // [local]
+    private int _refreshLogs;
+
     private void RefreshFromGuest(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageRefresh);
-        WatchImage(imageIdentifier);
         var image = _slots[imageIdentifier];
+        RestoreWatchHoles(image); // [local] only a changed hole page makes the image dirty
+        WatchImage(imageIdentifier);
         if (image.IsMaybeCpuDirty)
         {
             var hash = image.HashGuestEdges();
@@ -458,6 +462,8 @@ public sealed unsafe partial class GuestImageCache
             return;
         }
 
+        if (RefreshLog && _refreshLogs++ < 300) // [local]
+            Console.Error.WriteLine($"[IMAGE_REFRESH] address=0x{image.Description.Data.Address:X} size=0x{image.Description.Data.Size:X} format={image.Description.PixelFormat} bufferModified={image.IsBufferModified} cpuDirty={image.IsDefinitelyCpuDirty} edges=0x{image.HashGuestEdges():X16}{(_refreshLogs <= 4 ? " at=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
         PopulateFromGuest(imageIdentifier, request, "refresh");
     }
 
