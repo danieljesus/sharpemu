@@ -346,6 +346,13 @@ public static partial class Gen5SpirvTranslator
                 if (verify)
                 {
                     SaveNativeTlasState(plan);
+                    if (_request.TraceDeviceAddressFaults && _faultBuffer != 0)
+                    {
+                        // The halves' lane order is the subgroup's: a different mapping is counted (word 22).
+                        var mapped = UEqual(Load(_uintType, _subgroupInvocationIdInput), BitwiseAnd(GuestWaveLane(), UInt(31)));
+                        EmitConditional(LogicalNot(mapped), () =>
+                            _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, NativeTlasWord(22), UInt(1), UInt(0), UInt(1)));
+                    }
                 }
 
                 EmitNativeTlasLoop(plan);
@@ -729,6 +736,7 @@ public static partial class Gen5SpirvTranslator
         // region profile hold the next 64.
         //  0 compared exits  1 mismatches  2 capped walks  3 OR of mismatch masks  4 first-mismatch claim
         //  5 lane  6-12 guest v23 v29 v31 v21 v22 v6 v7  13-19 native  20 s97 21 s98 (instance table)
+        //  22 invocations whose subgroup id is not their lane within the half
         private uint NativeTlasWord(uint slot)
         {
             var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);

@@ -388,7 +388,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                 }
                 if (nativeTlas[0] != 0 || nativeTlas[2] != 0) // [local] SHARPEMU_NATIVE_TLAS_LOOP: verify record (2), capped walks (1 and 2)
                 {
-                    Console.Error.WriteLine($"[GPU][NATIVE_TLAS] scan_tick={scanTick} compared={nativeTlas[0]} mismatches={nativeTlas[1]} capped={nativeTlas[2]} mask=0x{nativeTlas[3]:X}");
+                    Console.Error.WriteLine($"[GPU][NATIVE_TLAS] scan_tick={scanTick} compared={nativeTlas[0]} mismatches={nativeTlas[1]} capped={nativeTlas[2]} mask=0x{nativeTlas[3]:X} lane_map_errors={nativeTlas[22]}");
                     if (nativeTlas[1] != 0)
                     {
                         string[] names = ["v23", "v29", "v31", "v21", "v22", "v6", "v7"];
