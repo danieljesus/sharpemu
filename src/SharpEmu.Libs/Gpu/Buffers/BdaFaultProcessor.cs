@@ -18,9 +18,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private const ulong PageFaultAreaSize = MaxPageFaults * sizeof(ulong);
     // [local] Trace tail after the fault bitmap: shaders address it from the buffer's end. The last
     // 256 bytes hold the probe words ([GPU][STACK]/[STEPS]/records), the 256 before them the native
-    // BLAS loop's verify record ([GPU][NATIVE_BLAS]).
-    private const ulong TraceTailBytes = 512;
-    private const int ProbeAreaOffset = 256;
+    // BLAS loop's verify record and the region profile ([GPU][NATIVE_BLAS], [GPU][RT_PROFILE]), and
+    // the first 256 the native TLAS loop's verify record ([GPU][NATIVE_TLAS]).
+    private const ulong TraceTailBytes = 768;
+    private const int ProbeAreaOffset = 512;
+    private const int NativeBlasAreaOffset = 256;
 
     private static long _reportedFaults;
     private readonly GpuDeviceInfo _device;
@@ -290,7 +292,8 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                 var stats = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 160, 32));
                 var oob = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 224, 32));
                 var record = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 192, 32));
-                var nativeBlas = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes), 256)); // [local]
+                var nativeBlas = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + NativeBlasAreaOffset, 256)); // [local]
+                var nativeTlas = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes), 256)); // [local]
                 if (stack[20] != 0)
                 {
                     var table = (ulong)stack[30] << 32 | stack[29];
@@ -381,6 +384,17 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                         var values = nativeBlas.Slice(8, 18).ToArray();
                         var registers = string.Join(" ", names.Select((name, index) => $"{name}=0x{values[index]:X}/0x{values[9 + index]:X}"));
                         Console.Error.WriteLine($"[GPU][NATIVE_BLAS_FIRST] scan_tick={scanTick} lane={nativeBlas[7]} guest/native: {registers} | root=0x{nativeBlas[26]:X} tmax_in=0x{nativeBlas[27]:X} v29_in=0x{nativeBlas[28]:X} blas=0x{((ulong)nativeBlas[30] << 32) | nativeBlas[29]:X} instance=0x{((ulong)nativeBlas[32] << 32) | nativeBlas[31]:X} native_iterations={nativeBlas[33]}");
+                    }
+                }
+                if (nativeTlas[0] != 0 || nativeTlas[2] != 0) // [local] SHARPEMU_NATIVE_TLAS_LOOP: verify record (2), capped walks (1 and 2)
+                {
+                    Console.Error.WriteLine($"[GPU][NATIVE_TLAS] scan_tick={scanTick} compared={nativeTlas[0]} mismatches={nativeTlas[1]} capped={nativeTlas[2]} mask=0x{nativeTlas[3]:X}");
+                    if (nativeTlas[1] != 0)
+                    {
+                        string[] names = ["v23", "v29", "v31", "v21", "v22", "v6", "v7"];
+                        var values = nativeTlas.Slice(5, 17).ToArray();
+                        var registers = string.Join(" ", names.Select((name, index) => $"{name}=0x{values[1 + index]:X}/0x{values[8 + index]:X}"));
+                        Console.Error.WriteLine($"[GPU][NATIVE_TLAS_FIRST] scan_tick={scanTick} lane={values[0]} guest/native: {registers} | instances=0x{((ulong)values[16] << 32) | values[15]:X}");
                     }
                 }
                 if (nativeBlas[34] != 0 || nativeBlas[60] != 0) // [local] SHARPEMU_8395_PROFILE: region clocks per subgroup and counters

@@ -50,6 +50,32 @@ public sealed class LocalNativeBlasLoopTests(ITestOutputHelper output)
             Environment.SetEnvironmentVariable("SHARPEMU_NATIVE_BLAS_LOOP", previous);
         }
 
+        // The native TLAS loop on top of the native BLAS loop, on and in verify mode, with and without tracing.
+        var previousTlas = Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_TLAS_LOOP");
+        try
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_NATIVE_BLAS_LOOP", "1");
+            foreach (var trace in new[] { false, true })
+            {
+                foreach (var mode in new[] { "1", "2" })
+                {
+                    Environment.SetEnvironmentVariable("SHARPEMU_NATIVE_TLAS_LOOP", mode);
+                    var spirv = Compile(trace);
+                    output.WriteLine($"tlas trace={trace} mode={mode} bytes={spirv.Length}");
+                    if (Environment.GetEnvironmentVariable("LOCAL_SPV_OUT") is { Length: > 0 } directory)
+                    {
+                        Directory.CreateDirectory(directory);
+                        File.WriteAllBytes(Path.Combine(directory, $"8395_tlas_trace{(trace ? 1 : 0)}_mode{mode}.spv"), spirv);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_NATIVE_TLAS_LOOP", previousTlas);
+            Environment.SetEnvironmentVariable("SHARPEMU_NATIVE_BLAS_LOOP", previous);
+        }
+
         // The region profile, with and without subgroup clocks.
         var previousProfile = Environment.GetEnvironmentVariable("SHARPEMU_8395_PROFILE");
         var previousClock = Gen5SpirvTranslator.ShaderClockEnabled;

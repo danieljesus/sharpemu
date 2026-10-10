@@ -320,6 +320,7 @@ public static partial class Gen5SpirvTranslator
                 // next-block guard, with natural loops as structured loops.
                 var structuredForward = StructuredForwardBlocks && blocks.Count != 0 && TryBuildLoopRegions(blocks, out _loopLatchByHeader);
                 _nativeBlas = structuredForward ? PrepareNativeBlasLoop(blocks) : null; // [local]
+                _nativeTlas = structuredForward ? PrepareNativeTlasLoop(blocks) : null; // [local]
                 if (structuredForward) PrepareRtProfile(blocks); // [local]
                 DeclareModule();
                 if (blocks.Count == 0)
@@ -2500,6 +2501,32 @@ public static partial class Gen5SpirvTranslator
             {
                 CloseRtProfileRegions(index, profiled);
                 OpenRtProfileRegions(index, enclosingHeader, profiled);
+                if (_nativeTlas is { } nativeTlas && index != enclosingHeader) // [local]
+                {
+                    if (index == nativeTlas.Header)
+                    {
+                        if (!NativeTlasSupported(out var unsupported))
+                        {
+                            Console.Error.WriteLine($"[NATIVE_TLAS] hash=0x{_request.Hash:X16} not applied: {unsupported}");
+                            _nativeTlas = null;
+                            _nativeTlasMode = NativeTlasMode.Off;
+                        }
+                        else
+                        {
+                            EmitNativeTlasRegion(nativeTlas);
+                            if (_nativeTlasMode == NativeTlasMode.Native)
+                            {
+                                index = nativeTlas.Latch + 1;
+                                continue;
+                            }
+                        }
+                    }
+                    else if (index == nativeTlas.Exit && _nativeTlasMode == NativeTlasMode.Verify)
+                    {
+                        EmitNativeTlasVerifyCompare(nativeTlas);
+                    }
+                }
+
                 if (_nativeBlas is { } nativeBlas && index != enclosingHeader) // [local]
                 {
                     if (index == nativeBlas.Header)
