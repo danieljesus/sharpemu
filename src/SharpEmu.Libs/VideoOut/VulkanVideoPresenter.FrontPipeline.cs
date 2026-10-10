@@ -71,6 +71,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // 1 the front patches its reads with the pending bytes (BLAS builds come out with cycles, rt340–rt367);
         // 2 (experiment, hangs the intro: rt376) the front does not block, and a read that touches a pending write runs on the render thread
         // after it (neither the stale nor the command-processor value is what the GPU will have written).
+        // 3 as 2, but a preparation on the front that touches a pending write is deferred to the render thread.
         internal static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WRITE_OVERLAY"), out var mode) ? mode : 0;
 
         public bool Overlaps(ulong address, ulong size)
@@ -134,7 +135,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public int Apply(ulong address, Span<byte> destination)
         {
-            if (IsEmpty || Mode == 2)
+            if (IsEmpty || Mode >= 2)
                 return 0;
             if (SkipRanges.Length != 0) // [local experiment] SHARPEMU_OVERLAY_APPLY_SKIP=<start>-<end>,...: no patching there
             {

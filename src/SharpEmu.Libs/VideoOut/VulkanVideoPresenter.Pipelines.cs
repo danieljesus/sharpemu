@@ -162,7 +162,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             // [local] A read of bytes a queued WriteGuestNow has not applied yet (overlay mode 2):
             // it runs on the render thread after the write, also while preparing (no deferral).
-            _backReadForPendingWrite = PendingWriteOverlay.Mode == 2 && FrontOverlay.Overlaps(address, size);
+            _backReadForPendingWrite = PendingWriteOverlay.Mode >= 2 && FrontOverlay.Overlaps(address, size);
             return _backReadForPendingWrite || _bufferCache.EverGpuWritten(address, size);
         }
 
@@ -224,7 +224,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private T RunBackRead<T>(Func<T> read)
         {
-            if (DeferFrontPreparation && _preparingOnFront && !_backReadForPendingWrite)
+            if (DeferFrontPreparation && _preparingOnFront && !(_backReadForPendingWrite && PendingWriteOverlay.Mode == 2)) // mode 3 defers like any synced read
             {
                 throw new DeferPreparationException();
             }

@@ -48,6 +48,12 @@ public static class DeviceStoreTablePlanner
     private static int _logs; // [local]
     public const ulong MaxEntryBytes = 64UL * 1024 * 1024;
 
+    // [local experiment] SHARPEMU_DEVICE_STORE_TABLES_WRITTEN_MIN=<hex bytes>: smaller table ranges are registered
+    // but not marked written (a tiny range marked written makes its whole 4 KB page GPU-owned).
+    private static readonly ulong WrittenMin = System.Convert.ToUInt64(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES_WRITTEN_MIN") ?? "0", 16);
+
+    private static bool MarksWritten(ulong bytes) => TableRangesWritten && bytes >= WrittenMin;
+
     private static readonly bool TableLog = System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_LOG") == "1"; // [local]
     private static int _tableLogs;
 
@@ -178,7 +184,7 @@ public static class DeviceStoreTablePlanner
 
                 if (readable && TryDecode(words, out var entryBase, out var entryBytes) && entryBytes <= MaxEntryBytes && (FilterGpuWritable ? SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.IsGpuWritable(entryBase, entryBytes) : entryBase + entryBytes <= TableMaxAddress))
                 {
-                    ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, entryBase, entryBytes, Planned: true, Written: TableRangesWritten)); // [local]
+                    ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, entryBase, entryBytes, Planned: true, Written: MarksWritten(entryBytes))); // [local]
                 }
             }
             if (MergeGap != ulong.MaxValue && ranges.Count - before > 1) // [local] coalesce neighbouring V# ranges
@@ -196,12 +202,12 @@ public static class DeviceStoreTablePlanner
                         continue;
                     }
 
-                    ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, start, end - start, Planned: true, Written: TableRangesWritten));
+                    ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, start, end - start, Planned: true, Written: MarksWritten(end - start)));
                     start = range.Base;
                     end = range.Base + range.Size;
                 }
 
-                ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, start, end - start, Planned: true, Written: TableRangesWritten));
+                ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, start, end - start, Planned: true, Written: MarksWritten(end - start)));
             }
 
             if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
