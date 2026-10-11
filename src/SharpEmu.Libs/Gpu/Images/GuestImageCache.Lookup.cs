@@ -35,8 +35,10 @@ public sealed partial class GuestImageCache
 
     public (long Hits, long Misses) LookupMemoCounters => (_lookupHits, _lookupMisses);
 
+    private static readonly long[] _missReasons = new long[4];
+
     public static string TakeLookupReport() => FormattableString.Invariant(
-        $"[PERF][IMAGE_LOOKUP] memo_hits={Interlocked.Exchange(ref _totalLookupHits, 0)} memo_misses={Interlocked.Exchange(ref _totalLookupMisses, 0)}");
+        $"[PERF][IMAGE_LOOKUP] memo_hits={Interlocked.Exchange(ref _totalLookupHits, 0)} memo_misses={Interlocked.Exchange(ref _totalLookupMisses, 0)} miss_empty={Interlocked.Exchange(ref _missReasons[0], 0)} miss_other_request={Interlocked.Exchange(ref _missReasons[1], 0)} miss_stale={Interlocked.Exchange(ref _missReasons[2], 0)} miss_gone={Interlocked.Exchange(ref _missReasons[3], 0)}");
 
     // [local] SHARPEMU_RANGE_LOOKUP_GENERATION: a lookup only sees images owning its pages, so a change
     // stamps the generation on the pages it touches (hashed into buckets) and a remembered lookup stays
@@ -97,8 +99,20 @@ public sealed partial class GuestImageCache
         return true;
     }
 
+    // [local] SHARPEMU_IMAGE_LOOKUP_FULL_HASH: the slot hashes every byte of the request, as SameRequest compares
+    // them. The field subset sent requests that differ elsewhere (level count, aspect, swizzle...) to the same slot
+    // whatever the table size, where they evicted each other (GTA V: 91 % of the misses).
+    private static readonly bool LookupFullHash = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_LOOKUP_FULL_HASH") == "1"; // opt-in: hits 67 -> 83 % with 4096 slots and range generations, ImageLookup unchanged (rt467)
+
     private static int LookupSlot(in ImageRequest request, bool exactFormat)
     {
+        if (LookupFullHash)
+        {
+            var bytes = MemoryMarshal.AsBytes(new ReadOnlySpan<ImageRequest>(in request));
+            var full = System.IO.Hashing.XxHash3.HashToUInt64(bytes, exactFormat ? 1 : 0);
+            return (int)(full ^ (full >> 32)) & (LookupSlots - 1);
+        }
+
         var hash = HashCode.Combine(request.Description.Data.Address, request.Description.Data.Size, request.Description.PixelFormat,
             request.Description.Extent.Width, request.View.Format, request.View.BaseLevel, request.View.BaseLayer,
             HashCode.Combine(request.Role, exactFormat, request.View.Type, request.Description.Resources));
@@ -123,6 +137,10 @@ public sealed partial class GuestImageCache
         {
             _lookupMisses++;
             Interlocked.Increment(ref _totalLookupMisses);
+            // [local] why: 0 empty slot, 1 another request, 2 stale generation, 3 image gone
+            var reason = memo.Generation == 0 ? 0 : memo.ExactFormat != exactFormat || !SameRequest(memo.Request, request) ? 1 :
+                RangeGeneration(request.Description.Data.Address, request.Description.Data.Size) > memo.Generation ? 2 : 3;
+            Interlocked.Increment(ref _missReasons[reason]);
             return false;
         }
 
