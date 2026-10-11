@@ -108,10 +108,22 @@ internal static unsafe partial class VulkanVideoPresenter
                     retireBuffers));
         }
 
+        // [local] SHARPEMU_COMPLETION_POLL_US: completed submissions are collected at most this often before draws
+        // (each poll reads the timeline and runs the deferred tick work); a full queue always collects. 0 polls every draw.
+        private static readonly long CompletionPollTicks = (long)(System.Diagnostics.Stopwatch.Frequency / 1e6 *
+            (double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_COMPLETION_POLL_US"), System.Globalization.CultureInfo.InvariantCulture, out var poll) && poll >= 0 ? poll : 100));
+        private long _lastCompletionPoll;
+
         private void EnsureGuestSubmissionCapacity()
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.SubmissionCapacity);
-            CollectCompletedGuestSubmissions(waitForOldest: false);
+            if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions || CompletionPollTicks == 0 ||
+                System.Diagnostics.Stopwatch.GetTimestamp() - _lastCompletionPoll >= CompletionPollTicks)
+            {
+                CollectCompletedGuestSubmissions(waitForOldest: false);
+                _lastCompletionPoll = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+
             if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
             {
                 CollectCompletedGuestSubmissions(waitForOldest: true);
