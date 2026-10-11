@@ -1265,7 +1265,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             for (var attempt = 0; ; attempt++)
             {
                 PendingDownload? pending = null;
-                if (!_relay.TryRunOnGpuQueue(() => pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true)))
+                var relayStarted = GuestReadSplit ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+                long relayEntered = 0;
+                if (!_relay.TryRunOnGpuQueue(() =>
+                    {
+                        if (GuestReadSplit) relayEntered = System.Diagnostics.Stopwatch.GetTimestamp();
+                        pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true);
+                    }))
                 {
                     return AwaitShutdown();
                 }
@@ -1275,7 +1281,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     return true;
                 }
 
+                var waitStarted = GuestReadSplit ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 readback.Wait(pending.Ticket);
+                if (GuestReadSplit) NoteGuestReadSplit(relayStarted, relayEntered, waitStarted, System.Diagnostics.Stopwatch.GetTimestamp());
                 var lastAttempt = attempt >= AsyncReadbackRetries;
                 var applied = false;
                 if (!_relay.TryRunOnGpuQueue(() => applied = CompleteReadMemoryOnGpu(pending, retrySynchronously: lastAttempt)))
@@ -1496,6 +1504,29 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         _eagerDownloads.Clear();
         _eagerCandidates.Clear();
+    }
+
+    // [local] SHARPEMU_GUEST_READ_SPLIT=1: where a guest thread's readback waits, every 5 s: until the GPU queue
+    // thread picks it up (relay), starting the download there (begin), and until the GPU finishes it (gpu).
+    private static readonly bool GuestReadSplit = Environment.GetEnvironmentVariable("SHARPEMU_GUEST_READ_SPLIT") == "1";
+    private static long _splitCount, _splitRelay, _splitBegin, _splitGpu, _splitReport;
+
+    private static void NoteGuestReadSplit(long started, long entered, long waitStarted, long finished)
+    {
+        Interlocked.Increment(ref _splitCount);
+        Interlocked.Add(ref _splitRelay, entered - started);
+        Interlocked.Add(ref _splitBegin, waitStarted - entered);
+        Interlocked.Add(ref _splitGpu, finished - waitStarted);
+        var last = Interlocked.Read(ref _splitReport);
+        if (finished - last < 5 * System.Diagnostics.Stopwatch.Frequency || Interlocked.CompareExchange(ref _splitReport, finished, last) != last)
+        {
+            return;
+        }
+
+        var count = Interlocked.Exchange(ref _splitCount, 0);
+        double Ms(ref long ticks) => Interlocked.Exchange(ref ticks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        Console.Error.WriteLine(FormattableString.Invariant(
+            $"[GUEST_READ_SPLIT] reads={count} relay_ms={Ms(ref _splitRelay):F0} begin_ms={Ms(ref _splitBegin):F0} gpu_ms={Ms(ref _splitGpu):F0}"));
     }
 
     private static readonly bool GuestReadsAwaitOffQueue =

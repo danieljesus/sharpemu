@@ -392,6 +392,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             if (BindingRepeatProbe.Enabled) BindingRepeatProbe.Record(program.Hash, stage); // [local]
+            using var setupScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingSetup); // [local]
             var prepared = new PreparedStageBindings(stage, program);
             // Register ownership before preparation can fail halfway through.
             preparation.Stages.Add(prepared);
@@ -399,6 +400,7 @@ internal static unsafe partial class VulkanVideoPresenter
             descriptors.Images = Scratch.Images.Rent(info.Images.Count);
             var movieCandidates = _hostMovieFramePixels is null ? null : MovieCandidates(resources, snapshot);
             var hostMovie = movieCandidates is null ? HostMovieTextureBindings.None : FindHostMovieTextureBindings(movieCandidates);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingTextureDecode)) // [local]
             for (var index = 0; index < info.Images.Count; index++)
             {
                 descriptors.Images[index] = index == hostMovie.Luma
@@ -409,12 +411,14 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             descriptors.Samplers = Scratch.Samplers.Rent(info.Samplers.Count);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingSamplers)) // [local]
             for (var index = 0; index < info.Samplers.Count; index++)
             {
                 descriptors.Samplers[index] = ResolveSampler(info.Samplers[index], snapshot.Samplers[index], program, index, stage,
                     SamplesIntegerViews(info, descriptors.Images, index));
             }
 
+            using var shaderDataScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingShaderData); // [local]
             var shaderData = Scratch.ShaderData.Rent(checked((int)layout.ShaderDataDwordCount));
             prepared.ShaderData = shaderData;
             for (var index = 0; index < layout.UserDataRegisters.Count; index++)
@@ -442,9 +446,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 descriptors.GlobalDataShare = new BufferView(_bufferCache.GdsBuffer.Handle, 0, Vk.WholeSize);
             }
 
-            FindDeviceAddressBuffers(prepared);
-            FindBuffers(prepared);
-            ValidateDrawImageTypes(prepared);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingValidation)) // [local]
+            {
+                FindDeviceAddressBuffers(prepared);
+                FindBuffers(prepared);
+                ValidateDrawImageTypes(prepared);
+            }
             if (RenderTrace.Enabled && RenderTrace.Pipeline())
             {
                 RenderTrace.Write(
@@ -985,9 +992,9 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
             var stage = (PreparedStageBindings)prepared;
-            BindBuffers(stage);
-            ObtainDeviceAddressRanges(stage);
-            BindImages(stage);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingBuffers)) BindBuffers(stage); // [local]
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingDeviceRanges)) ObtainDeviceAddressRanges(stage); // [local]
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingImages)) BindImages(stage); // [local]
             _preparedTextures.Add(stage.Textures);
         }
 

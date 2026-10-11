@@ -137,6 +137,15 @@ internal static class RenderPhaseProfile
         SubmissionCapacity,
         CompletedSubmissionCleanup,
         MovieFramePolling,
+        // [local] Pieces of DescriptorPreparation.
+        BindingSetup,
+        BindingTextureDecode,
+        BindingSamplers,
+        BindingShaderData,
+        BindingValidation,
+        BindingBuffers,
+        BindingDeviceRanges,
+        BindingImages,
         Count,
     }
 
