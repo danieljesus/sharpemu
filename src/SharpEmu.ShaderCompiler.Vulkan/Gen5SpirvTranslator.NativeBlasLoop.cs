@@ -353,7 +353,7 @@ public static partial class Gen5SpirvTranslator
         // claim is counted, so the result may differ instead of the dispatch hanging.
         private void EmitRtStackClaim()
         {
-            if (!RtStackSplit)
+            if (!RtStackSplit && !ScratchInSlots)
             {
                 return;
             }
@@ -408,6 +408,53 @@ public static partial class Gen5SpirvTranslator
                 }
             });
             Store(_rtStackSlot, _module.AddInstruction(SpirvOp.GroupNonUniformBroadcastFirst, _uintType, UInt(3), Load(_uintType, _rtStackSlot)));
+        }
+
+        // [local] SHARPEMU_SCRATCH_SLOTS (on by default, 0 = off, 2 = verify): a compute program's
+        // scratch (at most RtStackSlotEntries dwords per lane) lives in the warp slot of the RT stack
+        // area instead of a private array, which NVIDIA keeps in registers when the index is dynamic. Not for 0x8395 with the split
+        // stack, whose deep tier owns the slot.
+        private static readonly bool ScratchSlotsSwitch = Environment.GetEnvironmentVariable("SHARPEMU_SCRATCH_SLOTS") != "0";
+
+        private bool ScratchInSlots => ScratchSlotsSwitch && DeviceAddressPaging.RtStackAreaEnabled && !RtStackSplit &&
+            _stage == Gen5SpirvStage.Compute && _scratch != 0 && _scratchDwordCount <= DeviceAddressPaging.RtStackSlotEntries &&
+            _faultBuffer != 0 && _subgroupInvocationIdInput != 0 && _workGroupIdInput != 0;
+
+        private uint ScratchSlotPointer(uint dwordIndex) => RtStackDeepPointer(dwordIndex);
+
+        // SHARPEMU_SCRATCH_SLOTS=2 (verify): the private array is kept as well; every store goes to
+        // both and every load compares them. Differences (a read before any write sees zero in the
+        // private array and stale data in the slot) are counted in [GPU][RT_STACK]; the private
+        // value is used, so the image does not change.
+        private static readonly bool ScratchSlotsVerify = Environment.GetEnvironmentVariable("SHARPEMU_SCRATCH_SLOTS") == "2";
+        private readonly Dictionary<uint, uint> _scratchShadows = [];
+
+        private void ScratchStore(uint pointer, uint value)
+        {
+            Store(pointer, value);
+            if (_scratchShadows.TryGetValue(pointer, out var shadow))
+            {
+                Store(shadow, value);
+            }
+        }
+
+        private uint ScratchLoad(uint pointer)
+        {
+            var value = Load(_uintType, pointer);
+            if (!_scratchShadows.TryGetValue(pointer, out var shadow))
+            {
+                return value;
+            }
+
+            var expected = Load(_uintType, shadow);
+            if (_request.TraceDeviceAddressFaults)
+            {
+                _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, NativeTlasWord(32), UInt(1), UInt(0), UInt(1));
+                EmitConditional(_module.AddInstruction(SpirvOp.INotEqual, _boolType, value, expected), () =>
+                    _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, NativeTlasWord(33), UInt(1), UInt(0), UInt(1)));
+            }
+
+            return expected;
         }
 
         // At the end of the program the subgroup frees its slot.

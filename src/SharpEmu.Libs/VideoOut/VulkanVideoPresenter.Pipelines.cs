@@ -1317,6 +1317,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var pipelineInfo = new ComputePipelineCreateInfo
                 {
                     SType = StructureType.ComputePipelineCreateInfo,
+                    Flags = PipelineStatsProbe.CreateFlags,
                     Stage = stageInfo,
                     Layout = layout,
                 };
@@ -1331,6 +1332,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 MarkPipelineCacheDirty();
                 Interlocked.Increment(ref _perfPipelineCreations);
                 SetDebugName(ObjectType.Pipeline, pipeline.Handle, $"SharpEmu compute cs=0x{description.Stage.Hash:X16}");
+                PipelineStatsProbe.Report(_vk, _device, pipeline, $"cs=0x{description.Stage.Hash:X16}");
             }
             finally
             {
@@ -1456,7 +1458,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         // Importing a MoltenVK cache compiles its MSL libraries.
                         // Keep that work inside the same bounded compiler slot.
                         var cache = ResolveGuestPipelineCache(cacheSource);
-                        return CompileComputePipeline(vk, device, cache, computeModule, layout);
+                        return CompileComputePipeline(vk, device, cache, computeModule, layout, started.Hash);
                     }
                     finally
                     {
@@ -1480,7 +1482,8 @@ internal static unsafe partial class VulkanVideoPresenter
             Device device,
             PipelineCache cache,
             ShaderModule module,
-            PipelineLayout layout)
+            PipelineLayout layout,
+            ulong hash)
         {
             var entryPoint = (byte*)SilkMarshal.StringToPtr("main");
             try
@@ -1495,6 +1498,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var pipelineInfo = new ComputePipelineCreateInfo
                 {
                     SType = StructureType.ComputePipelineCreateInfo,
+                    Flags = PipelineStatsProbe.CreateFlags,
                     Stage = stageInfo,
                     Layout = layout,
                 };
@@ -1503,6 +1507,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     throw SubmissionScheduler.Fatal($"vkCreateComputePipelines(async) failed: {result}.");
                 }
+
+                PipelineStatsProbe.Report(vk, device, pipeline, $"cs=0x{hash:X16}");
 
                 return pipeline;
             }

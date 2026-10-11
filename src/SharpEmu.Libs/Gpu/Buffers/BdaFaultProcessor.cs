@@ -397,9 +397,9 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                         Console.Error.WriteLine($"[GPU][NATIVE_BLAS_FIRST] scan_tick={scanTick} lane={nativeBlas[7]} guest/native: {registers} | root=0x{nativeBlas[26]:X} tmax_in=0x{nativeBlas[27]:X} v29_in=0x{nativeBlas[28]:X} blas=0x{((ulong)nativeBlas[30] << 32) | nativeBlas[29]:X} instance=0x{((ulong)nativeBlas[32] << 32) | nativeBlas[31]:X} native_iterations={nativeBlas[33]}");
                     }
                 }
-                if (nativeTlas[30] != 0 || nativeTlas[31] != 0) // [local] SHARPEMU_RT_STACK_SPLIT: deep-tier pushes, slot claims that found no free slot
+                if (nativeTlas[30] != 0 || nativeTlas[31] != 0 || nativeTlas[32] != 0) // [local] SHARPEMU_RT_STACK_SPLIT / SHARPEMU_SCRATCH_SLOTS=2
                 {
-                    Console.Error.WriteLine($"[GPU][RT_STACK] scan_tick={scanTick} deep_pushes={nativeTlas[30]} slot_fallbacks={nativeTlas[31]}");
+                    Console.Error.WriteLine($"[GPU][RT_STACK] scan_tick={scanTick} deep_pushes={nativeTlas[30]} slot_fallbacks={nativeTlas[31]} scratch_loads={nativeTlas[32]} scratch_mismatches={nativeTlas[33]}");
                 }
                 if (nativeTlas[0] != 0 || nativeTlas[2] != 0) // [local] SHARPEMU_NATIVE_TLAS_LOOP: verify record (2), capped walks (1 and 2)
                 {

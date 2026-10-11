@@ -1224,9 +1224,9 @@ public static partial class Gen5SpirvTranslator
                 {
                     var pointer = ScratchPointer(offset, index * sizeof(uint));
                     if (store)
-                        Store(pointer, LoadV(control.SourceVectorRegister + index));
+                        ScratchStore(pointer, LoadV(control.SourceVectorRegister + index));
                     else
-                        StoreV(control.DestinationVectorRegister + index, Load(_uintType, pointer));
+                        StoreV(control.DestinationVectorRegister + index, ScratchLoad(pointer));
                 }
             }
 
@@ -1292,7 +1292,7 @@ public static partial class Gen5SpirvTranslator
 
                     for (uint index = 0; index < control.DwordCount; index++)
                     {
-                        Store(
+                        ScratchStore(
                             ScratchPointer(address, index * sizeof(uint)),
                             control.SourceIsScalar
                                 ? LoadS(control.SourceVectorRegister + index)
@@ -1329,7 +1329,7 @@ public static partial class Gen5SpirvTranslator
                 {
                     StoreV(
                         control.DestinationVectorRegister + index,
-                        Load(_uintType, ScratchPointer(address, index * sizeof(uint))));
+                        ScratchLoad(ScratchPointer(address, index * sizeof(uint))));
                 }
             });
             return true;
@@ -1367,6 +1367,17 @@ public static partial class Gen5SpirvTranslator
                     UInt(_scratchDwordCount));
             }
 
+            if (_rtStackSlot != 0 && ScratchInSlots)
+            {
+                var slotPointer = ScratchSlotPointer(dwordIndex);
+                if (ScratchSlotsVerify)
+                {
+                    _scratchShadows[slotPointer] = _module.AddInstruction(SpirvOp.AccessChain, _scratchElementPointer, _scratch, dwordIndex);
+                }
+
+                return slotPointer;
+            }
+
             return _module.AddInstruction(
                 SpirvOp.AccessChain,
                 _scratchElementPointer,
@@ -1378,7 +1389,7 @@ public static partial class Gen5SpirvTranslator
         {
             var shift = ShiftLeftLogical(BitwiseAnd(byteAddress, UInt(3)), UInt(3));
             var value = BitwiseAnd(
-                ShiftRightLogical(Load(_uintType, ScratchPointer(byteAddress)), shift),
+                ShiftRightLogical(ScratchLoad(ScratchPointer(byteAddress)), shift),
                 UInt(byteCount == 1 ? 0xFFu : 0xFFFFu));
             if (signExtend)
             {
@@ -1408,10 +1419,10 @@ public static partial class Gen5SpirvTranslator
             var shiftedMask = ShiftLeftLogical(elementMask, shift);
             var merged = BitwiseOr(
                 BitwiseAnd(
-                    Load(_uintType, pointer),
+                    ScratchLoad(pointer),
                     _module.AddInstruction(SpirvOp.Not, _uintType, shiftedMask)),
                 ShiftLeftLogical(BitwiseAnd(value, elementMask), shift));
-            Store(pointer, merged);
+            ScratchStore(pointer, merged);
         }
 
         // ---- buffers ----
