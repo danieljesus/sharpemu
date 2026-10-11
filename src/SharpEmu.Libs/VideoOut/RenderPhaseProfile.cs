@@ -139,6 +139,8 @@ internal static class RenderPhaseProfile
         MovieFramePolling,
         // [local] The render thread waits for deferred uploads before a submit.
         DeferredUploadWait,
+        // [local] A draw's image work recorded before its pipeline (PrepareStageImages, P1).
+        StageImagePreparation,
         // [local] Pieces of DescriptorPreparation.
         BindingSetup,
         BindingTextureDecode,

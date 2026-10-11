@@ -1341,7 +1341,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // barriers do not order, so the GPU sees the same commands; recording no longer ends a rendering scope.
         public void PrepareStageImages(PipelineBindPoint bindPoint, ReadOnlySpan<IPreparedBindings> stages)
         {
-            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorCommit);
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.StageImagePreparation);
             var preparation = RequirePreparation();
             SubstituteStencilStorage(preparation, stages);
             var uploadStage = bindPoint == PipelineBindPoint.Compute ? PipelineStageFlags.ComputeShaderBit : PipelineStageFlags.FragmentShaderBit;
