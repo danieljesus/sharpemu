@@ -325,6 +325,10 @@ public sealed unsafe partial class CachedImage : IDisposable
     internal ulong LastCpuWriteAddress { get; private set; }
     internal ulong LastCpuWriteSize { get; private set; }
 
+    private static readonly bool DirtyLog = Environment.GetEnvironmentVariable("SHARPEMU_REFRESH_LOG") == "1"; // [local]
+    private static long _dirtyLogCount;
+    private static long _dirtyLogged;
+
     // A byte overlap makes the image definitely dirty; a page-only overlap makes it maybe dirty.
     public void InvalidateCpuWrite(ulong address, ulong size)
     {
@@ -334,6 +338,13 @@ public sealed unsafe partial class CachedImage : IDisposable
             {
                 LastCpuWriteAddress = address;
                 LastCpuWriteSize = size;
+            }
+            if (DirtyLog && Description.Data.Size >= 2UL << 20 && Interlocked.Increment(ref _dirtyLogCount) % 100 == 0 &&
+                Interlocked.Increment(ref _dirtyLogged) <= 40) // [local] who makes a large image dirty, sampled
+            {
+                Console.Error.WriteLine(
+                    $"[IMAGE_CPU_DIRTY] image=0x{Description.Data.Address:X} size=0x{Description.Data.Size:X} format={Description.PixelFormat} " +
+                    $"write=0x{address:X} size=0x{size:X} at={new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ")}");
             }
             _cpuDirty = true;
             _maybeCpuDirty = false;

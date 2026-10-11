@@ -498,6 +498,7 @@ public sealed partial class RenderExecutor
     private static readonly bool RecordFills = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_FILLS") != "0";
     private long _recordFills, _recordFillsRefused;
     private static readonly bool RecordFillLog = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_FILL_LOG") == "1";
+    private static readonly bool RecordFillImageClear = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_FILL_IMAGE_CLEAR") != "0"; // [local]
     private readonly Dictionary<string, int> _recordFillShapes = new();
     private long _recordFillCensus;
 
@@ -542,7 +543,10 @@ public sealed partial class RenderExecutor
         }
 
         var size = records * 16;
-        var consumed = _host.TryAbsorbDccFill(destination.Address, size, value) || _host.TryFillGuestBuffer(destination.Address, size, value);
+        // [local] A fill of exactly one image's range clears the image on the GPU, as the constant fill does,
+        // instead of a CPU memset that makes the image reload from guest memory (GTA V: a 4K stencil per frame).
+        var consumed = (RecordFillImageClear && _host.TryClearImageFromBuffer(destination.Address, size, value)) ||
+                       _host.TryAbsorbDccFill(destination.Address, size, value) || _host.TryFillGuestBuffer(destination.Address, size, value);
         if (consumed && _recordFills++ % 500 == 0)
             Console.Error.WriteLine($"[RECORD_FILL] consumed={_recordFills} refused={_recordFillsRefused} address=0x{destination.Address:X} size=0x{size:X} value=0x{value:X8}");
         return consumed;
