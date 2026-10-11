@@ -270,11 +270,24 @@ public static partial class Gen5SpirvTranslator
                 return;
             }
 
-            var arrayType = _module.TypeArray(_uintType, NativeBlasStackCapacity);
-            _nativeStack = _module.AddGlobalVariable(
-                _module.TypePointer(SpirvStorageClass.Private, arrayType),
-                SpirvStorageClass.Private,
-                _module.ConstantNull(arrayType));
+            if (RtSharedStacks)
+            {
+                // Slot-major, entry n of lane i at n * 64 + i, so a push or pop of a warp hits 32 banks.
+                var sharedType = _module.TypeArray(_uintType, NativeBlasStackCapacity * 64);
+                _nativeStack = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Workgroup, sharedType),
+                    SpirvStorageClass.Workgroup);
+                _workgroupUintPointer = _module.TypePointer(SpirvStorageClass.Workgroup, _uintType);
+            }
+            else
+            {
+                var arrayType = _module.TypeArray(_uintType, NativeBlasStackCapacity);
+                _nativeStack = _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, arrayType),
+                    SpirvStorageClass.Private,
+                    _module.ConstantNull(arrayType));
+            }
+
             _module.AddName(_nativeStack, "nativeBlasStack");
             _interfaces.Add(_nativeStack);
             _nativeStackPointer = NativeVariable("nativeBlasStackPointer");
@@ -283,12 +296,28 @@ public static partial class Gen5SpirvTranslator
             _nativeCapped = NativeVariable("nativeBlasCapped");
         }
 
-        private uint NativeStackSlot(uint index) =>
-            _module.AddInstruction(
-                SpirvOp.AccessChain,
-                _privateUintPointer,
-                _nativeStack,
-                Ext(38, _uintType, index, UInt(NativeBlasStackCapacity - 1)));
+        private uint NativeStackSlot(uint index)
+        {
+            var clamped = Ext(38, _uintType, index, UInt(NativeBlasStackCapacity - 1));
+            if (RtSharedStacks)
+            {
+                return _module.AddInstruction(SpirvOp.AccessChain, _workgroupUintPointer, _nativeStack,
+                    IAdd(_module.AddInstruction(SpirvOp.IMul, _uintType, clamped, UInt(64)), RtStackLane()));
+            }
+
+            return _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, _nativeStack, clamped);
+        }
+
+        // [local] SHARPEMU_RT_SHARED_STACKS (on by default, 0 = off): the BLAS and TLAS stacks live in
+        // workgroup memory instead of per-invocation private arrays. NVIDIA keeps a dynamically
+        // indexed private array in registers, which pinned the pass at 255 registers (8 warps per SM);
+        // in workgroup memory it compiles to 180 registers and no local memory (hito4, rg002stk).
+        // Needs one guest wave per workgroup: the slots are indexed by the lane within the wave.
+        private static readonly bool RtSharedStacksSwitch = Environment.GetEnvironmentVariable("SHARPEMU_RT_SHARED_STACKS") != "0";
+        private bool RtSharedStacks => RtSharedStacksSwitch && _waveLaneCount == 64 && Wave64WavesPerWorkgroup == 1;
+        private uint _workgroupUintPointer;
+
+        private uint RtStackLane() => BitwiseAnd(GuestWaveLane(), UInt(63));
 
         private void EmitNativePush(uint value)
         {

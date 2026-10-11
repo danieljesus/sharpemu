@@ -209,10 +209,12 @@ public static partial class Gen5SpirvTranslator
             }
 
             var arrayType = _module.TypeArray(_uintType, 64);
-            _tlasStack = _module.AddGlobalVariable(
-                _module.TypePointer(SpirvStorageClass.Private, arrayType),
-                SpirvStorageClass.Private,
-                _module.ConstantNull(arrayType));
+            _tlasStack = RtSharedStacks
+                ? _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.Workgroup, _module.TypeArray(_uintType, 128)), SpirvStorageClass.Workgroup)
+                : _module.AddGlobalVariable(
+                    _module.TypePointer(SpirvStorageClass.Private, arrayType),
+                    SpirvStorageClass.Private,
+                    _module.ConstantNull(arrayType));
             _module.AddName(_tlasStack, "nativeTlasStack");
             _interfaces.Add(_tlasStack);
             _tlasExec = NativeVariable("nativeTlasExec");
@@ -225,8 +227,13 @@ public static partial class Gen5SpirvTranslator
             _tlasCapped = NativeVariable("nativeTlasCapped");
         }
 
+        // The stack is uniform over the wave. In workgroup memory each 32-lane half keeps its own
+        // copy, so no half reads what the other half's subgroup wrote.
         private uint TlasStackSlot(uint index) =>
-            _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, _tlasStack, BitwiseAnd(index, UInt(63)));
+            RtSharedStacks
+                ? _module.AddInstruction(SpirvOp.AccessChain, _module.TypePointer(SpirvStorageClass.Workgroup, _uintType), _tlasStack,
+                    IAdd(BitwiseAnd(index, UInt(63)), ShiftLeftLogical(BitwiseAnd(GuestWaveLane(), UInt(32)), UInt(1))))
+                : _module.AddInstruction(SpirvOp.AccessChain, _privateUintPointer, _tlasStack, BitwiseAnd(index, UInt(63)));
 
         // v_writelane v32, value, s96; s96 += 1.
         private void EmitTlasPush(uint value)
