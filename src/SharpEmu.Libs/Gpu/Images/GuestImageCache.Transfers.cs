@@ -427,6 +427,7 @@ public sealed unsafe partial class GuestImageCache
     // A maybe-dirty image resolves through its edge hash first; a dirty one is populated again.
     private static readonly bool RefreshLog = Environment.GetEnvironmentVariable("SHARPEMU_REFRESH_LOG") == "1"; // [local]
     private int _refreshLogs;
+    private long _refreshSamples;
 
     private void RefreshFromGuest(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
@@ -462,7 +463,8 @@ public sealed unsafe partial class GuestImageCache
             return;
         }
 
-        if (RefreshLog && _refreshLogs < 300) // [local] how much of the refreshed image is not zero
+        var logRefresh = RefreshLog && (_refreshLogs < 300 || ++_refreshSamples % 25 == 0); // [local] then one in 25
+        if (logRefresh) // [local] how much of the refreshed image is not zero
         {
             var range = image.Description.Data;
             var buffer = new byte[(int)Math.Min(range.Size, 64UL << 20)];
@@ -471,7 +473,7 @@ public sealed unsafe partial class GuestImageCache
                 foreach (var b in buffer) if (b != 0) nonZero++;
             Console.Error.WriteLine($"[IMAGE_REFRESH_CONTENT] address=0x{range.Address:X} size=0x{range.Size:X} nonzero_bytes={nonZero} first16={Convert.ToHexString(buffer, 0, 16)}");
         }
-        if (RefreshLog && _refreshLogs++ < 300) // [local]
+        if (logRefresh && _refreshLogs++ < 100000) // [local]
             Console.Error.WriteLine($"[IMAGE_REFRESH] address=0x{image.Description.Data.Address:X} size=0x{image.Description.Data.Size:X} format={image.Description.PixelFormat} bufferModified={image.IsBufferModified} cpuDirty={image.IsDefinitelyCpuDirty} edges=0x{image.HashGuestEdges():X16}{(_refreshLogs <= 4 ? " at=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
         PopulateFromGuest(imageIdentifier, request, "refresh");
     }

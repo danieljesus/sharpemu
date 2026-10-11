@@ -1169,7 +1169,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // False only when the store closed and its drain failed; the caller then declines the fault.
     private int _storeDownloadLogs; // [local]
     private static readonly bool ReadbackAudit = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_AUDIT") == "1"; // [local]
-    private static readonly Dictionary<(GuestMemoryProfile.ReadbackSource, ulong, ulong), (long Calls, double Ms)> _readbackAudit = new();
+    private static readonly Dictionary<(GuestMemoryProfile.ReadbackSource, ulong, ulong, int), (long Calls, double Ms)> _readbackAudit = new();
     private static long _readbackAuditReport = System.Diagnostics.Stopwatch.GetTimestamp();
 
     private bool ReadMemoryOrAwaitShutdown(ulong guestAddress, ulong size, bool isWrite,
@@ -1185,13 +1185,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var ms = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         lock (_readbackAudit)
         {
-            var key = (source, Diagnostics.GpuReadTrace.CurrentShader, guestAddress & ~0xFFFFUL);
+            var key = (source, Diagnostics.GpuReadTrace.CurrentShader, guestAddress & ~0xFFFFUL, 64 - System.Numerics.BitOperations.LeadingZeroCount(Math.Max(size, 1) - 1));
             var entry = _readbackAudit.GetValueOrDefault(key);
             _readbackAudit[key] = (entry.Calls + 1, entry.Ms + ms);
             if (System.Diagnostics.Stopwatch.GetElapsedTime(_readbackAuditReport).TotalSeconds >= 20)
             {
                 foreach (var (k, v) in _readbackAudit.OrderByDescending(pair => pair.Value.Ms).Take(15))
-                    Console.Error.WriteLine($"[READBACK_AUDIT] ms={v.Ms:F0} calls={v.Calls} source={k.Item1} shader=0x{k.Item2:X16} block=0x{k.Item3:X}");
+                    Console.Error.WriteLine($"[READBACK_AUDIT] ms={v.Ms:F0} calls={v.Calls} source={k.Item1} shader=0x{k.Item2:X16} block=0x{k.Item3:X} size_le=0x{1UL << k.Item4:X}");
                 _readbackAudit.Clear();
                 _readbackAuditReport = System.Diagnostics.Stopwatch.GetTimestamp();
             }
@@ -1259,7 +1259,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return AwaitShutdown();
     }
 
-    private const ulong ReadbackWindowBytes = 512 * 1024;
+    // [local] SHARPEMU_READBACK_WINDOW (bytes, power of two >= 4 KB): the GPU-written bytes one readback brings back
+    // around the requested range. GTA V reads 4-16 bytes at a time.
+    private static readonly ulong ReadbackWindowBytes =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_READBACK_WINDOW"), out var window) && window >= 4096 && (window & (window - 1)) == 0
+            ? window
+            : 512 * 1024;
     private const long HotWindowLifetime = 512;
     private const int MaxEagerReadbacks = 4;
     private readonly Dictionary<ulong, HotWindow> _hotWindows = new();
@@ -1651,7 +1656,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private List<DownloadPiece> CollectReadbackWindow(GpuBuffer buffer, ulong guestAddress, ulong size, out ulong windowBegin, out ulong windowEnd)
     {
-        const ulong windowSize = ReadbackWindowBytes;
+        var windowSize = ReadbackWindowBytes;
         var bufferEnd = buffer.CpuAddress + buffer.Size;
         windowBegin = Math.Max(guestAddress & ~(windowSize - 1), buffer.CpuAddress);
         windowEnd = Math.Min(Math.Max(windowBegin + windowSize, guestAddress + size), bufferEnd);
