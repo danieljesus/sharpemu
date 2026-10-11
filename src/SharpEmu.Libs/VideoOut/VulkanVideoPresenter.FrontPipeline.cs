@@ -641,6 +641,7 @@ internal static unsafe partial class VulkanVideoPresenter
         internal readonly PendingWriteOverlay FrontOverlay = new(); // [local]
         private BackQueue? _back;
         private long _frontBusyTicks;
+        private long _frontWorkTicks; // [local]
         private long _frontSlices;
 
         // [PERF][FRONT]: what the front thread spent interpreting and preparing, what it spent
@@ -649,12 +650,13 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (_back is null) return string.Empty;
             var busy = Interlocked.Exchange(ref _frontBusyTicks, 0);
+            var work = Interlocked.Exchange(ref _frontWorkTicks, 0);
             var slices = Interlocked.Exchange(ref _frontSlices, 0);
             var wait = Interlocked.Exchange(ref _back.WaitTicks, 0);
             var syncWait = Interlocked.Exchange(ref _back.SyncWaitTicks, 0);
             var depth = Interlocked.Exchange(ref _back.MaxDepth, 0);
             return FormattableString.Invariant(
-                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
+                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
         }
 
         internal ICpuMemory GuestMemory => _guestMemory;
@@ -735,8 +737,15 @@ internal static unsafe partial class VulkanVideoPresenter
                     finally
                     {
                         PauseFrontAliasAccess();
-                        Interlocked.Add(ref _frontBusyTicks, System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted);
+                        var sliceTicks = System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted;
+                        Interlocked.Add(ref _frontBusyTicks, sliceTicks);
                         Interlocked.Increment(ref _frontSlices);
+                    }
+
+                    // [local] Busy time without the empty polls: slices that progressed or completed.
+                    if (result is SliceResult.Progressed or SliceResult.Completed)
+                    {
+                        Interlocked.Add(ref _frontWorkTicks, System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted);
                     }
 
                     switch (result)
