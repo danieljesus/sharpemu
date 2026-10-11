@@ -2232,6 +2232,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var source = CollectUploadRanges(buffer, guestAddress, size, isWritten, preserveCpuWriteHotPages, out var copies, out var totalSize);
         if (source != null)
         {
+            if (Rendering.BatchSimulation.Enabled) Rendering.BatchSimulation.NoteUpload(); // [local]
             foreach (var copy in copies)
                 buffer.NoteGpuWrite(copy.DstOffset, copy.Size);
             var command = _scheduler.Current;

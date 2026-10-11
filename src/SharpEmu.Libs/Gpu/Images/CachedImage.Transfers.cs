@@ -126,6 +126,8 @@ public sealed unsafe partial class CachedImage
         }
 
         var (barriers, sourceStages) = GetBarriers(layout, access, stage, range);
+        if (SharpEmu.Libs.Gpu.Rendering.BatchSimulation.Enabled) // [local]
+            SharpEmu.Libs.Gpu.Rendering.BatchSimulation.NoteImage(Backing.Handle.Handle, barriers, barriers.Count != 0 && OnlyRepeatsAttachmentAccess(barriers));
         if (barriers.Count == 0)
         {
             return;

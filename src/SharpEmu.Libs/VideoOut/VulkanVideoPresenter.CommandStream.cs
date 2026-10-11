@@ -345,6 +345,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void EmitGlobalBarrier()
         {
+            if (Gpu.Rendering.BatchSimulation.Enabled && _renderingWritesMemory) Gpu.Rendering.BatchSimulation.HardCut(); // [local] C8
             // Inside a rendering scope whose draws only wrote attachments, the barrier matters only
             // to what runs after the scope: everything before the scope is ordered by the barrier
             // BeginRendering records, and a draw that stores to memory ends a deferred scope first.

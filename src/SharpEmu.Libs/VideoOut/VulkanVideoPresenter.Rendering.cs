@@ -906,6 +906,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void BeginRendering(in RenderingState state)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRenderingSetup);
+            if (Gpu.Rendering.BatchSimulation.Enabled) Gpu.Rendering.BatchSimulation.NoteDraw(in state); // [local]
             if (_renderingActive && _renderingState == state)
             {
                 _renderingWritesMemory |= _nextDrawWritesMemory;
@@ -1172,6 +1173,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void Dispatch(uint groupsX, uint groupsY, uint groupsZ)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            if (Gpu.Rendering.BatchSimulation.Enabled) Gpu.Rendering.BatchSimulation.HardCut(); // [local]
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
@@ -1274,7 +1276,13 @@ internal static unsafe partial class VulkanVideoPresenter
             VulkanSynchronization.PipelineBarrier(_vk,command, sourceStages, destinationStages, 0, 1, &barrier, 0, null, 0, null);
         }
 
-        public void ShaderWriteBarrier(PipelineStageFlags sourceStages) =>
+        public void ShaderWriteBarrier(PipelineStageFlags sourceStages)
+        {
+            if (Gpu.Rendering.BatchSimulation.Enabled) Gpu.Rendering.BatchSimulation.CutAfterDraw(); // [local]
+            ShaderWriteBarrierCore(sourceStages);
+        }
+
+        private void ShaderWriteBarrierCore(PipelineStageFlags sourceStages) =>
             RecordMemoryBarrier(
                 sourceStages,
                 PipelineStageFlags.ComputeShaderBit | PipelineStageFlags.VertexInputBit | PipelineStageFlags.VertexShaderBit |
@@ -1301,6 +1309,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Clears the bound targets on the GPU in place of the draw; the store owns the result.
         public void ClearColorTargets(ReadOnlySpan<ColorTargetState> targets, SolidColorClear clear)
         {
+            if (Gpu.Rendering.BatchSimulation.Enabled) Gpu.Rendering.BatchSimulation.HardCut(); // [local]
             EndRendering();
             var logicalClear = stackalloc float[4] { clear.Red, clear.Green, clear.Blue, clear.Alpha };
             foreach (ref readonly var target in targets)
@@ -1341,6 +1350,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void ResolveImage(ResourceSlotIdentifier source, uint sourceMip, uint sourceLayer, ResourceSlotIdentifier destination, uint destinationMip, uint destinationLayer)
         {
+            if (Gpu.Rendering.BatchSimulation.Enabled) Gpu.Rendering.BatchSimulation.HardCut(); // [local]
             EndRendering();
             var sourceImage = _imageCache.GetImage(source);
             var destinationImage = _imageCache.GetImage(destination);
