@@ -532,6 +532,7 @@ internal static class RenderPhaseProfile
         ReportImageUploads();
         BufferUploadProfile.Report();
         Console.Error.WriteLine(SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.TakeReport());
+        Console.Error.WriteLine(Gpu.Pipelines.BackMaterializations.TakeReport()); // [local]
         Console.Error.WriteLine(FormattableString.Invariant(
             $"[PERF][PREPARED_PROGRAMS] used={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsUsed, 0)} rejected={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsRejected, 0)} dynamic_state_rebuilt={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedDynamicStateMismatches, 0)}"));
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.GuestBufferCache.TakeAsyncReadbackReport());

@@ -341,6 +341,11 @@ internal sealed class ShaderProgramCache
             Diagnostics.GpuReadTrace.CurrentStage = source.Label;
         }
 
+        if (RenderPhaseProfile.DetailMeasurementsEnabled) // [local] the render thread materializes: which programs
+        {
+            BackMaterializations.Note(source.Stage, source.Hash);
+        }
+
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceMaterialization))
         {
             // Failure capture needs the full walk, so a dump run bypasses the cache.
@@ -358,12 +363,16 @@ internal sealed class ShaderProgramCache
             }
         }
 
+        // [local] An indirect dispatch by threads needs the layout that keeps its limits in ShaderData.
+        var needsShaderDataLimits = IndirectLimitsInShaderData && source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeInfo &&
+            IsIndirectThreadDispatch(computeInfo);
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPermutationLookup))
         {
             foreach (var candidate in entry.Permutations)
             {
                 var layout = candidate.Bindings;
-                if (layout.PushDataStartDword == (layout.LimitsInShaderData ? PushData.NoStart : PushData.StartFor(pushDataCursor, layout.ShaderDataDwordCount)) && candidate.Specialization.Equals(specialization)) // [local] a layout forced to ShaderData has no push start
+                if ((!needsShaderDataLimits || layout.LimitsInShaderData) &&
+                    layout.PushDataStartDword == (layout.LimitsInShaderData ? PushData.NoStart : PushData.StartFor(pushDataCursor, layout.ShaderDataDwordCount)) && candidate.Specialization.Equals(specialization)) // [local] a layout forced to ShaderData has no push start
                 {
                     stage = CreateStageResources(candidate.Program, snapshot, source, options);
                     layout.AdvancePushData(ref pushDataCursor);
@@ -597,7 +606,8 @@ internal sealed class ShaderProgramCache
         {
             resources = ResourceMaterializer.ApplyTo(plan, specialization);
             layout = AllocateLayout(program, plan, resources, source.UserDataBase, (uint)source.UserData.Length, pushDataCursor,
-                source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions);
+                source.Stage == ShaderStage.Compute && options.ComputeInfo!.DispatchThreadDimensions,
+                source.Stage == ShaderStage.Compute && IsIndirectThreadDispatch(options.ComputeInfo!));
         }
         catch (ResourcePlanException exception)
         {
@@ -739,7 +749,7 @@ internal sealed class ShaderProgramCache
     }
 
     private static BindingLayout AllocateLayout(Gen5ShaderProgram program, ShaderResourcePlan plan, SpecializedResourceInfo resources,
-        uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits) =>
+        uint userDataBase, uint userDataCount, uint pushDataCursor, bool usesDispatchThreadLimits, bool indirectThreads) =>
         BindingLayout.Allocate(
             resources.Info,
             BindingLayout.CollectUserDataRegisters(program, userDataBase, userDataCount),
@@ -748,7 +758,16 @@ internal sealed class ShaderProgramCache
             BindingLayout.ReadsShaderBase(program),
             pushDataCursor,
             usesDispatchThreadLimits: usesDispatchThreadLimits,
-            limitsInShaderData: LimitsInShaderDataHashes.Contains(plan.Hash));
+            limitsInShaderData: (IndirectLimitsInShaderData && indirectThreads) || LimitsInShaderDataHashes.Contains(plan.Hash));
+
+    // [local] An indirect dispatch by threads reaches preparation with zero counts (they stay in GPU memory). Its
+    // limits go in the ShaderData buffer so the GPU copies the counts there; with push constants the render thread had
+    // to read the counts back and prepare the program again for every dispatch (GTA V's BVH chain, ~80 per frame).
+    // SHARPEMU_INDIRECT_LIMITS_IN_SHADER_DATA=0 turns it off.
+    private static readonly bool IndirectLimitsInShaderData = Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_LIMITS_IN_SHADER_DATA") != "0";
+
+    private static bool IsIndirectThreadDispatch(ComputeInputInfo info) =>
+        info.DispatchThreadDimensions && info.DispatchThreadsX == 0 && info.DispatchThreadsY == 0 && info.DispatchThreadsZ == 0;
 
     // [local experiment] SHARPEMU_LIMITS_IN_SHADER_DATA_HASHES=<hex>,...: these programs keep their shader data
     // in the ShaderData buffer, so their indirect thread dispatches take the counts on the GPU.
@@ -794,7 +813,7 @@ internal sealed class ShaderProgramCache
                 waveSize: record.Info.WaveSize);
             var resources = ResourceMaterializer.ApplyTo(plan, record.Specialization);
             layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor,
-                record.Info.DispatchThreadDimensions);
+                record.Info.DispatchThreadDimensions, IsIndirectThreadDispatch(record.Info));
             var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
                 sharedInt64Atomics, bufferInt64Atomics, float16Conversions, execGuardElision, signedZeroInfNanPreserve);
             return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;

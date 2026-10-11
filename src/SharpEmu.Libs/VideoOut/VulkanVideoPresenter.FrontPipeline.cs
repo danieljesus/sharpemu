@@ -545,6 +545,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
         {
             var snapshot = Snapshot();
+            if (indirectArgumentsAddress != 0) Interlocked.Increment(ref presenter.IndirectDirect); // [local]
             var prepared = indirectArgumentsAddress == 0
                 ? presenter.TryPrepareComputeOnFront(() => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator))
                 : null;
@@ -573,6 +574,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void DispatchIndirectDeferred(ulong submitId, ulong argumentsAddress, uint dispatchInitiator)
         {
+            Interlocked.Increment(ref presenter.IndirectDeferred); // [local]
             var snapshot = Snapshot();
             queue.Enqueue(() =>
             {
@@ -668,6 +670,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
         private long _frontSlices;
+        internal long IndirectDirect, IndirectDeferred; // [local] dispatches the front does not prepare
 
         // [PERF][FRONT]: what the front thread spent interpreting and preparing, what it spent
         // waiting on the render thread, and how deep the queue got in the window.
@@ -684,7 +687,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var cpu = cpuNow - _frontCpuReported;
             _frontCpuReported = cpuNow;
             return FormattableString.Invariant(
-                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
+                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth} deferred_preps={Interlocked.Exchange(ref DeferredPreparations, 0)} indirect_direct={Interlocked.Exchange(ref IndirectDirect, 0)} indirect_deferred={Interlocked.Exchange(ref IndirectDeferred, 0)}");
         }
 
         internal ICpuMemory GuestMemory => _guestMemory;
