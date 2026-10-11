@@ -18,16 +18,22 @@ internal sealed class DeferredUploadWorker : IDisposable
 
     public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_PROTECT") != "0";
 
+    // SHARPEMU_DEFERRED_PROTECT_WORKERS: threads taking jobs. Jobs may then finish out of order, which is safe: each
+    // protects under its regions' locks before it copies, and a write after any protection faults and dirties.
+    private static readonly int WorkerCount = Math.Clamp(
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_PROTECT_WORKERS"), out var count) ? count : 1, 1, 8);
+
     private readonly BlockingCollection<Job> _queue = new();
-    private readonly Thread _thread;
     private long _enqueued;
     private long _completed;
     private Exception? _failure;
 
     public DeferredUploadWorker()
     {
-        _thread = new Thread(Run) { IsBackground = true, Name = "SharpEmu deferred uploads" };
-        _thread.Start();
+        for (var index = 0; index < WorkerCount; index++)
+        {
+            new Thread(Run) { IsBackground = true, Name = $"SharpEmu deferred uploads {index}" }.Start();
+        }
     }
 
     public void Enqueue(Job job)
