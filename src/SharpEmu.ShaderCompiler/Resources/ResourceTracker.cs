@@ -183,9 +183,12 @@ public sealed partial class ResourceTracker
 
     // [local] A descriptor dword read from a table at an offset derived from V_READFIRSTLANE:
     // the per-lane index of a waterfall loop, which the host cannot evaluate.
+    // SHARPEMU_WATERFALL_NULL_IMAGE=0 restores the upstream rejection (read per call: only
+    // reached once a descriptor dword is already invalid).
     private static bool IsWaterfallTableWord(ScalarValue value)
     {
-        if (value.Kind != ScalarValueKind.ScalarBufferWord || value.Operands.Length < 2)
+        if (value.Kind != ScalarValueKind.ScalarBufferWord || value.Operands.Length < 2 ||
+            Environment.GetEnvironmentVariable("SHARPEMU_WATERFALL_NULL_IMAGE") == "0")
         {
             return false;
         }

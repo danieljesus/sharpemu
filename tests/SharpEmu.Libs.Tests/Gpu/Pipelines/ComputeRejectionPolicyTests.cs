@@ -14,6 +14,7 @@ namespace SharpEmu.Libs.Tests.Gpu.Pipelines;
 public sealed class ComputeRejectionPolicyTests
 {
     private const string Variable = "SHARPEMU_STRICT_COMPUTE";
+    private const string WaterfallVariable = "SHARPEMU_WATERFALL_NULL_IMAGE";
     private const ulong CodeAddress = PipelineTestGuest.MemoryBase + 0x1000;
     private const ulong HeaderAddress = PipelineTestGuest.MemoryBase + 0x8000;
 
@@ -29,9 +30,11 @@ public sealed class ComputeRejectionPolicyTests
     public void ComputeRejectionUsesTheConfiguredPolicy(string? value, bool rejectPlan)
     {
         var previous = Environment.GetEnvironmentVariable(Variable);
+        var previousWaterfall = Environment.GetEnvironmentVariable(WaterfallVariable);
         try
         {
             Environment.SetEnvironmentVariable(Variable, value);
+            Environment.SetEnvironmentVariable(WaterfallVariable, "0");
             using var fatal = new FatalScope();
             var guest = new PipelineTestGuest();
             guest.RegisterProgram(CodeAddress, HeaderAddress, rejectPlan
@@ -64,6 +67,7 @@ public sealed class ComputeRejectionPolicyTests
         finally
         {
             Environment.SetEnvironmentVariable(Variable, previous);
+            Environment.SetEnvironmentVariable(WaterfallVariable, previousWaterfall);
         }
     }
 
