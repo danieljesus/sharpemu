@@ -339,6 +339,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return CreateBuffer(guestAddress, size);
     }
 
+    private static readonly bool ObtainFastChecks = Environment.GetEnvironmentVariable("SHARPEMU_OBTAIN_FAST_CHECKS") != "0";
+
     public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false, ResourceSlotIdentifier bufferIdentifier = default)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferAcquisitionChecks);
@@ -348,9 +350,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("A buffer request requires a command buffer that is recording.");
         }
 
-        if (!isWritten &&
-            !_tracker.HasGpuDirtyPages(guestAddress, size) &&
-            _tracker.HasCpuDirtyPages(guestAddress, size) &&
+        // [local] SHARPEMU_OBTAIN_FAST_CHECKS (on by default): the same predicate, cheapest first. A clean range
+        // answers from the lock-free block summary, and on the GPU queue thread a clear MayHaveGpuDirtyPages is exact.
+        var streamCandidate = ObtainFastChecks
+            ? !isWritten && _tracker.HasCpuDirtyPages(guestAddress, size) &&
+              (!_tracker.MayHaveGpuDirtyPages(guestAddress, size) || !_tracker.HasGpuDirtyPages(guestAddress, size))
+            : !isWritten && !_tracker.HasGpuDirtyPages(guestAddress, size) && _tracker.HasCpuDirtyPages(guestAddress, size);
+        if (streamCandidate &&
             (size <= CachingPageSize || (!isTexelBuffer && _tracker.IsCpuWriteHotRange(guestAddress, size))))
         {
             using var streamProfile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferStreamUpload);

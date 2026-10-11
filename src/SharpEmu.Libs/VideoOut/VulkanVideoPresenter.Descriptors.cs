@@ -188,8 +188,23 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var storage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage;
             _ = BeginBatchedGuestCommands();
-            TextureRequestResolution resolution;
+            ImageRequest request;
             ResourceSlotIdentifier imageIdentifier;
+            Format viewFormat;
+            uint swizzle;
+            if (LeanTexturePath && !ImageBindingMemoEnabled)
+            {
+                // [local] One working copy of the request: the lookup adjusts its view in place.
+                ref readonly var built = ref ImageRequestBuilders.TextureRef(words, ShapeOf(image));
+                request = built.Request;
+                var exactFormat = built.ExactFormat;
+                viewFormat = built.ViewFormat;
+                swizzle = built.Swizzle;
+                imageIdentifier = _imageCache.FindImage(ref request, exactFormat);
+                return FinishImageBinding(image, words, program, index, storage, in request, imageIdentifier, viewFormat, swizzle);
+            }
+
+            TextureRequestResolution resolution;
             var memoHit = -1;
             if (ImageBindingMemoEnabled)
             {
@@ -257,8 +272,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
-            var request = resolution.Request;
-            imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, resolution);
+            request = resolution.Request;
+            viewFormat = resolution.ViewFormat;
+            swizzle = resolution.Swizzle;
+            return FinishImageBinding(image, words, program, index, storage, in request, imageIdentifier, viewFormat, swizzle);
+        }
+
+        // [local] SHARPEMU_LEAN_TEXTURE_PATH (on by default): ResolveImageBinding without the resolution copies.
+        private static readonly bool LeanTexturePath = Environment.GetEnvironmentVariable("SHARPEMU_LEAN_TEXTURE_PATH") != "0";
+
+        private TextureResource FinishImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index, bool storage,
+            in ImageRequest request, ResourceSlotIdentifier imageIdentifier, Format viewFormat, uint swizzle)
+        {
+            imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, in request, viewFormat, swizzle);
             BindImage(imageIdentifier, storage);
             var descriptor = new TextureDescriptorWords(words);
             if (ShouldTraceTextureBindings() &&

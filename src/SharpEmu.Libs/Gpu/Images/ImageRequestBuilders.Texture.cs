@@ -194,6 +194,31 @@ public static partial class ImageRequestBuilders
         return resolution;
     }
 
+    // [local] The memoised resolution by reference: the request inside is ~570 bytes (16 inline mip layouts), so the
+    // hit path copies it once instead of out of the dictionary and again into the return value. The reference is
+    // valid until the next call on this thread.
+    public static ref readonly TextureRequestResolution TextureRef(ReadOnlySpan<uint> words, in ShaderImageShape shape)
+    {
+        Span<uint> key = stackalloc uint[8];
+        words[..Math.Min(words.Length, 8)].CopyTo(key);
+        var cacheKey = new TextureKey(key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7], shape);
+        var cache = _textureCache ??= new Dictionary<TextureKey, TextureRequestResolution>();
+        ref var entry = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrNullRef(cache, cacheKey);
+        if (!System.Runtime.CompilerServices.Unsafe.IsNullRef(ref entry))
+        {
+            return ref entry;
+        }
+
+        if (cache.Count >= TextureCacheLimit)
+        {
+            cache.Clear();
+        }
+
+        ref var added = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrAddDefault(cache, cacheKey, out _);
+        added = BuildTexture(key, shape);
+        return ref added;
+    }
+
     private static TextureRequestResolution BuildTexture(ReadOnlySpan<uint> words, in ShaderImageShape shape)
     {
         Span<uint> padded = stackalloc uint[8];
@@ -325,7 +350,12 @@ public static partial class ImageRequestBuilders
     }
 
     // After the lookup: a stencil association redirects to its depth owner; the view rules run on the owner.
-    public static ResourceSlotIdentifier ValidateTextureOwner(GuestImageCache cache, ResourceSlotIdentifier imageIdentifier, in TextureRequestResolution resolution)
+    public static ResourceSlotIdentifier ValidateTextureOwner(GuestImageCache cache, ResourceSlotIdentifier imageIdentifier, in TextureRequestResolution resolution) =>
+        ValidateTextureOwner(cache, imageIdentifier, resolution.Request, resolution.ViewFormat, resolution.Swizzle);
+
+    // [local] The same rules from the request and the resolution's view fields, without a resolution copy.
+    public static ResourceSlotIdentifier ValidateTextureOwner(GuestImageCache cache, ResourceSlotIdentifier imageIdentifier, in ImageRequest request,
+        Format viewFormat, uint swizzle)
     {
         var image = cache.GetImage(imageIdentifier);
         if (image.DepthOwner.IsValid)
@@ -333,7 +363,7 @@ public static partial class ImageRequestBuilders
             return image.DepthOwner;
         }
 
-        var storage = resolution.Request.Role == ImageRole.StorageImage;
+        var storage = request.Role == ImageRole.StorageImage;
         if (image.Description.IsDepth)
         {
             if (storage)
@@ -341,15 +371,15 @@ public static partial class ImageRequestBuilders
                 throw SubmissionScheduler.Fatal($"A depth target cannot be bound as a storage image: address=0x{image.Description.Data.Address:X16}.");
             }
 
-            _ = ViewFormatRules.SelectSampledDepthView(image.Description.PixelFormat, resolution.ViewFormat, resolution.Swizzle);
+            _ = ViewFormatRules.SelectSampledDepthView(image.Description.PixelFormat, viewFormat, swizzle);
         }
         else if (storage)
         {
-            ViewFormatRules.ValidateStorageColorView(image.Description.PixelFormat, resolution.Request.View.Format, resolution.Swizzle);
+            ViewFormatRules.ValidateStorageColorView(image.Description.PixelFormat, request.View.Format, swizzle);
         }
         else
         {
-            _ = ViewFormatRules.SelectSampledColorView(image.Description.PixelFormat, resolution.ViewFormat, resolution.Swizzle);
+            _ = ViewFormatRules.SelectSampledColorView(image.Description.PixelFormat, viewFormat, swizzle);
         }
 
         return imageIdentifier;
