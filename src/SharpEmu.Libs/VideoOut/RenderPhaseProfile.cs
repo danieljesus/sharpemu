@@ -149,6 +149,11 @@ internal static class RenderPhaseProfile
         // [local] Pieces of CommandDispatchTranslation.
         DispatchProgram,
         DispatchConsumers,
+        // [local] Pieces of ImageLookup.
+        ImageLookupCore,
+        ImageLookupDccSync,
+        ImageLookupDccClear,
+        ImageLookupDccReadback,
         Count,
     }
 

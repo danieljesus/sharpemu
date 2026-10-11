@@ -124,7 +124,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         }
 
         var metadataBaseLayer = request.View.BaseLayer;
-        var result = LookUpImage(ref request, exactFormat);
+        ResourceSlotIdentifier result;
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageLookupCore)) // [local]
+            result = LookUpImage(ref request, exactFormat);
 
         if (request.Role is ImageRole.Texture or ImageRole.StorageImage)
         {
@@ -146,11 +148,13 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
             if (sliceSize != 0)
             {
+                using var dccScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageLookupDccSync); // [local]
                 SynchronizeGuestDccMetadata(metadataAddress, sliceSize, request.View.BaseLayer, request.View.LayerCount);
             }
         }
 
-        MaterializeDccClear(result, request, metadataBaseLayer);
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageLookupDccClear)) // [local]
+            MaterializeDccClear(result, request, metadataBaseLayer);
         if (request.Role == ImageRole.DisplaySurface && request.Description.Metadata.Compression != DisplayCompression.Uncompressed)
         {
             using var held = _lock.Hold();

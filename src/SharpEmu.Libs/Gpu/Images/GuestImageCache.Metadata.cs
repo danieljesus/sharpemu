@@ -70,6 +70,7 @@ public sealed partial class GuestImageCache
 
         if (_bufferCache.HasGpuDirtyBytes(synchronizedAddress, synchronizedSize))
         {
+            using var readbackScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ImageLookupDccReadback); // [local]
             _bufferCache.ReadMemory(synchronizedAddress, synchronizedSize, isWrite: false);
         }
 
@@ -82,13 +83,15 @@ public sealed partial class GuestImageCache
             for (uint slice = 0; slice < count; slice++)
             {
                 var address = range.Address + sliceSize * (first + slice);
-                if (!_backing.TryReadBacking(address, firstByte))
+                // [local] The key and, when it decodes, the scan read the slice in place through the backing alias.
+                var inPlace = TryScanInPlace(address, sliceSize, scan: false, 0, out var aliasCode);
+                if (inPlace is null && !_backing.TryReadBacking(address, firstByte))
                 {
                     throw SubmissionScheduler.Fatal(
                         $"Could not read DCC metadata key: address=0x{address:X16}.");
                 }
 
-                var code = firstByte[0];
+                var code = inPlace is null ? firstByte[0] : aliasCode;
                 if (!PackedClearValue.TryDecodeDccColor(
                         request.View.Format,
                         code * 0x01010101u,
@@ -99,8 +102,9 @@ public sealed partial class GuestImageCache
                     continue;
                 }
 
-                var uniform = true;
-                for (ulong position = 0; position < sliceSize && uniform;)
+                var scanned = inPlace is null ? null : TryScanInPlace(address, sliceSize, scan: true, code, out _);
+                var uniform = scanned ?? true;
+                for (ulong position = 0; scanned is null && position < sliceSize && uniform;)
                 {
                     var length = checked((int)Math.Min(
                         sliceSize - position,
@@ -112,13 +116,9 @@ public sealed partial class GuestImageCache
                             $"Could not read DCC metadata backing: address=0x{address + position:X16} size=0x{length:X}.");
                     }
 
-                    for (var index = 0; index < chunk.Length; index++)
+                    if (chunk.IndexOfAnyExcept(code) >= 0) // [local] vectorized; was a byte loop
                     {
-                        if (chunk[index] != code)
-                        {
-                            uniform = false;
-                            break;
-                        }
+                        uniform = false;
                     }
 
                     position += (ulong)length;
@@ -152,6 +152,35 @@ public sealed partial class GuestImageCache
         finally
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(bytes);
+        }
+    }
+
+    // [local] SHARPEMU_DCC_SCAN_IN_PLACE (on by default): the metadata key, or whether the whole slice repeats it, read
+    // through the backing alias without copying; null when the alias does not map the whole slice.
+    private static readonly bool DccScanInPlace = Environment.GetEnvironmentVariable("SHARPEMU_DCC_SCAN_IN_PLACE") != "0";
+
+    private unsafe bool? TryScanInPlace(ulong address, ulong size, bool scan, byte expected, out byte code)
+    {
+        code = 0;
+        if (!DccScanInPlace || size == 0 || size > int.MaxValue || !_backing.TryEnterBackingAliasAccess())
+        {
+            return null;
+        }
+
+        try
+        {
+            if (!_backing.TryResolveBackingAlias(address, size, out var alias) || alias == 0)
+            {
+                return null;
+            }
+
+            var bytes = new ReadOnlySpan<byte>((void*)alias, (int)size);
+            code = bytes[0];
+            return !scan || bytes.IndexOfAnyExcept(expected) < 0;
+        }
+        finally
+        {
+            _backing.ExitBackingAliasAccess();
         }
     }
 
