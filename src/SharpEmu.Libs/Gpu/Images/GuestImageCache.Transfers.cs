@@ -788,6 +788,34 @@ public sealed unsafe partial class GuestImageCache
         return true;
     }
 
+    // [local] SHARPEMU_STENCIL_LAYER_CLEAR=0 turns off the clear of one layer of a layered stencil plane.
+    private static readonly bool StencilLayerClear = Environment.GetEnvironmentVariable("SHARPEMU_STENCIL_LAYER_CLEAR") != "0";
+
+    // [local] The layer of a depth image's stencil plane that this range covers exactly, through the plane's
+    // association. GTA V clears its six-layer shadow stencil one 1 MB layer at a time, drawing each layer in
+    // between; a CPU fill made the whole 6 MB plane reload before every one of those draws.
+    private bool TryGetStencilLayer(CachedImage association, ulong address, ulong size, out ResourceSlotIdentifier depthIdentifier, out uint layer)
+    {
+        depthIdentifier = association.DepthOwner;
+        layer = 0;
+        var plane = association.Description.Data;
+        if (!StencilLayerClear || _slots.TryGet(depthIdentifier) is not { } depth || !depth.Backing.Exists || !depth.Description.HasStencil ||
+            depth.Description.Stencil.Address != plane.Address || depth.Backing.Layers < 2 || depth.Description.Resources.Levels != 1)
+        {
+            return false;
+        }
+
+        var layerBytes = (ulong)depth.Description.Extent.Width * depth.Description.Extent.Height;
+        if (layerBytes == 0 || (layerBytes & 0xFFFF) != 0 || size != layerBytes || address < plane.Address ||
+            (address - plane.Address) % layerBytes != 0 || address + size > plane.Address + plane.Size)
+        {
+            return false;
+        }
+
+        layer = (uint)((address - plane.Address) / layerBytes);
+        return layer < depth.Backing.Layers;
+    }
+
     // Clears the one image that owns exactly this range; false when no single owner or clear value fits.
     public bool TryClearImageFromBuffer(ulong address, ulong size, uint packedClear)
     {
@@ -800,6 +828,7 @@ public sealed unsafe partial class GuestImageCache
         using var held = _lock.Hold();
         var selected = ResourceSlotIdentifier.Invalid;
         ImageAspectFlags aspect = 0;
+        uint? selectedLayer = null; // [local] one stencil layer instead of the whole image
         foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: false))
         {
             var owner = _slots.TryGet(imageIdentifier);
@@ -810,7 +839,14 @@ public sealed unsafe partial class GuestImageCache
 
             ImageAspectFlags candidate = 0;
             var candidateId = imageIdentifier;
-            if (owner.DepthOwner.IsValid && owner.Description.Data.Address == address && owner.Description.Data.Size == size)
+            uint? candidateLayer = null;
+            if (owner.DepthOwner.IsValid && owner.Description.Data.Size > size && TryGetStencilLayer(owner, address, size, out var layerDepth, out var layer))
+            {
+                candidate = ImageAspectFlags.StencilBit;
+                candidateId = layerDepth;
+                candidateLayer = layer;
+            }
+            else if (owner.DepthOwner.IsValid && owner.Description.Data.Address == address && owner.Description.Data.Size == size)
             {
                 candidate = ImageAspectFlags.StencilBit;
                 candidateId = owner.DepthOwner;
@@ -835,8 +871,14 @@ public sealed unsafe partial class GuestImageCache
                 return false;
             }
 
+            if (selected.IsValid && selectedLayer != candidateLayer)
+            {
+                return false;
+            }
+
             selected = candidateId;
             aspect = candidate;
+            selectedLayer = candidateLayer;
         }
 
         if (!selected.IsValid)
@@ -878,7 +920,9 @@ public sealed unsafe partial class GuestImageCache
         command.EndRendering();
         var native = new CommandBuffer(command.Handle);
         image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, native);
-        var range = new ImageSubresourceRange(aspect, 0, Vk.RemainingMipLevels, 0, image.Backing.Layers);
+        var range = selectedLayer is { } clearedLayer
+            ? new ImageSubresourceRange(aspect, 0, Vk.RemainingMipLevels, clearedLayer, 1)
+            : new ImageSubresourceRange(aspect, 0, Vk.RemainingMipLevels, 0, image.Backing.Layers);
         if (aspect == ImageAspectFlags.ColorBit)
         {
             _device.Vk.CmdClearColorImage(native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &colorClear, 1, &range);
