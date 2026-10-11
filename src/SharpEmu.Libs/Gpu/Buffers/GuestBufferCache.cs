@@ -42,6 +42,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly IGpuQueueRelay _relay;
     private readonly GuestBufferUploader _uploader;
     private readonly DeferredUploadWorker? _deferredUploads; // [local]
+    private readonly ReadbackMirror? _mirror; // [local]
 
     // [local] Every deferred upload so far has protected its pages and copied them (the scheduler does this before
     // each submit).
@@ -142,6 +143,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _tracker = new GuestPageTracker(pages);
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
         _uploader = new GuestBufferUploader(device, scheduler, guest, _staging);
+        if (ReadbackMirror.Mode != 0) // [local]
+        {
+            _mirror = new ReadbackMirror(device, scheduler);
+            scheduler.BeforeSubmit += RecordMirrorCopies;
+        }
+
         if (DeferredUploadWorker.Enabled) // [local]
         {
             _deferredUploads = new DeferredUploadWorker();
@@ -1638,7 +1645,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (copies.Count != 0)
         {
+            var classStarted = ReadbackClassLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+            var readbackClass = ReadbackClassLog ? ClassifyReadback(guestAddress, size, source) : -1;
             DownloadBufferMemory(copies);
+            if (readbackClass >= 0) NoteReadbackClass(readbackClass, System.Diagnostics.Stopwatch.GetTimestamp() - classStarted);
             _tracker.ClearGpuDirtyPages(windowBegin, windowEnd - windowBegin);
         }
 
@@ -1649,6 +1659,112 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         RecordReadback(windowBegin, windowEnd, isWrite, copies, readbackStarted, source);
         return null;
+    }
+
+    // [local] The readback mirror (ReadbackMirror): the bytes of a small read whose last GPU writer was submitted, from
+    // the line copies recorded at the end of command buffers. False sends the caller to the readback.
+    internal bool TryReadMirrored(ulong address, Span<byte> destination)
+    {
+        if (_mirror is not { } mirror || destination.Length == 0 || destination.Length > ReadbackMirror.MaxRead || !_relay.IsGpuQueueThread)
+        {
+            return false;
+        }
+
+        var size = (ulong)destination.Length;
+        if (!_gpuModifiedRanges.Contains(address, size))
+        {
+            mirror.NoteMiss(ReadbackMirror.Miss.Partial);
+            return false;
+        }
+
+        if (FindOwner(address, size) is not { } owner)
+        {
+            mirror.NoteMiss(ReadbackMirror.Miss.NoOwner);
+            return false;
+        }
+
+        var needed = owner.GpuWriteTick(owner.Offset(address), size);
+        var current = _scheduler.CurrentTick;
+        if (needed >= current)
+        {
+            mirror.NoteMiss(ReadbackMirror.Miss.WriterNotSubmitted);
+            return false;
+        }
+
+        if (!mirror.TryLocate(address, size, needed, current, out var wait))
+        {
+            return false;
+        }
+
+        var waited = !_scheduler.IsTickComplete(wait);
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (waited)
+        {
+            using var waitScope = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.GpuCompletionWait);
+            _scheduler.Wait(wait);
+        }
+
+        _scheduler.WaitForPriorityOperations(wait);
+        mirror.Read(address, destination, waited, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+        if (ReadbackMirror.Mode == 2)
+        {
+            Span<byte> mirrored = stackalloc byte[destination.Length];
+            destination.CopyTo(mirrored);
+            if (!TrySynchronizeCpuRead(address, size, GuestMemoryProfile.ReadbackSource.ShaderResourceRead) || !_guestMemory.TryRead(address, destination))
+            {
+                return false;
+            }
+
+            mirror.NoteCompare(mirrored.SequenceEqual(destination), address, needed, mirrored, destination);
+        }
+
+        return true;
+    }
+
+    private void RecordMirrorCopies()
+    {
+        if (_mirror is { } mirror && _relay.IsGpuQueueThread)
+        {
+            mirror.RecordCopies(new Silk.NET.Vulkan.CommandBuffer(_scheduler.Current.Handle), line => FindOwner(line, 64));
+        }
+    }
+
+    // [local] SHARPEMU_READBACK_CLASS_LOG=1 (step 3.0 of diseno-espejo-readbacks.md): the render thread's synchronous
+    // readbacks of shader and command reads (<= 256 B), by where the requested bytes' last writer is: 0 the command
+    // buffer being recorded (needs a submit), 1 submitted and still running, 2 finished. A mirror of hot lines only
+    // saves classes 1 and 2; class 0 also needs the writer submitted early. Counts and wall ms per frame window.
+    private static readonly bool ReadbackClassLog = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_CLASS_LOG") == "1";
+    private readonly long[] _readbackClassCalls = new long[3];
+    private readonly long[] _readbackClassTicks = new long[3];
+    private long _readbackClassReported = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private int ClassifyReadback(ulong guestAddress, ulong size, GuestMemoryProfile.ReadbackSource source)
+    {
+        if (size > 256 || source is not (GuestMemoryProfile.ReadbackSource.ShaderResourceRead or GuestMemoryProfile.ReadbackSource.CommandMemoryRead) ||
+            FindOwner(guestAddress, size) is not { } owner)
+        {
+            return -1;
+        }
+
+        var tick = owner.GpuWriteTick(owner.Offset(guestAddress), size);
+        return tick >= _scheduler.CurrentTick ? 0 : _scheduler.IsTickComplete(tick) ? 2 : 1;
+    }
+
+    private void NoteReadbackClass(int readbackClass, long ticks)
+    {
+        _readbackClassCalls[readbackClass]++;
+        _readbackClassTicks[readbackClass] += ticks;
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_readbackClassReported).TotalSeconds < 5)
+        {
+            return;
+        }
+
+        _readbackClassReported = System.Diagnostics.Stopwatch.GetTimestamp();
+        var ms = (long value) => value * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        Console.Error.WriteLine(FormattableString.Invariant(
+            $"[PERF][READBACK_CLASS] current={_readbackClassCalls[0]}/{ms(_readbackClassTicks[0]):F1}ms submitted={_readbackClassCalls[1]}/{ms(_readbackClassTicks[1]):F1}ms finished={_readbackClassCalls[2]}/{ms(_readbackClassTicks[2]):F1}ms"));
+        Array.Clear(_readbackClassCalls);
+        Array.Clear(_readbackClassTicks);
     }
 
     private bool CompleteReadMemoryOnGpu(PendingDownload pending, bool retrySynchronously)
@@ -2151,7 +2267,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         var bufferIdentifier = _registry.AllocateBuffer(new GpuBuffer(
             _device, _scheduler, GpuBufferUsage.DeviceLocal, overlap.Begin,
-            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin, allowSlab: true), overlap.Begin, overlap.End - overlap.Begin);
+            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin, allowSlab: true)
+            { GpuWriteObserver = _mirror is { } mirror ? mirror.Invalidate : null }, overlap.Begin, overlap.End - overlap.Begin);
         foreach (var oldId in overlapping)
         {
             MergeOverlappingBuffer(bufferIdentifier, oldId, !overlap.HasStreamLeap);

@@ -172,9 +172,13 @@ public unsafe class GpuBuffer : IDisposable
     // A readback of it only has to wait for that tick, not for all queued work.
     public ulong LastGpuWriteTick { get; private set; }
 
+    // [local] Told the guest range of every GPU write recorded into this buffer (the readback mirror).
+    internal Action<ulong, ulong>? GpuWriteObserver { get; set; }
+
     // Called by every path that records a GPU write into this buffer.
     public void NoteGpuWrite()
     {
+        GpuWriteObserver?.Invoke(CpuAddress, Size);
         var tick = _scheduler.CurrentTick;
         if (tick > LastGpuWriteTick)
         {
@@ -202,6 +206,8 @@ public unsafe class GpuBuffer : IDisposable
             NoteGpuWrite();
             return;
         }
+
+        GpuWriteObserver?.Invoke(CpuAddress + offset, size);
 
         var tick = _scheduler.CurrentTick;
         if (tick > LastGpuWriteTick)

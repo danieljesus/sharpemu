@@ -388,6 +388,13 @@ internal static unsafe partial class VulkanVideoPresenter
                         Diagnostics.GpuReadTrace.Record(address, ResourceMaterializationCache.ReadingTable);
                     }
 
+                    Span<byte> mirrored = stackalloc byte[sizeof(uint)]; // [local] SHARPEMU_READBACK_MIRROR
+                    if (_bufferCache.TryReadMirrored(address, mirrored))
+                    {
+                        word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(mirrored);
+                        return true;
+                    }
+
                     // [local experiment] the pending command buffer may hold the writes this word depends on
                     if (FlushBeforeTableReads) { _flushedTableReads++; _scheduler.FlushAndWait(); }
                     if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
