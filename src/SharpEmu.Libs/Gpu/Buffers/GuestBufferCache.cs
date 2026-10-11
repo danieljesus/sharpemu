@@ -1212,22 +1212,36 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (!_relay.IsGpuQueueThread && AsyncReadback is { } readback && GuestReadsAwaitOffQueue)
         {
-            PendingDownload? pending = null;
-            if (_relay.TryRunOnGpuQueue(() => pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true)))
+            // [local] A download the GPU overwrote meanwhile is retried from this thread, so the
+            // GPU queue thread does not block on the new copy; the last attempt retries there.
+            for (var attempt = 0; ; attempt++)
             {
+                PendingDownload? pending = null;
+                if (!_relay.TryRunOnGpuQueue(() => pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true)))
+                {
+                    return AwaitShutdown();
+                }
+
                 if (pending is null)
                 {
                     return true;
                 }
 
                 readback.Wait(pending.Ticket);
-                if (_relay.TryRunOnGpuQueue(() => CompleteReadMemoryOnGpu(pending, retrySynchronously: true)))
+                var lastAttempt = attempt >= AsyncReadbackRetries;
+                var applied = false;
+                if (!_relay.TryRunOnGpuQueue(() => applied = CompleteReadMemoryOnGpu(pending, retrySynchronously: lastAttempt)))
+                {
+                    return AwaitShutdown();
+                }
+
+                if (applied || lastAttempt)
                 {
                     return true;
                 }
-            }
 
-            return AwaitShutdown();
+                Interlocked.Increment(ref _reportedAsyncRetried);
+            }
         }
 
         var onQueue = _relay.IsGpuQueueThread;
@@ -1434,6 +1448,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static readonly bool GuestReadsAwaitOffQueue =
         Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_GUEST_READBACK") != "0";
 
+    // [local] SHARPEMU_ASYNC_READBACK_RETRIES: stale guest readbacks retried off the GPU queue thread (0: old behaviour).
+    private static readonly int AsyncReadbackRetries =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_READBACK_RETRIES"), out var retries) && retries >= 0 ? retries : 3;
+    private static long _reportedAsyncRetried;
+
     private bool AwaitShutdown()
     {
         lock (_shutdownGate)
@@ -1458,7 +1477,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static long _reportedRetried;
 
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
-        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
+        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
 
     private sealed record PendingDownload
     {
