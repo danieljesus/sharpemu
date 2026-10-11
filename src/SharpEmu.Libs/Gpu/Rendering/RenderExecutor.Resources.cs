@@ -262,6 +262,9 @@ public sealed partial class RenderExecutor
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepTargets)) // [local]
             DropUnwrittenColorTargets(context, ref state, pixelProgram);
         state.Rendering = AcquireAttachments(ref state);
+        Span<IPreparedBindings> stages = pixelBindings is null ? [vertexBindings] : [vertexBindings, pixelBindings];
+        if (PrepareStageImagesEnabled) // [local]
+            _host.PrepareStageImages(PipelineBindPoint.Graphics, stages);
         // Nothing after the pipeline touches guest memory.
         var pipeline = _pipelines.CreateGraphicsPipeline(
             BoundColors(ref state),
@@ -293,7 +296,6 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x300);
         }
 
-        Span<IPreparedBindings> stages = pixelBindings is null ? [vertexBindings] : [vertexBindings, pixelBindings];
         _host.CommitBindings(PipelineBindPoint.Graphics, in pipeline, stages);
         if (indexBuffer.Size != 0)
         {
@@ -363,6 +365,9 @@ public sealed partial class RenderExecutor
     }
 
     private const ulong IndexedIndirectArgumentsSize = 20;
+
+    // [local] SHARPEMU_PREPARE_STAGE_IMAGES=0 keeps the image work of a draw inside CommitBindings.
+    private static readonly bool PrepareStageImagesEnabled = Environment.GetEnvironmentVariable("SHARPEMU_PREPARE_STAGE_IMAGES") != "0";
 
     private void EmitDraw(UserConfigRegisters userConfig, VertexInputInfo vertexInput, in DrawCall draw, in DrawEmission emission)
     {

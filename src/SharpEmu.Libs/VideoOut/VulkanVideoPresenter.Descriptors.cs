@@ -69,6 +69,9 @@ internal static unsafe partial class VulkanVideoPresenter
             public uint[] ShaderData { get; set; } = [];
 
             public TextureResource[] Textures => Descriptors.Images;
+
+            // [local] PrepareStageImages already recorded this stage's image work.
+            public bool ImagesPrepared { get; set; }
         }
 
         private static ShaderStage StageOf(ShaderProgramInfo program) => program.Stage switch
@@ -1333,6 +1336,73 @@ internal static unsafe partial class VulkanVideoPresenter
             return new DescriptorImageInfo { ImageView = view, ImageLayout = texture.Layout };
         }
 
+        // [local] P1 of transiciones-diferidas.md: the image work of CommitBindings, recorded right after the attachments
+        // are acquired. Between the two points the draw records only pipeline creation and vertex buffer binds, which
+        // barriers do not order, so the GPU sees the same commands; recording no longer ends a rendering scope.
+        public void PrepareStageImages(PipelineBindPoint bindPoint, ReadOnlySpan<IPreparedBindings> stages)
+        {
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorCommit);
+            var preparation = RequirePreparation();
+            SubstituteStencilStorage(preparation, stages);
+            var uploadStage = bindPoint == PipelineBindPoint.Compute ? PipelineStageFlags.ComputeShaderBit : PipelineStageFlags.FragmentShaderBit;
+            foreach (var prepared in stages)
+            {
+                var stage = (PreparedStageBindings)prepared;
+                RecordStageImageWork(stage, uploadStage);
+                stage.ImagesPrepared = true;
+            }
+        }
+
+        // All stages that read the same stencil bytes share the shader's working image.
+        private static void SubstituteStencilStorage(RenderPreparation preparation, ReadOnlySpan<IPreparedBindings> stages)
+        {
+            if (preparation.StencilStorageImages is not { } stencilImages)
+            {
+                return;
+            }
+
+            foreach (var prepared in stages)
+            {
+                foreach (var texture in ((PreparedStageBindings)prepared).Textures)
+                {
+                    if (texture.CachedImage is { } attachment && ViewFormatRules.IsStencilViewFormat(texture.Request.View.Format) &&
+                        stencilImages.TryGetValue(attachment, out var storage))
+                    {
+                        texture.CachedImage = storage;
+                        texture.Image = storage.Backing.Handle;
+                        texture.View = storage.GetOrCreateView(texture.Request.View with { Aspect = ImageAspectFlags.ColorBit });
+                        texture.MipViews = [];
+                    }
+                }
+            }
+        }
+
+        private void RecordStageImageWork(PreparedStageBindings stage, PipelineStageFlags uploadStage)
+        {
+            var descriptors = stage.Descriptors;
+            if (descriptors.GlobalDataShare.Buffer.Handle != 0)
+            {
+                // The host and every earlier queue write to the data share complete before the shader reads it.
+                EndRendering();
+                var command = BeginBatchedGuestCommands();
+                var barrier = GlobalDataShareBarrier.Make(descriptors.GlobalDataShare.Buffer);
+                var stageFlag = DescriptorWriter.ShaderStageFlag(StageOf(stage.Program));
+                VulkanSynchronization.PipelineBarrier(_vk,command, GlobalDataShareBarrier.SourceStages, DescriptorWriter.PipelineStageFlag(stageFlag), 0, 0, null, 1, &barrier, 0, null);
+            }
+
+            RecordStageTextureTransitions(stage.Textures);
+            foreach (var texture in stage.Textures)
+            {
+                if (texture.IsHostMovie && texture.NeedsUpload)
+                {
+                    EndRendering();
+                    break;
+                }
+            }
+
+            RecordHostMovieUploads(stage.Textures, uploadStage);
+        }
+
         // Joins every stage's writes, records the image work and binds the set by push or from the heap.
         public void CommitBindings(PipelineBindPoint bindPoint, in PipelineHandle pipeline, ReadOnlySpan<IPreparedBindings> stages)
         {
@@ -1376,23 +1446,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 maxStageImages = Math.Max(maxStageImages, stage.Textures.Length);
             }
 
-            // All stages that read the same stencil bytes share the shader's working image.
-            if (preparation.StencilStorageImages is { } stencilImages)
+            // Prepared stages substituted before their transitions, which can add working images of their own.
+            if (stages.Length == 0 || !((PreparedStageBindings)stages[0]).ImagesPrepared)
             {
-                foreach (var prepared in stages)
-                {
-                    foreach (var texture in ((PreparedStageBindings)prepared).Textures)
-                    {
-                        if (texture.CachedImage is { } attachment && ViewFormatRules.IsStencilViewFormat(texture.Request.View.Format) &&
-                            stencilImages.TryGetValue(attachment, out var storage))
-                        {
-                            texture.CachedImage = storage;
-                            texture.Image = storage.Backing.Handle;
-                            texture.View = storage.GetOrCreateView(texture.Request.View with { Aspect = ImageAspectFlags.ColorBit });
-                            texture.MipViews = [];
-                        }
-                    }
-                }
+                SubstituteStencilStorage(preparation, stages);
             }
 
             // Vulkan consumes these host-side descriptions during the call.
@@ -1425,26 +1482,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     var descriptors = stage.Descriptors;
                     var shaderStage = StageOf(program);
                     var stageFlag = DescriptorWriter.ShaderStageFlag(shaderStage);
-                    if (descriptors.GlobalDataShare.Buffer.Handle != 0)
+                    if (!stage.ImagesPrepared)
                     {
-                        // The host and every earlier queue write to the data share complete before the shader reads it.
-                        EndRendering();
+                        RecordStageImageWork(stage, uploadStage);
                         command = BeginBatchedGuestCommands();
-                        var barrier = GlobalDataShareBarrier.Make(descriptors.GlobalDataShare.Buffer);
-                        VulkanSynchronization.PipelineBarrier(_vk,command, GlobalDataShareBarrier.SourceStages, DescriptorWriter.PipelineStageFlag(stageFlag), 0, 0, null, 1, &barrier, 0, null);
                     }
-
-                    RecordStageTextureTransitions(stage.Textures);
-                    foreach (var texture in stage.Textures)
-                    {
-                        if (texture.IsHostMovie && texture.NeedsUpload)
-                        {
-                            EndRendering();
-                            break;
-                        }
-                    }
-
-                    RecordHostMovieUploads(stage.Textures, uploadStage);
                     foreach (var texture in stage.Textures)
                     {
                         textures[textureIndex++] = texture;

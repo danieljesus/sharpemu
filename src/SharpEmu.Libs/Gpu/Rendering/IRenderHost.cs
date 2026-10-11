@@ -131,6 +131,12 @@ public interface IRenderHost
 
     void CommitBindings(PipelineBindPoint bindPoint, in PipelineHandle pipeline, ReadOnlySpan<IPreparedBindings> stages);
 
+    // [local] Records the stages' image work (data share barrier, texture transitions, movie uploads) ahead of the
+    // pipeline and descriptor writes; CommitBindings then skips it for these stages.
+    void PrepareStageImages(PipelineBindPoint bindPoint, ReadOnlySpan<IPreparedBindings> stages)
+    {
+    }
+
     void SetDynamicState(in DynamicDrawState state);
 
     void BeginRendering(in RenderingState state);
