@@ -14,6 +14,10 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 internal sealed unsafe class ReadbackMirror(GpuDeviceInfo device, SubmissionScheduler scheduler)
 {
     public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_READBACK_MIRROR"), out var mode) ? mode : 0;
+    // SHARPEMU_READBACK_MIRROR_FLUSH=1: a write of a line read within the last FlushLifetime reads asks for the
+    // batch to be submitted before the next draw or dispatch, so that read finds its writer submitted.
+    public static readonly bool FlushHotWrites = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_MIRROR_FLUSH") == "1";
+    private const long FlushLifetime = 4096;
     public const int MaxRead = 256;
     private const ulong LineSize = 64;
     private const int MaxLines = 2048;
@@ -36,6 +40,7 @@ internal sealed unsafe class ReadbackMirror(GpuDeviceInfo device, SubmissionSche
     private GpuBuffer? _host;
     private long _uses;
     private readonly long[] _misses = new long[(int)Miss.Count];
+    private long _flushes;
     private long _hits, _hitsNoWait, _waitTicks, _copies, _evictions, _invalidations, _mismatches, _compared;
     private long _reported = System.Diagnostics.Stopwatch.GetTimestamp();
 
@@ -152,8 +157,24 @@ internal sealed unsafe class ReadbackMirror(GpuDeviceInfo device, SubmissionSche
         }
     }
 
+    public bool FlushRequested { get; private set; }
+
+    public void OnBatchSubmitted()
+    {
+        if (FlushRequested)
+        {
+            _flushes++;
+            FlushRequested = false;
+        }
+    }
+
     private void Stale(ulong line, Line entry)
     {
+        if (FlushHotWrites && _uses - entry.LastUse < FlushLifetime)
+        {
+            FlushRequested = true;
+        }
+
         entry.CopyTick = 0;
         _invalidations++;
         Queue(line, entry);
@@ -283,8 +304,8 @@ internal sealed unsafe class ReadbackMirror(GpuDeviceInfo device, SubmissionSche
 
         _reported = System.Diagnostics.Stopwatch.GetTimestamp();
         Console.Error.WriteLine(FormattableString.Invariant(
-            $"[PERF][MIRROR] hits={_hits} hits_no_wait={_hitsNoWait} wait_ms={_waitTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} no_line={_misses[0]} stale={_misses[1]} writer_not_submitted={_misses[2]} no_owner={_misses[3]} partial={_misses[4]} lines={_lines.Count} copies={_copies} evictions={_evictions} invalidations={_invalidations} compared={_compared} mismatches={_mismatches}"));
-        _hits = _hitsNoWait = _waitTicks = _copies = _evictions = _invalidations = _compared = 0;
+            $"[PERF][MIRROR] hits={_hits} hits_no_wait={_hitsNoWait} wait_ms={_waitTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} no_line={_misses[0]} stale={_misses[1]} writer_not_submitted={_misses[2]} no_owner={_misses[3]} partial={_misses[4]} lines={_lines.Count} copies={_copies} evictions={_evictions} invalidations={_invalidations} compared={_compared} mismatches={_mismatches} flushes={_flushes}"));
+        _hits = _hitsNoWait = _waitTicks = _copies = _evictions = _invalidations = _compared = _flushes = 0;
         Array.Clear(_misses);
     }
 }

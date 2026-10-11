@@ -1385,12 +1385,19 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
-    public bool HotWritePending { get; private set; }
+    private bool _hotWritePending;
+
+    public bool HotWritePending
+    {
+        get => _hotWritePending || (_mirror?.FlushRequested ?? false);
+        private set => _hotWritePending = value;
+    }
 
     public void OnBatchSubmitted()
     {
         _batchSerial++;
         HotWritePending = false;
+        _mirror?.OnBatchSubmitted(); // [local]
         if (AsyncReadback is not { } readback)
         {
             return;
