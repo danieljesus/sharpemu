@@ -406,6 +406,48 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return (buffer, buffer.Offset(guestAddress));
     }
 
+    // [local] SHARPEMU_UNIFORM_IMAGE_SOURCE: an image source of one repeated byte (GTA V clears a 6 MB depth
+    // image to 0xFF in 1 MB fills every frame) is filled in staging on the GPU instead of copied from guest
+    // memory. The guest bytes are scanned in place through the backing alias; anything else is copied as before.
+    private static readonly bool UniformImageSource = Environment.GetEnvironmentVariable("SHARPEMU_UNIFORM_IMAGE_SOURCE") == "1"; // opt-in: ImageUpload -0.6 ms, FPS within noise (rt456)
+    private const ulong UniformImageSourceMin = 1UL << 20;
+    private static long _uniformImageSources;
+
+    internal static long TakeUniformImageSources() => Interlocked.Exchange(ref _uniformImageSources, 0);
+
+    private bool TryFillUniformStaging(ulong guestAddress, ulong size, ulong stageOffset)
+    {
+        if (!UniformImageSource || size < UniformImageSourceMin || size > int.MaxValue || ((size | stageOffset) & 3) != 0 ||
+            !_backing.TryEnterBackingAliasAccess())
+        {
+            return false;
+        }
+
+        byte value;
+        try
+        {
+            if (!_backing.TryResolveBackingAlias(guestAddress, size, out var alias) || alias == 0)
+            {
+                return false;
+            }
+
+            var bytes = new ReadOnlySpan<byte>((void*)alias, (int)size);
+            value = bytes[0];
+            if (bytes.IndexOfAnyExcept(value) >= 0)
+            {
+                return false;
+            }
+        }
+        finally
+        {
+            _backing.ExitBackingAliasAccess();
+        }
+
+        _staging.Fill(stageOffset, size, value * 0x01010101u);
+        Interlocked.Increment(ref _uniformImageSources);
+        return true;
+    }
+
     public (GpuBuffer Buffer, ulong Offset) ObtainBufferForImage(ulong guestAddress, ulong size)
     {
         if (!IsValidRange(guestAddress, size))
@@ -445,7 +487,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal(
                 $"Cannot reserve image staging space: address=0x{guestAddress:X16} size=0x{size:X16} capacity=0x{_staging.Size:X16} tick={_scheduler.CurrentTick}.");
         }
-        if (!_backing.TryReadBacking(guestAddress, _staging.Mapped.Slice((int)stageOffset, (int)size)) &&
+        if (!TryFillUniformStaging(guestAddress, size, stageOffset) &&
+            !_backing.TryReadBacking(guestAddress, _staging.Mapped.Slice((int)stageOffset, (int)size)) &&
             !KernelMemoryCompatExports.TryReadPrtBacking(_backing, guestAddress,
                 _staging.Mapped.Slice((int)stageOffset, (int)size)))
         {
@@ -1482,7 +1525,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static long _reportedRetried;
 
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
-        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
+        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} uniform_image_sources={TakeUniformImageSources()} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
 
     private sealed record PendingDownload
     {
