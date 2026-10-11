@@ -611,6 +611,7 @@ public static partial class Gen5SpirvTranslator
                     _module.AddLabel(returnLabel);
                 }
 
+                EmitRtStackRelease();
                 _module.AddStatement(SpirvOp.Return);
                 _module.EndFunction();
 
@@ -1496,6 +1497,7 @@ public static partial class Gen5SpirvTranslator
                 Store(_programActive, invocationInBounds);
                 EmitComputeExecMask(workGroupId, invocationInBounds);
                 EmitWave64ExchangeReset();
+                EmitRtStackClaim();
                 EmitPairTableScan();
 
                 if (_request.ComputeSystemRegisters is { } registers)

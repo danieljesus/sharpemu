@@ -4,6 +4,7 @@
 using System.Runtime.InteropServices;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Scheduling;
+using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
 using SharpEmu.Libs.Gpu.Vulkan;
 using Silk.NET.Vulkan;
@@ -67,6 +68,8 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private readonly ulong _pageSize;
     private readonly ulong _pageCount;
     private readonly ulong _faultBufferSize;
+    private readonly ulong _traceTailOffset;
+    private bool _rtStackAreaInitialized;
     private readonly GpuBuffer _faultBuffer;
     private readonly GpuBuffer _downloadBuffer;
     private readonly GpuBuffer? _traceDownloadBuffer;
@@ -87,8 +90,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         _pageSize = 1UL << pageBits;
         _pageCount = pageCount;
         _faultBufferSize = pageCount / 8;
+        if (DeviceAddressPaging.RtStackAreaEnabled && _faultBufferSize != DeviceAddressPaging.FaultBitmapBytes)
+            throw new InvalidOperationException("The fault bitmap size does not match DeviceAddressPaging.FaultBitmapBytes.");
+        _traceTailOffset = _faultBufferSize + DeviceAddressPaging.RtStackAreaBytes; // [local] RT stack area before the tail
         _faultBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags,
-            _faultBufferSize + (GuestGpuMemoryHook.TraceEnabled ? TraceTailBytes : 0UL));
+            _traceTailOffset + (GuestGpuMemoryHook.TraceEnabled ? TraceTailBytes : 0UL));
         if (GuestGpuMemoryHook.TraceEnabled)
             _traceDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * TraceTailBytes);
         _downloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
@@ -215,8 +221,13 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         {
             if (_traceDownloadBuffer is not null && !_traceInitialized)
             {
-                _faultBuffer.Fill(_faultBufferSize, TraceTailBytes, 0);
+                _faultBuffer.Fill(_traceTailOffset, TraceTailBytes, 0);
                 _traceInitialized = true;
+            }
+            if (DeviceAddressPaging.RtStackAreaEnabled && !_rtStackAreaInitialized) // [local] every warp slot free
+            {
+                _faultBuffer.Fill(_faultBufferSize, DeviceAddressPaging.RtStackSlotBitmapBytes, 0);
+                _rtStackAreaInitialized = true;
             }
             return _faultBuffer;
         }
@@ -279,9 +290,9 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         }
         if (_traceDownloadBuffer is not null)
         {
-            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, _faultBufferSize, area * TraceTailBytes, TraceTailBytes,
+            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, _traceTailOffset, area * TraceTailBytes, TraceTailBytes,
                 destinationAfter: AccessFlags.HostReadBit);
-            _faultBuffer.Fill(_faultBufferSize, TraceTailBytes, 0);
+            _faultBuffer.Fill(_traceTailOffset, TraceTailBytes, 0);
         }
         _scheduler.QueueCompletionAction(() =>
         {
@@ -385,6 +396,10 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                         var registers = string.Join(" ", names.Select((name, index) => $"{name}=0x{values[index]:X}/0x{values[9 + index]:X}"));
                         Console.Error.WriteLine($"[GPU][NATIVE_BLAS_FIRST] scan_tick={scanTick} lane={nativeBlas[7]} guest/native: {registers} | root=0x{nativeBlas[26]:X} tmax_in=0x{nativeBlas[27]:X} v29_in=0x{nativeBlas[28]:X} blas=0x{((ulong)nativeBlas[30] << 32) | nativeBlas[29]:X} instance=0x{((ulong)nativeBlas[32] << 32) | nativeBlas[31]:X} native_iterations={nativeBlas[33]}");
                     }
+                }
+                if (nativeTlas[30] != 0 || nativeTlas[31] != 0) // [local] SHARPEMU_RT_STACK_SPLIT: deep-tier pushes, slot claims that found no free slot
+                {
+                    Console.Error.WriteLine($"[GPU][RT_STACK] scan_tick={scanTick} deep_pushes={nativeTlas[30]} slot_fallbacks={nativeTlas[31]}");
                 }
                 if (nativeTlas[0] != 0 || nativeTlas[2] != 0) // [local] SHARPEMU_NATIVE_TLAS_LOOP: verify record (2), capped walks (1 and 2)
                 {

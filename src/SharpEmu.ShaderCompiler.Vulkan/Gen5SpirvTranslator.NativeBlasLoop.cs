@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.ShaderCompiler;
+using SharpEmu.ShaderCompiler.Resources;
 
 namespace SharpEmu.ShaderCompiler.Vulkan;
 
@@ -273,11 +274,16 @@ public static partial class Gen5SpirvTranslator
             if (RtSharedStacks)
             {
                 // Slot-major, entry n of lane i at n * 64 + i, so a push or pop of a warp hits 32 banks.
-                var sharedType = _module.TypeArray(_uintType, NativeBlasStackCapacity * 64);
+                var rows = RtStackSplit ? RtStackSharedRows : NativeBlasStackCapacity;
+                var sharedType = _module.TypeArray(_uintType, rows * 64);
                 _nativeStack = _module.AddGlobalVariable(
                     _module.TypePointer(SpirvStorageClass.Workgroup, sharedType),
                     SpirvStorageClass.Workgroup);
                 _workgroupUintPointer = _module.TypePointer(SpirvStorageClass.Workgroup, _uintType);
+                if (RtStackSplit)
+                {
+                    _nativePopped = NativeVariable("nativeBlasPopped");
+                }
             }
             else
             {
@@ -319,10 +325,164 @@ public static partial class Gen5SpirvTranslator
 
         private uint RtStackLane() => BitwiseAnd(GuestWaveLane(), UInt(63));
 
+        // [local] SHARPEMU_RT_STACK_SPLIT=<rows>: the BLAS stack in three tiers. Entries 0-13 use rows
+        // 2-15 of the guest LDS (64 dwords a row, the lane's own column), which the pass only uses for
+        // the guest stack (the same columns, rows 1-14, run after the native loop of the same lane in
+        // verify) and the TLAS exchange (rows 0-1). The next <rows> entries use a smaller workgroup
+        // array, and the rest the RT stack area of the fault buffer, in the warp slot the subgroup
+        // claimed at the start of the program. NVIDIA sizes the register budget by the occupancy the
+        // workgroup memory allows: with less of it per group, more groups are resident. A private
+        // array for the deep entries is not an option: NVIDIA keeps it in registers (hito 5).
+        private const uint RtStackLdsRows = 14;
+        private const uint RtStackLdsFirstRow = 2;
+        private static uint RtStackSplitRows => DeviceAddressPaging.RtStackSplitRows;
+        private bool RtStackSplit => RtSharedStacks && RtStackSplitRows != 0 && DeviceAddressPaging.RtStackAreaEnabled &&
+            _lds != 0 && _ldsDwordMask + 1 >= 1024 && _faultBuffer != 0 && _subgroupInvocationIdInput != 0 && _request.Hash == NativeBlasHash;
+        private static uint RtStackSharedRows => RtStackSplitRows;
+        private uint _nativePopped;
+        private uint _rtStackSlot;
+
+        private const uint RtStackSlotBitmapWords = DeviceAddressPaging.RtStackWarpSlots / 32;
+        private const uint RtStackBitmapDword = (uint)(DeviceAddressPaging.FaultBitmapBytes / 4);
+        private const uint RtStackEntriesDword = RtStackBitmapDword + RtStackSlotBitmapWords;
+        private const uint RtStackFallbackBit = 0x8000_0000;
+
+        // At the start of the program the first lane of each 32-lane subgroup claims a free warp slot
+        // (a set bit is taken) and broadcasts it. One full pass over the bitmap is enough while fewer
+        // warps are resident than there are slots; if none is free the hashed slot is shared and the
+        // claim is counted, so the result may differ instead of the dispatch hanging.
+        private void EmitRtStackClaim()
+        {
+            if (!RtStackSplit)
+            {
+                return;
+            }
+
+            _rtStackSlot = NativeVariable("rtStackSlot");
+            var cursor = NativeVariable("rtStackCursor");
+            var steps = NativeVariable("rtStackSteps");
+            var group = Load(_uvec3Type, _workGroupIdInput);
+            var key = IAdd(_module.AddInstruction(SpirvOp.IMul, _uintType, IAdd(
+                    _module.AddInstruction(SpirvOp.IMul, _uintType, _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, group, 1), UInt(4099)),
+                    _module.AddInstruction(SpirvOp.CompositeExtract, _uintType, group, 0)), UInt(2)),
+                ShiftRightLogical(BitwiseAnd(GuestWaveLane(), UInt(63)), UInt(5)));
+            var start = BitwiseAnd(ShiftRightLogical(_module.AddInstruction(SpirvOp.IMul, _uintType, key, UInt(2654435761)), UInt(20)), UInt(RtStackSlotBitmapWords - 1));
+            var elected = _module.AddInstruction(SpirvOp.GroupNonUniformElect, _boolType, UInt(3));
+            EmitConditional(elected, () =>
+            {
+                Store(_rtStackSlot, BitwiseOr(ShiftLeftLogical(start, UInt(5)), UInt(RtStackFallbackBit)));
+                Store(cursor, start);
+                Store(steps, UInt(0));
+                var header = _module.AllocateId();
+                var body = _module.AllocateId();
+                var next = _module.AllocateId();
+                var merge = _module.AllocateId();
+                _module.AddStatement(SpirvOp.Branch, header);
+                _module.AddLabel(header);
+                _module.AddStatement(SpirvOp.LoopMerge, merge, next, 0);
+                _module.AddStatement(SpirvOp.Branch, body);
+                _module.AddLabel(body);
+                var word = Load(_uintType, cursor);
+                var pointer = BlockWordPointer(_faultBuffer, IAdd(UInt(RtStackBitmapDword), word));
+                var free = _module.AddInstruction(SpirvOp.Not, _uintType,
+                    _module.AddInstruction(SpirvOp.AtomicLoad, _uintType, pointer, UInt(1), UInt(0)));
+                EmitConditional(IsNotZero(free), () =>
+                {
+                    var bit = ShiftLeftLogical(UInt(1), Ext(73, _uintType, free));
+                    var before = _module.AddInstruction(SpirvOp.AtomicOr, _uintType, pointer, UInt(1), UInt(0), bit);
+                    EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, BitwiseAnd(before, bit), UInt(0)),
+                        () => Store(_rtStackSlot, IAdd(ShiftLeftLogical(word, UInt(5)), Ext(73, _uintType, free))));
+                }, () => Store(cursor, BitwiseAnd(IAdd(word, UInt(1)), UInt(RtStackSlotBitmapWords - 1))));
+                _module.AddStatement(SpirvOp.Branch, next);
+                _module.AddLabel(next);
+                var count = IAdd(Load(_uintType, steps), UInt(1));
+                Store(steps, count);
+                var again = LogicalAnd(IsNotZero(BitwiseAnd(Load(_uintType, _rtStackSlot), UInt(RtStackFallbackBit))),
+                    ULess(count, UInt(RtStackSlotBitmapWords * 4)));
+                _module.AddStatement(SpirvOp.BranchConditional, again, header, merge);
+                _module.AddLabel(merge);
+                if (_request.TraceDeviceAddressFaults)
+                {
+                    EmitConditional(IsNotZero(BitwiseAnd(Load(_uintType, _rtStackSlot), UInt(RtStackFallbackBit))), () =>
+                        _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, NativeTlasWord(31), UInt(1), UInt(0), UInt(1)));
+                }
+            });
+            Store(_rtStackSlot, _module.AddInstruction(SpirvOp.GroupNonUniformBroadcastFirst, _uintType, UInt(3), Load(_uintType, _rtStackSlot)));
+        }
+
+        // At the end of the program the subgroup frees its slot.
+        private void EmitRtStackRelease()
+        {
+            if (_rtStackSlot == 0)
+            {
+                return;
+            }
+
+            var slot = Load(_uintType, _rtStackSlot);
+            var owned = LogicalAnd(_module.AddInstruction(SpirvOp.GroupNonUniformElect, _boolType, UInt(3)),
+                _module.AddInstruction(SpirvOp.IEqual, _boolType, BitwiseAnd(slot, UInt(RtStackFallbackBit)), UInt(0)));
+            EmitConditional(owned, () =>
+                _module.AddInstruction(SpirvOp.AtomicAnd, _uintType,
+                    BlockWordPointer(_faultBuffer, IAdd(UInt(RtStackBitmapDword), ShiftRightLogical(slot, UInt(5)))), UInt(1), UInt(0),
+                    _module.AddInstruction(SpirvOp.Not, _uintType, ShiftLeftLogical(UInt(1), BitwiseAnd(slot, UInt(31))))));
+        }
+
+        // Entry e of the deep tier for this lane: entry-major within the slot, so a warp's push is one line.
+        private uint RtStackDeepPointer(uint entry)
+        {
+            var slot = BitwiseAnd(Load(_uintType, _rtStackSlot), UInt(DeviceAddressPaging.RtStackWarpSlots - 1));
+            var row = IAdd(_module.AddInstruction(SpirvOp.IMul, _uintType, slot, UInt(DeviceAddressPaging.RtStackSlotEntries)), entry);
+            return BlockWordPointer(_faultBuffer, IAdd(UInt(RtStackEntriesDword),
+                IAdd(ShiftLeftLogical(row, UInt(5)), Load(_uintType, _subgroupInvocationIdInput))));
+        }
+
+        private uint ULess(uint left, uint right) => _module.AddInstruction(SpirvOp.ULessThan, _boolType, left, right);
+
+        private uint USub(uint left, uint right) => _module.AddInstruction(SpirvOp.ISub, _uintType, left, right);
+
+        // The three tiers for entry `index` (already below the capacity): LDS row, workgroup row, private.
+        private void EmitSplitStackAccess(uint index, Action<uint> access)
+        {
+            EmitConditional(ULess(index, UInt(RtStackLdsRows)), () =>
+                access(_module.AddInstruction(SpirvOp.AccessChain, _ldsElementPointer, _lds,
+                    IAdd(_module.AddInstruction(SpirvOp.IMul, _uintType, IAdd(index, UInt(RtStackLdsFirstRow)), UInt(64)), RtStackLane()))),
+                () => EmitConditional(ULess(index, UInt(RtStackLdsRows + RtStackSharedRows)), () =>
+                    access(_module.AddInstruction(SpirvOp.AccessChain, _workgroupUintPointer, _nativeStack,
+                        IAdd(_module.AddInstruction(SpirvOp.IMul, _uintType, USub(index, UInt(RtStackLdsRows)), UInt(64)), RtStackLane()))),
+                    () => access(RtStackDeepPointer(USub(index, UInt(RtStackLdsRows + RtStackSharedRows))))));
+        }
+
+        private void EmitNativeStackStore(uint index, uint value)
+        {
+            if (!RtStackSplit)
+            {
+                Store(NativeStackSlot(index), value);
+                return;
+            }
+
+            EmitSplitStackAccess(Ext(38, _uintType, index, UInt(NativeBlasStackCapacity - 1)), pointer => Store(pointer, value));
+            if (_request.TraceDeviceAddressFaults)
+            {
+                EmitConditional(_module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, index, UInt(RtStackLdsRows + RtStackSharedRows)), () =>
+                    _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, NativeTlasWord(30), UInt(1), UInt(0), UInt(1)));
+            }
+        }
+
+        private uint EmitNativeStackLoad(uint index)
+        {
+            if (!RtStackSplit)
+            {
+                return Load(_uintType, NativeStackSlot(index));
+            }
+
+            EmitSplitStackAccess(Ext(38, _uintType, index, UInt(NativeBlasStackCapacity - 1)), pointer => Store(_nativePopped, Load(_uintType, pointer)));
+            return Load(_uintType, _nativePopped);
+        }
+
         private void EmitNativePush(uint value)
         {
             var pointer = Load(_uintType, _nativeStackPointer);
-            Store(NativeStackSlot(pointer), value);
+            EmitNativeStackStore(pointer, value);
             Store(_nativeStackPointer, IAdd(pointer, UInt(1)));
         }
 
@@ -501,7 +661,7 @@ public static partial class Gen5SpirvTranslator
                     {
                         var top = _module.AddInstruction(SpirvOp.ISub, _uintType, pointer, UInt(1));
                         Store(_nativeStackPointer, top);
-                        StoreV(8, Load(_uintType, NativeStackSlot(top)), guardWithExec: false);
+                        StoreV(8, EmitNativeStackLoad(top), guardWithExec: false);
                     });
             });
 
