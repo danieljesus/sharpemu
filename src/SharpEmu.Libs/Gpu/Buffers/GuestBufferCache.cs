@@ -1012,6 +1012,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             TouchBuffer(_registry.GetRegisteredIdentifier(index));
     }
 
+    // [local] SHARPEMU_BDA_PRESERVE_HOT=1: device-address uploads leave pages the CPU writes after every upload
+    // writable and dirty (uploaded on each visit) instead of protecting them again (a VirtualProtect, then a
+    // guest write fault, per page and frame). Negative (rt457: 8.5 FPS, every bind streams the hot pages again).
+    private static readonly bool BdaPreserveHot = Environment.GetEnvironmentVariable("SHARPEMU_BDA_PRESERVE_HOT") == "1";
+
     // The upload half of SynchronizeBuffersInRange, for a range that may hold CPU-dirty pages.
     private void UploadDirtyBuffersInRange(ulong guestAddress, ulong size)
     {
@@ -1023,7 +1028,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var start = Math.Max(buffer.CpuAddress, guestAddress);
             var finish = Math.Min(buffer.CpuAddress + buffer.Size, end);
             if (start < finish && _tracker.MayHaveCpuDirtyPages(start, finish - start))
-                _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: false);
+                _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: BdaPreserveHot);
         }
     }
 
@@ -1049,7 +1054,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 // SynchronizeBuffer takes for this read-only call), and the block summary
                 // answers that without a lock for the common all-clean case.
                 if (_tracker.HasCpuDirtyPages(start, finish - start))
-                    _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: false);
+                    _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: BdaPreserveHot);
             }
         }
     }
