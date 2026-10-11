@@ -71,6 +71,11 @@ public static partial class AgcExports
             });
     }
 
+    // [local] The shader registers a snapshot check compares, recorded where the draw's packet ran. A host that
+    // interprets ahead runs the draw on another thread, while the interpreter keeps writing its live registers.
+    internal static KeyValuePair<uint, uint>[] DrawShaderRegisters(GpuCommandInterpreter interpreter) =>
+        RecordShaderRegisters(interpreter.Registers.Shader);
+
     // A snapshot is used only when the state it was captured under is the state the draw runs with.
     private static bool IsCaptureStateCurrent(
         GeometryCaptureFingerprint capture,
@@ -78,7 +83,8 @@ public static partial class AgcExports
         bool indexed,
         ulong indexAddress,
         uint count,
-        uint instanceCount)
+        uint instanceCount,
+        KeyValuePair<uint, uint>[]? drawRegisters = null)
     {
         if (capture.IndexCount != count)
         {
@@ -110,7 +116,7 @@ public static partial class AgcExports
             return false;
         }
 
-        var live = RecordShaderRegisters(state.ShRegisters);
+        var live = drawRegisters ?? RecordShaderRegisters(state.ShRegisters);
         if (live.Length != capture.ShaderRegisters.Length)
         {
             DcbSubmissionProfile.RecordCaptureRejection("register_count", (ulong)capture.ShaderRegisters.Length, (ulong)live.Length);
@@ -264,10 +270,10 @@ public static partial class AgcExports
         // Runs a draw on the executor from the given banks, which a host interpreting ahead
         // captured when the packet ran, with the programs it prepared from them.
         internal void ExecuteDraw(ulong submitId, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments,
-            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs)
+            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs, KeyValuePair<uint, uint>[]? drawRegisters = null)
         {
-            if (indexed) RecordIndexedDrawState(in indexedArguments);
-            else RecordAutoDrawState(in autoArguments);
+            if (indexed) RecordIndexedDrawState(in indexedArguments, drawRegisters);
+            else RecordAutoDrawState(in autoArguments, drawRegisters);
             if (!TryRunExecutorDraw(submitId, RequireCurrent(), banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs))
                 throw _host.Fatal("The command stream has no render executor.");
         }
@@ -382,7 +388,7 @@ public static partial class AgcExports
                 throw _host.Fatal("The command stream has no render executor.");
         }
 
-        internal void RecordIndexedDrawState(in DrawIndexedArguments arguments)
+        internal void RecordIndexedDrawState(in DrawIndexedArguments arguments, KeyValuePair<uint, uint>[]? drawRegisters = null)
         {
             var state = RequireCurrent();
             state.IndexBufferAddress = arguments.IndexAddress;
@@ -390,7 +396,7 @@ public static partial class AgcExports
             state.DrawIndexOffset = 0;
             state.IndexSize = arguments.IndexTypeAndSize & 0x3u;
             state.InstanceCount = Math.Max(arguments.InstanceCount, 1);
-            SelectSnapshots(state, arguments.PacketAddress, indexed: true, arguments.IndexAddress, arguments.IndexCount);
+            SelectSnapshots(state, arguments.PacketAddress, indexed: true, arguments.IndexAddress, arguments.IndexCount, drawRegisters);
         }
 
         public void DrawAuto(ulong submitId, in DrawAutoArguments arguments)
@@ -400,15 +406,16 @@ public static partial class AgcExports
                 throw _host.Fatal("The command stream has no render executor.");
         }
 
-        internal void RecordAutoDrawState(in DrawAutoArguments arguments)
+        internal void RecordAutoDrawState(in DrawAutoArguments arguments, KeyValuePair<uint, uint>[]? drawRegisters = null)
         {
             var state = RequireCurrent();
             state.InstanceCount = Math.Max(arguments.InstanceCount, 1);
-            SelectSnapshots(state, arguments.PacketAddress, indexed: false, 0, arguments.VertexCount);
+            SelectSnapshots(state, arguments.PacketAddress, indexed: false, 0, arguments.VertexCount, drawRegisters);
         }
 
         // Candidates are found by packet address; each is validated against the execution-time state.
-        private static void SelectSnapshots(SubmittedDcbState state, ulong packetAddress, bool indexed, ulong indexAddress, uint count)
+        private static void SelectSnapshots(SubmittedDcbState state, ulong packetAddress, bool indexed, ulong indexAddress, uint count,
+            KeyValuePair<uint, uint>[]? drawRegisters = null)
         {
             using var validationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GeometrySnapshotValidation);
             var decision = GeometrySnapshotDecision.None;
@@ -416,7 +423,7 @@ public static partial class AgcExports
             if (state.ActiveVertexSnapshots is not null &&
                 state.ActiveVertexSnapshots.TryGetValue(packetAddress, out var vertexSnapshot))
             {
-                if (IsCaptureStateCurrent(vertexSnapshot.Capture, state, indexed, indexAddress, count, state.InstanceCount))
+                if (IsCaptureStateCurrent(vertexSnapshot.Capture, state, indexed, indexAddress, count, state.InstanceCount, drawRegisters))
                 {
                     state.CurrentVertexSnapshot = vertexSnapshot;
                     decision = GeometrySnapshotDecision.Accepted;
@@ -435,7 +442,7 @@ public static partial class AgcExports
             {
                 if (indexSnapshot.SourceAddress == indexAddress &&
                     indexSnapshot.IndexCount == count &&
-                    IsCaptureStateCurrent(indexSnapshot.Capture, state, indexed, indexAddress, count, state.InstanceCount))
+                    IsCaptureStateCurrent(indexSnapshot.Capture, state, indexed, indexAddress, count, state.InstanceCount, drawRegisters))
                 {
                     state.CurrentIndexSnapshot = indexSnapshot;
                     if (decision != GeometrySnapshotDecision.Rejected)

@@ -371,6 +371,7 @@ internal static unsafe partial class VulkanVideoPresenter
     {
         private readonly ConcurrentStack<RegisterBanks> _snapshots = new();
         private int _queueId;
+        private bool _geometrySnapshots; // [local] the submission carries geometry snapshots to validate
         private readonly Action _flush = presenter.Flush;
         private readonly Action _barrier = presenter.EmitGlobalBarrier;
         private readonly Action _collect = presenter.RunGarbageCollector;
@@ -420,6 +421,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void BeginSubmission(int queueId, ulong submissionId, object? geometrySnapshots)
         {
             _queueId = queueId;
+            _geometrySnapshots = geometrySnapshots is not null;
             queue.Enqueue(() => presenter.BeginSubmission(queueId, submissionId, geometrySnapshots));
         }
 
@@ -498,16 +500,21 @@ internal static unsafe partial class VulkanVideoPresenter
             return snapshot;
         }
 
+        // [local] Taken with the banks: the render thread must not read the interpreter's live registers.
+        private KeyValuePair<uint, uint>[]? DrawRegisters() =>
+            _geometrySnapshots ? AgcExports.DrawShaderRegisters(presenter.CommandStream.GetInterpreter(_queueId)) : null;
+
         public void DrawIndexed(ulong submitId, in DrawIndexedArguments arguments)
         {
             var snapshot = Snapshot();
+            var registers = DrawRegisters();
             var prepared = presenter.TryPrepareOnFront(() => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
             var copy = arguments;
             queue.Enqueue(() =>
             {
                 try
                 {
-                    presenter.ExecuteQueuedDraw(submitId, snapshot, true, in copy, default, prepared, in inputs);
+                    presenter.ExecuteQueuedDraw(submitId, snapshot, true, in copy, default, prepared, in inputs, registers);
                 }
                 finally
                 {
@@ -519,13 +526,14 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DrawAuto(ulong submitId, in DrawAutoArguments arguments)
         {
             var snapshot = Snapshot();
+            var registers = DrawRegisters();
             var prepared = presenter.TryPrepareOnFront(() => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
             var copy = arguments;
             queue.Enqueue(() =>
             {
                 try
                 {
-                    presenter.ExecuteQueuedDraw(submitId, snapshot, false, default, in copy, prepared, in inputs);
+                    presenter.ExecuteQueuedDraw(submitId, snapshot, false, default, in copy, prepared, in inputs, registers);
                 }
                 finally
                 {
@@ -828,13 +836,13 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         internal void ExecuteQueuedDraw(ulong submitId, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments,
-            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs)
+            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs, KeyValuePair<uint, uint>[]? drawRegisters = null)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
-                _translation.ExecuteDraw(submitId, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs);
+                _translation.ExecuteDraw(submitId, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs, drawRegisters);
             }
             finally
             {
