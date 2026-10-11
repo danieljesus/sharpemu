@@ -260,7 +260,7 @@ public sealed partial class RenderExecutor
                 physicalGroups[axisOrder[logical]] = logicalGroups[logical];
             }
 
-            if (physicalGroups[0] == 1 && physicalGroups[1] == 1 && physicalGroups[2] == 1 && _hdrDispatchLogs++ < 600) Console.Error.WriteLine($"[DISPATCH_EXEC] shader=0x{compute.Address:X} groups=1,1,1 indirect=0x{indirectArgumentsAddress:X}"); // [local]
+            if (DispatchExecLog && physicalGroups[0] == 1 && physicalGroups[1] == 1 && physicalGroups[2] == 1 && _hdrDispatchLogs++ < 600) Console.Error.WriteLine($"[DISPATCH_EXEC] shader=0x{compute.Address:X} groups=1,1,1 indirect=0x{indirectArgumentsAddress:X}"); // [local]
             if (gpuThreadIndirect)
             {
                 if (!_host.TryDispatchIndirectThreads(indirectArgumentsAddress, bindings))
@@ -285,6 +285,7 @@ public sealed partial class RenderExecutor
 
     // The dispatch counts threads; the host counts groups of the shader's thread size.
     private int _hdrDispatchLogs; // [local]
+    private static readonly bool DispatchExecLog = Environment.GetEnvironmentVariable("SHARPEMU_DISPATCH_EXEC_LOG") == "1"; // [local]
 
     public static uint GroupsFromThreads(uint threads, uint groupSize)
     {
