@@ -8,7 +8,12 @@ namespace SharpEmu.Libs.Gpu.Images;
 
 public sealed partial class GuestImageCache
 {
-    private const int LookupSlots = 256;
+    // [local] SHARPEMU_IMAGE_LOOKUP_SLOTS (power of two): GTA V looks up thousands of distinct requests
+    // per frame, which collide in 256 slots.
+    private static readonly int LookupSlots =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_LOOKUP_SLOTS"), out var slots) && slots > 0 && (slots & (slots - 1)) == 0
+            ? slots
+            : 256;
 
     private static readonly bool LookupMemoEnabled = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_LOOKUP_MEMO") != "0";
 
@@ -33,7 +38,46 @@ public sealed partial class GuestImageCache
     public static string TakeLookupReport() => FormattableString.Invariant(
         $"[PERF][IMAGE_LOOKUP] memo_hits={Interlocked.Exchange(ref _totalLookupHits, 0)} memo_misses={Interlocked.Exchange(ref _totalLookupMisses, 0)}");
 
-    private void InvalidateLookups() => _lookupGeneration++;
+    // [local] SHARPEMU_RANGE_LOOKUP_GENERATION: a lookup only sees images owning its pages, so a change
+    // stamps the generation on the pages it touches (hashed into buckets) and a remembered lookup stays
+    // valid while no page of its range was stamped after it. Off: any change invalidates every lookup.
+    private static readonly bool RangeLookupGeneration =
+        Environment.GetEnvironmentVariable("SHARPEMU_RANGE_LOOKUP_GENERATION") == "1";
+    private const int GenerationBuckets = 4096;
+    private readonly ulong[] _pageGenerations = new ulong[GenerationBuckets];
+
+    private void InvalidateLookups(ulong firstPage, ulong lastPageExclusive)
+    {
+        var generation = ++_lookupGeneration;
+        if (lastPageExclusive - firstPage >= GenerationBuckets)
+        {
+            Array.Fill(_pageGenerations, generation);
+            return;
+        }
+
+        for (var page = firstPage; page < lastPageExclusive; page++)
+        {
+            _pageGenerations[page & (GenerationBuckets - 1)] = generation;
+        }
+    }
+
+    // The latest generation that can affect a lookup of this range; equal to LookupGeneration when off.
+    public ulong RangeGeneration(ulong address, ulong size)
+    {
+        if (!RangeLookupGeneration || !ImagePageOwnerTable.TryGetPageRange(address, size, out var first, out var lastExclusive) ||
+            lastExclusive - first >= GenerationBuckets)
+        {
+            return _lookupGeneration;
+        }
+
+        var latest = 0UL;
+        for (var page = first; page < lastExclusive; page++)
+        {
+            latest = Math.Max(latest, _pageGenerations[page & (GenerationBuckets - 1)]);
+        }
+
+        return latest;
+    }
 
     // [local, from #1077] Changes whenever an image a lookup could find is created, removed or replaced,
     // so a caller that remembers a lookup's result can tell when it may have changed.
@@ -73,7 +117,8 @@ public sealed partial class GuestImageCache
         }
 
         ref var memo = ref lookups[LookupSlot(request, exactFormat)];
-        if (memo.Generation != _lookupGeneration || memo.ExactFormat != exactFormat || !SameRequest(memo.Request, request) ||
+        if (memo.Generation == 0 || memo.ExactFormat != exactFormat || !SameRequest(memo.Request, request) ||
+            RangeGeneration(request.Description.Data.Address, request.Description.Data.Size) > memo.Generation ||
             _slots.TryGet(memo.Result) is not { Registered: true } image)
         {
             _lookupMisses++;

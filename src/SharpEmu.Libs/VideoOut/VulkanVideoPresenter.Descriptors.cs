@@ -123,23 +123,31 @@ internal static unsafe partial class VulkanVideoPresenter
             public TextureRequestResolution Resolution;
             public ResourceSlotIdentifier Found;
 
-            public readonly bool Matches(uint[] words, ulong generation) =>
-                Words is not null && Generation == generation && words.AsSpan().SequenceEqual(Words);
+            public readonly bool Matches(uint[] words, GuestImageCache cache) =>
+                Words is not null && words.AsSpan().SequenceEqual(Words) &&
+                cache.RangeGeneration(Resolution.Request.Description.Data.Address, Resolution.Request.Description.Data.Size) <= Generation;
         }
+
+        // [local] SHARPEMU_IMAGE_BINDING_MEMO_WAYS: remembered lookups per image slot of a program (a program binds
+        // different textures across draws); replaced round robin.
+        private static readonly int ImageBindingMemoWays =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_BINDING_MEMO_WAYS"), out var ways) && ways is > 0 and <= 64 ? ways : 1;
 
         private static readonly bool ImageBindingMemoEnabled = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_BINDING_MEMO") == "1";
         private Dictionary<ShaderProgramInfo, ImageBindingMemo[]>? _imageBindingMemos;
         private ShaderProgramInfo? _lastMemoProgram;
         private ImageBindingMemo[] _lastMemos = [];
 
-        private ref ImageBindingMemo ImageBindingMemoOf(ShaderProgramInfo program, int index)
+        // The remembered lookups of one image slot, ImageBindingMemoWays wide.
+        private Span<ImageBindingMemo> ImageBindingMemosOf(ShaderProgramInfo program, int index)
         {
-            if (!ReferenceEquals(program, _lastMemoProgram) || index >= _lastMemos.Length)
+            var stride = ImageBindingMemoWays;
+            if (!ReferenceEquals(program, _lastMemoProgram) || (index + 1) * stride > _lastMemos.Length)
             {
                 var all = _imageBindingMemos ??= new Dictionary<ShaderProgramInfo, ImageBindingMemo[]>(ReferenceEqualityComparer.Instance);
-                if (!all.TryGetValue(program, out var memos) || index >= memos.Length)
+                if (!all.TryGetValue(program, out var memos) || (index + 1) * stride > memos.Length)
                 {
-                    Array.Resize(ref memos, Math.Max(index + 1, program.Resources?.Info.Images.Count ?? 0));
+                    Array.Resize(ref memos, Math.Max(index + 1, program.Resources?.Info.Images.Count ?? 0) * stride);
                     all[program] = memos;
                 }
 
@@ -147,7 +155,28 @@ internal static unsafe partial class VulkanVideoPresenter
                 _lastMemos = memos;
             }
 
-            return ref _lastMemos[index];
+            return _lastMemos.AsSpan(index * stride, stride);
+        }
+
+        private Dictionary<ShaderProgramInfo, byte[]>? _imageBindingMemoCursors;
+
+        private int NextWay(ShaderProgramInfo program, int index)
+        {
+            if (ImageBindingMemoWays == 1)
+            {
+                return 0;
+            }
+
+            var all = _imageBindingMemoCursors ??= new Dictionary<ShaderProgramInfo, byte[]>(ReferenceEqualityComparer.Instance);
+            if (!all.TryGetValue(program, out var cursors) || index >= cursors.Length)
+            {
+                Array.Resize(ref cursors, Math.Max(index + 1, program.Resources?.Info.Images.Count ?? 0));
+                all[program] = cursors;
+            }
+
+            var way = cursors[index];
+            cursors[index] = (byte)((way + 1) % ImageBindingMemoWays);
+            return way;
         }
 
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
@@ -161,9 +190,39 @@ internal static unsafe partial class VulkanVideoPresenter
             _ = BeginBatchedGuestCommands();
             TextureRequestResolution resolution;
             ResourceSlotIdentifier imageIdentifier;
-            if (ImageBindingMemoEnabled && ImageBindingMemoOf(program, index) is var cachedMemo &&
-                cachedMemo.Matches(words, _imageCache.LookupGeneration) && _imageCache.TryTouchRemembered(cachedMemo.Found))
+            var memoHit = -1;
+            if (ImageBindingMemoEnabled)
             {
+                var memos = ImageBindingMemosOf(program, index);
+                var outcome = 0;
+                for (var way = 0; way < memos.Length; way++)
+                {
+                    ref readonly var memo = ref memos[way];
+                    if (memo.Words is null || !words.AsSpan().SequenceEqual(memo.Words))
+                    {
+                        outcome = Math.Max(outcome, memo.Words is null ? 0 : 1);
+                        continue;
+                    }
+
+                    if (memo.Matches(words, _imageCache) && _imageCache.TryTouchRemembered(memo.Found))
+                    {
+                        memoHit = way;
+                        outcome = 3;
+                    }
+                    else
+                    {
+                        outcome = 2;
+                    }
+
+                    break;
+                }
+
+                if (BindingRepeatProbe.Enabled) BindingRepeatProbe.CountMemo(outcome);
+            }
+
+            if (memoHit >= 0)
+            {
+                ref readonly var cachedMemo = ref ImageBindingMemosOf(program, index)[memoHit];
                 resolution = cachedMemo.Resolution;
                 imageIdentifier = cachedMemo.Found;
             }
@@ -175,8 +234,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 resolution = resolution with { Request = lookupRequest };
                 if (ImageBindingMemoEnabled)
                 {
-                    // An empty range or DCC metadata needs the full lookup on every draw.
-                    ImageBindingMemoOf(program, index) = !ImageDescription.IsEmptyRange(lookupRequest.Description.Data) &&
+                    // An empty range or DCC metadata needs the full lookup on every draw. A stale entry for the
+                    // same words is replaced in place.
+                    var memos = ImageBindingMemosOf(program, index);
+                    var target = -1;
+                    for (var way = 0; way < memos.Length && target < 0; way++)
+                    {
+                        if (memos[way].Words is { } remembered && words.AsSpan().SequenceEqual(remembered)) target = way;
+                    }
+
+                    if (target < 0) target = NextWay(program, index);
+                    ImageBindingMemosOf(program, index)[target] = !ImageDescription.IsEmptyRange(lookupRequest.Description.Data) &&
                         _imageCache.GetImage(imageIdentifier).Description.DccSliceSize == 0
                         ? new ImageBindingMemo
                         {
@@ -323,6 +391,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"samplers={snapshot.Samplers.Length}/{info.Samplers.Count} buffers={snapshot.Buffers.Length}/{info.Buffers.Count}.");
             }
 
+            if (BindingRepeatProbe.Enabled) BindingRepeatProbe.Record(program.Hash, stage); // [local]
             var prepared = new PreparedStageBindings(stage, program);
             // Register ownership before preparation can fail halfway through.
             preparation.Stages.Add(prepared);

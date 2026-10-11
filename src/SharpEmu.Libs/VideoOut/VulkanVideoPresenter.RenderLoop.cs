@@ -441,6 +441,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 PImageIndices = &imageIndex,
             };
             Result presentResult;
+            BindingRepeatProbe.EndFrame(); // [local]
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueuePresent))
             {
                 lock (_queueGate)
