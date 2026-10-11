@@ -403,7 +403,11 @@ internal static class RenderPhaseProfile
     // Cache calls on other threads must not enter the render-thread counters.
     // Check the switch first to avoid thread-local storage allocation when profiling is disabled.
     internal static Scope MeasureDetail(Phase phase) =>
-        Enabled && _scopeDepth > 0 ? Measure(phase) : default;
+        Enabled && _scopeDepth > 0 && (FineEnabled || phase < Phase.BindingSetup) ? Measure(phase) : default;
+
+    // [local] SHARPEMU_PROFILE_FINE=1: the Binding*, Dispatch*, ImageLookup* and DrawPrep* pieces. Off by default:
+    // their scopes double the profiler's cost on the draw path, and their time stays in the parent phase.
+    private static readonly bool FineEnabled = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_FINE") == "1";
 
     internal static bool DetailMeasurementsEnabled => Enabled && _scopeDepth > 0;
 
