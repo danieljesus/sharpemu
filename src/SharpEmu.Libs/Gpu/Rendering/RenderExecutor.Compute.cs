@@ -76,7 +76,9 @@ public sealed partial class RenderExecutor
         var useThreadDimensions = (dispatchInitiator & DispatchInitiatorUseThreadDimensions) != 0;
         // [local] Thread counts left in GPU memory: handed over as zero counts with the address.
         var gpuThreadIndirect = useThreadDimensions && indirectArgumentsAddress != 0 && groupsX == 0 && groupsY == 0 && groupsZ == 0;
-        var computeProgram = preparedProgram ?? _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+        ComputeProgram computeProgram;
+        using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchProgram)) // [local]
+            computeProgram = preparedProgram ?? _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
         if (gpuThreadIndirect && computeProgram.Available && !computeProgram.Consumed &&
             !CanDispatchThreadsOnGpu(computeProgram.Input))
         {
@@ -130,43 +132,52 @@ public sealed partial class RenderExecutor
                 $"buffers={program.Buffers.Length} images={program.Images.Length} samplers={program.SamplerCount}");
         }
 
+        var consumersScope = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchConsumers); // [local]
         if (indirectArgumentsAddress == 0 && TryConsumeMetadataClear(input))
         {
+            consumersScope.Dispose();
             _host.ResetBindings();
             return;
         }
 
         if (indirectArgumentsAddress == 0 && TryConsumeRecordFill(input, groupsX, groupsY, groupsZ, useThreadDimensions)) // [local]
         {
+            consumersScope.Dispose();
             _host.ResetBindings();
             return;
         }
 
         if (indirectArgumentsAddress == 0 && TryConsumeConstantFill(input, groupsX, groupsY, groupsZ))
         {
+            consumersScope.Dispose();
             _host.ResetBindings();
             return;
         }
 
         if (indirectArgumentsAddress == 0 && TryConsumeBoundedFill(input, groupsX, groupsY, groupsZ, dispatchInitiator))
         {
+            consumersScope.Dispose();
             _host.ResetBindings();
             return;
         }
 
         if (indirectArgumentsAddress == 0 && TryConsumeBoundedCopy(input, groupsX, groupsY, groupsZ, dispatchInitiator))
         {
+            consumersScope.Dispose();
             _host.ResetBindings();
             return;
         }
 
         if (indirectArgumentsAddress == 0 && TryConsumeImageClear(input, groupsX, groupsY, groupsZ, dispatchInitiator))
         {
+            consumersScope.Dispose();
             _host.ResetBindings();
             return;
         }
 
-        var dimsLine = $"[DISPATCH_DIMS] shader=0x{compute.Address:X} thread_dims={useThreadDimensions} dims={groupsX}x{groupsY}x{groupsZ} local={compute.ThreadsX}x{compute.ThreadsY}x{compute.ThreadsZ} indirect=0x{indirectArgumentsAddress:X} initiator=0x{dispatchInitiator:X}"; // [local]
+        consumersScope.Dispose();
+
+        var (dimsX, dimsY, dimsZ, dimsIndirect) = (groupsX, groupsY, groupsZ, indirectArgumentsAddress); // [local] for the log below
         if (useThreadDimensions && !gpuThreadIndirect)
         {
             // The indirect buffer carries thread counts in this mode, while Vulkan indirect
@@ -263,7 +274,7 @@ public sealed partial class RenderExecutor
             }
             if (DispatchBarriers)
                 _host.ShaderAccessBarrier();
-            if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0 || (useThreadDimensions && _dimsLogs++ < 3000)) Console.Error.WriteLine(dimsLine + $" groups={physicalGroups[0]}x{physicalGroups[1]}x{physicalGroups[2]}"); // [local]
+            if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0 || (useThreadDimensions && _dimsLogs++ < 3000)) Console.Error.WriteLine($"[DISPATCH_DIMS] shader=0x{compute.Address:X} thread_dims={useThreadDimensions} dims={dimsX}x{dimsY}x{dimsZ} local={compute.ThreadsX}x{compute.ThreadsY}x{compute.ThreadsZ} indirect=0x{dimsIndirect:X} initiator=0x{dispatchInitiator:X} groups={physicalGroups[0]}x{physicalGroups[1]}x{physicalGroups[2]}"); // [local]
             var hook = Gpu.Buffers.GuestBufferCache.PostDispatchHook; // [local]
             if (hook != null) { Gpu.Buffers.GuestBufferCache.PostDispatchHook = null; hook(); }
             if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0) { var hooks = Gpu.Buffers.GuestBufferCache.PostDispatchHooks.ToArray(); Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Clear(); foreach (var h in hooks) h(); }

@@ -146,6 +146,9 @@ internal static class RenderPhaseProfile
         BindingBuffers,
         BindingDeviceRanges,
         BindingImages,
+        // [local] Pieces of CommandDispatchTranslation.
+        DispatchProgram,
+        DispatchConsumers,
         Count,
     }
 
