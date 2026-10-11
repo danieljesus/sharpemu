@@ -406,7 +406,8 @@ internal static class RenderPhaseProfile
         Enabled && _scopeDepth > 0 && (FineEnabled || phase < Phase.BindingSetup) ? Measure(phase) : default;
 
     // [local] SHARPEMU_PROFILE_FINE=1: the Binding*, Dispatch*, ImageLookup* and DrawPrep* pieces. Off by default:
-    // their scopes double the profiler's cost on the draw path, and their time stays in the parent phase.
+    // their scopes double the profiler's cost on the draw path, and their time stays in the parent phase. Every
+    // phase from BindingSetup on counts as fine: a coarse phase must be declared before it.
     private static readonly bool FineEnabled = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_FINE") == "1";
 
     internal static bool DetailMeasurementsEnabled => Enabled && _scopeDepth > 0;

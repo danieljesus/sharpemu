@@ -642,6 +642,23 @@ internal static unsafe partial class VulkanVideoPresenter
         private BackQueue? _back;
         private long _frontBusyTicks;
         private long _frontWorkTicks; // [local]
+        // [local] The front thread's CPU time (kernel + user, 100 ns units), sampled every FrontCpuSampleSlices slices:
+        // work_ms is wall time and still holds waits inside a slice that progressed.
+        private long _frontCpuTime;
+        private long _frontCpuReported;
+        private const int FrontCpuSampleSlices = 1024;
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern bool GetThreadTimes(nint thread, out long creation, out long exit, out long kernel, out long user);
+
+        private void SampleFrontCpuTime()
+        {
+            // -2 is the current-thread pseudo handle.
+            if (OperatingSystem.IsWindows() && GetThreadTimes(-2, out _, out _, out var kernel, out var user))
+            {
+                Volatile.Write(ref _frontCpuTime, kernel + user);
+            }
+        }
         private long _frontSlices;
 
         // [PERF][FRONT]: what the front thread spent interpreting and preparing, what it spent
@@ -655,8 +672,11 @@ internal static unsafe partial class VulkanVideoPresenter
             var wait = Interlocked.Exchange(ref _back.WaitTicks, 0);
             var syncWait = Interlocked.Exchange(ref _back.SyncWaitTicks, 0);
             var depth = Interlocked.Exchange(ref _back.MaxDepth, 0);
+            var cpuNow = Volatile.Read(ref _frontCpuTime);
+            var cpu = cpuNow - _frontCpuReported;
+            _frontCpuReported = cpuNow;
             return FormattableString.Invariant(
-                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
+                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth}");
         }
 
         internal ICpuMemory GuestMemory => _guestMemory;
@@ -739,7 +759,10 @@ internal static unsafe partial class VulkanVideoPresenter
                         PauseFrontAliasAccess();
                         var sliceTicks = System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted;
                         Interlocked.Add(ref _frontBusyTicks, sliceTicks);
-                        Interlocked.Increment(ref _frontSlices);
+                        if ((Interlocked.Increment(ref _frontSlices) & (FrontCpuSampleSlices - 1)) == 0)
+                        {
+                            SampleFrontCpuTime();
+                        }
                     }
 
                     // [local] Busy time without the empty polls: slices that progressed or completed.
