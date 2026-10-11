@@ -154,6 +154,17 @@ internal static class RenderPhaseProfile
         ImageLookupDccSync,
         ImageLookupDccClear,
         ImageLookupDccReadback,
+        // [local] Pieces of DrawResourcePreparation.
+        DrawPrepBegin,
+        DrawPrepBuffers,
+        DrawPrepBindVertex,
+        DrawPrepDynamicState,
+        DrawPrepEnd,
+        DrawPrepBindings,
+        DrawPrepTargets,
+        DrawPrepIndexBind,
+        DrawPrepMemoryWrites,
+        DrawPrepTail,
         Count,
     }
 

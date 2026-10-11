@@ -212,11 +212,15 @@ public sealed partial class RenderExecutor
         var context = banks.Context;
         var vertexInput = state.Programs.VertexInput;
         var pixelInput = state.Programs.PixelInput;
-        using var preparation = _host.BeginPreparation();
+        var beginScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepBegin); // [local]
+        var preparation = _host.BeginPreparation();
+        beginScope.Dispose();
+        using var endScope = new PreparationEnd(preparation); // [local] the dispose, measured
         IPreparedBindings vertexBindings;
         IPreparedBindings? pixelBindings;
         try
         {
+            using var bindingsScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepBindings); // [local]
             vertexBindings = PrepareBindings(vertexInput.Stage);
             pixelBindings = state.PixelActive ? PrepareBindings(pixelInput.Stage) : null;
         }
@@ -248,12 +252,15 @@ public sealed partial class RenderExecutor
             _host.BindResources(pixelBindings);
         }
 
+        var buffersScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepBuffers); // [local]
         var vertexBuffers = AcquireVertexBuffers(vertexInput);
         var indexBuffer = AcquireIndexBuffer(in indexSource);
         var indirectArguments = emission.IndirectArgumentsAddress != 0
             ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, IndexedIndirectArgumentsSize, isWritten: false)
             : default;
-        DropUnwrittenColorTargets(context, ref state, pixelProgram);
+        buffersScope.Dispose();
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepTargets)) // [local]
+            DropUnwrittenColorTargets(context, ref state, pixelProgram);
         state.Rendering = AcquireAttachments(ref state);
         // Nothing after the pipeline touches guest memory.
         var pipeline = _pipelines.CreateGraphicsPipeline(
@@ -278,7 +285,8 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x200);
         }
 
-        _host.BindVertexBuffers(vertexBuffers, vertexInput);
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepBindVertex)) // [local]
+            _host.BindVertexBuffers(vertexBuffers, vertexInput);
 
         if (pixelBindings is not null && setAutoDebug)
         {
@@ -289,15 +297,20 @@ public sealed partial class RenderExecutor
         _host.CommitBindings(PipelineBindPoint.Graphics, in pipeline, stages);
         if (indexBuffer.Size != 0)
         {
+            using var indexScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepIndexBind); // [local]
             _host.BindIndexBuffer(indexBuffer.Binding, indexBuffer.Type);
         }
 
-        _host.SetDynamicState(DynamicStateOf(context, ref state));
+        DynamicDrawState dynamicState;
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepDynamicState)) // [local]
+            dynamicState = DynamicStateOf(context, ref state);
+        _host.SetDynamicState(dynamicState);
         if (setAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x400);
         }
 
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepMemoryWrites)) // [local]
         if (DrawWritesMemory(vertexInput.Stage) || (pixelBindings is not null && DrawWritesMemory(pixelInput.Stage)))
         {
             _host.PrepareMemoryWritingDraw();
@@ -325,6 +338,7 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x600);
         }
 
+        using var tailScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepTail); // [local]
         var writeStages = PipelineStageFlags.None;
         if (HasBufferWrites(vertexInput.Stage))
         {
@@ -406,6 +420,16 @@ public sealed partial class RenderExecutor
                 break;
             default:
                 throw _host.Fatal($"The primitive type is unknown: primitiveType={userConfig.PrimitiveType}.");
+        }
+    }
+
+    // [local] Disposes a resource preparation under its own profile phase.
+    private readonly ref struct PreparationEnd(IResourcePreparation preparation)
+    {
+        public void Dispose()
+        {
+            using var scope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepEnd);
+            preparation.Dispose();
         }
     }
 }
