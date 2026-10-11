@@ -411,6 +411,7 @@ internal static unsafe partial class VulkanVideoPresenter
     private static void Run()
     {
         SharpEmu.HLE.Host.HostLaneReservation.ApplyToRenderThread();
+        SharpEmu.HLE.GpuMemory.GpuMemoryAccessProfile.MarkRenderThread(); // [local]
         uint width;
         uint height;
         lock (_gate)

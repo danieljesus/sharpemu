@@ -82,7 +82,12 @@ public static class GpuMemoryAccessProfile
         (Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_PERFORMANCE") == "1" ||
          Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_RENDER") == "1");
     private static readonly Measurements Counters = new();
+    // [local] The same operations, counted on the render thread only (MarkRenderThread).
+    private static readonly Measurements RenderCounters = new();
+    [ThreadStatic] private static bool _renderThread;
     [ThreadStatic] private static int _faultDepth;
+
+    public static void MarkRenderThread() => _renderThread = true;
 
     // Initialize before protected pages can fault, not from the fault handler.
     internal static void Initialize() => _ = Counters;
@@ -115,9 +120,18 @@ public static class GpuMemoryAccessProfile
     {
         Counters.Record(GetLockOperation(category, hold: false), ticks, 0);
         Counters.Record(_faultDepth == 0 ? Operation.RegionLockWait : Operation.FaultRegionLockWait, ticks, 0);
+        if (_renderThread) // [local]
+        {
+            RenderCounters.Record(GetLockOperation(category, hold: false), ticks, 0);
+            RenderCounters.Record(_faultDepth == 0 ? Operation.RegionLockWait : Operation.FaultRegionLockWait, ticks, 0);
+        }
     }
 
-    internal static void RecordLockHold(Operation operation, long ticks) => Counters.Record(operation, ticks, 0);
+    internal static void RecordLockHold(Operation operation, long ticks)
+    {
+        Counters.Record(operation, ticks, 0);
+        if (_renderThread) RenderCounters.Record(operation, ticks, 0); // [local]
+    }
 
     public static void CountImageCpuWrite()
     {
@@ -153,6 +167,7 @@ public static class GpuMemoryAccessProfile
             var elapsed = Stopwatch.GetTimestamp() - _started;
             if (_fault) _faultDepth--;
             Counters.Record(_operation, elapsed, _bytes);
+            if (_renderThread) RenderCounters.Record(_operation, elapsed, _bytes); // [local]
         }
     }
 
@@ -184,13 +199,18 @@ public static class GpuMemoryAccessProfile
     public static void WriteReport()
     {
         if (!Enabled) return;
-        var snapshot = Counters.Snapshot();
+        WriteReport(Counters.Snapshot(), string.Empty);
+        WriteReport(RenderCounters.Snapshot(), " thread=render"); // [local]
+    }
+
+    private static void WriteReport(Measurement[] snapshot, string thread)
+    {
         for (var index = 0; index < snapshot.Length; index++)
         {
             var value = snapshot[index];
             if (value.Calls == 0) continue;
             Console.Error.WriteLine(FormattableString.Invariant(
-                $"[PERF][GPU_MEMORY_ACCESS] operation={(Operation)index} cumulative=1 calls={value.Calls} inclusive_ms={value.Ticks * 1000.0 / Stopwatch.Frequency:F3} max_ms={value.MaximumTicks * 1000.0 / Stopwatch.Frequency:F3} bytes={value.Bytes}"));
+                $"[PERF][GPU_MEMORY_ACCESS]{thread} operation={(Operation)index} cumulative=1 calls={value.Calls} inclusive_ms={value.Ticks * 1000.0 / Stopwatch.Frequency:F3} max_ms={value.MaximumTicks * 1000.0 / Stopwatch.Frequency:F3} bytes={value.Bytes}"));
         }
     }
 }
