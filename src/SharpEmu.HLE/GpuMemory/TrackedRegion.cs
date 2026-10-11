@@ -161,12 +161,15 @@ public sealed class TrackedRegion
     }
 
     // Hot read-only pages stay writable and dirty, so each obtain observes current CPU bytes.
-    public void ForEachCpuUploadRange(
+    // [local] With deferProtection the cleared pages stay writable until ApplyPendingCpuProtection; returns whether
+    // any are pending. The caller must read their bytes only after that call.
+    public bool ForEachCpuUploadRange(
         bool preserveHotPages,
         ulong address,
         ulong size,
         Action<ulong, ulong> visitCleared,
-        Action<ulong, ulong> visitUpload)
+        Action<ulong, ulong> visitUpload,
+        bool deferProtection = false)
     {
         var (start, end) = GetPageRange(address, size);
         var upload = new PageMask(_cpuDirty, start, end);
@@ -178,12 +181,17 @@ public sealed class TrackedRegion
             _recentCpuUploads.SetRange(runStart, runEnd);
         }
 
-        UpdateCpuProtection(track: true);
+        var pending = UpdateCpuProtection(track: true, deferProtection);
         foreach (var (runStart, runEnd) in upload)
         {
             visitUpload(BaseAddress + (ulong)runStart * PageBytes, (ulong)(runEnd - runStart) * PageBytes);
         }
+
+        return pending;
     }
+
+    // [local] Protects the clean pages a deferred upload left writable. Call with the lock held.
+    public void ApplyPendingCpuProtection() => UpdateCpuProtection(track: true);
 
     public void ResetCpuWriteHeat(ulong address, ulong size)
     {
@@ -226,29 +234,40 @@ public sealed class TrackedRegion
     private ref PageMask GetDirtyMask(WriteOrigin side) => ref side == WriteOrigin.Cpu ? ref _cpuDirty : ref _gpuDirty;
 
     // Every change to the CPU-dirty mask ends here, so it also publishes the block summary.
-    private void UpdateCpuProtection(bool track)
+    // [local] Each direction is applied on its own: with deferred protection, clean pages may still be writable when
+    // another page of the block turns dirty, and one shared direction would unprotect them as if they were dirty.
+    // Without pending pages only one of the two masks is ever non-empty, as before. Returns whether clean pages were
+    // left writable (defer only).
+    private bool UpdateCpuProtection(bool track, bool defer = false)
     {
+        _ = track;
         _summary?.Set(BaseAddress / BlockBytes, _cpuDirty.Any);
-        if (_summary is not null && (_cpuDirty & ~_writable).Any)
+        var unprotect = _cpuDirty & ~_writable;
+        if (_summary is not null && unprotect.Any)
         {
             _summary.NoteDirtied();
         }
 
-        var mask = _cpuDirty ^ _writable;
-        _writable = _cpuDirty;
-        if (mask.None)
+        var protect = _writable & ~_cpuDirty;
+        if (unprotect.Any)
         {
-            return;
+            _pages.RemoveWatchMask(BaseAddress, unprotect, blockReads: false);
         }
 
-        if (track)
+        if (defer)
         {
-            _pages.AddWatchMask(BaseAddress, mask, blockReads: false);
+            // The pending pages stay writable in the mask, which is what the pages really are.
+            _writable = _cpuDirty ^ protect;
+            return protect.Any;
         }
-        else
+
+        if (protect.Any)
         {
-            _pages.RemoveWatchMask(BaseAddress, mask, blockReads: false);
+            _pages.AddWatchMask(BaseAddress, protect, blockReads: false);
         }
+
+        _writable = _cpuDirty;
+        return false;
     }
 
     private void UpdateGpuProtection(bool track)

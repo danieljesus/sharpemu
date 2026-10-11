@@ -41,6 +41,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly SubmissionScheduler _scheduler;
     private readonly IGpuQueueRelay _relay;
     private readonly GuestBufferUploader _uploader;
+    private readonly DeferredUploadWorker? _deferredUploads; // [local]
     private readonly IGuestBackedSpace _backing;
     private readonly BdaFaultProcessor _faults;
     private readonly GpuBuffer _gds;
@@ -137,6 +138,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _tracker = new GuestPageTracker(pages);
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
         _uploader = new GuestBufferUploader(device, scheduler, guest, _staging);
+        if (DeferredUploadWorker.Enabled) // [local]
+        {
+            _deferredUploads = new DeferredUploadWorker();
+            scheduler.BeforeSubmit += _deferredUploads.WaitIdle;
+        }
         _guestMemory = guest; // [local]
         _stream = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Stream, 64 * MiB);
         _download = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Download, 32 * MiB);
@@ -2159,6 +2165,47 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var collected = new List<BufferCopy>();
         var collectedSize = 0UL;
         GpuBuffer? source = null;
+        if (_deferredUploads is { } deferred && !isWritten) // [local]
+        {
+            var pending = new List<TrackedRegion>();
+            var reads = new List<(ulong Address, ulong Offset, int Size)>();
+            GpuRingBuffer? reserved = null;
+            _tracker.ForEachUploadRange(
+                guestAddress,
+                size,
+                isWritten,
+                (address, bytes) =>
+                {
+                    collected.Add(new BufferCopy(collectedSize, buffer.Offset(address), bytes));
+                    collectedSize += bytes;
+                },
+                () =>
+                {
+                    source = reserved = _uploader.ReserveSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(collected), collectedSize, reads);
+                    if (reserved == null)
+                    {
+                        // No staging for a later copy: protect now, then copy as before.
+                        GuestPageTracker.ApplyDeferredProtection(pending);
+                        pending.Clear();
+                        source = _uploader.PrepareSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(collected), collectedSize, guestAddress, size);
+                    }
+                },
+                preserveCpuWriteHotPages,
+                pending);
+            if (reserved != null)
+            {
+                deferred.Enqueue(new DeferredUploadWorker.Job(pending, _uploader, reserved, reads));
+            }
+            else if (pending.Count != 0)
+            {
+                GuestPageTracker.ApplyDeferredProtection(pending);
+            }
+
+            copies = collected;
+            totalSize = collectedSize;
+            return source;
+        }
+
         _tracker.ForEachUploadRange(
             guestAddress,
             size,

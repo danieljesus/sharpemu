@@ -461,6 +461,9 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
     }
 
+    // [local] Runs before every command buffer ends and is submitted (the deferred uploads join here).
+    public Action? BeforeSubmit { get; set; }
+
     public ulong Submit(SubmitBundle? bundle = null)
     {
         if (SubmitProbe) RecordSubmit(); // [local]
@@ -471,6 +474,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
 
         _prepareSubmit?.Invoke(submit);
+        BeforeSubmit?.Invoke();
         if (submit.WaitCount > SubmitBundle.MaxSemaphores || submit.SignalCount >= SubmitBundle.MaxSemaphores)
         {
             throw Fatal($"The submission exceeds its capacity: waits={submit.WaitCount} signals={submit.SignalCount}.");

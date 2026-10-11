@@ -137,6 +137,8 @@ internal static class RenderPhaseProfile
         SubmissionCapacity,
         CompletedSubmissionCleanup,
         MovieFramePolling,
+        // [local] The render thread waits for deferred uploads before a submit.
+        DeferredUploadWait,
         // [local] Pieces of DescriptorPreparation.
         BindingSetup,
         BindingTextureDecode,

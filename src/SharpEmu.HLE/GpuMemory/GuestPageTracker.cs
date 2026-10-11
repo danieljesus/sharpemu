@@ -244,9 +244,12 @@ public sealed class GuestPageTracker
     }
 
     // Region locks stay held across uploadFunc only for a written range, which turns GPU-dirty.
+    // [local] A non-null deferredProtection (reads only) collects the regions whose cleared pages stay writable; the
+    // caller reads their bytes only after ApplyDeferredProtection.
     public void ForEachUploadRange(ulong vaddr, ulong size, bool isWritten, Action<ulong, ulong> rangeFunc, Action uploadFunc,
-        bool preserveCpuWriteHotPages = true)
+        bool preserveCpuWriteHotPages = true, List<TrackedRegion>? deferredProtection = null)
     {
+        var defer = deferredProtection is not null && !isWritten;
         RejectUploadCallbackReentry();
         VisitRegions(vaddr, size, create: true, static (_, _, _) => false);
         var previousOwner = _uploadOwner;
@@ -262,12 +265,16 @@ public sealed class GuestPageTracker
                     region.Lock.Enter();
                     held.Add(region);
                     var address = region.BaseAddress + offset;
-                    region.ForEachCpuUploadRange(
+                    if (region.ForEachCpuUploadRange(
                         preserveHotPages: !isWritten && preserveCpuWriteHotPages,
                         address,
                         bytes,
                         (runAddress, runSize) => cleared.Add((region, runAddress, runSize)),
-                        rangeFunc);
+                        rangeFunc,
+                        defer))
+                    {
+                        deferredProtection!.Add(region);
+                    }
                     if (!isWritten)
                     {
                         region.Lock.Exit();
@@ -336,6 +343,23 @@ public sealed class GuestPageTracker
             }
 
             _uploadOwner = previousOwner;
+        }
+    }
+
+    // [local] Protects what deferred uploads left writable, one region lock at a time. Any thread.
+    public static void ApplyDeferredProtection(List<TrackedRegion> regions)
+    {
+        foreach (var region in regions)
+        {
+            region.Lock.Enter();
+            try
+            {
+                region.ApplyPendingCpuProtection();
+            }
+            finally
+            {
+                region.Lock.Exit();
+            }
         }
     }
 

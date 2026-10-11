@@ -46,6 +46,35 @@ internal sealed class GuestBufferUploader(
         return temporary;
     }
 
+    // [local] PrepareSource without the copy: reserves the staging bytes and lists the reads for a later copy.
+    // Null when the staging ring is not coherent (its flush would come before the bytes) or cannot serve the size.
+    public GpuRingBuffer? ReserveSource(ulong bufferAddress, Span<BufferCopy> regions, ulong totalSize,
+        List<(ulong Address, ulong Offset, int Size)> reads)
+    {
+        if (regions.IsEmpty || !staging.IsCoherent || !staging.TryMap(totalSize, out var baseOffset, 4))
+        {
+            return null;
+        }
+
+        foreach (ref var copy in regions)
+        {
+            reads.Add((bufferAddress + copy.DstOffset, baseOffset + copy.SrcOffset, (int)copy.Size));
+            copy.SrcOffset += baseOffset;
+        }
+
+        staging.Commit();
+        return staging;
+    }
+
+    // [local] The deferred copy of ReserveSource's reads.
+    public void ReadInto(GpuRingBuffer source, List<(ulong Address, ulong Offset, int Size)> reads)
+    {
+        foreach (var (address, offset, size) in reads)
+        {
+            ReadGuestBytes(address, source.Mapped.Slice((int)offset, size), address, (ulong)size);
+        }
+    }
+
     private void ReadGuestBytes(ulong address, Span<byte> destination, ulong requestedAddress, ulong requestedSize)
     {
         if (!guest.TryRead(address, destination))
