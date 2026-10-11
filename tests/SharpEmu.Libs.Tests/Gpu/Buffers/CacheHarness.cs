@@ -222,6 +222,8 @@ internal sealed class CacheHarness : IDisposable
 
     public HostPageProtection Protection(ulong address)
     {
+        // Deferred uploads protect their pages on a worker, at the latest before the next submit.
+        Cache.WaitDeferredUploads();
         Assert.True(_host.Query(address, out var info));
         return info.Protection;
     }

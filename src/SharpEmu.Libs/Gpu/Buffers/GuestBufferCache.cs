@@ -42,6 +42,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly IGpuQueueRelay _relay;
     private readonly GuestBufferUploader _uploader;
     private readonly DeferredUploadWorker? _deferredUploads; // [local]
+
+    // [local] Every deferred upload so far has protected its pages and copied them (the scheduler does this before
+    // each submit).
+    internal void WaitDeferredUploads() => _deferredUploads?.WaitIdle();
     private readonly IGuestBackedSpace _backing;
     private readonly BdaFaultProcessor _faults;
     private readonly GpuBuffer _gds;
