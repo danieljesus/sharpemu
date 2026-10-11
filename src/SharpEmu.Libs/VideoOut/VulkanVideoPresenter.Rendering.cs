@@ -690,29 +690,77 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdClearDepthStencilImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &value, 1, &vkRange);
         }
 
+        // [local] SHARPEMU_DYNAMIC_STATE_FILTER: dynamic state lasts across draws, pipeline binds (every guest
+        // pipeline declares the same dynamic states) and rendering scopes of one command buffer, so each group
+        // is recorded only when it differs from what this command buffer last recorded.
+        private static readonly bool DynamicStateFilter = Environment.GetEnvironmentVariable("SHARPEMU_DYNAMIC_STATE_FILTER") != "0";
+        private nint _dynamicStateCommand;
+        private ulong _dynamicStateTick;
+        private int _dynamicStateEpoch;
+        private DynamicDrawState _dynamicState;
+
         public void SetDynamicState(in DynamicDrawState state)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawDynamicStateRecording);
             var command = BeginBatchedGuestCommands();
-            var viewport = new Viewport(state.ViewportX, state.ViewportY, state.ViewportWidth, state.ViewportHeight, state.ViewportMinDepth, state.ViewportMaxDepth);
-            _vk.CmdSetViewport(command, 0, 1, &viewport);
-            var scissor = new Rect2D(
-                new Offset2D(state.Scissor.Left, state.Scissor.Top),
-                new Extent2D((uint)(state.Scissor.Right - state.Scissor.Left), (uint)(state.Scissor.Bottom - state.Scissor.Top)));
-            _vk.CmdSetScissor(command, 0, 1, &scissor);
-            _vk.CmdSetLineWidth(command, state.LineWidth);
-            var blendConstants = stackalloc float[4] { state.BlendRed, state.BlendGreen, state.BlendBlue, state.BlendAlpha };
-            _vk.CmdSetBlendConstants(command, blendConstants);
-            _vk.CmdSetDepthTestEnable(command, state.DepthTestEnabled);
-            _vk.CmdSetDepthWriteEnable(command, state.DepthWriteEnabled);
-            _vk.CmdSetDepthCompareOp(command, state.DepthCompare);
-            _vk.CmdSetDepthBiasEnable(command, state.DepthBiasEnabled);
-            if (state.DepthBiasEnabled)
+            var known = DynamicStateFilter && _dynamicStateCommand == command.Handle && _dynamicStateTick == _scheduler.CurrentTick &&
+                _dynamicStateEpoch == Volatile.Read(ref Gpu.Images.ColorToMultisampleDepthBlit.DynamicStateEpoch);
+            var last = _dynamicState;
+            if (!known || state.ViewportX != last.ViewportX || state.ViewportY != last.ViewportY || state.ViewportWidth != last.ViewportWidth ||
+                state.ViewportHeight != last.ViewportHeight || state.ViewportMinDepth != last.ViewportMinDepth || state.ViewportMaxDepth != last.ViewportMaxDepth)
+            {
+                var viewport = new Viewport(state.ViewportX, state.ViewportY, state.ViewportWidth, state.ViewportHeight, state.ViewportMinDepth, state.ViewportMaxDepth);
+                _vk.CmdSetViewport(command, 0, 1, &viewport);
+            }
+
+            if (!known || state.Scissor != last.Scissor)
+            {
+                var scissor = new Rect2D(
+                    new Offset2D(state.Scissor.Left, state.Scissor.Top),
+                    new Extent2D((uint)(state.Scissor.Right - state.Scissor.Left), (uint)(state.Scissor.Bottom - state.Scissor.Top)));
+                _vk.CmdSetScissor(command, 0, 1, &scissor);
+            }
+
+            if (!known || state.LineWidth != last.LineWidth)
+            {
+                _vk.CmdSetLineWidth(command, state.LineWidth);
+            }
+
+            if (!known || state.BlendRed != last.BlendRed || state.BlendGreen != last.BlendGreen || state.BlendBlue != last.BlendBlue || state.BlendAlpha != last.BlendAlpha)
+            {
+                var blendConstants = stackalloc float[4] { state.BlendRed, state.BlendGreen, state.BlendBlue, state.BlendAlpha };
+                _vk.CmdSetBlendConstants(command, blendConstants);
+            }
+
+            if (!known || state.DepthTestEnabled != last.DepthTestEnabled)
+            {
+                _vk.CmdSetDepthTestEnable(command, state.DepthTestEnabled);
+            }
+
+            if (!known || state.DepthWriteEnabled != last.DepthWriteEnabled)
+            {
+                _vk.CmdSetDepthWriteEnable(command, state.DepthWriteEnabled);
+            }
+
+            if (!known || state.DepthCompare != last.DepthCompare)
+            {
+                _vk.CmdSetDepthCompareOp(command, state.DepthCompare);
+            }
+
+            if (!known || state.DepthBiasEnabled != last.DepthBiasEnabled)
+            {
+                _vk.CmdSetDepthBiasEnable(command, state.DepthBiasEnabled);
+            }
+
+            // Bias and stencil values are recorded only while enabled; the cache keeps the last recorded ones.
+            if (state.DepthBiasEnabled && (!known || !last.DepthBiasEnabled ||
+                state.DepthBiasConstantFactor != last.DepthBiasConstantFactor || state.DepthBiasClamp != last.DepthBiasClamp ||
+                state.DepthBiasSlopeFactor != last.DepthBiasSlopeFactor))
             {
                 _vk.CmdSetDepthBias(command, state.DepthBiasConstantFactor, _supportsDepthBiasClamp ? state.DepthBiasClamp : 0f, state.DepthBiasSlopeFactor);
             }
 
-            if (state.StencilTestEnabled)
+            if (state.StencilTestEnabled && (!known || !last.StencilTestEnabled || state.FrontStencil != last.FrontStencil || state.BackStencil != last.BackStencil))
             {
                 _vk.CmdSetStencilCompareMask(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.CompareMask);
                 _vk.CmdSetStencilCompareMask(command, StencilFaceFlags.FaceBackBit, state.BackStencil.CompareMask);
@@ -722,7 +770,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 _vk.CmdSetStencilReference(command, StencilFaceFlags.FaceBackBit, state.BackStencil.Reference);
             }
 
-            if (_colorWriteEnableApi is { } colorWriteEnable && state.ColorWriteCount != 0)
+            if (_colorWriteEnableApi is { } colorWriteEnable && state.ColorWriteCount != 0 &&
+                (!known || state.ColorWriteCount != last.ColorWriteCount || state.ColorWriteEnableMask != last.ColorWriteEnableMask))
             {
                 var enables = stackalloc Bool32[RenderingState.ColorAttachmentCapacity];
                 for (var index = 0; index < state.ColorWriteCount; index++)
@@ -732,6 +781,38 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 colorWriteEnable.CmdSetColorWriteEnable(command, state.ColorWriteCount, enables);
             }
+
+            if (!DynamicStateFilter)
+            {
+                return;
+            }
+
+            // A group that was not recorded keeps the values recorded before it, not this draw's.
+            var recorded = state;
+            if (known && !state.DepthBiasEnabled)
+            {
+                recorded = recorded with
+                {
+                    DepthBiasConstantFactor = last.DepthBiasConstantFactor,
+                    DepthBiasClamp = last.DepthBiasClamp,
+                    DepthBiasSlopeFactor = last.DepthBiasSlopeFactor,
+                };
+            }
+
+            if (known && !state.StencilTestEnabled)
+            {
+                recorded = recorded with { FrontStencil = last.FrontStencil, BackStencil = last.BackStencil };
+            }
+
+            if (known && (state.ColorWriteCount == 0 || _colorWriteEnableApi is null))
+            {
+                recorded = recorded with { ColorWriteCount = last.ColorWriteCount, ColorWriteEnableMask = last.ColorWriteEnableMask };
+            }
+
+            _dynamicState = recorded;
+            _dynamicStateCommand = command.Handle;
+            _dynamicStateTick = _scheduler.CurrentTick;
+            _dynamicStateEpoch = Volatile.Read(ref Gpu.Images.ColorToMultisampleDepthBlit.DynamicStateEpoch);
         }
 
 

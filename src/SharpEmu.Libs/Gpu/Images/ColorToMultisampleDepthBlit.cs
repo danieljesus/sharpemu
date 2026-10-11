@@ -12,6 +12,9 @@ namespace SharpEmu.Libs.Gpu.Images;
 // Writes each channel of a single-sample color image into one sample of a multisample depth image.
 public sealed unsafe class ColorToMultisampleDepthBlit : IDisposable
 {
+    // [local] Bumped whenever this blit binds its pipeline, which overrides the dynamic draw state.
+    internal static int DynamicStateEpoch;
+
     public const ImageLayout DestinationLayout = ImageLayout.DepthStencilAttachmentOptimal;
     private const uint SetsPerPool = 64;
 
@@ -303,6 +306,8 @@ public sealed unsafe class ColorToMultisampleDepthBlit : IDisposable
         vk.CmdBeginRenderPass(command, &begin, SubpassContents.Inline);
         vk.CmdBindDescriptorSets(command, PipelineBindPoint.Graphics, _pipelineLayout, 0, 1, &set, 0, null);
         vk.CmdBindPipeline(command, PipelineBindPoint.Graphics, cached.Pipeline);
+        // [local] This pipeline's static states replace the guest draws' dynamic ones.
+        Interlocked.Increment(ref DynamicStateEpoch);
         var viewport = new Viewport(0.0f, 0.0f, extent.Width, extent.Height, 0.0f, 1.0f);
         var scissor = new Rect2D(new Offset2D(0, 0), extent);
         vk.CmdSetViewport(command, 0, 1, &viewport);
