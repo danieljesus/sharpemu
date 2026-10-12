@@ -20,7 +20,9 @@ internal static unsafe class VulkanSynchronization
         uint bufferMemoryBarrierCount,
         BufferMemoryBarrier2* bufferMemoryBarriers,
         uint imageMemoryBarrierCount,
-        ImageMemoryBarrier2* imageMemoryBarriers)
+        ImageMemoryBarrier2* imageMemoryBarriers,
+        [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "", // [local]
+        [System.Runtime.CompilerServices.CallerLineNumber] int callerLine = 0) // [local]
     {
         var sourceStages2 = (PipelineStageFlags2)(ulong)sourceStages;
         var destinationStages2 = (PipelineStageFlags2)(ulong)destinationStages;
@@ -51,6 +53,7 @@ internal static unsafe class VulkanSynchronization
             ImageMemoryBarrierCount = imageMemoryBarrierCount,
             PImageMemoryBarriers = imageMemoryBarriers,
         };
+        VkCallProbe.CountBarrier(command.Handle, memoryBarrierCount, bufferMemoryBarrierCount, imageMemoryBarrierCount, callerFile, callerLine); // [local]
         var vkProbe54 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
         vk.CmdPipelineBarrier2(command, &dependencyInfo);
         SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe54); // [local]

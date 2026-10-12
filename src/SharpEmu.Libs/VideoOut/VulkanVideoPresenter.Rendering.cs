@@ -1296,6 +1296,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Size = 3u * sizeof(uint),
             };
             var beforeInfo = new DependencyInfo { SType = StructureType.DependencyInfo, BufferMemoryBarrierCount = 1, PBufferMemoryBarriers = &before };
+            SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.CountBarrier(command.Handle, 0, 1, 0); // [local]
             var vkProbe1238 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             _vk.CmdPipelineBarrier2(command, &beforeInfo);
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe1238); // [local]
@@ -1322,6 +1323,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Size = 3u * sizeof(uint),
             };
             var afterInfo = new DependencyInfo { SType = StructureType.DependencyInfo, BufferMemoryBarrierCount = 1, PBufferMemoryBarriers = &after };
+            SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.CountBarrier(command.Handle, 0, 1, 0); // [local]
             var vkProbe1260 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             _vk.CmdPipelineBarrier2(command, &afterInfo);
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe1260); // [local]

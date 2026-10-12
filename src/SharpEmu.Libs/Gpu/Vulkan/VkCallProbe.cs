@@ -21,6 +21,12 @@ internal static class VkCallProbe
     private static readonly bool SampleCallers = Environment.GetEnvironmentVariable("SHARPEMU_VKCALL_PROBE_CALLERS") == "1";
     private const int HandleSampleEvery = 32;
 
+    // SHARPEMU_VKCALL_PROBE_BARRIERS=1 (with the probe) counts vkCmdPipelineBarrier2 per call site and how many came
+    // right after another barrier on the same command buffer with no probed command in between (an upper bound on
+    // what merging adjacent barriers could save: unprobed commands such as image copies and clears are not seen).
+    public static readonly bool CountBarrierSites = Enabled &&
+        Environment.GetEnvironmentVariable("SHARPEMU_VKCALL_PROBE_BARRIERS") == "1";
+
     internal enum Kind
     {
         Draw,
@@ -49,6 +55,9 @@ internal static class VkCallProbe
     private static readonly long[] _calls = new long[(int)Kind.Count];
     private static long _handles;
     private static readonly Dictionary<string, long> _handleCallers = new();
+    private static readonly Dictionary<(string File, int Line), long[]> _barrierSites = new();
+    [ThreadStatic]
+    private static nint _lastBarrierCommand;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long Start() => Enabled ? Stopwatch.GetTimestamp() : 0;
@@ -60,6 +69,37 @@ internal static class VkCallProbe
         {
             Interlocked.Add(ref _ticks[(int)kind], Stopwatch.GetTimestamp() - start);
             Interlocked.Increment(ref _calls[(int)kind]);
+            if (kind != Kind.Barrier)
+            {
+                _lastBarrierCommand = 0;
+            }
+        }
+    }
+
+    // Per site: calls, calls adjacent to the previous barrier, memory, buffer and image barriers.
+    public static void CountBarrier(nint command, uint memory, uint buffer, uint image,
+        [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
+    {
+        if (!CountBarrierSites)
+        {
+            return;
+        }
+
+        var adjacent = _lastBarrierCommand == command ? 1 : 0;
+        _lastBarrierCommand = command;
+        lock (_barrierSites)
+        {
+            if (!_barrierSites.TryGetValue((file, line), out var counts))
+            {
+                counts = new long[5];
+                _barrierSites[(file, line)] = counts;
+            }
+
+            counts[0]++;
+            counts[1] += adjacent;
+            counts[2] += memory;
+            counts[3] += buffer;
+            counts[4] += image;
         }
     }
 
@@ -126,6 +166,30 @@ internal static class VkCallProbe
         {
             callers = _handleCallers.OrderByDescending(pair => pair.Value).Take(15).ToList();
             _handleCallers.Clear();
+        }
+
+        if (CountBarrierSites)
+        {
+            List<KeyValuePair<(string File, int Line), long[]>> sites;
+            lock (_barrierSites)
+            {
+                sites = _barrierSites.Where(pair => pair.Value[0] != 0).OrderByDescending(pair => pair.Value[0])
+                    .Select(pair => new KeyValuePair<(string File, int Line), long[]>(pair.Key, (long[])pair.Value.Clone())).ToList();
+                foreach (var counts in _barrierSites.Values)
+                {
+                    Array.Clear(counts);
+                }
+            }
+
+            var total = sites.Sum(pair => pair.Value[0]);
+            var adjacentTotal = sites.Sum(pair => pair.Value[1]);
+            yield return string.Create(CultureInfo.InvariantCulture,
+                $"[PERF][VKCALL_BARRIER] window_s={seconds:F1} calls_per_frame={total / (double)perFrame:F0} adjacent_per_frame={adjacentTotal / (double)perFrame:F0}");
+            foreach (var (site, counts) in sites)
+            {
+                yield return string.Create(CultureInfo.InvariantCulture,
+                    $"[PERF][VKCALL_BARRIER] per_frame={counts[0] / (double)perFrame:F1} adjacent={counts[1] / (double)perFrame:F1} mem={counts[2] / (double)perFrame:F1} buf={counts[3] / (double)perFrame:F1} img={counts[4] / (double)perFrame:F1} site={Path.GetFileName(site.File)}:{site.Line}");
+            }
         }
 
         yield return string.Create(CultureInfo.InvariantCulture,

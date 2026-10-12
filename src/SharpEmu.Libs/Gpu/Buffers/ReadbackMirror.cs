@@ -230,6 +230,7 @@ internal sealed unsafe class ReadbackMirror(GpuDeviceInfo device, SubmissionSche
             DstAccessMask = AccessFlags2.TransferReadBit | AccessFlags2.TransferWriteBit,
         };
         var beforeDependency = new DependencyInfo { SType = StructureType.DependencyInfo, MemoryBarrierCount = 1, PMemoryBarriers = &before };
+        Vulkan.VkCallProbe.CountBarrier(command.Handle, 1, 0, 0); // [local]
         vk.CmdPipelineBarrier2(command, &beforeDependency);
         foreach (var (source, regions) in bySource)
         {
@@ -251,6 +252,7 @@ internal sealed unsafe class ReadbackMirror(GpuDeviceInfo device, SubmissionSche
             DstAccessMask = AccessFlags2.HostReadBit,
         };
         var afterDependency = new DependencyInfo { SType = StructureType.DependencyInfo, MemoryBarrierCount = 1, PMemoryBarriers = &after };
+        Vulkan.VkCallProbe.CountBarrier(command.Handle, 1, 0, 0); // [local]
         vk.CmdPipelineBarrier2(command, &afterDependency);
     }
 
