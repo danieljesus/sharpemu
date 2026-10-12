@@ -445,6 +445,8 @@ internal static unsafe partial class VulkanVideoPresenter
             FpsLog.FramePresented(); // [local]
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueuePresent))
             {
+                // [local] The present waits on a binary semaphore: its signal must be submitted first.
+                _scheduler.WaitSubmitted(_submitTimeline);
                 lock (_queueGate)
                 {
                     presentResult = _swapchainApi.QueuePresent(_queue, &presentInfo);

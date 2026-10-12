@@ -483,6 +483,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _swapchainRecreateDeferred = false;
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan VideoOut recreating swapchain after {operation}: {result}");
+            _scheduler?.WaitAllSubmitted(); // [local] idle must cover the work still queued for the submit thread
             lock (_queueGate)
             {
                 _vk.DeviceWaitIdle(_device);

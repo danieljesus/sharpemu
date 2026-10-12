@@ -271,6 +271,9 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         RequireSuccess(_vk.EndCommandBuffer(new CommandBuffer(buffer)), "vkEndCommandBuffer(scheduler)");
     }
 
+    // [local] Marked on the recording thread: the profile's buffer table is not shared with a submit thread.
+    public void MarkSealed(nint buffer) => CommandProfile?.MarkSubmitted(buffer);
+
     public bool TrySubmit(nint buffer, SubmitBundle bundle, out string failure)
     {
         var commandBuffer = new CommandBuffer(buffer);
@@ -360,8 +363,6 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
                 }
             }
 
-            if (result == Result.Success)
-                CommandProfile?.MarkSubmitted(buffer);
             failure = result.ToString();
             return result == Result.Success;
         }

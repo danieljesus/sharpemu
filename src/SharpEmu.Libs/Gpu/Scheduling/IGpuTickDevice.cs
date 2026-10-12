@@ -21,4 +21,10 @@ public interface IGpuTickDevice : IDisposable
     void EndBuffer(nint buffer);
 
     bool TrySubmit(nint buffer, SubmitBundle bundle, out string failure);
+
+    // [local] The buffer has ended and will be submitted; it is reused only after its tick completes. Runs on the
+    // recording thread, also when a submit thread does the submit.
+    void MarkSealed(nint buffer)
+    {
+    }
 }

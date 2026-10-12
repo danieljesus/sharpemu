@@ -42,16 +42,24 @@ internal sealed class DeferredUploadWorker : IDisposable
         _queue.Add(job);
     }
 
+    // [local] The jobs enqueued so far: a submit captures this when its buffer is sealed and joins it before the submit.
+    public long Enqueued => Volatile.Read(ref _enqueued);
+
     // Every job enqueued so far has protected and copied.
-    public void WaitIdle()
+    public void WaitIdle() => WaitIdle(Volatile.Read(ref _enqueued));
+
+    // [local] The first target jobs have protected and copied. With one worker, jobs finish in order.
+    public void WaitIdle(long target)
     {
-        var target = Volatile.Read(ref _enqueued);
         if (Volatile.Read(ref _completed) >= target)
         {
             return;
         }
 
-        using var profileScope = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.DeferredUploadWait);
+        // The submit thread keeps its own counters: the render-thread profile is not shared.
+        using var profileScope = SharpEmu.Libs.Gpu.Scheduling.SubmissionScheduler.OnSubmitThread
+            ? default
+            : RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.DeferredUploadWait);
         var spinner = new SpinWait();
         while (Volatile.Read(ref _completed) < target)
         {

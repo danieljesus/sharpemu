@@ -48,12 +48,31 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     private readonly IRenderingState _rendering;
     private ulong _lastMemoryDrainTick;
 
+    // [local] SHARPEMU_SUBMIT_THREAD=1: the recording thread seals each buffer (end, tick, signal, completion work) and
+    // a submit thread joins its deferred uploads and calls vkQueueSubmit2, in tick order. Host waits on the timeline
+    // stay legal before the submit (wait-before-signal); present and the readback queue wait for the submit first.
+    internal static readonly bool SubmitThreadDefault = Environment.GetEnvironmentVariable("SHARPEMU_SUBMIT_THREAD") == "1";
+
+    private readonly record struct SealedSubmit(nint Buffer, SubmitBundle Bundle, ulong Tick, long Target, SubmissionTraceEntry Trace);
+
+    [ThreadStatic]
+    private static bool _onSubmitThread;
+    private readonly Thread? _submitThread;
+    private readonly Queue<SealedSubmit> _sealed = new();
+    private readonly object _submitLock = new();
+    private ulong _submittedTick;
+    private bool _submitStopRequested;
+    private bool _submitWorkerParked;
+    private int _submitWaiters;
+    private string? _submitFailure;
+
     public SubmissionScheduler(
         IGpuTickDevice device,
         IRenderingState rendering,
         Action<SubmitBundle>? prepareSubmit = null,
         Action<ulong>? submitted = null,
-        Action<ulong>? completed = null)
+        Action<ulong>? completed = null,
+        bool? submitThread = null)
     {
         _device = device;
         _rendering = rendering;
@@ -65,7 +84,20 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _command = new RecordingBuffer(this, device, rendering);
         _priorityThread = new Thread(RunPriorityWorker) { IsBackground = true, Name = "SharpEmu GPU priority" };
         _priorityThread.Start();
+        if (submitThread ?? SubmitThreadDefault) // [local]
+        {
+            _submitThread = new Thread(RunSubmitWorker) { IsBackground = true, Name = "SharpEmu GPU submit" };
+            _submitThread.Start();
+        }
     }
+
+    // [local]
+    public bool UsesSubmitThread => _submitThread != null;
+
+    internal static bool OnSubmitThread => _onSubmitThread;
+
+    // [local] The highest tick handed to the queue. Without a submit thread every sealed tick is submitted.
+    public ulong SubmittedTick => _submitThread == null ? CurrentTick - 1 : Volatile.Read(ref _submittedTick);
 
     public static bool InDeferredOperation => _callbackOwner != null;
 
@@ -159,6 +191,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             Submit();
         }
 
+        WaitSubmitted(CurrentTick - 1); // [local]
+        StopSubmitWorker(); // [local]
         _timeline.Wait(CurrentTick - 1);
         RunCompletedOperations();
         WaitForAllPriorityOperations();
@@ -234,6 +268,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     public void FlushAndWait()
     {
         var tick = Submit();
+        WaitSubmitted(tick); // [local]
         _timeline.Wait(tick);
         BeginNextCommandBuffer();
     }
@@ -246,6 +281,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             Submit();
         }
 
+        WaitSubmitted(CurrentTick - 1); // [local]
         _timeline.Wait(CurrentTick - 1);
         BeginNextCommandBuffer();
         RunCompletedOperations();
@@ -294,11 +330,13 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                 throw Fatal($"The submitted tick {submitted} does not match the requested tick {tick}.");
             }
 
+            WaitSubmitted(tick); // [local]
             _timeline.Wait(tick);
             BeginNextCommandBuffer();
         }
         else
         {
+            WaitSubmitted(tick); // [local]
             _timeline.Wait(tick);
         }
     }
@@ -461,12 +499,19 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
     }
 
-    // [local] Runs before every command buffer ends and is submitted (the deferred uploads join here).
+    // [local] Runs on the recording thread before every command buffer ends (it may record into it).
     public Action? BeforeSubmit { get; set; }
+
+    // [local] The queue part of the submit: CaptureSubmitTarget runs on the recording thread once the buffer's work is
+    // decided, WaitSubmitTarget joins that target right before vkQueueSubmit2 (the deferred uploads).
+    public Func<long>? CaptureSubmitTarget { get; set; }
+
+    public Action<long>? WaitSubmitTarget { get; set; }
 
     public ulong Submit(SubmitBundle? bundle = null)
     {
         if (SubmitProbe) RecordSubmit(); // [local]
+        ThrowIfSubmitFailed(); // [local]
         var submit = bundle == null ? new SubmitBundle() : new SubmitBundle(bundle);
         if (_command.IsInvalid)
         {
@@ -475,6 +520,12 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
         _prepareSubmit?.Invoke(submit);
         BeforeSubmit?.Invoke();
+        var target = CaptureSubmitTarget?.Invoke() ?? 0; // [local]
+        if (_submitThread == null)
+        {
+            WaitSubmitTarget?.Invoke(target);
+        }
+
         if (submit.WaitCount > SubmitBundle.MaxSemaphores || submit.SignalCount >= SubmitBundle.MaxSemaphores)
         {
             throw Fatal($"The submission exceeds its capacity: waits={submit.WaitCount} signals={submit.SignalCount}.");
@@ -482,6 +533,12 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
         _command.End();
         var buffer = _command.Buffer;
+        _device.MarkSealed(buffer); // [local]
+        if (_submitThread != null)
+        {
+            return SealForSubmitThread(buffer, submit, target);
+        }
+
         bool submitted;
         string failure;
         ulong tick;
@@ -520,6 +577,238 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _command.Buffer = 0;
         _submitted?.Invoke(tick);
         return tick;
+    }
+
+    // [local] Reserve the tick and queue the sealed buffer for the submit thread. The tick is reserved and queued under
+    // one lock, so the thread submits in tick order and the sealed tick is the submitted tick.
+    private ulong SealForSubmitThread(nint buffer, SubmitBundle submit, long target)
+    {
+        SealedSubmit item;
+        bool inline;
+        SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 12, "scheduler.op_12");
+        lock (_operationLock)
+        {
+            var tick = _timeline.ReserveTick();
+            submit.AddSignal(_timeline.Handle, tick);
+            item = new SealedSubmit(buffer, submit, tick, target, new SubmissionTraceEntry(tick, _command.DebugOp,
+                _command.DebugSubmitId, _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3,
+                _command.DebugArg4));
+            lock (_submitLock)
+            {
+                // After shutdown stopped the thread, a late submit runs inline; the queue is empty by then.
+                inline = _submitStopRequested;
+                if (!inline)
+                {
+                    _sealed.Enqueue(item);
+                    SubmitThreadStats.Sealed(_sealed.Count);
+                    if (_submitWorkerParked)
+                    {
+                        Monitor.Pulse(_submitLock);
+                    }
+                }
+            }
+
+            if (_completed is { } completed)
+            {
+                _priority.Enqueue(new TickWork(() => completed(item.Tick), item.Tick));
+                Monitor.Pulse(_operationLock);
+            }
+        }
+
+        if (inline)
+        {
+            if (!SubmitSealed(item, out var failure))
+            {
+                throw Fatal(FormatSubmitFailure(item, failure));
+            }
+
+            lock (_submitLock)
+            {
+                Volatile.Write(ref _submittedTick, item.Tick);
+                Monitor.PulseAll(_submitLock);
+            }
+        }
+
+        _submissionHistory[_nextSubmissionHistoryIndex] = item.Trace;
+        _nextSubmissionHistoryIndex = (_nextSubmissionHistoryIndex + 1) % _submissionHistory.Length;
+        _submissionHistoryCount = Math.Min(_submissionHistoryCount + 1, _submissionHistory.Length);
+        _command.Buffer = 0;
+        _submitted?.Invoke(item.Tick);
+        return item.Tick;
+    }
+
+    // [local] The queue part of a submit: join the buffer's deferred uploads, then submit under the queue gate.
+    private bool SubmitSealed(in SealedSubmit item, out string failure)
+    {
+        var start = System.Diagnostics.Stopwatch.GetTimestamp();
+        WaitSubmitTarget?.Invoke(item.Target);
+        var joined = System.Diagnostics.Stopwatch.GetTimestamp();
+        bool submitted;
+        lock (_device.QueueGate)
+        {
+            submitted = _device.TrySubmit(item.Buffer, item.Bundle, out failure);
+        }
+
+        SubmitThreadStats.Submitted(joined - start, System.Diagnostics.Stopwatch.GetTimestamp() - joined);
+        return submitted;
+    }
+
+    private static string FormatSubmitFailure(in SealedSubmit item, string failure)
+    {
+        var trace = item.Trace;
+        return $"vkQueueSubmit failed: {failure}, tick={item.Tick} debug_op={trace.Op} debug_submit={trace.SubmitId} " +
+            $"args={trace.Arg0},{trace.Arg1},{trace.Arg2},{trace.Arg3},0x{trace.Arg4:X16}";
+    }
+
+    private void RunSubmitWorker()
+    {
+        _onSubmitThread = true;
+        for (;;)
+        {
+            SealedSubmit item;
+            lock (_submitLock)
+            {
+                while (_sealed.Count == 0 && !_submitStopRequested)
+                {
+                    _submitWorkerParked = true;
+                    Monitor.Wait(_submitLock);
+                    _submitWorkerParked = false;
+                }
+
+                if (_sealed.Count == 0)
+                {
+                    return;
+                }
+
+                item = _sealed.Peek();
+            }
+
+            string? message = null;
+            try
+            {
+                if (!SubmitSealed(item, out var failure))
+                {
+                    message = FormatSubmitFailure(item, failure);
+                }
+            }
+            catch (Exception exception)
+            {
+                message = $"The submit thread failed at tick={item.Tick}: {exception.Message}";
+            }
+
+            if (message != null)
+            {
+                Console.Error.WriteLine($"[GPU][ERROR] submission history known_completed_tick={_timeline.CompletedTick}");
+                foreach (var entry in FormatRecentSubmissions())
+                    Console.Error.WriteLine($"[GPU][ERROR] {entry}");
+                try
+                {
+                    // As without the thread: the fatal hook ends the process. A hook that throws (tests) leaves the
+                    // failure for the recording thread, which rethrows it at its next submit or wait.
+                    Fatal(message);
+                }
+                catch
+                {
+                }
+            }
+
+            lock (_submitLock)
+            {
+                _sealed.Dequeue();
+                if (message == null)
+                {
+                    Volatile.Write(ref _submittedTick, item.Tick);
+                }
+                else
+                {
+                    _submitFailure = message;
+                }
+
+                if (_submitWaiters != 0 || message != null)
+                {
+                    Monitor.PulseAll(_submitLock);
+                }
+            }
+
+            if (message != null)
+            {
+                return;
+            }
+        }
+    }
+
+    private void ThrowIfSubmitFailed()
+    {
+        if (_submitThread != null && Volatile.Read(ref _submitFailure) is { } failure)
+        {
+            throw Fatal(failure);
+        }
+    }
+
+    // [local] Block until the submit thread has handed every tick up to this one to the queue. A tick that is not
+    // sealed yet waits for the newest sealed one. Needed before a binary-semaphore wait (present), a submit on another
+    // queue that waits on the timeline, and vkDeviceWaitIdle.
+    public void WaitSubmitted(ulong tick)
+    {
+        if (_submitThread == null)
+        {
+            return;
+        }
+
+        tick = Math.Min(tick, CurrentTick - 1);
+        if (Volatile.Read(ref _submittedTick) >= tick)
+        {
+            return;
+        }
+
+        if (_onSubmitThread)
+        {
+            throw Fatal("The submit thread cannot wait for its own submissions.");
+        }
+
+        var start = System.Diagnostics.Stopwatch.GetTimestamp();
+        using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.SubmitThreadWait))
+        {
+            lock (_submitLock)
+            {
+                _submitWaiters++;
+                try
+                {
+                    while (_submittedTick < tick && _submitFailure == null)
+                    {
+                        Monitor.Wait(_submitLock);
+                    }
+                }
+                finally
+                {
+                    _submitWaiters--;
+                }
+            }
+        }
+
+        SubmitThreadStats.Waited(System.Diagnostics.Stopwatch.GetTimestamp() - start);
+        ThrowIfSubmitFailed();
+    }
+
+    public void WaitAllSubmitted() => WaitSubmitted(CurrentTick - 1);
+
+    private void StopSubmitWorker()
+    {
+        if (_submitThread == null)
+        {
+            return;
+        }
+
+        lock (_submitLock)
+        {
+            _submitStopRequested = true;
+            Monitor.PulseAll(_submitLock);
+        }
+
+        if (!_onSubmitThread)
+        {
+            _submitThread.Join();
+        }
     }
 
     // Report the last operation in each saved submission. Earlier GPU work can cause device loss.

@@ -139,6 +139,8 @@ internal static class RenderPhaseProfile
         MovieFramePolling,
         // [local] The render thread waits for deferred uploads before a submit.
         DeferredUploadWait,
+        // [local] The render thread waits for the submit thread to hand a tick to the queue (present, readback, drain).
+        SubmitThreadWait,
         // [local] A draw's image work recorded before its pipeline (PrepareStageImages, P1).
         StageImagePreparation,
         // [local] Pieces of DescriptorPreparation.
@@ -529,6 +531,7 @@ internal static class RenderPhaseProfile
             string.Join(" ", allocations.Select(part => $"{part.Phase}={part.Bytes / 1024}kb")));
 
         if (FrontReport?.Invoke() is { Length: > 0 } frontReport) Console.Error.WriteLine(frontReport);
+        if (Gpu.Scheduling.SubmitThreadStats.TakeReport(seconds, frames) is { } submitReport) Console.Error.WriteLine(submitReport); // [local]
         ReportImageUploads();
         BufferUploadProfile.Report();
         Console.Error.WriteLine(SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.TakeReport());

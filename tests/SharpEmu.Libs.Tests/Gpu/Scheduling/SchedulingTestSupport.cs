@@ -137,8 +137,19 @@ internal sealed class FakeTickDevice : IGpuTickDevice
 
     public void EndBuffer(nint buffer) => Note($"end {Name(buffer)}");
 
+    // [local] When set, every submit blocks until the test opens it.
+    public ManualResetEventSlim? SubmitGate { get; set; }
+
+    public List<int> SubmitThreads { get; } = new();
+
     public bool TrySubmit(nint buffer, SubmitBundle bundle, out string failure)
     {
+        SubmitGate?.Wait();
+        lock (SubmitThreads)
+        {
+            SubmitThreads.Add(Environment.CurrentManagedThreadId);
+        }
+
         failure = "VK_ERROR_DEVICE_LOST";
         if (FailSubmit)
         {

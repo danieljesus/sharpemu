@@ -295,6 +295,12 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             SignalSemaphoreInfoCount = 1,
             PSignalSemaphoreInfos = &signal,
         };
+        if (waitTick != 0)
+        {
+            // [local] A submit thread may still hold the main-queue submit that signals waitTick.
+            _scheduler.WaitSubmitted(waitTick);
+        }
+
         Require(vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback)");
         slot.Busy = true;
         return new Ticket(slot, signalValue, offsets, sizes);
