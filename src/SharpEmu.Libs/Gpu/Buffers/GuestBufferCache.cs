@@ -1377,7 +1377,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var last = (guestAddress + size - 1) & ~(ReadbackWindowBytes - 1);
         for (var key = guestAddress & ~(ReadbackWindowBytes - 1); key <= last; key += ReadbackWindowBytes)
         {
-            if (_hotWindows.TryGetValue(key, out var hot) && _batchSerial - hot.LastHit <= HotWindowLifetime)
+            if (_hotWindows.TryGetValue(key, out var hot) && _batchSerial - hot.LastHit <= HotWindowLifetime &&
+                !(MuteStaleEagerWindows && _eagerMute.IsMuted(key, _batchSerial)))
             {
                 _eagerCandidates.Add(key);
                 HotWritePending = true;
@@ -1422,6 +1423,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             {
                 _hotWindows.Remove(key);
             }
+
+            _eagerMute.Prune(_batchSerial);
         }
 
         if (_eagerCandidates.Count == 0)
@@ -1443,6 +1446,20 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         _eagerCandidates.Clear();
+    }
+
+    // [local] SHARPEMU_EAGER_MUTE (on by default; only acts with SHARPEMU_EAGER_READBACK=1): a read-ahead window whose
+    // eager downloads went stale three times in a row is not read ahead for 4096 batches. 0 keeps reading it ahead.
+    private static readonly bool MuteStaleEagerWindows = Environment.GetEnvironmentVariable("SHARPEMU_EAGER_MUTE") != "0";
+    private readonly EagerWindowMute _eagerMute = new(strikeLimit: 3, muteBatches: 4096);
+    private static long _reportedEagerMuted;
+
+    private void NoteEagerOutcome(PendingDownload pending, bool wasted)
+    {
+        if (MuteStaleEagerWindows && pending.Eager && _eagerMute.Note(pending.HotKey, wasted, _batchSerial))
+        {
+            Interlocked.Increment(ref _reportedEagerMuted);
+        }
     }
 
     private void StartEagerReadback(HotWindow hot)
@@ -1473,6 +1490,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             GuestAddress = hot.Address,
             Size = hot.Size,
             IsWrite = false,
+            Eager = true,
+            HotKey = hot.Address & ~(ReadbackWindowBytes - 1),
             Source = GuestMemoryProfile.ReadbackSource.ShaderResourceRead,
             Started = System.Diagnostics.Stopwatch.GetTimestamp(),
         });
@@ -1591,7 +1610,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static long _reportedRetried;
 
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
-        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} published_pieces={Interlocked.Exchange(ref _reportedPublishedPieces, 0)} stale_pieces={Interlocked.Exchange(ref _reportedStalePieces, 0)}uniform_image_sources={TakeUniformImageSources()} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
+        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} published_pieces={Interlocked.Exchange(ref _reportedPublishedPieces, 0)} stale_pieces={Interlocked.Exchange(ref _reportedStalePieces, 0)}uniform_image_sources={TakeUniformImageSources()} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)} eager_muted={Interlocked.Exchange(ref _reportedEagerMuted, 0)}");
 
     private sealed record PendingDownload
     {
@@ -1603,6 +1622,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         public required ulong GuestAddress { get; init; }
         public required ulong Size { get; init; }
         public required bool IsWrite { get; init; }
+        public bool Eager { get; init; } // [local]
+        public ulong HotKey { get; init; } // [local]
         public required GuestMemoryProfile.ReadbackSource Source { get; init; }
         public required long Started { get; init; }
     }
@@ -1836,6 +1857,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var stale = copies.Count - published;
             Interlocked.Add(ref _reportedPublishedPieces, published);
             Interlocked.Add(ref _reportedStalePieces, stale);
+            NoteEagerOutcome(pending, wasted: stale != 0);
             var clean = pending.IsWrite
                 ? !_tracker.HasGpuDirtyPages(pending.GuestAddress, pending.Size)
                 : !HasGpuDirtyBytes(pending.GuestAddress, pending.Size);
@@ -1915,7 +1937,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var readback = AsyncReadback ?? throw SubmissionScheduler.Fatal("The pending readback lost its queue.");
         try
         {
-            if (!IsPendingDownloadCurrent(pending))
+            var whole = IsPendingDownloadCurrent(pending);
+            NoteEagerOutcome(pending, wasted: !whole);
+            if (!whole)
             {
                 readback.Complete(pending.Ticket, null);
                 if (retrySynchronously)
