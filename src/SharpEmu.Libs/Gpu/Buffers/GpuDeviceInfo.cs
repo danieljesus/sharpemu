@@ -20,6 +20,10 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     // VK_EXT_image_view_min_lod is enabled, so a view can clamp to a texture descriptor's MIN_LOD.
     public bool ImageViewMinLodSupported { get; init; }
 
+    // [local] VK_KHR_maintenance8 is enabled, so vkCmdCopyImage may copy between a depth aspect and a
+    // size-compatible color format (D16 <-> R16).
+    public bool Maintenance8Supported { get; init; }
+
     public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device)
     {
         Vk = vk;

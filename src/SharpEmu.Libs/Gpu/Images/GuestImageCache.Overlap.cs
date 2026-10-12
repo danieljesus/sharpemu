@@ -182,6 +182,28 @@ public sealed partial class GuestImageCache
         return true;
     }
 
+    // [local] SHARPEMU_DEPTH_COLOR_COPY (on by default): with VK_KHR_maintenance8, a single-sample D16 depth image and an
+    // R16 color image of the same extent copy with one vkCmdCopyImage (depth aspect on one side, color on the other)
+    // instead of a round trip through a buffer. The bits are copied unchanged either way. 0 restores the buffer copy.
+    private static readonly bool DepthColorCopy = Environment.GetEnvironmentVariable("SHARPEMU_DEPTH_COLOR_COPY") != "0";
+    private static long _depthColorCopies;
+
+    internal static long TakeDepthColorCopies() => Interlocked.Exchange(ref _depthColorCopies, 0);
+
+    // The depth/color pairs of the maintenance8 size-compatibility table this cache produces: D16's depth aspect and
+    // the 16-bit single-channel color formats.
+    internal static bool IsDepth16ColorCopyPair(Format first, Format second) =>
+        (first == Format.D16Unorm && IsSingleChannel16Color(second)) || (second == Format.D16Unorm && IsSingleChannel16Color(first));
+
+    private static bool IsSingleChannel16Color(Format format) =>
+        format is Format.R16Unorm or Format.R16SNorm or Format.R16Uint or Format.R16Sint or Format.R16Sfloat;
+
+    private bool IsDirectDepthColorCopy(CachedImage destination, CachedImage source) =>
+        DepthColorCopy && _device.Maintenance8Supported &&
+        source.Backing.Samples == 1 && destination.Backing.Samples == 1 &&
+        IsDepth16ColorCopyPair(source.Backing.Format, destination.Backing.Format) &&
+        SameExtent(source.Backing.Extent, destination.Backing.Extent);
+
     private void CopyWholeImage(ResourceSlotIdentifier destinationImageIdentifier, ResourceSlotIdentifier sourceImageIdentifier)
     {
         RefreshCopySource(sourceImageIdentifier);
@@ -214,9 +236,14 @@ public sealed partial class GuestImageCache
         var directCopy = compatibleTypes &&
                          (source.Backing.Format == destination.Backing.Format ||
                           (!sourceDepth && !destinationDepth && ViewFormatRules.BlockBytes(source.Backing.Format) == ViewFormatRules.BlockBytes(destination.Backing.Format)));
-        if (directCopy)
+        var depthColorCopy = !directCopy && compatibleTypes && IsDirectDepthColorCopy(destination, source); // [local]
+        if (directCopy || depthColorCopy)
         {
             destination.CopyFrom(source);
+            if (depthColorCopy)
+            {
+                Interlocked.Increment(ref _depthColorCopies);
+            }
         }
         else if (!CopyDepth16(destination, source))
         {

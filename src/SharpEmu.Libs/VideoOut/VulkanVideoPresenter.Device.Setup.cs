@@ -725,6 +725,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private const string ImageViewMinLodExtensionName = "VK_EXT_image_view_min_lod";
         private const string FillRectangleExtensionName = "VK_NV_fill_rectangle";
         private bool _supportsImageViewMinLod;
+        private bool _supportsMaintenance8; // [local]
 
         private void CreateDevice()
         {
@@ -966,6 +967,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var supportsSharedInt64Atomics = atomicInt64Features.ShaderSharedInt64Atomics;
             var supportsBufferInt64Atomics = atomicInt64Features.ShaderBufferInt64Atomics;
             var supportsMaintenance8 = maintenance8Features.Maintenance8;
+            _supportsMaintenance8 = supportsMaintenance8; // [local]
             var supportsRobustBufferAccess2 = robustness2Features.RobustBufferAccess2;
             var supportsRobustImageAccess2 = robustness2Features.RobustImageAccess2;
             var supportsNullDescriptor = robustness2Features.NullDescriptor;
@@ -1292,7 +1294,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
-            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device) { ImageViewMinLodSupported = _supportsImageViewMinLod };
+            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device) { ImageViewMinLodSupported = _supportsImageViewMinLod, Maintenance8Supported = _supportsMaintenance8 };
             if (_readbackQueueFamilyIndex is { } readbackQueueFamily)
             {
                 _vk.GetDeviceQueue(_device, readbackQueueFamily, 0, out _readbackQueue);

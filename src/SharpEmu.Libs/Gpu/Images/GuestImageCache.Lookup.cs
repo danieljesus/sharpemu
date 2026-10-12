@@ -38,7 +38,7 @@ public sealed partial class GuestImageCache
     private static readonly long[] _missReasons = new long[4];
 
     public static string TakeLookupReport() => FormattableString.Invariant(
-        $"[PERF][IMAGE_LOOKUP] memo_hits={Interlocked.Exchange(ref _totalLookupHits, 0)} memo_misses={Interlocked.Exchange(ref _totalLookupMisses, 0)} miss_empty={Interlocked.Exchange(ref _missReasons[0], 0)} miss_other_request={Interlocked.Exchange(ref _missReasons[1], 0)} miss_stale={Interlocked.Exchange(ref _missReasons[2], 0)} miss_gone={Interlocked.Exchange(ref _missReasons[3], 0)}");
+        $"[PERF][IMAGE_LOOKUP] memo_hits={Interlocked.Exchange(ref _totalLookupHits, 0)} memo_misses={Interlocked.Exchange(ref _totalLookupMisses, 0)} miss_empty={Interlocked.Exchange(ref _missReasons[0], 0)} miss_other_request={Interlocked.Exchange(ref _missReasons[1], 0)} miss_stale={Interlocked.Exchange(ref _missReasons[2], 0)} miss_gone={Interlocked.Exchange(ref _missReasons[3], 0)} depth_color_copies={TakeDepthColorCopies()}");
 
     // [local] SHARPEMU_RANGE_LOOKUP_GENERATION: a lookup only sees images owning its pages, so a change
     // stamps the generation on the pages it touches (hashed into buckets) and a remembered lookup stays
