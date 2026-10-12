@@ -26,6 +26,12 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
     private readonly Slot[] _slots;
     private readonly VkSemaphore _timeline;
     private readonly object _gate = new();
+
+    // [local] SHARPEMU_READBACK_SUBMIT_GUARD=1 waits for the submit thread to hand waitTick to the main queue before
+    // submitting the copy. Not needed: the copy runs on another queue and its wait is on a timeline semaphore, which may
+    // be submitted before its signal (wait-before-signal); the submit thread hands every sealed tick to the queue in
+    // order, and teardown waits for all of them before it idles the device or disposes this readback.
+    private static readonly bool SubmitGuard = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_SUBMIT_GUARD") == "1";
     private ulong _signaled;
     private int _waiters;
     private bool _disposed;
@@ -295,7 +301,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             SignalSemaphoreInfoCount = 1,
             PSignalSemaphoreInfos = &signal,
         };
-        if (waitTick != 0)
+        if (waitTick != 0 && SubmitGuard)
         {
             // [local] A submit thread may still hold the main-queue submit that signals waitTick.
             _scheduler.WaitSubmitted(waitTick);
