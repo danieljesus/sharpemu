@@ -95,7 +95,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
     }
 
     // Copies the pieces once the main-queue tick has completed and hands each one's bytes
-    // to consume, in order. The caller must have submitted waitTick already.
+    // to consume, in order. The caller must have sealed waitTick (flushed it); the guard waits for its submit.
     public void Read(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick, ReadbackConsumer consume)
     {
         if (!PrepareMainQueueWait(_scheduler, waitTick, SubmitGuard))
