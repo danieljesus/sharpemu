@@ -785,6 +785,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"queue={_activeGuestQueue.Name} submission={_activeGuestQueue.SubmissionId} " +
                     $"request={requestId} addr=0x{displayBuffer.Address:X16} " +
                     $"size={extent.Width}x{extent.Height}");
+                if (RenderDocCapture.IsAvailable) // [local] the capture boundary must see the frame's work issued and submitted
+                {
+                    Gpu.Vulkan.CommandRing.DrainActive(Gpu.Vulkan.RingDrainReason.Capture);
+                    _scheduler.WaitAllSubmitted();
+                }
+
                 RenderDocCapture.OnGuestFlipBoundary(version);
                 VideoOutExports.TraceGpuFlip(_guestMemory, handle, index, flipMode, flipArg, displayBuffer.Address, VideoOutExports.GetFlipEventCount(requestId));
             }

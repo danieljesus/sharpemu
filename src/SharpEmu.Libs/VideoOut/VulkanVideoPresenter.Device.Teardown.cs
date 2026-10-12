@@ -22,6 +22,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             _vulkanReady = false;
             _scheduler?.WaitAllSubmitted(); // [local] idle must cover the work still queued for the submit thread
+            Gpu.Vulkan.CommandRing.DrainActive(Gpu.Vulkan.RingDrainReason.Shutdown); // [local] and the open buffer's records
             lock (_queueGate)
             {
                 _vk.DeviceWaitIdle(_device);

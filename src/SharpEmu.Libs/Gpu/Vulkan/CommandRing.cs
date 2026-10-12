@@ -218,6 +218,11 @@ internal sealed unsafe partial class CommandRing : IDisposable
         RingStats.Drained(reason, Stopwatch.GetTimestamp() - start);
     }
 
+    // On the recording thread: wait until every record appended so far, including those of the buffer still being
+    // recorded, has been issued. WaitAllSubmitted only covers sealed buffers, so teardown and swapchain recreation
+    // call this before they destroy objects the open buffer may reference.
+    public static void DrainActive(RingDrainReason reason) => Active?.Drain(reason);
+
     // Any thread: wait until the replay thread has issued records up to this position.
     public void WaitReplayed(long position)
     {
@@ -455,6 +460,8 @@ internal enum RingDrainReason
     InlineSubmit,
     Fallback,
     Shutdown,
+    Recreate,
+    Capture,
     Count,
 }
 
