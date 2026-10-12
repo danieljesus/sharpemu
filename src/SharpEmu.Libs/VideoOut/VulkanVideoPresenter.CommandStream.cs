@@ -309,8 +309,17 @@ internal static unsafe partial class VulkanVideoPresenter
             return _guestMemory.TryRead(address, destination);
         }
 
+        // [local] SHARPEMU_RELAY_GUARD (on by default; =0 disables): every draw and dispatch polls the relay; skip the
+        // measured scope and the call while nothing is queued. The relay loop checks the same counter.
+        private static readonly bool RelayGuard = Environment.GetEnvironmentVariable("SHARPEMU_RELAY_GUARD") != "0";
+
         public bool RunPendingCommands()
         {
+            if (RelayGuard && !_relay.HasPendingCommands) // [local]
+            {
+                return false;
+            }
+
             using var relayScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.QueueRelay);
             return _relay.RunPendingCommands();
         }
