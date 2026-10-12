@@ -32,7 +32,13 @@ internal sealed unsafe partial class CommandRing : IDisposable
     internal const int BlockSize = 256 * 1024;
     private const int MaxBlocks = 128;
     internal const int MaxPayload = BlockSize / 4;
-    private const int WakeEvery = 16;
+    // SHARPEMU_RECORD_RING_WAKE: records appended before a parked replay thread is woken (sync points wake it at
+    // once). SHARPEMU_RECORD_RING_SPIN_US: how long the replay thread spins on an empty ring before it parks.
+    private static readonly int WakeEvery = Math.Max(1, EnvInt("SHARPEMU_RECORD_RING_WAKE", 1));
+    private static readonly long SpinTicks = EnvInt("SHARPEMU_RECORD_RING_SPIN_US", 1000) * Stopwatch.Frequency / 1_000_000;
+
+    private static int EnvInt(string name, int fallback) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), out var value) && value >= 0 ? value : fallback;
 
     private sealed class Block
     {
@@ -365,16 +371,20 @@ internal sealed unsafe partial class CommandRing : IDisposable
 
     private void Idle(Block block)
     {
-        var spin = new SpinWait();
-        for (var index = 0; index < 40; index++)
+        var spinStart = Stopwatch.GetTimestamp();
+        do
         {
-            if (Volatile.Read(ref block.Published) > _readPos || _stop)
+            for (var index = 0; index < 16; index++)
             {
-                return;
-            }
+                if (Volatile.Read(ref block.Published) > _readPos || _stop)
+                {
+                    return;
+                }
 
-            spin.SpinOnce(sleep1Threshold: -1);
+                Thread.SpinWait(8);
+            }
         }
+        while (Stopwatch.GetTimestamp() - spinStart < SpinTicks);
 
         var start = Stopwatch.GetTimestamp();
         Volatile.Write(ref _parked, 1);
