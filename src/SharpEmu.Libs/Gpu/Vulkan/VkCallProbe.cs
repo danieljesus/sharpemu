@@ -16,7 +16,9 @@ internal static class VkCallProbe
 {
     public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_VKCALL_PROBE") == "1";
 
-    // One stack trace per this many handle accesses; the per-caller counts are scaled back.
+    // SHARPEMU_VKCALL_PROBE_CALLERS=1 also samples the handle's callers: one stack trace per this many accesses, the
+    // counts scaled back. It costs ~16 ms/frame and inflates the call times, so take the call times without it.
+    private static readonly bool SampleCallers = Environment.GetEnvironmentVariable("SHARPEMU_VKCALL_PROBE_CALLERS") == "1";
     private const int HandleSampleEvery = 32;
 
     internal enum Kind
@@ -63,7 +65,7 @@ internal static class VkCallProbe
 
     public static void CountHandle()
     {
-        if (Interlocked.Increment(ref _handles) % HandleSampleEvery != 0)
+        if (Interlocked.Increment(ref _handles) % HandleSampleEvery != 0 || !SampleCallers)
         {
             return;
         }
