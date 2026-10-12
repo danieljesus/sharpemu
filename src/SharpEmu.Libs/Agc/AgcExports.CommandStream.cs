@@ -177,7 +177,9 @@ public static partial class AgcExports
             if (_pipelines is null || _renderHost is null) return null;
             try
             {
-                inputs = RenderExecutor.ResolveProgramInputs(banks, _renderHost.FormatSupport, _renderHost.Limits, _renderHost.Fatal);
+                using (SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramInputs))
+                    inputs = RenderExecutor.ResolveProgramInputs(banks, _renderHost.FormatSupport, _renderHost.Limits, _renderHost.Fatal);
+                using var sourceScope = SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramSource);
                 return _pipelines.GetGraphicsPrograms(banks.Shader.Vertex, banks.Shader.Pixel, banks.Context.ShaderInterface, banks.Context,
                     inputs.ExportMapping, inputs.PixelActive, inputs.DepthBound);
             }

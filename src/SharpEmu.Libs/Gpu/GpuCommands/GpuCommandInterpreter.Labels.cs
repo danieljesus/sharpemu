@@ -460,7 +460,7 @@ public sealed partial class GpuCommandInterpreter
             return true;
         }
 
-        Suspend();
+        Suspend(SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.FlipSlot, 0);
         return false;
     }
 
@@ -520,7 +520,7 @@ public sealed partial class GpuCommandInterpreter
         _host.Flush();
         if (!_host.IsFlipDone((int)videoOutHandle, (int)displayBufferIndex))
         {
-            Suspend();
+            Suspend(SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.FlipDone, ((ulong)videoOutHandle << 32) | displayBufferIndex);
         }
     }
 }

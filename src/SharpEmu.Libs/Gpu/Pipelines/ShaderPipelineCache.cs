@@ -204,8 +204,10 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderStageResources vertexStage;
         ShaderStageResources pixelStage = default;
         SharpEmu.HLE.LockProbe.Probe(_gate, 24 + 1, "pipelines.gate_1");
+        SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
         lock (_gate)
         {
+            SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramLookup);
             var pushDataCursor = 0u;
             if (pixelSource is not null)
             {
@@ -225,6 +227,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 return new GraphicsPrograms { Available = false };
         }
 
+        SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramTail);
         vertexInfo.Stage = vertexStage;
         if (pixelInfo is not null)
         {
@@ -420,8 +423,10 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderProgram handle;
         ShaderStageResources stage;
         SharpEmu.HLE.LockProbe.Probe(_gate, 24 + 2, "pipelines.gate_2");
+        SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
         lock (_gate)
         {
+            SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramLookup);
             var pushDataCursor = 0u;
             var computeOptions = _computeOptions.Reset();
             computeOptions.ComputeInfo = input;
@@ -432,6 +437,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             }
         }
 
+        SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.PrepareCompute);
         input.Stage = stage;
         return new ComputeProgram { Program = handle, Input = input };
     }

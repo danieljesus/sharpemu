@@ -169,6 +169,8 @@ public sealed partial class GpuCommandInterpreter
 
         execution.Suspended = false;
         execution.MadeProgress = false;
+        LastSuspendKind = FrontProfile.SuspendKind.None;
+        LastSuspendAddress = 0;
         // Forwarding is local to this slice, never a cached signal from an older submission.
         _lastWriteLength = 0;
         _execution = execution;
@@ -214,7 +216,19 @@ public sealed partial class GpuCommandInterpreter
         _chainRequested = true;
     }
 
-    public void Suspend() => RequireExecution().Suspended = true;
+    public void Suspend() => Suspend(FrontProfile.SuspendKind.Other, 0);
+
+    // [local] Why the last run suspended, for SHARPEMU_PROFILE_FRONT.
+    internal FrontProfile.SuspendKind LastSuspendKind { get; private set; }
+
+    internal ulong LastSuspendAddress { get; private set; }
+
+    internal void Suspend(FrontProfile.SuspendKind kind, ulong address)
+    {
+        RequireExecution().Suspended = true;
+        LastSuspendKind = kind;
+        LastSuspendAddress = address;
+    }
 
     // A paired wait must still observe this queue's immediate label store when the CPU
     // resets the live address for the next frame between the two packets (Dead Cells).
@@ -270,7 +284,9 @@ public sealed partial class GpuCommandInterpreter
 
             var packetAddress = cursor.Address + ((ulong)cursor.Offset * sizeof(uint));
             var cursorEnd = cursor.Address + ((ulong)cursor.DwordCount * sizeof(uint));
-            var header = ReadHeader(cursorIndex, packetAddress, cursorEnd);
+            uint header;
+            using (FrontProfile.Measure(FrontProfile.Phase.StreamRead))
+                header = ReadHeader(cursorIndex, packetAddress, cursorEnd);
             _packetSerial++;
             var total = cursor.DwordCount;
             var remaining = cursor.Remaining;
@@ -287,6 +303,8 @@ public sealed partial class GpuCommandInterpreter
             if (header == 0 && cursor.FollowedChunkAdvance)
             {
                 execution.Suspended = true;
+                LastSuspendKind = FrontProfile.SuspendKind.RingChunk;
+                LastSuspendAddress = packetAddress;
                 return;
             }
 
@@ -325,9 +343,14 @@ public sealed partial class GpuCommandInterpreter
                 throw _host.Fatal($"The packet opcode is unknown: offset=0x{offset:X5} header=0x{header:X8} opcode=0x{opcode:X2} address=0x{packetAddress:X16}.");
             }
 
-            var payload = ReadPayload(cursorIndex, packetAddress, length - 1, cursorEnd);
+            ReadOnlySpan<uint> payload;
+            using (FrontProfile.Measure(FrontProfile.Phase.StreamRead))
+                payload = ReadPayload(cursorIndex, packetAddress, length - 1, cursorEnd);
             var packet = new PacketContext(header & ~1u, packetAddress, offset, remaining, total);
-            var consumed = handler(this, in packet, payload) + 1;
+            uint consumed;
+            if (FrontProfile.LoopEnabled) FrontProfile.Packets++;
+            using (FrontProfile.PhasesEnabled ? FrontProfile.Measure(FrontProfile.PacketPhase(opcode)) : default)
+                consumed = handler(this, in packet, payload) + 1;
             if (!KeepsWindow(opcode, header))
             {
                 DropWindow();

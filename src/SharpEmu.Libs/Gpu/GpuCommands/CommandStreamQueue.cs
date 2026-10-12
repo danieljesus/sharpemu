@@ -77,6 +77,13 @@ public sealed class CommandStreamQueue
 
     public ulong BlockedRetries { get; private set; }
 
+    // [local] The wait the last selected submission was blocked on, if it was (SHARPEMU_PROFILE_FRONT).
+    internal SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind LastRunBlockedKind { get; private set; }
+
+    internal ulong LastRunBlockedAddress { get; private set; }
+
+    internal long LastRunBlockedSince { get; private set; }
+
     public int FrameNumber => Volatile.Read(ref _doneCount);
 
     public bool IsStopping
@@ -406,6 +413,7 @@ public sealed class CommandStreamQueue
             if (IsControlBarrierReadyLocked())
             {
                 control = _controlBarriers.Dequeue();
+                LastRunBlockedKind = SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.None;
             }
             else
             {
@@ -418,6 +426,10 @@ public sealed class CommandStreamQueue
                 var queue = _queues[selected];
                 submission = queue.First!.Value;
                 queue.RemoveFirst();
+                LastRunBlockedKind = submission.BlockedKind;
+                LastRunBlockedAddress = submission.BlockedWaitAddress;
+                LastRunBlockedSince = submission.BlockedKind == SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.None ? 0 : submission.BlockedSinceTicks;
+                submission.BlockedKind = SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.None;
                 _submissionCount--;
                 _nextQueue = (selected + 1) % QueueCount;
             }
@@ -488,6 +500,12 @@ public sealed class CommandStreamQueue
                 submission!.Blocked = true;
                 submission.BlockedSinceTicks = System.Diagnostics.Stopwatch.GetTimestamp();
                 submission.BlockedPacketAddress = submission.Commands.CurrentPacketAddress;
+                if (_interpreters[submission.QueueId] is { } interpreter)
+                {
+                    submission.BlockedKind = interpreter.LastSuspendKind == SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.None
+                        ? SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Other : interpreter.LastSuspendKind;
+                    submission.BlockedWaitAddress = interpreter.LastSuspendAddress;
+                }
                 _queues[submission.QueueId].AddFirst(submission);
                 _submissionCount++;
                 result = submission.Commands.MadeProgress ? SliceResult.Progressed : SliceResult.BlockedWithoutProgress;

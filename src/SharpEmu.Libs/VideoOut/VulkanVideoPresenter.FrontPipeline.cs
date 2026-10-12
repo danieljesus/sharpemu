@@ -215,11 +215,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (FrontProfile.LoopEnabled) FrontProfile.Enqueues++;
+            using var enqueueScope = FrontProfile.Measure(FrontProfile.Phase.Enqueue);
             bool wasEmpty;
             lock (_gate)
             {
                 if (_items.Count >= capacity && _failure is null)
                 {
+                    using var backpressureScope = FrontProfile.Measure(FrontProfile.Phase.Backpressure);
                     beforeWait?.Invoke();
                     var waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                     while (_items.Count >= capacity && _failure is null)
@@ -289,6 +292,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (!completion.Done && _failure is null)
                 {
+                    using var syncScope = FrontProfile.Measure(FrontProfile.Phase.SyncWait);
                     beforeWait?.Invoke();
                     var waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                     while (!completion.Done && _failure is null)
@@ -384,6 +388,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryReadGuest(ulong address, Span<byte> destination)
         {
+            using var profileScope = FrontProfile.Measure(FrontProfile.Phase.CommandRead);
             // [local] Command memory the GPU may have written (indirect arguments, labels) is read
             // on the render thread, after the work queued before it, through the synchronized path.
             if (presenter.NeedsFrontCommandSync(address, (ulong)destination.Length))
@@ -454,6 +459,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void RecordEndOfPipe(in EndOfPipeWrite write)
         {
+            FrontProfile.NoteStreamWrite(write.Destination, 3);
             var copy = write;
             queue.Enqueue(() => presenter.RecordEndOfPipe(in copy), _pauseAlias, _resumeAlias);
         }
@@ -490,6 +496,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private RegisterBanks Snapshot()
         {
+            using var profileScope = FrontProfile.Measure(FrontProfile.Phase.Snapshot);
             var live = presenter.CommandStream.GetInterpreter(_queueId).TypedRegisters;
             if (!_snapshots.TryPop(out var snapshot))
             {
@@ -501,11 +508,17 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // [local] Taken with the banks: the render thread must not read the interpreter's live registers.
-        private KeyValuePair<uint, uint>[]? DrawRegisters() =>
-            _geometrySnapshots ? AgcExports.DrawShaderRegisters(presenter.CommandStream.GetInterpreter(_queueId)) : null;
+        private KeyValuePair<uint, uint>[]? DrawRegisters()
+        {
+            if (!_geometrySnapshots)
+                return null;
+            using var profileScope = FrontProfile.Measure(FrontProfile.Phase.DrawRegisters);
+            return AgcExports.DrawShaderRegisters(presenter.CommandStream.GetInterpreter(_queueId));
+        }
 
         public void DrawIndexed(ulong submitId, in DrawIndexedArguments arguments)
         {
+            if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
             var snapshot = Snapshot();
             var registers = DrawRegisters();
             var prepared = presenter.TryPrepareOnFront(() => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
@@ -525,6 +538,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void DrawAuto(ulong submitId, in DrawAutoArguments arguments)
         {
+            if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
             var snapshot = Snapshot();
             var registers = DrawRegisters();
             var prepared = presenter.TryPrepareOnFront(() => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
@@ -544,11 +558,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
         {
+            if (FrontProfile.LoopEnabled) FrontProfile.Dispatches++;
             var snapshot = Snapshot();
             if (indirectArgumentsAddress != 0) Interlocked.Increment(ref presenter.IndirectDirect); // [local]
+            var computeScope = FrontProfile.Measure(FrontProfile.Phase.PrepareCompute);
             var prepared = indirectArgumentsAddress == 0
                 ? presenter.TryPrepareComputeOnFront(() => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator))
                 : null;
+            computeScope.Dispose();
             queue.Enqueue(() =>
             {
                 try
@@ -575,6 +592,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DispatchIndirectDeferred(ulong submitId, ulong argumentsAddress, uint dispatchInitiator)
         {
             Interlocked.Increment(ref presenter.IndirectDeferred); // [local]
+            if (FrontProfile.LoopEnabled) FrontProfile.Dispatches++;
             var snapshot = Snapshot();
             queue.Enqueue(() =>
             {
@@ -606,7 +624,10 @@ internal static unsafe partial class VulkanVideoPresenter
         // reuse memory a queued draw still has to capture.
         public void WriteGuest(ulong address, ReadOnlySpan<byte> source)
         {
-            var bytes = source.ToArray();
+            FrontProfile.NoteStreamWrite(address, 1);
+            byte[] bytes;
+            using (FrontProfile.Measure(FrontProfile.Phase.WriteCopy))
+                bytes = source.ToArray();
             queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
         }
 
@@ -616,7 +637,10 @@ internal static unsafe partial class VulkanVideoPresenter
             // [local] The write records device copies, so it runs on the render thread, in order.
             // The front does not wait for it: until the render thread applies it, the front's own
             // reads see the new bytes through the pending-write overlay.
+            FrontProfile.NoteStreamWrite(address, 2);
+            var writeScope = FrontProfile.Measure(FrontProfile.Phase.WriteCopy);
             var bytes = source.ToArray();
+            writeScope.Dispose();
             if (!WriteOverlay)
             {
                 FrontSyncStats.Note(2);
@@ -686,7 +710,8 @@ internal static unsafe partial class VulkanVideoPresenter
             var cpuNow = Volatile.Read(ref _frontCpuTime);
             var cpu = cpuNow - _frontCpuReported;
             _frontCpuReported = cpuNow;
-            return FormattableString.Invariant(
+            var frontLines = string.Join("\n", FrontProfile.TakeReport(RenderPhaseProfile.LastReportFrames));
+            return (frontLines.Length != 0 ? frontLines + "\n" : string.Empty) + FormattableString.Invariant(
                 $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth} deferred_preps={Interlocked.Exchange(ref DeferredPreparations, 0)} indirect_direct={Interlocked.Exchange(ref IndirectDirect, 0)} indirect_deferred={Interlocked.Exchange(ref IndirectDeferred, 0)}");
         }
 
@@ -748,6 +773,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // The front: the slices the render thread ran before, on their own thread.
         private void FrontLoop()
         {
+            FrontProfile.BindFrontThread();
+            var pendingBlockedTicks = 0L; // [local] SHARPEMU_PROFILE_FRONT: idle with every head blocked, since the last progress
             try
             {
                 while (!_frontStop)
@@ -761,12 +788,14 @@ internal static unsafe partial class VulkanVideoPresenter
                     SliceResult result;
                     ResumeFrontAliasAccess();
                     var sliceStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                    FrontProfile.BeginSlice();
                     try
                     {
                         result = _commandStream.ProcessOne();
                     }
                     finally
                     {
+                        FrontProfile.EndSlice();
                         PauseFrontAliasAccess();
                         var sliceTicks = System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted;
                         Interlocked.Add(ref _frontBusyTicks, sliceTicks);
@@ -782,20 +811,60 @@ internal static unsafe partial class VulkanVideoPresenter
                         Interlocked.Add(ref _frontWorkTicks, System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted);
                     }
 
+                    if (FrontProfile.LoopEnabled)
+                    {
+                        var sliceEnded = System.Diagnostics.Stopwatch.GetTimestamp();
+                        var sliceTicks = sliceEnded - sliceStarted;
+                        if (result is SliceResult.Progressed or SliceResult.Completed)
+                        {
+                            FrontProfile.ProgressTicks += sliceTicks;
+                            var kind = _commandStream.LastRunBlockedKind;
+                            if (kind != FrontProfile.SuspendKind.None)
+                                FrontProfile.ChargeBlocked(kind, _commandStream.LastRunBlockedAddress, pendingBlockedTicks, sliceStarted - _commandStream.LastRunBlockedSince);
+                            else if (pendingBlockedTicks != 0)
+                                FrontProfile.BlockedUnattributedTicks += pendingBlockedTicks;
+                            pendingBlockedTicks = 0;
+                        }
+                        else if (result == SliceResult.NoWork)
+                        {
+                            FrontProfile.NoWorkTicks += sliceTicks;
+                        }
+                        else
+                        {
+                            FrontProfile.BlockedTicks += sliceTicks;
+                            pendingBlockedTicks += sliceTicks;
+                        }
+                    }
+
+                    var waitStarted = FrontProfile.LoopEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     switch (result)
                     {
                         case SliceResult.NoWork:
                             _commandStream.WaitForWork(8);
+                            if (FrontProfile.LoopEnabled) FrontProfile.NoWorkTicks += System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
                             break;
                         case SliceResult.AllBlocked:
                             RetryBlockedCommandStreamIfDue();
                             _commandStream.WaitForRetryInterval(1);
+                            if (FrontProfile.LoopEnabled)
+                            {
+                                var waited = System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
+                                FrontProfile.BlockedTicks += waited;
+                                pendingBlockedTicks += waited;
+                            }
+
                             break;
                         case SliceResult.BlockedWithoutProgress:
                             if (!_commandStream.HasUnblockedPending)
                             {
                                 RetryBlockedCommandStreamIfDue();
                                 _commandStream.WaitForRetryInterval(1);
+                                if (FrontProfile.LoopEnabled)
+                                {
+                                    var waited = System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
+                                    FrontProfile.BlockedTicks += waited;
+                                    pendingBlockedTicks += waited;
+                                }
                             }
 
                             break;

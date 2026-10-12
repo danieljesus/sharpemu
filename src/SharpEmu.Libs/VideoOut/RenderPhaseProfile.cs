@@ -218,6 +218,8 @@ internal static class RenderPhaseProfile
     // Set by a presenter that interprets on a front thread; its line joins the window report.
     internal static Func<string>? FrontReport;
 
+    internal static int LastReportFrames; // [local] frames of the window being reported
+
     internal static void RecordSubmissionArrival()
     {
         if (!FrameTraceEnabled) return;
@@ -481,6 +483,7 @@ internal static class RenderPhaseProfile
         var seconds = elapsedTicks / (double)Stopwatch.Frequency;
         var frames = _frames;
         _frames = 0;
+        LastReportFrames = (int)frames;
 
         var parts = new List<(Phase Phase, double Percent, long Entries, double Milliseconds)>((int)Phase.Count);
         var accounted = 0L;

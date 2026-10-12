@@ -43,7 +43,7 @@ public sealed partial class GpuCommandInterpreter
         {
             if (WaitProbe && (++_waitMisses & 0x7FF) == 0) // [local]
                 Console.Error.WriteLine($"[WAIT_MEM] misses={_waitMisses} address=0x{address:X} value=0x{value:X} reference=0x{reference:X} mask=0x{mask:X} compare={compareFunction} queue_wait_op=0x{waitOperation:X}");
-            Suspend();
+            Suspend(SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Memory, address);
         }
     }
 
@@ -96,7 +96,7 @@ public sealed partial class GpuCommandInterpreter
     {
         if (ConstantEngineCount <= DrawEngineCount && !ConstantEngineComplete)
         {
-            Suspend();
+            Suspend(SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.ConstantEngine, 0);
         }
     }
 
@@ -109,7 +109,7 @@ public sealed partial class GpuCommandInterpreter
 
         if (ConstantEngineCount - DrawEngineCount >= difference)
         {
-            Suspend();
+            Suspend(SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.DrawEngineDiff, 0);
         }
     }
 
@@ -117,7 +117,7 @@ public sealed partial class GpuCommandInterpreter
     {
         if (!valid)
         {
-            Suspend();
+            Suspend(SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Rewind, 0);
         }
     }
 

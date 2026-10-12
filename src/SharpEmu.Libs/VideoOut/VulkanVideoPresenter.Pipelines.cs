@@ -179,10 +179,12 @@ internal static unsafe partial class VulkanVideoPresenter
         internal GraphicsPrograms? TryPrepareOnFront(Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare, out RenderExecutor.DrawProgramInputs inputs)
         {
             _preparingOnFront = true;
+            var started = FrontProfile.LoopEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             try
             {
                 var (programs, prepared) = prepare();
                 inputs = prepared;
+                if (FrontProfile.LoopEnabled && programs is null) FrontProfile.DeferredPrepTicks += System.Diagnostics.Stopwatch.GetTimestamp() - started;
                 return programs;
             }
             catch (DeferPreparationException)
@@ -203,10 +205,12 @@ internal static unsafe partial class VulkanVideoPresenter
         internal ComputeProgram? TryPrepareComputeOnFront(Func<ComputeProgram?> prepare)
         {
             _preparingOnFront = true;
+            var started = FrontProfile.LoopEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             try
             {
                 SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.CurrentPlanHash = 0; // [local]
                 var program = prepare();
+                if (FrontProfile.LoopEnabled && program is null) FrontProfile.DeferredPrepTicks += System.Diagnostics.Stopwatch.GetTimestamp() - started;
                 if (FrontPrepLog && Interlocked.Increment(ref _frontPrepLogs) <= 20000)
                     Console.Error.WriteLine($"[FRONT_PREP] hash=0x{SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.CurrentPlanHash:X16} prepared={(program is null ? "no" : program.Available ? "yes" : "unavailable")} overlay={FrontOverlay.Count}");
                 return program;

@@ -129,4 +129,9 @@ public sealed class CommandSubmission
 
     // Address of the packet the blocked slice stopped on; diagnostics only.
     public ulong BlockedPacketAddress { get; internal set; }
+
+    // [local] What the head waits on while blocked (SHARPEMU_PROFILE_FRONT).
+    internal SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind BlockedKind { get; set; }
+
+    internal ulong BlockedWaitAddress { get; set; }
 }

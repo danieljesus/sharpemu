@@ -47,7 +47,7 @@ public sealed partial class GpuCommandInterpreter
 
         if (atomic.Command == 1 && !comparePassed)
         {
-            Suspend();
+            Suspend(SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Atomic, atomic.Address);
         }
 
         return 8;
@@ -84,7 +84,7 @@ public sealed partial class GpuCommandInterpreter
 
         if (priorValue == 0)
         {
-            Suspend();
+            Suspend(SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Semaphore, semaphore.Address);
         }
 
         return 3;
