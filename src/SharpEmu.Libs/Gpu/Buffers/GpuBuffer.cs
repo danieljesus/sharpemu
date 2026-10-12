@@ -180,6 +180,7 @@ public unsafe class GpuBuffer : IDisposable
     {
         GpuWriteObserver?.Invoke(CpuAddress, Size);
         var tick = _scheduler.CurrentTick;
+        GpuWriteHistory.Note(CpuAddress, Size, tick); // [local]
         if (tick > LastGpuWriteTick)
         {
             LastGpuWriteTick = tick;
@@ -210,6 +211,7 @@ public unsafe class GpuBuffer : IDisposable
         GpuWriteObserver?.Invoke(CpuAddress + offset, size);
 
         var tick = _scheduler.CurrentTick;
+        GpuWriteHistory.Note(CpuAddress + offset, size, tick); // [local]
         if (tick > LastGpuWriteTick)
         {
             LastGpuWriteTick = tick;
@@ -241,6 +243,34 @@ public unsafe class GpuBuffer : IDisposable
             {
                 tick = ticks[block];
             }
+        }
+
+        if (GpuWriteHistory.Narrows) // [local] never later than the block tick
+        {
+            var precise = GpuWriteHistory.LastWriteTick(CpuAddress + offset, size);
+            if (precise != 0 && precise < tick)
+            {
+                return precise;
+            }
+        }
+
+        return tick;
+    }
+
+    // [local] The block tick without the precise history (the verification of SHARPEMU_PRECISE_WRITE_TICKS=2).
+    internal ulong BlockWriteTick(ulong offset, ulong size)
+    {
+        if (!RangeWriteTicks || _blockWriteTicks is not { } ticks || size == 0)
+        {
+            return LastGpuWriteTick;
+        }
+
+        var tick = _wholeWriteTick;
+        var first = (int)(offset >> WriteTickBlockShift);
+        var last = (int)(Math.Min(offset + size - 1, Size - 1) >> WriteTickBlockShift);
+        for (var block = first; block <= last; block++)
+        {
+            tick = Math.Max(tick, ticks[block]);
         }
 
         return tick;

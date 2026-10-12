@@ -95,6 +95,10 @@ internal static unsafe partial class VulkanVideoPresenter
             if (_readbackQueueFamilyIndex is { } readbackFamily)
             {
                 _bufferCache.AsyncReadback = new Gpu.Vulkan.VulkanAsyncReadback(_deviceInfo, _scheduler, _readbackQueue, readbackFamily);
+                if (_syncReadbackQueue.Handle != 0) // [local] SHARPEMU_SYNC_READBACK_QUEUE
+                {
+                    _bufferCache.SyncReadback = new Gpu.Vulkan.VulkanAsyncReadback(_deviceInfo, _scheduler, _syncReadbackQueue, readbackFamily);
+                }
             }
         }
 

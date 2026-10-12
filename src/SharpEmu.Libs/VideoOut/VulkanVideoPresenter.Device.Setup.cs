@@ -679,6 +679,10 @@ internal static unsafe partial class VulkanVideoPresenter
         // family first, then a compute family. SHARPEMU_ASYNC_READBACK=0 keeps one queue.
         private uint? _readbackQueueFamilyIndex;
         private Queue _readbackQueue;
+        // [local] SHARPEMU_SYNC_READBACK_QUEUE=1: a second queue of the readback family for the render thread's synchronous reads.
+        private static readonly bool SyncReadbackQueue = Environment.GetEnvironmentVariable("SHARPEMU_SYNC_READBACK_QUEUE") == "1";
+        private uint _readbackQueueCount;
+        private Queue _syncReadbackQueue;
 
         private uint? SelectReadbackQueueFamily()
         {
@@ -706,11 +710,13 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 if ((flags & QueueFlags.TransferBit) != 0 && (flags & (QueueFlags.GraphicsBit | QueueFlags.ComputeBit)) == 0)
                 {
+                    _readbackQueueCount = families[index].QueueCount;
                     return index;
                 }
 
                 if ((flags & QueueFlags.ComputeBit) != 0 && (flags & QueueFlags.GraphicsBit) == 0)
                 {
+                    if (compute is null) _readbackQueueCount = families[index].QueueCount;
                     compute ??= index;
                 }
             }
@@ -730,6 +736,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void CreateDevice()
         {
             var priority = 1.0f;
+            var readbackPriorities = stackalloc float[2] { 1.0f, 1.0f };
             var queueInfos = stackalloc DeviceQueueCreateInfo[2];
             queueInfos[0] = new DeviceQueueCreateInfo
             {
@@ -746,8 +753,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     SType = StructureType.DeviceQueueCreateInfo,
                     QueueFamilyIndex = readbackFamily,
-                    QueueCount = 1,
-                    PQueuePriorities = &priority,
+                    QueueCount = SyncReadbackQueue && _readbackQueueCount >= 2 ? 2u : 1u,
+                    PQueuePriorities = readbackPriorities,
                 };
                 queueInfoCount = 2;
             }
@@ -1298,6 +1305,11 @@ internal static unsafe partial class VulkanVideoPresenter
             if (_readbackQueueFamilyIndex is { } readbackQueueFamily)
             {
                 _vk.GetDeviceQueue(_device, readbackQueueFamily, 0, out _readbackQueue);
+                if (SyncReadbackQueue && _readbackQueueCount >= 2)
+                {
+                    _vk.GetDeviceQueue(_device, readbackQueueFamily, 1, out _syncReadbackQueue);
+                    Console.Error.WriteLine($"[LOADER][INFO] Vulkan synchronous readback queue: family={readbackQueueFamily} index=1");
+                }
                 _deviceInfo.SharedQueueFamilies = [_queueFamilyIndex, readbackQueueFamily];
                 Console.Error.WriteLine($"[LOADER][INFO] Vulkan async readback queue: family={readbackQueueFamily} (main family={_queueFamilyIndex})");
             }

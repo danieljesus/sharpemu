@@ -277,6 +277,7 @@ public sealed partial class RenderExecutor
             if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0 || (useThreadDimensions && _dimsLogs++ < 3000)) Console.Error.WriteLine($"[DISPATCH_DIMS] shader=0x{compute.Address:X} thread_dims={useThreadDimensions} dims={dimsX}x{dimsY}x{dimsZ} local={compute.ThreadsX}x{compute.ThreadsY}x{compute.ThreadsZ} indirect=0x{dimsIndirect:X} initiator=0x{dispatchInitiator:X} groups={physicalGroups[0]}x{physicalGroups[1]}x{physicalGroups[2]}"); // [local]
             var hook = Gpu.Buffers.GuestBufferCache.PostDispatchHook; // [local]
             if (hook != null) { Gpu.Buffers.GuestBufferCache.PostDispatchHook = null; hook(); }
+            if (Gpu.Buffers.GuestBufferCache.EarlySubmitPending) { Gpu.Buffers.GuestBufferCache.EarlySubmitPending = false; Gpu.Buffers.GuestBufferCache.EarlySubmit?.Invoke(); } // [local] SHARPEMU_EARLY_WRITER_SUBMIT
             if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0) { var hooks = Gpu.Buffers.GuestBufferCache.PostDispatchHooks.ToArray(); Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Clear(); foreach (var h in hooks) h(); }
         }
 

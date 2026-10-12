@@ -335,7 +335,7 @@ internal sealed class ShaderProgramCache
         var snapshot = EmptySnapshot;
         var specialization = EmptySpecialization;
         var captureIndirectImageFailure = _spirvDumpEnabled ? ShaderPermutationDump.CreateFailureCapture(source) : null;
-        if (Diagnostics.GpuReadTrace.Enabled)
+        if (Diagnostics.GpuReadTrace.Enabled || Diagnostics.TableReadCensus.Enabled) // [local] census
         {
             Diagnostics.GpuReadTrace.CurrentShader = source.Hash;
             Diagnostics.GpuReadTrace.CurrentStage = source.Label;

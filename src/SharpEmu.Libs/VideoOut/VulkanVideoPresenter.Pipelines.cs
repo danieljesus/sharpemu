@@ -397,10 +397,31 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     // [local experiment] the pending command buffer may hold the writes this word depends on
                     if (FlushBeforeTableReads) { _flushedTableReads++; _scheduler.FlushAndWait(); }
+                    _bufferCache.NoteSyncTableRead(address, sizeof(uint)); // [local] SHARPEMU_EARLY_WRITER_SUBMIT
+                    var census = Diagnostics.TableReadCensus.Enabled; // [local]
+                    var censusTicks = default((ulong Own, ulong Window, ulong Precise, ulong Current, ulong Completed));
+                    var censusPre = 0u;
+                    var censusStarted = 0L;
+                    if (census)
+                    {
+                        Span<byte> pre = stackalloc byte[sizeof(uint)];
+                        censusPre = _guestMemory.TryRead(address, pre) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(pre) : 0;
+                        censusTicks = _bufferCache.CensusTicks(address, sizeof(uint));
+                        censusStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                    }
+
                     if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
                             SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
                     {
                         return false;
+                    }
+
+                    if (census)
+                    {
+                        var ms = System.Diagnostics.Stopwatch.GetElapsedTime(censusStarted).TotalMilliseconds;
+                        Span<byte> post = stackalloc byte[sizeof(uint)];
+                        var postWord = _guestMemory.TryRead(address, post) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(post) : censusPre;
+                        Diagnostics.TableReadCensus.Record(address, postWord != censusPre, ms, censusTicks.Own, censusTicks.Window, censusTicks.Precise, censusTicks.Current, censusTicks.Completed);
                     }
 
                     synchronized = true;

@@ -135,6 +135,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     {
         _device = device;
         _scheduler = scheduler;
+        if (EarlyWriterSubmit) EarlySubmit = () => { _earlySubmits++; _scheduler.Flush(); }; // [local]
         _relay = relay;
         _backing = backing;
         _faults = new BdaFaultProcessor(device, scheduler, this, CachingPageBits, CachingPageCount);
@@ -299,6 +300,20 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return tracked && completed;
     }
 
+    // [local] SHARPEMU_TABLE_READ_CENSUS: the writer tick of the range itself and the one the readback window waits for.
+    internal (ulong Own, ulong Window, ulong Precise, ulong Current, ulong Completed) CensusTicks(ulong address, ulong size)
+    {
+        var buffer = _registry.GetBuffer(FindBuffer(address, size));
+        var own = buffer.BlockWriteTick(buffer.Offset(address), size);
+        var window = 0UL;
+        foreach (var copy in CollectReadbackWindow(buffer, address, size, out _, out _))
+        {
+            window = Math.Max(window, copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size));
+        }
+
+        return (own, window, GpuWriteHistory.Enabled ? GpuWriteHistory.LastWriteTick(address, size) : own, _scheduler.CurrentTick, _scheduler.Timeline.CompletedTick);
+    }
+
     public bool TrySynchronizeCpuRead(ulong address, ulong size) =>
         TrySynchronizeCpuRead(address, size, GuestMemoryProfile.ReadbackSource.CpuReadSynchronization);
 
@@ -453,6 +468,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 Console.Error.WriteLine($"[DIRTY_WATCH] range=0x{guestAddress:X}+0x{size:X} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16} stage={Diagnostics.GpuReadTrace.CurrentStage} tick={_scheduler.CurrentTick} caller={(_dirtyWatchLogs < 6 ? new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
             if (size < BroadWriteBytes) _preciseGpuModifiedRanges.Add(guestAddress, size); // [local]
             NoteEverGpuWritten(guestAddress, size); // [local]
+            if (Diagnostics.TableReadCensus.Enabled) Diagnostics.TableReadCensus.NoteWrite(guestAddress, size, _scheduler.CurrentTick); // [local]
+            if (EarlyWriterSubmit && !EarlySubmitPending) NoteHotWordWrite(guestAddress, size); // [local]
             if (ReadbackTickLog) // [local] diagnostic: last writer tick per 4 KB page
                 for (var page = guestAddress >> 12; page <= (guestAddress + size - 1) >> 12; page++)
                     _pageWriteTicks[page] = _scheduler.CurrentTick;
@@ -1714,9 +1731,35 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             var classStarted = ReadbackClassLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
             var readbackClass = ReadbackClassLog ? ClassifyReadback(guestAddress, size, source) : -1;
+            var verify = !isWrite && GpuWriteHistory.Mode == 2 ? BeginPreciseTickCheck(copies[0].Buffer, guestAddress, size) : null; // [local]
+            var narrowed = !isWrite && GpuWriteHistory.Narrows && NarrowReadbackWindow(copies, guestAddress, size); // [local]
             DownloadBufferMemory(copies);
             if (readbackClass >= 0) NoteReadbackClass(readbackClass, System.Diagnostics.Stopwatch.GetTimestamp() - classStarted);
-            _tracker.ClearGpuDirtyPages(windowBegin, windowEnd - windowBegin);
+            if (narrowed)
+            {
+                // [local] Pieces left out stay GPU-dirty, and so do the pages they touch.
+                for (var page = windowBegin & ~(TrackerLayout.PageBytes - 1); page < windowEnd; page += TrackerLayout.PageBytes)
+                {
+                    if (!_gpuModifiedRanges.Overlaps(page, TrackerLayout.PageBytes))
+                    {
+                        _tracker.ClearGpuDirtyPages(page, TrackerLayout.PageBytes);
+                    }
+                }
+            }
+            else
+            {
+                _tracker.ClearGpuDirtyPages(windowBegin, windowEnd - windowBegin);
+            }
+
+            if (verify is not null)
+            {
+                EndPreciseTickCheck(verify, guestAddress, size);
+            }
+
+            if (narrowed && GpuWriteHistory.Mode == 3)
+            {
+                CheckNarrowedWindow(copies);
+            }
         }
 
         if (isWrite)
@@ -1726,6 +1769,276 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         RecordReadback(windowBegin, windowEnd, isWrite, copies, readbackStarted, source);
         return null;
+    }
+
+    // [local] SHARPEMU_EARLY_WRITER_SUBMIT=1: table words the render thread had to read while their writer was still in
+    // the batch being recorded are remembered; the next dispatch that writes one of them submits the batch right
+    // after it is recorded, so the GPU is already running it when the read comes.
+    internal static readonly bool EarlyWriterSubmit = Environment.GetEnvironmentVariable("SHARPEMU_EARLY_WRITER_SUBMIT") == "1";
+    internal static bool EarlySubmitPending;
+    internal static Action? EarlySubmit;
+    private const int HotReadWordCount = 16;
+    private readonly ulong[] _hotReadWords = new ulong[HotReadWordCount];
+    private int _hotReadNext;
+    private long _earlySubmits, _earlyReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    internal void NoteSyncTableRead(ulong address, ulong size)
+    {
+        if (!EarlyWriterSubmit)
+        {
+            return;
+        }
+
+        EarlySubmitPending = false;
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_earlyReport).TotalSeconds >= 5)
+        {
+            _earlyReport = System.Diagnostics.Stopwatch.GetTimestamp();
+            Console.Error.WriteLine($"[EARLY_WRITER_SUBMIT] submits={_earlySubmits} hot_words={string.Join(",", _hotReadWords.Where(word => word != 0).Select(word => $"0x{word:X}"))}");
+            _earlySubmits = 0;
+        }
+
+        if (address == 0 || FindOwner(address, size) is not { } owner ||
+            owner.GpuWriteTick(owner.Offset(address), size) < _scheduler.CurrentTick ||
+            Array.IndexOf(_hotReadWords, address) >= 0)
+        {
+            return;
+        }
+
+        _hotReadWords[_hotReadNext] = address;
+        _hotReadNext = (_hotReadNext + 1) % HotReadWordCount;
+    }
+
+    // Only a binding about the size of the word's record counts as its writer: wide bindings (a 40 MB append queue,
+    // a whole BVH blob) cover hot words without writing them and would submit after nearly every dispatch.
+    private static readonly ulong EarlyWriterMaxBytes = Convert.ToUInt64(Environment.GetEnvironmentVariable("SHARPEMU_EARLY_WRITER_MAX") ?? "100", 16);
+
+    private void NoteHotWordWrite(ulong guestAddress, ulong size)
+    {
+        if (size > EarlyWriterMaxBytes)
+        {
+            return;
+        }
+
+        foreach (var word in _hotReadWords)
+        {
+            if (word != 0 && guestAddress <= word && word < guestAddress + size)
+            {
+                EarlySubmitPending = true;
+                return;
+            }
+        }
+    }
+
+    // [local] SHARPEMU_PRECISE_WRITE_TICKS=1: a synchronous read waits for the last writer of the bytes it needs, not
+    // for the newest writer anywhere in its window. The window keeps every byte last written by that tick or
+    // earlier; only the ranges written after it are cut out (they stay GPU-dirty for a later read). Cutting the
+    // window down to the requested bytes instead turned one readback into several (one per header word).
+    private long _narrowedReads, _narrowedDropped, _narrowedSplit, _narrowedFallback, _narrowedReport = System.Diagnostics.Stopwatch.GetTimestamp();
+    private readonly List<(ulong Begin, ulong End)> _writtenAfter = new();
+    private const int MaxNarrowedPieces = 64;
+
+    private bool NarrowReadbackWindow(List<DownloadPiece> copies, ulong guestAddress, ulong size)
+    {
+        var owner = copies[0].Buffer;
+        if (!owner.IsInBounds(guestAddress, size))
+        {
+            return false;
+        }
+
+        var needed = owner.GpuWriteTick(owner.Offset(guestAddress), size);
+        var begin = ulong.MaxValue;
+        var end = 0UL;
+        var later = false;
+        foreach (var copy in copies)
+        {
+            begin = Math.Min(begin, copy.Address);
+            end = Math.Max(end, copy.Address + copy.Size);
+            later |= copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size) > needed;
+        }
+
+        ReportNarrowing();
+        if (!later)
+        {
+            return false;
+        }
+
+        _writtenAfter.Clear();
+        if (!GpuWriteHistory.CollectWrittenAfter(begin, end, needed, _writtenAfter) || _writtenAfter.Count == 0)
+        {
+            _narrowedFallback++;
+            return false;
+        }
+
+        _writtenAfter.Sort((left, right) => left.Begin.CompareTo(right.Begin));
+        var narrowed = new List<DownloadPiece>(copies.Count + 4);
+        foreach (var copy in copies)
+        {
+            if (copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size) <= needed)
+            {
+                narrowed.Add(copy);
+                continue;
+            }
+
+            var cursor = copy.Address;
+            var copyEnd = copy.Address + copy.Size;
+            var pieces = 0;
+            foreach (var (cutBegin, cutEnd) in _writtenAfter)
+            {
+                if (cutEnd <= cursor || cutBegin >= copyEnd)
+                {
+                    continue;
+                }
+
+                if (cutBegin > cursor)
+                {
+                    narrowed.Add(copy with { SourceOffset = copy.SourceOffset + (cursor - copy.Address), Address = cursor, Size = cutBegin - cursor });
+                    pieces++;
+                }
+
+                cursor = Math.Max(cursor, cutEnd);
+            }
+
+            if (cursor < copyEnd)
+            {
+                narrowed.Add(copy with { SourceOffset = copy.SourceOffset + (cursor - copy.Address), Address = cursor, Size = copyEnd - cursor });
+                pieces++;
+            }
+
+            if (pieces == 0) _narrowedDropped++; else _narrowedSplit++;
+        }
+
+        // The requested bytes must all still be downloaded; anything else keeps the whole window.
+        var covered = 0UL;
+        foreach (var piece in narrowed)
+        {
+            var overlapBegin = Math.Max(piece.Address, guestAddress);
+            var overlapEnd = Math.Min(piece.Address + piece.Size, guestAddress + size);
+            if (overlapBegin < overlapEnd) covered += overlapEnd - overlapBegin;
+        }
+
+        var requested = 0UL;
+        foreach (var copy in copies)
+        {
+            var overlapBegin = Math.Max(copy.Address, guestAddress);
+            var overlapEnd = Math.Min(copy.Address + copy.Size, guestAddress + size);
+            if (overlapBegin < overlapEnd) requested += overlapEnd - overlapBegin;
+        }
+
+        if (covered != requested || narrowed.Count > MaxNarrowedPieces)
+        {
+            _narrowedFallback++;
+            return false;
+        }
+
+        copies.Clear();
+        copies.AddRange(narrowed);
+        _narrowedReads++;
+        return true;
+    }
+
+    private void ReportNarrowing()
+    {
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_narrowedReport).TotalSeconds >= 5)
+        {
+            _narrowedReport = System.Diagnostics.Stopwatch.GetTimestamp();
+            Console.Error.WriteLine($"[PRECISE_WRITE_TICKS] narrowed_reads={_narrowedReads} dropped_pieces={_narrowedDropped} split_pieces={_narrowedSplit} fallbacks={_narrowedFallback}");
+            _narrowedReads = _narrowedDropped = _narrowedSplit = _narrowedFallback = 0;
+        }
+    }
+
+    // [local] SHARPEMU_PRECISE_WRITE_TICKS=2: the requested bytes are also copied after only their precise writer
+    // tick, and compared with what the normal readback (block ticks) brings back.
+    private long _preciseChecks, _preciseMismatches, _preciseSkipped, _preciseReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private byte[]? BeginPreciseTickCheck(GpuBuffer buffer, ulong guestAddress, ulong size)
+    {
+        if (AsyncReadback is not { } readback || size > 256 || !buffer.IsInBounds(guestAddress, size) || !GpuWriteHistory.Enabled)
+        {
+            return null;
+        }
+
+        var offset = buffer.Offset(guestAddress);
+        var block = buffer.BlockWriteTick(offset, size);
+        var precise = GpuWriteHistory.LastWriteTick(guestAddress, size);
+        if (precise == 0 || precise >= block)
+        {
+            _preciseSkipped++;
+            return null;
+        }
+
+        byte[]? captured = null;
+        readback.Read([new ReadbackPiece(buffer, offset, size)], precise, (_, bytes) => captured = bytes.ToArray());
+        return captured;
+    }
+
+    // [local] SHARPEMU_PRECISE_WRITE_TICKS=3: the pieces a narrowed window downloaded are copied again after the
+    // block ticks (everything recorded so far) and must match what the narrowed readback wrote.
+    private long _windowChecks, _windowMismatches, _windowReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private void CheckNarrowedWindow(List<DownloadPiece> copies)
+    {
+        if (AsyncReadback is not { } readback)
+        {
+            return;
+        }
+
+        var wait = 0UL;
+        var total = 0UL;
+        var pieces = new ReadbackPiece[copies.Count];
+        for (var index = 0; index < copies.Count; index++)
+        {
+            var copy = copies[index];
+            wait = Math.Max(wait, copy.Buffer.BlockWriteTick(copy.SourceOffset, copy.Size));
+            pieces[index] = new ReadbackPiece(copy.Buffer, copy.SourceOffset, copy.Size);
+            total += copy.Size;
+        }
+
+        if (total > 1UL << 20)
+        {
+            return;
+        }
+
+        if (wait >= _scheduler.CurrentTick)
+        {
+            _scheduler.Flush();
+        }
+
+        readback.Read(pieces, wait, (index, bytes) =>
+        {
+            var copy = copies[index];
+            var current = new byte[bytes.Length];
+            _windowChecks++;
+            if (!_backing.TryReadBacking(copy.Address, current) || !bytes.SequenceEqual(current))
+            {
+                if (_windowMismatches++ < 40)
+                    Console.Error.WriteLine($"[PRECISE_WRITE_TICKS] window mismatch piece=0x{copy.Address:X}+0x{copy.Size:X}");
+            }
+        });
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_windowReport).TotalSeconds >= 5)
+        {
+            _windowReport = System.Diagnostics.Stopwatch.GetTimestamp();
+            Console.Error.WriteLine($"[PRECISE_WRITE_TICKS] window_checks={_windowChecks} window_mismatches={_windowMismatches}");
+        }
+    }
+
+    private void EndPreciseTickCheck(byte[] captured, ulong guestAddress, ulong size)
+    {
+        Span<byte> final = stackalloc byte[(int)size];
+        if (_backing.TryReadBacking(guestAddress, final))
+        {
+            _preciseChecks++;
+            if (!final.SequenceEqual(captured))
+            {
+                if (_preciseMismatches++ < 40)
+                    Console.Error.WriteLine($"[PRECISE_WRITE_TICKS] mismatch address=0x{guestAddress:X} size=0x{size:X} precise=0x{Convert.ToHexString(captured)} block=0x{Convert.ToHexString(final)} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16}");
+            }
+        }
+
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_preciseReport).TotalSeconds >= 5)
+        {
+            _preciseReport = System.Diagnostics.Stopwatch.GetTimestamp();
+            Console.Error.WriteLine($"[PRECISE_WRITE_TICKS] checks={_preciseChecks} mismatches={_preciseMismatches} skipped={_preciseSkipped}");
+        }
     }
 
     // [local] The readback mirror (ReadbackMirror): the bytes of a small read whose last GPU writer was submitted, from
@@ -2203,6 +2516,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // Set when a second queue can copy readbacks; null keeps every readback on the main queue.
     internal VulkanAsyncReadback? AsyncReadback { get; set; }
 
+    // [local] SHARPEMU_SYNC_READBACK_QUEUE=1: the render thread's synchronous readbacks go through their own queue. On the
+    // shared queue a copy whose writer finished long ago still waited behind an asynchronous guest-thread copy that waits
+    // for the batch being recorded (the queue runs its submissions in order).
+    internal VulkanAsyncReadback? SyncReadback { get; set; }
+
     private const ulong AsyncReadbackLimit = 64UL << 20;
 
     // Packs pieces into the download ring, waits for the copy, then writes each through the backing alias.
@@ -2312,7 +2630,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private bool TryDownloadAsync(List<DownloadPiece> copies)
     {
-        if (AsyncReadback is not { } readback || copies.Count == 0)
+        if ((SyncReadback ?? AsyncReadback) is not { } readback || copies.Count == 0)
         {
             return false;
         }
