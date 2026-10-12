@@ -1649,7 +1649,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static long _reportedRetried;
 
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
-        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} published_pieces={Interlocked.Exchange(ref _reportedPublishedPieces, 0)} stale_pieces={Interlocked.Exchange(ref _reportedStalePieces, 0)} uniform_image_sources={TakeUniformImageSources()} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)} eager_muted={Interlocked.Exchange(ref _reportedEagerMuted, 0)} slots_full={VulkanAsyncReadback.TakeSlotsFull()}");
+        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} published_pieces={Interlocked.Exchange(ref _reportedPublishedPieces, 0)} stale_pieces={Interlocked.Exchange(ref _reportedStalePieces, 0)} uniform_image_sources={TakeUniformImageSources()} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)} eager_muted={Interlocked.Exchange(ref _reportedEagerMuted, 0)}");
 
     private sealed record PendingDownload
     {
