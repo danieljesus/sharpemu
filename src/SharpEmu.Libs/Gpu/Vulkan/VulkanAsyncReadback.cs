@@ -27,11 +27,16 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
     private readonly VkSemaphore _timeline;
     private readonly object _gate = new();
 
-    // [local] SHARPEMU_READBACK_SUBMIT_GUARD=1 waits for the submit thread to hand waitTick to the main queue before
-    // submitting the copy. Not needed: the copy runs on another queue and its wait is on a timeline semaphore, which may
-    // be submitted before its signal (wait-before-signal); the submit thread hands every sealed tick to the queue in
-    // order, and teardown waits for all of them before it idles the device or disposes this readback.
-    private static readonly bool SubmitGuard = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_SUBMIT_GUARD") == "1";
+    // [local] SHARPEMU_READBACK_SUBMIT_GUARD (on by default; =0 restores 2484f3fa): before a copy that waits on the main
+    // timeline for waitTick is submitted, wait until the submit thread has handed waitTick to the main queue, so the
+    // readback queue never holds a wait-before-signal. The GTA V intro hang (2026-10-12, ~1 in 50-140 sessions) left
+    // the submit thread, the record ring and the deferred uploads idle with empty queues and the render thread in the
+    // readback wait: every sealed tick was submitted, so the only GPU dependency left outstanding was such a cross-queue
+    // wait. It costs the render thread's own reads little: their copy cannot run before waitTick completes anyway.
+    internal static readonly bool SubmitGuard = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_SUBMIT_GUARD") != "0";
+
+    // [local] A readback wait longer than this reports where the ticks stand (timelines, sealed and submitted ticks).
+    private const ulong StallReportNs = 5_000_000_000;
     private ulong _signaled;
     private int _waiters;
     private bool _disposed;
@@ -43,10 +48,11 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         public bool Busy;
     }
 
-    internal sealed class Ticket(Slot slot, ulong value, ulong[] offsets, ulong[] sizes)
+    internal sealed class Ticket(Slot slot, ulong value, ulong waitTick, ulong[] offsets, ulong[] sizes)
     {
         public Slot Slot { get; } = slot;
         public ulong Value { get; } = value;
+        public ulong WaitTick { get; } = waitTick; // [local]
         public ulong[] Offsets { get; } = offsets;
         public ulong[] Sizes { get; } = sizes;
     }
@@ -92,6 +98,12 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
     // to consume, in order. The caller must have submitted waitTick already.
     public void Read(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick, ReadbackConsumer consume)
     {
+        if (!PrepareMainQueueWait(_scheduler, waitTick, SubmitGuard))
+        {
+            // The caller is the recording thread: nothing else would ever seal waitTick.
+            throw SubmissionScheduler.Fatal($"A synchronous readback waits for the unsealed tick {waitTick} (current {_scheduler.CurrentTick}).");
+        }
+
         Ticket ticket;
         lock (_gate)
         {
@@ -111,6 +123,11 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
     public bool TryBegin(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick, out Ticket? ticket)
     {
         ticket = null;
+        if (!PrepareMainQueueWait(_scheduler, waitTick, SubmitGuard))
+        {
+            return false;
+        }
+
         lock (_gate)
         {
             if (_disposed)
@@ -129,6 +146,37 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         }
 
         return false;
+    }
+
+    private static int _unsealedReports; // [local]
+
+    // [local] Before a copy that waits on the main timeline for waitTick is recorded and submitted. False when waitTick
+    // is still the tick being recorded: its signal is not sealed yet, and only the recording thread can seal it. With
+    // the guard, returns once the submit thread has handed waitTick to the main queue (at once without a submit thread).
+    internal static bool PrepareMainQueueWait(SubmissionScheduler scheduler, ulong waitTick, bool guard)
+    {
+        if (waitTick == 0)
+        {
+            return true;
+        }
+
+        if (waitTick >= scheduler.CurrentTick)
+        {
+            if (Interlocked.Increment(ref _unsealedReports) <= 4)
+            {
+                Console.Error.WriteLine($"[GPU][ERROR] readback wait for unsealed tick={waitTick} current={scheduler.CurrentTick} " +
+                    $"submitted={scheduler.SubmittedTick}");
+            }
+
+            return false;
+        }
+
+        if (guard)
+        {
+            scheduler.WaitSubmitted(waitTick);
+        }
+
+        return true;
     }
 
     public bool IsComplete(Ticket ticket)
@@ -181,7 +229,14 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             var probeStart = System.Diagnostics.Stopwatch.GetTimestamp(); // [local]
             using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.GpuCompletionWait))
             {
-                Require(vk.WaitSemaphores(_device.Device, &waitInfo, ulong.MaxValue), "vkWaitSemaphores(readback)");
+                var result = vk.WaitSemaphores(_device.Device, &waitInfo, StallReportNs);
+                if (result == Result.Timeout)
+                {
+                    ReportStall(ticket);
+                    result = vk.WaitSemaphores(_device.Device, &waitInfo, ulong.MaxValue);
+                }
+
+                Require(result, "vkWaitSemaphores(readback)");
             }
             VideoOut.RenderWaitProbe.Record("readback", probeStart);
         }
@@ -192,6 +247,20 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
                 _waiters--;
             }
         }
+    }
+
+    // [local] Tells which side a stalled readback waits on: the readback queue (main_completed >= wait_tick), the main
+    // queue (submitted >= wait_tick > main_completed) or the submit thread (submitted < wait_tick).
+    private void ReportStall(Ticket ticket)
+    {
+        ulong value = 0;
+        _ = _device.Vk.GetSemaphoreCounterValue(_device.Device, _timeline, &value);
+        var timeline = _scheduler.Timeline;
+        timeline.RefreshCompletedTick();
+        Console.Error.WriteLine($"[GPU][STALL] readback wait over {StallReportNs / 1_000_000_000} s: ticket={ticket.Value} " +
+            $"readback_value={value} signaled={Volatile.Read(ref _signaled)} wait_tick={ticket.WaitTick} " +
+            $"main_completed={timeline.CompletedTick} submitted={_scheduler.SubmittedTick} current={timeline.CurrentTick} " +
+            $"guard={SubmitGuard} thread={Environment.CurrentManagedThreadId}");
     }
 
     public void Complete(Ticket ticket, ReadbackConsumer? consume)
@@ -301,15 +370,10 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             SignalSemaphoreInfoCount = 1,
             PSignalSemaphoreInfos = &signal,
         };
-        if (waitTick != 0 && SubmitGuard)
-        {
-            // [local] A submit thread may still hold the main-queue submit that signals waitTick.
-            _scheduler.WaitSubmitted(waitTick);
-        }
-
+        // [local] PrepareMainQueueWait ran before the gate: with the guard, waitTick is already on the main queue.
         Require(vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback)");
         slot.Busy = true;
-        return new Ticket(slot, signalValue, offsets, sizes);
+        return new Ticket(slot, signalValue, waitTick, offsets, sizes);
     }
 
     public delegate void ReadbackConsumer(int index, ReadOnlySpan<byte> bytes);
