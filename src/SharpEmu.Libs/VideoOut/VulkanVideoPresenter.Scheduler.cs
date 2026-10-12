@@ -71,7 +71,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 this,
                 PrepareGuestSubmission,
                 CompleteGuestSubmission,
-                _ => WakeRenderThread());
+                _ => WakeRenderThread(),
+                SubmissionScheduler.SubmitThreadDefault); // [local]
         }
 
         // Both stores share the manager's page guard and read guest memory through its address space.

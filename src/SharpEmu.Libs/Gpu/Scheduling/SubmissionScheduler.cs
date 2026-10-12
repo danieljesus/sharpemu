@@ -48,10 +48,11 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     private readonly IRenderingState _rendering;
     private ulong _lastMemoryDrainTick;
 
-    // [local] SHARPEMU_SUBMIT_THREAD=1: the recording thread seals each buffer (end, tick, signal, completion work) and
-    // a submit thread joins its deferred uploads and calls vkQueueSubmit2, in tick order. Host waits on the timeline
-    // stay legal before the submit (wait-before-signal); present and the readback queue wait for the submit first.
-    internal static readonly bool SubmitThreadDefault = Environment.GetEnvironmentVariable("SHARPEMU_SUBMIT_THREAD") == "1";
+    // [local] SHARPEMU_SUBMIT_THREAD (on by default for the presenter; =0 disables): the recording thread seals each
+    // buffer (end, tick, signal, completion work) and a submit thread joins its deferred uploads and calls
+    // vkQueueSubmit2, in tick order. Host waits on the timeline stay legal before the submit (wait-before-signal);
+    // present and the readback queue wait for the submit first. A/B of 2026-10-12: -1.5 ms/frame, +0.47 FPS.
+    internal static readonly bool SubmitThreadDefault = Environment.GetEnvironmentVariable("SHARPEMU_SUBMIT_THREAD") != "0";
 
     private readonly record struct SealedSubmit(nint Buffer, SubmitBundle Bundle, ulong Tick, long Target, SubmissionTraceEntry Trace);
 
@@ -72,7 +73,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         Action<SubmitBundle>? prepareSubmit = null,
         Action<ulong>? submitted = null,
         Action<ulong>? completed = null,
-        bool? submitThread = null)
+        bool submitThread = false)
     {
         _device = device;
         _rendering = rendering;
@@ -84,7 +85,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _command = new RecordingBuffer(this, device, rendering);
         _priorityThread = new Thread(RunPriorityWorker) { IsBackground = true, Name = "SharpEmu GPU priority" };
         _priorityThread.Start();
-        if (submitThread ?? SubmitThreadDefault) // [local]
+        if (submitThread) // [local]
         {
             _submitThread = new Thread(RunSubmitWorker) { IsBackground = true, Name = "SharpEmu GPU submit" };
             _submitThread.Start();
