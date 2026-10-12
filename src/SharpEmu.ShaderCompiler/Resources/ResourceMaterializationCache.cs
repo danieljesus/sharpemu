@@ -70,7 +70,7 @@ public sealed class ResourceMaterializationCache
         var refreshes = Interlocked.Exchange(ref _totalRefreshes, 0);
         var total = hits + misses;
         return FormattableString.Invariant(
-            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()}");
+            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)}");
     }
 
     public bool Materialize(
@@ -86,14 +86,16 @@ public sealed class ResourceMaterializationCache
         var found = TryFind(key, plan, inputs, out var cached);
         if (found)
         {
+            if (StaleLog) _lastStaleReason = "nomatch";
             var unreadable = false;
             Entry? previous = null;
             for (var variant = cached; variant is not null; previous = variant, variant = variant.Next)
             {
                 if (!variant.Matches(plan, inputs))
                     continue;
-                if (Validate(variant, inputs, residentReader, out var variantUnreadable) &&
-                    variant.SnapshotFor(inputs, _patches) is { } hit)
+                var validated = Validate(variant, inputs, residentReader, out var variantUnreadable);
+                if (validated && StaleLog) _lastStaleReason = "snapshot";
+                if (validated && variant.SnapshotFor(inputs, _patches) is { } hit)
                 {
                     if (previous is not null)
                     {
@@ -126,6 +128,8 @@ public sealed class ResourceMaterializationCache
             Interlocked.Increment(ref _totalStale);
             if (unreadable)
                 Interlocked.Increment(ref _totalStaleUnreadable);
+            if (StaleLog)
+                NoteStale(plan.Hash, cached);
         }
 
         Misses++;
@@ -383,6 +387,32 @@ public sealed class ResourceMaterializationCache
     // of them is a patchable read: (word index, the draw's word).
     private readonly List<(int Word, uint Value)> _patches = new();
 
+    // [local] SHARPEMU_MATERIALIZE_STALE_LOG=1: why entries found by their key fail validation, by plan.
+    private static readonly bool StaleLog = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_STALE_LOG") == "1";
+    private string _lastStaleReason = "none";
+    private static readonly Dictionary<ulong, Dictionary<string, long>> _staleByPlan = new();
+    private static long _staleSamples;
+    private static readonly Dictionary<ulong, int> _staleLogged = new();
+
+    private void NoteStale(ulong planHash, Entry entry)
+    {
+        var words = entry.Bytes.Length / sizeof(uint);
+        lock (_staleByPlan)
+        {
+            if (!_staleByPlan.TryGetValue(planHash, out var reasons))
+                _staleByPlan[planHash] = reasons = new Dictionary<string, long>();
+            reasons[_lastStaleReason] = reasons.GetValueOrDefault(_lastStaleReason) + 1;
+            reasons[$"words{words}"] = reasons.GetValueOrDefault($"words{words}") + 1;
+            reasons[$"ranges{entry.RangeAddresses.Length}"] = reasons.GetValueOrDefault($"ranges{entry.RangeAddresses.Length}") + 1;
+            if ((++_staleSamples & 4095) == 0)
+            {
+                foreach (var (plan, counts) in _staleByPlan.OrderByDescending(pair => pair.Value.Where(kv => !kv.Key.StartsWith("words") && !kv.Key.StartsWith("ranges")).Sum(kv => kv.Value)).Take(10))
+                    Console.Error.WriteLine($"[MATERIALIZE_STALE] plan=0x{plan:X16} " + string.Join(" ", counts.OrderByDescending(kv => kv.Value).Take(12).Select(kv => $"{kv.Key}={kv.Value}")));
+                _staleByPlan.Clear();
+            }
+        }
+    }
+
     private bool Validate(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader, out bool unreadable)
     {
         unreadable = false;
@@ -390,7 +420,10 @@ public sealed class ResourceMaterializationCache
         for (var index = 0; index < entry.RangeAddresses.Length; index++)
         {
             if (!entry.TryRebase(index, inputs, out var address))
+            {
+                if (StaleLog) _lastStaleReason = $"rebase:r{index}:base{entry.RangeBase[index]}";
                 return false;
+            }
             var length = entry.RangeLengths[index];
             if (_scratch.Length < length)
                 _scratch = new byte[Math.Max(length, _scratch.Length * 2)];
@@ -398,12 +431,38 @@ public sealed class ResourceMaterializationCache
             if (!residentReader(address, current, entry.RangeClean[index]))
             {
                 unreadable = true;
+                if (StaleLog) _lastStaleReason = $"unreadable:r{index}:clean{entry.RangeClean[index]}";
                 return false;
             }
 
             var cached = entry.Bytes.AsSpan(entry.RangeOffsets[index], length);
             if (current.SequenceEqual(cached))
                 continue;
+            if (StaleLog)
+            {
+                var first = 0;
+                var changedWords = 0;
+                for (var offset = length - sizeof(uint); offset >= 0; offset -= sizeof(uint))
+                    if (!current.Slice(offset, sizeof(uint)).SequenceEqual(cached.Slice(offset, sizeof(uint))))
+                    {
+                        first = offset;
+                        changedWords++;
+                    }
+                var wordIndex = (entry.RangeOffsets[index] + first) / sizeof(uint);
+                lock (_staleByPlan)
+                {
+                    var logged = _staleLogged.GetValueOrDefault(entry.Plan.Hash);
+                    if (logged < 4 && _staleLogged.Count < 64)
+                    {
+                        _staleLogged[entry.Plan.Hash] = logged + 1;
+                        var info = entry.Plan.Info;
+                        Console.Error.WriteLine($"[MATERIALIZE_STALE_SAMPLE] plan=0x{entry.Plan.Hash:X16} range={index} address=0x{address:X} recorded=0x{entry.RangeAddresses[index]:X} base={entry.RangeBase[index]} " +
+                            $"cached={Convert.ToHexString(cached)} current={Convert.ToHexString(current)} buffers={info.Buffers.Count} images={info.Images.Count} samplers={info.Samplers.Count} sources={entry.Plan.DescriptorSources.Count} " +
+                            $"user_data=[{string.Join(",", entry.UserData.Select(word => word.ToString("X8")))}] draw_user_data=[{string.Join(",", Enumerable.Range(0, inputs.UserData.Count).Select(i => inputs.UserData[i].ToString("X8")))}]");
+                    }
+                }
+                _lastStaleReason = $"word:r{index}/{entry.RangeAddresses.Length}:len{length}:dw{first / sizeof(uint)}:changed{changedWords}:table{entry.WordTableOnly[wordIndex]}:patchable{entry.WordPatches?.ContainsKey(wordIndex) == true}:base{entry.RangeBase[index]}";
+            }
             if (entry.WordPatches is null)
                 return false;
             for (var offset = 0; offset < length; offset += sizeof(uint))
@@ -623,6 +682,8 @@ public sealed class ResourceMaterializationCache
         public void Reset()
         {
             _reads.Clear();
+            if (_memo.Count != 0)
+                _memo.Clear();
             // Retain ordinary descriptor walks without keeping unusually large
             // tables alive for the lifetime of the renderer.
             if (_reads.Capacity > 16384)
@@ -653,13 +714,34 @@ public sealed class ResourceMaterializationCache
             return _recordRead;
         }
 
+        // [local] SHARPEMU_MATERIALIZE_READ_MEMO=1: a word read again during the same walk returns the value the
+        // first read returned (the walk reads descriptor words several times); every read is still recorded.
+        internal static readonly bool ReadMemo = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_READ_MEMO") == "1";
+        private readonly Dictionary<ulong, uint> _memo = new();
+        internal static long MemoHits, MemoMisses;
+
         private bool Read(GuestWordReader inner, ulong address, out uint word, bool clean)
         {
-            if (!inner(address, out word))
+            var key = (address << 1) | (clean ? 1UL : 0UL);
+            if (ReadMemo && _memo.TryGetValue(key, out word))
             {
-                Failed = true;
-                return false;
+                MemoHits++;
             }
+            else
+            {
+                if (!inner(address, out word))
+                {
+                    Failed = true;
+                    return false;
+                }
+
+                if (ReadMemo)
+                {
+                    MemoMisses++;
+                    _memo[key] = word;
+                }
+            }
+
             _reads.Add((address, word, clean, _inTable, RuntimeValueEvaluator.CurrentReadBase, RuntimeValueEvaluator.CurrentReadNode));
             return true;
         }
