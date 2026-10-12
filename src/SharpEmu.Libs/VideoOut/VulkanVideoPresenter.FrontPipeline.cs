@@ -781,6 +781,12 @@ internal static unsafe partial class VulkanVideoPresenter
             _back!.RunPending(renderWorkDeadline);
         }
 
+        // [local] SHARPEMU_FRONT_POLL_BLOCKED=1: with every head blocked, the front retries them after each 1 ms wait,
+        // as the command processor polls its wait addresses. Without it a blocked head runs again only on a completed
+        // GPU tick, a presentation, a finished submission or after 100 ms without progress, so a label the guest CPU
+        // writes is seen late.
+        private static readonly bool PollBlocked = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_POLL_BLOCKED") == "1";
+
         // The front: the slices the render thread ran before, on their own thread.
         private void FrontLoop()
         {
@@ -856,7 +862,8 @@ internal static unsafe partial class VulkanVideoPresenter
                             break;
                         case SliceResult.AllBlocked:
                             RetryBlockedCommandStreamIfDue();
-                            _commandStream.WaitForRetryInterval(1);
+                            if (!_commandStream.WaitForRetryInterval(1) && PollBlocked)
+                                _commandStream.RetryBlocked();
                             if (FrontProfile.LoopEnabled)
                             {
                                 var waited = System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
@@ -869,7 +876,8 @@ internal static unsafe partial class VulkanVideoPresenter
                             if (!_commandStream.HasUnblockedPending)
                             {
                                 RetryBlockedCommandStreamIfDue();
-                                _commandStream.WaitForRetryInterval(1);
+                                if (!_commandStream.WaitForRetryInterval(1) && PollBlocked)
+                                    _commandStream.RetryBlocked();
                                 if (FrontProfile.LoopEnabled)
                                 {
                                     var waited = System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
