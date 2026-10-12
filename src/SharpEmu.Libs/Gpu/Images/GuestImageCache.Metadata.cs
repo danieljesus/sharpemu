@@ -16,10 +16,13 @@ public sealed partial class GuestImageCache
         in ImageRequest request,
         uint metadataBaseLayer)
     {
+        _dccClearCounts[(int)DccClearCount.Calls]++;
         if (request.Description.Metadata.Kind != MetadataKind.Dcc)
         {
             return;
         }
+
+        _dccClearCounts[(int)DccClearCount.Dcc]++;
 
         var description = request.Description;
         var range = description.Metadata.Range;
@@ -41,6 +44,7 @@ public sealed partial class GuestImageCache
             _surfaceMetadata.Remove(range.Address);
         }
 
+        _dccClearCounts[(int)DccClearCount.Eligible]++;
         var layers = description.TransferLayers;
         const ulong metadataBlockSize = 0x1000;
         if (!ImageDescription.IsValidRange(range) ||
@@ -71,6 +75,7 @@ public sealed partial class GuestImageCache
         if (_bufferCache.HasGpuDirtyBytes(synchronizedAddress, synchronizedSize))
         {
             using var readbackScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ImageLookupDccReadback); // [local]
+            _dccClearCounts[(int)DccClearCount.Readbacks]++;
             _bufferCache.ReadMemory(synchronizedAddress, synchronizedSize, isWrite: false);
         }
 
@@ -92,6 +97,7 @@ public sealed partial class GuestImageCache
                 }
 
                 var code = inPlace is null ? firstByte[0] : aliasCode;
+                _dccClearCounts[(int)DccClearCount.Slices]++;
                 if (!PackedClearValue.TryDecodeDccColor(
                         request.View.Format,
                         code * 0x01010101u,
@@ -102,6 +108,8 @@ public sealed partial class GuestImageCache
                     continue;
                 }
 
+                _dccClearCounts[(int)DccClearCount.KeyClear]++;
+                _dccClearCounts[(int)DccClearCount.ScannedBytes] += (long)sliceSize;
                 var scanned = inPlace is null ? null : TryScanInPlace(address, sliceSize, scan: true, code, out _);
                 var uniform = scanned ?? true;
                 for (ulong position = 0; scanned is null && position < sliceSize && uniform;)
@@ -129,6 +137,8 @@ public sealed partial class GuestImageCache
                     continue;
                 }
 
+                _dccClearCounts[(int)DccClearCount.Cleared]++;
+
                 using (var held = _lock.Hold())
                 {
                     if (_slots.TryGet(imageIdentifier) == null)
@@ -153,6 +163,25 @@ public sealed partial class GuestImageCache
         {
             System.Buffers.ArrayPool<byte>.Shared.Return(bytes);
         }
+    }
+
+    // [local] Where MaterializeDccClear's calls go, for [PERF][DCC_CLEAR]: every call, DCC requests, those past the
+    // single-level/sized early-outs, GPU-dirty readbacks, slices whose key was read, keys that decode to a clear,
+    // the bytes scanned for them, and slices cleared. Unsynchronized (render thread only).
+    private enum DccClearCount { Calls, Dcc, Eligible, Readbacks, Slices, KeyClear, ScannedBytes, Cleared, Count }
+
+    private static readonly long[] _dccClearCounts = new long[(int)DccClearCount.Count];
+
+    public static string TakeDccClearReport()
+    {
+        var counts = new long[(int)DccClearCount.Count];
+        for (var index = 0; index < counts.Length; index++)
+        {
+            counts[index] = Interlocked.Exchange(ref _dccClearCounts[index], 0);
+        }
+
+        return FormattableString.Invariant(
+            $"[PERF][DCC_CLEAR] calls={counts[0]} dcc={counts[1]} eligible={counts[2]} readbacks={counts[3]} slices={counts[4]} key_clear={counts[5]} scanned_kb={counts[6] / 1024} cleared={counts[7]}");
     }
 
     // [local] SHARPEMU_DCC_SCAN_IN_PLACE (on by default): the metadata key, or whether the whole slice repeats it, read

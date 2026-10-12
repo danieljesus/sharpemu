@@ -356,7 +356,26 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return CreateBuffer(guestAddress, size);
     }
 
-    private static readonly bool ObtainFastChecks = Environment.GetEnvironmentVariable("SHARPEMU_OBTAIN_FAST_CHECKS") != "0";
+    // [local] Where ObtainBuffer's calls go, for [PERF][BUFFER_OBTAIN]: the stream ring (with or without a buffer the
+    // caller already looked up), a failed stream map, or the cache buffer (prefound or looked up here); a cached
+    // result that was a stream candidate too large or not hot enough to stream is counted again.
+    private enum ObtainOutcome { Stream, StreamPrefound, StreamFailed, CachedPrefound, CachedLookup, CachedStreamCandidate, Count }
+
+    private static readonly long[] _obtainCounts = new long[(int)ObtainOutcome.Count];
+
+    public static string TakeObtainReport()
+    {
+        var counts = new long[(int)ObtainOutcome.Count];
+        for (var index = 0; index < counts.Length; index++)
+        {
+            counts[index] = Interlocked.Exchange(ref _obtainCounts[index], 0);
+        }
+
+        return FormattableString.Invariant(
+            $"[PERF][BUFFER_OBTAIN] stream={counts[0]} stream_prefound={counts[1]} stream_failed={counts[2]} cached_prefound={counts[3]} cached_lookup={counts[4]} cached_stream_candidate={counts[5]}");
+    }
+
+    private static readonly bool ObtainFastChecks =Environment.GetEnvironmentVariable("SHARPEMU_OBTAIN_FAST_CHECKS") != "0";
 
     public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false, ResourceSlotIdentifier bufferIdentifier = default)
     {
@@ -381,8 +400,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 _backing.TryReadBacking(guestAddress, _stream.Mapped.Slice((int)streamOffset, (int)size)))
             {
                 _stream.Commit();
+                _obtainCounts[bufferIdentifier.IsValid ? (int)ObtainOutcome.StreamPrefound : (int)ObtainOutcome.Stream]++;
                 return (_stream, streamOffset);
             }
+
+            _obtainCounts[(int)ObtainOutcome.StreamFailed]++;
         }
 
         // A GPU write into memory without backing could never download later; refuse it now.
@@ -396,6 +418,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             bufferIdentifier = FindBuffer(guestAddress, size);
             buffer = _registry.GetBuffer(bufferIdentifier);
+            _obtainCounts[(int)ObtainOutcome.CachedLookup]++;
+        }
+        else
+        {
+            _obtainCounts[(int)ObtainOutcome.CachedPrefound]++;
+        }
+
+        if (streamCandidate)
+        {
+            _obtainCounts[(int)ObtainOutcome.CachedStreamCandidate]++;
         }
 
         TouchBuffer(bufferIdentifier);
