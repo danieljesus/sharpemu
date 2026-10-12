@@ -212,9 +212,11 @@ public sealed class GuestPageTracker
                 _invalidations++;
                 if (SkipCpuDirtyWrites)
                 {
-                    // Pairs with the region lock an upload takes before clearing CPU-dirty bits and reading the
-                    // bytes: a writer that stored its bytes before this check either sees the cleared bit and takes
-                    // the lock, or saw the bit before it was cleared and the upload reads its bytes afterwards.
+                    // A writer that stored its bytes before this check either sees a bit an upload cleared and takes
+                    // the lock, or saw the bit before it was cleared, and then the upload reads its bytes afterwards.
+                    // The fence keeps the writer's byte stores ahead of this load; on the upload side the host
+                    // protection change (a kernel call) between clearing the bits and reading the bytes, directly
+                    // or through ApplyDeferredProtection, keeps the read after the clear.
                     Interlocked.MemoryBarrier();
                     if (region.IsCpuDirtyThroughout(offset, bytes))
                     {
