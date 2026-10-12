@@ -239,7 +239,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 label.Color[1] = 0.60f;
                 label.Color[2] = 1.00f;
                 label.Color[3] = 1.00f;
-                _cmdBeginDebugUtilsLabel(commandBuffer, &label);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginDebugUtilsLabel(_cmdBeginDebugUtilsLabel, commandBuffer, &label); // [local]
             }
         }
 
@@ -248,7 +248,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (_cmdEndDebugUtilsLabel is not null &&
                 commandBuffer.Handle != 0)
             {
-                _cmdEndDebugUtilsLabel(commandBuffer);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndDebugUtilsLabel(_cmdEndDebugUtilsLabel, commandBuffer); // [local]
             }
         }
 

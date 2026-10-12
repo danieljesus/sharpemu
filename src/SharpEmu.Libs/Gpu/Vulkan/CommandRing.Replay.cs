@@ -57,6 +57,8 @@ internal enum RingOp : ushort
     EndRenderPass,
     ResetQueryPool,
     WriteTimestamp2,
+    BeginDebugLabel,
+    EndDebugLabel,
     Count,
 }
 
@@ -208,6 +210,13 @@ internal static class RingArgs
     {
         public RenderPassBeginInfo Info;
         public SubpassContents Contents;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DebugLabel
+    {
+        public nint Function;
+        public DebugUtilsLabelEXT Label;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -490,6 +499,16 @@ internal sealed unsafe partial class CommandRing
                 vk.CmdWriteTimestamp2(command, args->Stage, args->Pool, args->First);
                 break;
             }
+            case RingOp.BeginDebugLabel:
+            {
+                var args = (RingArgs.DebugLabel*)payload;
+                args->Label.PLabelName = payload + sizeof(RingArgs.DebugLabel);
+                ((delegate* unmanaged<CommandBuffer, DebugUtilsLabelEXT*, void>)args->Function)(command, &args->Label);
+                break;
+            }
+            case RingOp.EndDebugLabel:
+                ((delegate* unmanaged<CommandBuffer, void>)(*(nint*)payload))(command);
+                break;
             default:
                 throw new InvalidOperationException($"Unknown record ring operation {op}.");
         }

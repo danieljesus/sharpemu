@@ -871,6 +871,48 @@ internal static unsafe class VkRecord
         vk.CmdResetQueryPool(command, pool, first, count);
     }
 
+    // VK_EXT_debug_utils labels, called through the device's function pointers.
+    public static void CmdBeginDebugUtilsLabel(delegate* unmanaged<CommandBuffer, DebugUtilsLabelEXT*, void> function, CommandBuffer command,
+        DebugUtilsLabelEXT* label)
+    {
+        if (Ring(command) is { } ring)
+        {
+            var length = 0;
+            while (label->PLabelName[length] != 0)
+            {
+                length++;
+            }
+
+            var payloadSize = sizeof(RingArgs.DebugLabel) + length + 1;
+            if (label->PNext == null && Fits(payloadSize))
+            {
+                var payload = ring.Reserve(RingOp.BeginDebugLabel, payloadSize);
+                var args = (RingArgs.DebugLabel*)payload;
+                args->Function = (nint)function;
+                args->Label = *label;
+                Unsafe.CopyBlockUnaligned(payload + sizeof(RingArgs.DebugLabel), label->PLabelName, (uint)length + 1);
+                ring.Commit();
+                return;
+            }
+
+            Fallback(ring, RingOp.BeginDebugLabel);
+        }
+
+        function(command, label);
+    }
+
+    public static void CmdEndDebugUtilsLabel(delegate* unmanaged<CommandBuffer, void> function, CommandBuffer command)
+    {
+        if (Ring(command) is { } ring)
+        {
+            *(nint*)ring.Reserve(RingOp.EndDebugLabel, sizeof(nint)) = (nint)function;
+            ring.Commit();
+            return;
+        }
+
+        function(command);
+    }
+
     public static void CmdWriteTimestamp2(Vk vk, CommandBuffer command, PipelineStageFlags2 stage, QueryPool pool, uint query)
     {
         if (Ring(command) is { } ring)
