@@ -381,6 +381,45 @@ public sealed unsafe partial class GuestImageCacheTests
         harness.Shutdown();
     }
 
+    // [local] The association map follows a stencil range that moves to another depth image.
+    [Fact]
+    public void ReassociatedStencil_IsDeletedWithItsCurrentDepthOwnerOnly()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x100000, ReadWrite);
+        var stencilAddress = address + 0x80000;
+        ImageRequest Combined(ulong depthAddress)
+        {
+            var request = LinearRequest(depthAddress, 0x10000, Format.D32Sfloat, GuestPixelFormat.Bits32Float, GuestImageType.Color2D, new Extent3D(1, 1, 1), 1, 4, 1);
+            request = AsDepthTarget(request, Format.D32Sfloat);
+            request.Description.Stencil = new GuestSpan(stencilAddress, 0x10000);
+            request.Description.PixelFormat = Format.D32SfloatS8Uint;
+            request.View = request.View with { Format = Format.D32SfloatS8Uint, Aspect = ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit };
+            return request;
+        }
+
+        var first = Combined(address + 0x20000);
+        var firstId = harness.Find(ref first);
+        var second = Combined(address + 0x40000);
+        var secondId = harness.Find(ref second);
+        Assert.NotEqual(firstId, secondId);
+        harness.Worker.Run(() => harness.Images.AssociateStencilForTest(firstId, first.Description.Stencil));
+        var proxy = harness.ProxyAt(stencilAddress, 0x10000);
+        Assert.Equal(firstId, harness.Image(proxy).DepthOwner);
+        harness.Worker.Run(() => harness.Images.AssociateStencilForTest(secondId, second.Description.Stencil));
+        Assert.Equal(proxy, harness.ProxyAt(stencilAddress, 0x10000));
+        Assert.Equal(secondId, harness.Image(proxy).DepthOwner);
+
+        harness.Worker.Run(() => harness.Images.DeleteImageForTest(firstId));
+        Assert.True(harness.Images.Contains(proxy));
+        Assert.Equal(1, harness.Images.StencilAssociationEntriesForTest);
+        harness.Worker.Run(() => harness.Images.DeleteImageForTest(secondId));
+        Assert.False(harness.Images.Contains(proxy));
+        Assert.Equal(0, harness.Images.StencilAssociationEntriesForTest);
+        harness.Shutdown();
+    }
+
     [Fact]
     public void DepthOnlyToCombined_RecreatesDepthAndAssociatesStencil()
     {

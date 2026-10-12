@@ -83,14 +83,9 @@ public sealed partial class GuestImageCache
 
         if (!image.DepthOwner.IsValid)
         {
-            var associations = new List<ResourceSlotIdentifier>();
-            _slots.ForEach((candidate, associated) =>
-            {
-                if (associated.DepthOwner == imageIdentifier)
-                {
-                    associations.Add(candidate);
-                }
-            });
+            var associations = StencilAssociationMap
+                ? TakeStencilAssociations(imageIdentifier)
+                : ScanStencilAssociations(imageIdentifier);
             foreach (var association in associations)
             {
                 var associated = _slots[association];
@@ -101,6 +96,10 @@ public sealed partial class GuestImageCache
 
                 DeleteImage(association);
             }
+        }
+        else if (StencilAssociationMap)
+        {
+            ForgetStencilAssociation(image.DepthOwner, imageIdentifier);
         }
 
         if (image.IsGpuModified)
@@ -124,6 +123,76 @@ public sealed partial class GuestImageCache
             _slots.Erase(imageIdentifier);
         }
     }
+
+    // [local] SHARPEMU_STENCIL_ASSOCIATION_MAP (on by default): the stencil associations of each depth image are
+    // kept in a map filled when they are made, so deleting a depth image no longer walks every slot (~31 us per
+    // delete in GTA V, growing with the session). 0 restores the walk.
+    private static readonly bool StencilAssociationMap = Environment.GetEnvironmentVariable("SHARPEMU_STENCIL_ASSOCIATION_MAP") != "0";
+
+    private readonly Dictionary<ResourceSlotIdentifier, List<ResourceSlotIdentifier>> _stencilAssociations = new();
+
+    private void RecordStencilAssociation(CachedImage record, ResourceSlotIdentifier association, ResourceSlotIdentifier depthImageIdentifier)
+    {
+        if (!StencilAssociationMap || record.DepthOwner == depthImageIdentifier)
+        {
+            return;
+        }
+
+        if (record.DepthOwner.IsValid)
+        {
+            ForgetStencilAssociation(record.DepthOwner, association);
+        }
+
+        if (!_stencilAssociations.TryGetValue(depthImageIdentifier, out var associations))
+        {
+            associations = new List<ResourceSlotIdentifier>(1);
+            _stencilAssociations.Add(depthImageIdentifier, associations);
+        }
+
+        associations.Add(association);
+    }
+
+    private void ForgetStencilAssociation(ResourceSlotIdentifier depthImageIdentifier, ResourceSlotIdentifier association)
+    {
+        if (_stencilAssociations.TryGetValue(depthImageIdentifier, out var associations) &&
+            associations.Remove(association) && associations.Count == 0)
+        {
+            _stencilAssociations.Remove(depthImageIdentifier);
+        }
+    }
+
+    // The recorded associations that still name this depth image; the entry leaves the map with it.
+    private List<ResourceSlotIdentifier> TakeStencilAssociations(ResourceSlotIdentifier depthImageIdentifier)
+    {
+        var associations = new List<ResourceSlotIdentifier>();
+        if (_stencilAssociations.Remove(depthImageIdentifier, out var recorded))
+        {
+            foreach (var association in recorded)
+            {
+                if (_slots.TryGet(association) is { } associated && associated.DepthOwner == depthImageIdentifier)
+                {
+                    associations.Add(association);
+                }
+            }
+        }
+
+        return associations;
+    }
+
+    private List<ResourceSlotIdentifier> ScanStencilAssociations(ResourceSlotIdentifier depthImageIdentifier)
+    {
+        var associations = new List<ResourceSlotIdentifier>();
+        _slots.ForEach((candidate, associated) =>
+        {
+            if (associated.DepthOwner == depthImageIdentifier)
+            {
+                associations.Add(candidate);
+            }
+        });
+        return associations;
+    }
+
+    internal int StencilAssociationEntriesForTest => _stencilAssociations.Count;
 
     private void ReleaseImage(ResourceSlotIdentifier imageIdentifier)
     {

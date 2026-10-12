@@ -619,6 +619,7 @@ public sealed partial class GuestImageCache
 
         var record = _slots[association];
         TouchImage(record);
+        RecordStencilAssociation(record, association, depthImageIdentifier); // [local]
         record.AssociateDepth(depthImageIdentifier);
         return association;
     }
