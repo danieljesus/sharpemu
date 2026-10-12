@@ -89,7 +89,7 @@ public sealed class SpanSetTests
     [Fact]
     public void Snapshot_ContainsMatchesTheSet()
     {
-        var random = new Random(1234);
+        var random = new System.Random(1234);
         var set = new SpanSet();
         Assert.False(set.Snapshot().Contains(0x1000, 1));
         for (var step = 0; step < 400; step++)
