@@ -351,11 +351,18 @@ internal sealed class ShaderProgramCache
         using (SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.Materialize))
         {
             // Failure capture needs the full walk, so a dump run bypasses the cache.
+            var frontStarted = SharpEmu.Libs.VideoOut.FrontProfile.Active ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+            var hitsBefore = _materializations?.Hits ?? 0;
+            var refreshesBefore = _materializations?.TableRefreshes ?? 0;
             var materialized = _materializations is not null && captureIndirectImageFailure is null
                 ? _materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
                     out var materializationFailure)
                 : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
                     captureIndirectImageFailure);
+            if (frontStarted != 0)
+                SharpEmu.Libs.VideoOut.FrontProfile.NoteMaterialize(
+                    _materializations is { } cache && cache.Hits != hitsBefore ? 0 : _materializations is { } refreshed && refreshed.TableRefreshes != refreshesBefore ? 1 : 2,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - frontStarted);
             if (!materialized)
             {
                 var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}.";

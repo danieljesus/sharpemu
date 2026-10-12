@@ -309,6 +309,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
+            using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.WordRead);
             if (OnFrontThread)
             {
                 if (NeedsBackRead(address, sizeof(uint)))
@@ -461,6 +462,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
+            using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.WordRead);
             if (OnFrontThread)
             {
                 if (NeedsBackRead(address, sizeof(uint)))
@@ -510,6 +512,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
             var size = (ulong)destination.Length;
+            using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.ResidentRead);
             if (OnFrontThread && NeedsBackRead(address, size))
             {
                 var buffer = new byte[destination.Length];

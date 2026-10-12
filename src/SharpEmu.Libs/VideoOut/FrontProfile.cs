@@ -36,6 +36,8 @@ internal static class FrontProfile
         Materialize,
         Permutation,
         StageResources,
+        ResidentRead,
+        WordRead,
         PrepareCompute,
         Enqueue,
         Backpressure,
@@ -88,7 +90,17 @@ internal static class FrontProfile
             _writers[address & ~3UL] = writer;
     }
 
-    internal static bool Active => _active;
+    internal static bool Active => PhasesEnabled && _active;
+
+    // Materialization calls by outcome: 0 hit, 1 table refresh, 2 miss (full walk).
+    private static readonly long[] _materializeTicks = new long[3];
+    private static readonly long[] _materializeCalls = new long[3];
+
+    internal static void NoteMaterialize(int outcome, long ticks)
+    {
+        _materializeTicks[outcome] += ticks;
+        _materializeCalls[outcome]++;
+    }
 
     // Called on the front thread once.
     internal static void BindFrontThread()
@@ -228,6 +240,14 @@ internal static class FrontProfile
             var bytes = Interlocked.Exchange(ref _allocated[index], 0);
             if (ticks != 0)
                 parts.Add(FormattableString.Invariant($"{(Phase)index}={Ms(ticks):F2}ms/n{entries}/kb{bytes / 1024}"));
+        }
+
+        string[] outcomes = ["hit", "refresh", "miss"];
+        for (var index = 0; index < 3; index++)
+        {
+            var ticks = Interlocked.Exchange(ref _materializeTicks[index], 0);
+            var calls = Interlocked.Exchange(ref _materializeCalls[index], 0);
+            parts.Add(FormattableString.Invariant($"Materialize_{outcomes[index]}={Ms(ticks):F2}ms/n{calls}/kb0"));
         }
 
         yield return $"[PERF][FRONT_PHASES] frames={frames} " + string.Join(" ", parts);
