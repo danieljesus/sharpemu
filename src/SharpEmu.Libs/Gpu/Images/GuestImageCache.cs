@@ -38,6 +38,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ulong _memoryPressureBytes = 1536 * MiB;
     private ulong _criticalMemoryBytes = 3072 * MiB;
     private ulong _collectionTick;
+
+    // [local] The tick image touches record (SHARPEMU_TARGET_MEMO).
+    public ulong CollectionTick => _collectionTick;
     private uint _queryEpoch;
     private bool _readbackLinearImages;
     private bool _disposed;

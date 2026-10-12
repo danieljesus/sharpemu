@@ -318,6 +318,8 @@ internal static unsafe partial class VulkanVideoPresenter
             return clamped;
         }
 
+        public TargetLookupStamp TargetLookupStamp => new(_imageCache.LookupGeneration, _scheduler.CurrentTick, _imageCache.CollectionTick); // [local]
+
         public ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat)
         {
             _ = BeginBatchedGuestCommands();

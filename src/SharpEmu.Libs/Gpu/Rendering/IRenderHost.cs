@@ -11,6 +11,12 @@ namespace SharpEmu.Libs.Gpu.Rendering;
 // A host buffer and the byte offset a guest address maps to inside it.
 public readonly record struct BufferBinding(ulong Handle, ulong Offset);
 
+// [local] The image cache's lookup generation, the scheduler tick and the image cache's collection tick.
+public readonly record struct TargetLookupStamp(ulong LookupGeneration, ulong Tick, ulong CollectionTick)
+{
+    public bool IsValid => LookupGeneration != 0;
+}
+
 // The packet arguments of a draw the host keeps until the next flip.
 public readonly record struct TargetlessDrawArguments(ulong SubmitId, bool Indexed, GpuCommands.DrawIndexedArguments Indexed_, GpuCommands.DrawAutoArguments Auto);
 
@@ -96,6 +102,10 @@ public interface IRenderHost
     ulong ClampMappedSize(ulong address, ulong size);
 
     ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat);
+
+    // [local] SHARPEMU_TARGET_MEMO: what a target lookup's result depends on besides its registers; the default never
+    // lets a remembered lookup be reused.
+    TargetLookupStamp TargetLookupStamp => default;
 
     void BindRenderTarget(ResourceSlotIdentifier image);
 

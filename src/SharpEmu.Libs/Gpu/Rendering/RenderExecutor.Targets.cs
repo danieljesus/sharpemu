@@ -36,16 +36,14 @@ public sealed partial class RenderExecutor
                 continue;
             }
 
-            var request = resolution.Request;
-            var image = _host.FindImage(ref request, exactFormat: false);
+            var image = FindColorTargetImage(context, resolvedSlot, in resolution); // [local] SHARPEMU_TARGET_MEMO
             _host.BindRenderTarget(image);
             state.Colors[(int)state.ColorCount++] = new ColorTargetState(in resolution, resolvedSlot, image);
         }
 
         if (DepthTargetResolver.Resolve(context, _host.FormatSupport, _fatal) is { } depthTarget)
         {
-            var request = depthTarget.Target.Request;
-            var image = _host.FindImage(ref request, exactFormat: false);
+            var image = FindDepthTargetImage(context, in depthTarget); // [local] SHARPEMU_TARGET_MEMO
             _host.BindRenderTarget(image);
             state.Depth = new DepthAttachmentState(in depthTarget, image);
         }
