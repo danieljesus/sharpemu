@@ -103,6 +103,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramSourceRead);
         RegisteredShader registered;
         ulong hash;
+        var identityScope = SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.SourceIdentity);
         if (_knownShaders.TryGetValue(codeAddress, out var known) &&
             ShaderIdentity.Compute(_context.Memory, codeAddress, known.CodeRanges, label) == known.Hash)
         {
@@ -117,6 +118,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             _knownShaders[codeAddress] = new KnownShader(hash, registered, ranges);
         }
 
+        identityScope.Dispose();
+        using var userDataScope = SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.SourceUserData);
         var userData = UserData(registers, declaredCount, probeWrittenRegisters, codeAddress, label);
         return new ShaderSource(registered, hash, userData, userDataBase, stage);
     }
@@ -176,6 +179,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 RenderTrace.Write($"PixelDrawState shader=0x{pixelSource.Address:X16} hash=0x{pixelSource.Hash:X16} " +
                     $"user_data=[{string.Join(",", pixelSource.UserData.Select(word => $"{word:X8}"))}]");
             using var pixelProfile = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PixelInputResolution);
+            using var pixelFront = SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.PixelInputs);
             var pixelProgram = _programs.Decode(pixelSource);
             var pixelFacts = PixelFactsOf(pixelProgram);
             attributeCount = pixelFacts.InterpolatedAttributeCount;
@@ -267,6 +271,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private VertexInputInfo PrepareVertexInput(ShaderSource source, ShaderInterfaceRegisters shaderInterface, ContextRegisters context)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VertexInputResolution);
+        using var frontScope = SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.VertexInputs);
         var clipSpace = default(ClipSpaceTransform);
         if (context.Clip.ClipDisable)
         {

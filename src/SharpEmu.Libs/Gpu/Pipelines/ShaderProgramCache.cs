@@ -303,6 +303,7 @@ internal sealed class ShaderProgramCache
         ProgramKey? key = null;
         ProgramSourceEntry? entry;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCacheLookup))
+        using (SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramKey))
         {
             BuildStaticState(source.Stage, options);
             var lookup = new ProgramKeyLookup(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, CollectionsMarshal.AsSpan(_staticState));
@@ -347,6 +348,7 @@ internal sealed class ShaderProgramCache
         }
 
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceMaterialization))
+        using (SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.Materialize))
         {
             // Failure capture needs the full walk, so a dump run bypasses the cache.
             var materialized = _materializations is not null && captureIndirectImageFailure is null
@@ -367,6 +369,7 @@ internal sealed class ShaderProgramCache
         var needsShaderDataLimits = IndirectLimitsInShaderData && source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeInfo &&
             IsIndirectThreadDispatch(computeInfo);
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPermutationLookup))
+        using (SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.Permutation))
         {
             foreach (var candidate in entry.Permutations)
             {
@@ -404,6 +407,7 @@ internal sealed class ShaderProgramCache
         ShaderProgramInfo program, ResourceSnapshot snapshot, ShaderSource source, StageCompileOptions options)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramResourceAssembly);
+        using var frontScope = SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.StageResources);
         return new(program, snapshot, source.Address)
         {
             ThreadLimits = source.Stage == ShaderStage.Compute && options.ComputeInfo is { DispatchThreadDimensions: true } compute
