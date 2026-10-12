@@ -91,27 +91,45 @@ internal static unsafe partial class VulkanVideoPresenter
                         }
                     }
 
-                    if (!Committed && FeedbackSnapshots is { } feedbackSnapshots)
-                    {
-                        foreach (var snapshot in feedbackSnapshots)
-                        {
-                            snapshot.Dispose();
-                        }
-                    }
-
                     if (Committed)
                     {
                         return;
                     }
 
+                    // [local] An abandoned preparation may already have recorded the feedback snapshot copies and the
+                    // host movie uploads into the current tick (and with the record ring they may not be replayed
+                    // yet), so their images and staging buffers are released once that tick completes.
+                    var snapshots = FeedbackSnapshots?.ToArray() ?? [];
+                    var staging = new List<(VkBuffer Buffer, DeviceMemory Memory)>();
                     foreach (var stage in Stages)
                     {
-                        owner.DestroyStageBindings(stage);
+                        owner.CollectStageStaging(stage, staging);
                     }
 
-                    foreach (var (buffer, memory) in OverflowBuffers)
+                    staging.AddRange(OverflowBuffers);
+                    if (snapshots.Length != 0 || staging.Count != 0)
                     {
-                        owner.RecycleHostBuffer(buffer, memory);
+                        void Release()
+                        {
+                            foreach (var snapshot in snapshots)
+                            {
+                                snapshot.Dispose();
+                            }
+
+                            foreach (var (buffer, memory) in staging)
+                            {
+                                owner.RecycleHostBuffer(buffer, memory);
+                            }
+                        }
+
+                        if (owner._scheduler.Active)
+                        {
+                            owner._scheduler.QueueCompletionAction(Release);
+                        }
+                        else
+                        {
+                            Release();
+                        }
                     }
                 }
                 finally

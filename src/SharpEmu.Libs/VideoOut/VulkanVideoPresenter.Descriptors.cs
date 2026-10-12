@@ -1296,13 +1296,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private void DestroyStageBindings(PreparedStageBindings stage)
+        private void CollectStageStaging(PreparedStageBindings stage, List<(VkBuffer Buffer, DeviceMemory Memory)> staging)
         {
             foreach (var texture in stage.Textures)
             {
                 if (texture is { StagingBuffer.Handle: not 0 })
                 {
-                    RecycleHostBuffer(texture.StagingBuffer, texture.StagingMemory);
+                    staging.Add((texture.StagingBuffer, texture.StagingMemory));
                 }
             }
         }
