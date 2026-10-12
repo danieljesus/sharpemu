@@ -214,8 +214,36 @@ internal static class FrontProfile
         return previous;
     }
 
+    // Queued CP writes: the time from the front queueing one to the render thread applying it, and for the
+    // addresses a blocked head waited on, the time from that write being applied to the head running again.
+    private static long _writeLatencyTicks, _writesApplied;
+    private static long _wakeTicks, _wakes;
+    private static readonly Dictionary<ulong, long> _appliedAt = new();
+
+    internal static void NoteWriteApplied(ulong address, long queuedTicks)
+    {
+        var now = Stopwatch.GetTimestamp();
+        Interlocked.Add(ref _writeLatencyTicks, now - queuedTicks);
+        Interlocked.Increment(ref _writesApplied);
+        lock (_appliedAt)
+            _appliedAt[address & ~3UL] = now;
+    }
+
     internal static void ChargeBlocked(SuspendKind kind, ulong address, long idleTicks, long blockedTicks)
     {
+        if (kind == SuspendKind.Memory)
+        {
+            long applied;
+            lock (_appliedAt)
+                applied = _appliedAt.GetValueOrDefault(address & ~3UL);
+            var now = Stopwatch.GetTimestamp();
+            if (applied != 0 && now - applied < Stopwatch.Frequency)
+            {
+                _wakeTicks += now - applied;
+                _wakes++;
+            }
+        }
+
         var writer = kind is SuspendKind.Memory or SuspendKind.Semaphore or SuspendKind.Atomic ? _writers.GetValueOrDefault(address & ~3UL) : (byte)0;
         lock (_blocked)
         {
@@ -233,6 +261,10 @@ internal static class FrontProfile
         var perFrame = Math.Max(frames, 1);
         yield return FormattableString.Invariant(
             $"[PERF][FRONT_SPLIT] frames={frames} progress_ms={Ms(Interlocked.Exchange(ref ProgressTicks, 0)):F1} nowork_ms={Ms(Interlocked.Exchange(ref NoWorkTicks, 0)):F1} blocked_ms={Ms(Interlocked.Exchange(ref BlockedTicks, 0)):F1} blocked_unattributed_ms={Ms(Interlocked.Exchange(ref BlockedUnattributedTicks, 0)):F1} draws={Interlocked.Exchange(ref Draws, 0)} dispatches={Interlocked.Exchange(ref Dispatches, 0)} enqueues={Interlocked.Exchange(ref Enqueues, 0)} packets={Interlocked.Exchange(ref Packets, 0)} deferred_prep_ms={Ms(Interlocked.Exchange(ref DeferredPrepTicks, 0)):F1}");
+        var writes = Interlocked.Exchange(ref _writesApplied, 0);
+        var wakes = Interlocked.Exchange(ref _wakes, 0);
+        yield return FormattableString.Invariant(
+            $"[PERF][FRONT_LABELS] writes_applied={writes} write_latency_ms_mean={(writes == 0 ? 0 : Ms(Interlocked.Exchange(ref _writeLatencyTicks, 0)) / writes):F3} wakes={wakes} wake_after_apply_ms_mean={(wakes == 0 ? 0 : Ms(Interlocked.Exchange(ref _wakeTicks, 0)) / wakes):F3}");
         (SuspendKind Kind, ulong Address, byte Writer, long IdleTicks, long Count, long BlockedTicks)[] blocked;
         lock (_blocked)
         {

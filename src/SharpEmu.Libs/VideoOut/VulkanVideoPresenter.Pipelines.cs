@@ -176,6 +176,59 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool DeferFrontPreparation = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_DEFER_PREP") != "0";
         internal long DeferredPreparations;
 
+        // [local] SHARPEMU_FRONT_SKIP_DEFERRING=1: programs whose last front preparations all came back empty (the
+        // render thread prepared them again, usually because they read GPU-written data) are left to the render
+        // thread without trying; one attempt in SkipRetryEvery checks whether that still holds. The render thread
+        // prepares a draw or dispatch the front did not, as it does for every preparation that came back empty.
+        private static readonly bool SkipDeferring = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SKIP_DEFERRING") == "1";
+        private const int SkipAfterEmpty = 4;
+        private const int SkipRetryEvery = 32;
+        private readonly Dictionary<ulong, int> _frontEmptyPreparations = new();
+        internal long SkippedPreparations;
+
+        private bool SkipFrontPreparation(ulong key)
+        {
+            if (!SkipDeferring || !_frontEmptyPreparations.TryGetValue(key, out var empty) || empty < SkipAfterEmpty)
+                return false;
+            _frontEmptyPreparations[key] = empty + 1;
+            if ((empty - SkipAfterEmpty) % SkipRetryEvery == SkipRetryEvery - 1)
+                return false;
+            SkippedPreparations++;
+            return true;
+        }
+
+        private void NoteFrontPreparation(ulong key, bool empty)
+        {
+            if (!SkipDeferring)
+                return;
+            if (!empty)
+                _frontEmptyPreparations.Remove(key);
+            else if (_frontEmptyPreparations.GetValueOrDefault(key) is var count && count < SkipAfterEmpty && (count != 0 || _frontEmptyPreparations.Count < 65536))
+                _frontEmptyPreparations[key] = count + 1;
+        }
+
+        internal GraphicsPrograms? TryPrepareOnFront(ulong key, Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare, out RenderExecutor.DrawProgramInputs inputs)
+        {
+            if (SkipFrontPreparation(key))
+            {
+                inputs = default;
+                return null;
+            }
+
+            var result = TryPrepareOnFront(prepare, out inputs);
+            NoteFrontPreparation(key, result is null);
+            return result;
+        }
+
+        internal ComputeProgram? TryPrepareComputeOnFront(ulong key, Func<ComputeProgram?> prepare)
+        {
+            if (SkipFrontPreparation(key))
+                return null;
+            var result = TryPrepareComputeOnFront(prepare);
+            NoteFrontPreparation(key, result is null);
+            return result;
+        }
+
         internal GraphicsPrograms? TryPrepareOnFront(Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare, out RenderExecutor.DrawProgramInputs inputs)
         {
             _preparingOnFront = true;

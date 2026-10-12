@@ -507,6 +507,10 @@ internal static unsafe partial class VulkanVideoPresenter
             return snapshot;
         }
 
+        // [local] The programs a draw names, for SHARPEMU_FRONT_SKIP_DEFERRING.
+        private static ulong GraphicsKey(RegisterBanks banks) =>
+            banks.Shader.Vertex.ExportAddress * 0x9E3779B97F4A7C15UL ^ banks.Shader.Pixel.Address;
+
         // [local] Taken with the banks: the render thread must not read the interpreter's live registers.
         private KeyValuePair<uint, uint>[]? DrawRegisters()
         {
@@ -521,7 +525,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
             var snapshot = Snapshot();
             var registers = DrawRegisters();
-            var prepared = presenter.TryPrepareOnFront(() => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
+            var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
             var copy = arguments;
             queue.Enqueue(() =>
             {
@@ -541,7 +545,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
             var snapshot = Snapshot();
             var registers = DrawRegisters();
-            var prepared = presenter.TryPrepareOnFront(() => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
+            var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
             var copy = arguments;
             queue.Enqueue(() =>
             {
@@ -563,7 +567,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (indirectArgumentsAddress != 0) Interlocked.Increment(ref presenter.IndirectDirect); // [local]
             var computeScope = FrontProfile.Measure(FrontProfile.Phase.PrepareCompute);
             var prepared = indirectArgumentsAddress == 0
-                ? presenter.TryPrepareComputeOnFront(() => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator))
+                ? presenter.TryPrepareComputeOnFront(snapshot.Shader.Compute.Address, () => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator))
                 : null;
             computeScope.Dispose();
             queue.Enqueue(() =>
@@ -628,6 +632,13 @@ internal static unsafe partial class VulkanVideoPresenter
             byte[] bytes;
             using (FrontProfile.Measure(FrontProfile.Phase.WriteCopy))
                 bytes = source.ToArray();
+            if (FrontProfile.LoopEnabled)
+            {
+                var queued = System.Diagnostics.Stopwatch.GetTimestamp();
+                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); FrontProfile.NoteWriteApplied(address, queued); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
         }
 
@@ -712,7 +723,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _frontCpuReported = cpuNow;
             var frontLines = string.Join("\n", FrontProfile.TakeReport(RenderPhaseProfile.LastReportFrames));
             return (frontLines.Length != 0 ? frontLines + "\n" : string.Empty) + FormattableString.Invariant(
-                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth} deferred_preps={Interlocked.Exchange(ref DeferredPreparations, 0)} indirect_direct={Interlocked.Exchange(ref IndirectDirect, 0)} indirect_deferred={Interlocked.Exchange(ref IndirectDeferred, 0)}");
+                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth} deferred_preps={Interlocked.Exchange(ref DeferredPreparations, 0)} skipped_preps={Interlocked.Exchange(ref SkippedPreparations, 0)} indirect_direct={Interlocked.Exchange(ref IndirectDirect, 0)} indirect_deferred={Interlocked.Exchange(ref IndirectDeferred, 0)}");
         }
 
         internal ICpuMemory GuestMemory => _guestMemory;
