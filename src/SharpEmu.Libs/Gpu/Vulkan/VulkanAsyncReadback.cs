@@ -17,7 +17,16 @@ public readonly record struct ReadbackPiece(GpuBuffer Source, ulong SourceOffset
 internal sealed unsafe class VulkanAsyncReadback : IDisposable
 {
     private const ulong Alignment = 16;
-    private const int SlotCount = 8;
+    // [local] SHARPEMU_ASYNC_READBACK_SLOTS (default 8, 2..64): slot 0 serves the synchronous Read; the others serve
+    // guest reads that wait off the GPU queue thread. A guest read that finds them all busy falls back to Read, which
+    // blocks the GPU queue thread until the copy lands.
+    private static readonly int SlotCount =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_READBACK_SLOTS"), out var slots) && slots is >= 2 and <= 64 ? slots : 8;
+
+    private static long _slotsFull;
+
+    // [local] TryBegin calls that found every asynchronous slot busy.
+    public static long TakeSlotsFull() => Interlocked.Exchange(ref _slotsFull, 0);
 
     private readonly GpuDeviceInfo _device;
     private readonly SubmissionScheduler _scheduler;
@@ -69,7 +78,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             SType = StructureType.CommandBufferAllocateInfo,
             CommandPool = _pool,
             Level = CommandBufferLevel.Primary,
-            CommandBufferCount = SlotCount,
+            CommandBufferCount = (uint)SlotCount,
         };
         var commands = stackalloc CommandBuffer[SlotCount];
         Require(vk.AllocateCommandBuffers(device.Device, &allocateInfo, commands), "vkAllocateCommandBuffers(readback)");
@@ -126,6 +135,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
                     return true;
                 }
             }
+
+            _slotsFull++;
         }
 
         return false;
