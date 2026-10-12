@@ -2017,6 +2017,8 @@ public static class KernelEventQueueCompatExports
 
     private static bool WriteKernelEvent(CpuContext ctx, ulong address, KernelQueuedEvent queuedEvent)
     {
+        if (VideoOut.LabelTrace.Enabled && queuedEvent.Filter == KernelEventFilterGraphics) // [local]
+            VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.EventDelivered, Environment.CurrentManagedThreadId, queuedEvent.Ident, queuedEvent.Data, queuedEvent.UserData);
         Span<byte> eventBytes = stackalloc byte[KernelEventSize];
         BinaryPrimitives.WriteUInt64LittleEndian(eventBytes[0x00..], queuedEvent.Ident);
         BinaryPrimitives.WriteInt16LittleEndian(eventBytes[0x08..], queuedEvent.Filter);

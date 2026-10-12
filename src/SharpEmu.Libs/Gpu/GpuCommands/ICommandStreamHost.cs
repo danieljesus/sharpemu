@@ -84,6 +84,13 @@ public interface ICommandStreamHost
     // Reads guest memory the GPU may have written; the host synchronizes GPU-owned pages first.
     bool TryReadGuest(ulong address, Span<byte> destination);
 
+    // [local] A label value this host's stream wrote that has not reached guest memory yet (SHARPEMU_FRONT_PENDING_LABELS).
+    bool TryReadPendingLabel(ulong address, int size, out ulong value)
+    {
+        value = 0;
+        return false;
+    }
+
     // Runs commands other threads posted to this worker. Called before every packet.
     // True when at least one command ran: it may have changed guest memory.
     bool RunPendingCommands();

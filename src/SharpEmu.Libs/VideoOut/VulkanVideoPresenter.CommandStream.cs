@@ -480,6 +480,8 @@ internal static unsafe partial class VulkanVideoPresenter
             using var completionScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandEndOfPipe);
             _ = BeginBatchedGuestCommands();
             var buffer = _scheduler.Current;
+            if (LabelTrace.Enabled && (write.EventId != 0 || write.Kind is EndOfPipeWriteKind.InterruptOnly || write.Kind >= EndOfPipeWriteKind.Flip || LabelTrace.IsWatched(write.Destination)))
+                LabelTrace.Note(LabelTrace.Kind.EopBack, -1, write.Destination, write.Value, (ulong)write.Kind | ((ulong)(uint)write.EventId << 8) | (_scheduler.CurrentTick << 32));
             if (Gpu.Buffers.GuestBufferCache.BvhWatch(write.Destination, 8)) Console.Error.WriteLine($"[BVH_CPWRITE] eop kind={write.Kind} destination=0x{write.Destination:X} value=0x{write.Value:X} tick={_scheduler.CurrentTick}");
             switch (write.Kind)
             {

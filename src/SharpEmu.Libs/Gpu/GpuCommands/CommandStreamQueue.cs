@@ -145,6 +145,7 @@ public sealed class CommandStreamQueue
 
     public void EnqueueGraphics(ulong address, uint dwordCount, ulong submissionId, object? geometrySnapshots)
     {
+        if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.GuestSubmit, 0, address, dwordCount); // [local]
         if (dwordCount == 0)
         {
             return;
@@ -164,6 +165,7 @@ public sealed class CommandStreamQueue
     // Compute queues are addressed 0x20 to 0x57; queue id 1 is the first of them.
     public void EnqueueCompute(uint queue, ulong address, uint dwordCount, ulong submissionId, object? geometrySnapshots)
     {
+        if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.GuestSubmit, (int)queue, address, dwordCount); // [local]
         if (queue < GpuCommandInterpreter.ComputeQueueBase || queue >= GpuCommandInterpreter.ComputeQueueBase + ComputeQueueCount)
         {
             throw _host.Fatal($"The compute queue is outside the supported range: queue=0x{queue:X}.");
@@ -377,6 +379,7 @@ public sealed class CommandStreamQueue
             }
 
             _lastCompletedGpuTick = completedTick;
+            if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.RetryOnTick, -1, 0, completedTick); // [local]
             RetryBlocked();
         }
     }

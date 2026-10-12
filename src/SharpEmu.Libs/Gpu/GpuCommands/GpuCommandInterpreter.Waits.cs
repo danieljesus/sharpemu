@@ -39,6 +39,17 @@ public sealed partial class GpuCommandInterpreter
             _ = WaitOperation.TryCompare(ownValue, reference, mask, compareFunction, out satisfied);
         }
 
+        // [local] SHARPEMU_FRONT_PENDING_LABELS=1: another queue's release the front queued and the render thread has
+        // not applied yet.
+        if (!satisfied && _host.TryReadPendingLabel(address, is64Bit ? sizeof(ulong) : sizeof(uint), out var pendingValue))
+        {
+            _ = WaitOperation.TryCompare(pendingValue, reference, mask, compareFunction, out satisfied);
+            if (satisfied)
+                value = pendingValue;
+        }
+
+        if (SharpEmu.Libs.VideoOut.LabelTrace.Enabled) SharpEmu.Libs.VideoOut.LabelTrace.WaitPolled(QueueId, address, value, reference, compareFunction, satisfied); // [local]
+
         if (!satisfied)
         {
             if (WaitProbe && (++_waitMisses & 0x7FF) == 0) // [local]

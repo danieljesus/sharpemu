@@ -124,14 +124,26 @@ public sealed class EndOfPipe
             {
                 var contextId = (uint)signal.CompletionData;
                 var eventId = signal.InterruptEventId;
-                scheduler.QueuePriorityCompletionAction(() => _sink.TriggerInterrupt(eventId, contextId));
+                var tick = scheduler.CurrentTick; // [local] SHARPEMU_LABEL_TRACE
+                if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.InterruptQueued, -1, signal.Destination ?? 0, tick, (ulong)(uint)eventId);
+                scheduler.QueuePriorityCompletionAction(() =>
+                {
+                    if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Interrupt, -1, 0, tick, (ulong)(uint)eventId);
+                    _sink.TriggerInterrupt(eventId, contextId);
+                });
                 return;
             }
 
             case EndOfPipeCompletion.Flip:
             {
                 var requestId = signal.CompletionData;
-                scheduler.QueuePriorityCompletionAction(() => _flips.CompleteFlip(requestId));
+                var tick = scheduler.CurrentTick; // [local] SHARPEMU_LABEL_TRACE
+                if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.FlipQueued, -1, 0, tick, requestId);
+                scheduler.QueuePriorityCompletionAction(() =>
+                {
+                    if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Flip, -1, 0, tick, requestId);
+                    _flips.CompleteFlip(requestId);
+                });
                 return;
             }
 
@@ -139,8 +151,11 @@ public sealed class EndOfPipe
             {
                 var requestId = signal.CompletionData;
                 var eventId = signal.InterruptEventId;
+                var tick = scheduler.CurrentTick; // [local] SHARPEMU_LABEL_TRACE
+                if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.FlipQueued, -1, 0, tick, requestId);
                 scheduler.QueuePriorityCompletionAction(() =>
                 {
+                    if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Flip, -1, 0, tick, requestId);
                     _flips.CompleteFlip(requestId);
                     _sink.TriggerInterrupt(eventId, 0);
                 });
@@ -230,7 +245,13 @@ public sealed class EndOfPipe
             throw SubmissionScheduler.Fatal("An end-of-pipe event requires the current command buffer.");
         }
 
-        scheduler.QueuePriorityCompletionAction(() => _sink.TriggerInterrupt(eventId, contextId));
+        var tick = scheduler.CurrentTick; // [local] SHARPEMU_LABEL_TRACE
+        if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.InterruptQueued, -1, 0, tick, (ulong)(uint)eventId);
+        scheduler.QueuePriorityCompletionAction(() =>
+        {
+            if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Interrupt, -1, 0, tick, (ulong)(uint)eventId);
+            _sink.TriggerInterrupt(eventId, contextId);
+        });
     }
 
     private static void ValidateSignal(in EndOfPipeSignal signal)

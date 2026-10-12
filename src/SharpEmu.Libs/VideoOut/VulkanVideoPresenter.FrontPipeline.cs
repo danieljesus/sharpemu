@@ -57,6 +57,67 @@ internal static unsafe partial class VulkanVideoPresenter
         }
     }
 
+    // [local] SHARPEMU_FRONT_PENDING_LABELS=1: the 4- and 8-byte stream writes (labels, release values) the front queued
+    // and the render thread has not applied yet, by address; only memory waits read them. Queues synchronize through
+    // such labels: one queue's release writes the value another queue's wait polls. The render thread runs everything
+    // in the order the front queued it, so the waiting queue's later work lands after the write either way; without
+    // this the front stalls until the render thread reaches the write (the back's backlog, 6-11 ms per hop in GTA V).
+    internal sealed class PendingLabels
+    {
+        internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PENDING_LABELS") == "1";
+        internal static long Reads, Satisfied;
+
+        private readonly Dictionary<ulong, (ulong Value, int Length, long Serial)> _labels = new();
+        private long _serial;
+        private int _count;
+
+        public long Add(ulong address, byte[] bytes)
+        {
+            if (bytes.Length is not (4 or 8))
+                return 0;
+            Span<byte> padded = stackalloc byte[8];
+            bytes.CopyTo(padded);
+            var value = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(padded);
+            lock (_labels)
+            {
+                var serial = ++_serial;
+                _labels[address] = (value, bytes.Length, serial);
+                Volatile.Write(ref _count, _labels.Count);
+                return serial;
+            }
+        }
+
+        public void Retire(ulong address, long serial)
+        {
+            if (serial == 0)
+                return;
+            lock (_labels)
+            {
+                if (_labels.TryGetValue(address, out var entry) && entry.Serial == serial)
+                    _labels.Remove(address);
+                Volatile.Write(ref _count, _labels.Count);
+            }
+        }
+
+        // The value a wait of size bytes at address reads once the pending write landed; a write that covers only
+        // part of the waited bytes is not used.
+        public bool TryRead(ulong address, int size, out ulong value)
+        {
+            value = 0;
+            if (Volatile.Read(ref _count) == 0)
+                return false;
+            lock (_labels)
+            {
+                if (!_labels.TryGetValue(address, out var entry) || entry.Length < size)
+                    return false;
+                value = size == 4 ? (uint)entry.Value : entry.Value;
+            }
+
+            Interlocked.Increment(ref Reads);
+            return true;
+        }
+    }
+
     // [local] Bytes the front wrote with WriteGuestNow that the render thread has not applied
     // yet, per dword. The front patches its reads with them; the render thread retires each
     // entry once it applied the write (unless a newer write to the dword is pending).
@@ -460,12 +521,17 @@ internal static unsafe partial class VulkanVideoPresenter
         public void RecordEndOfPipe(in EndOfPipeWrite write)
         {
             FrontProfile.NoteStreamWrite(write.Destination, 3);
+            if (LabelTrace.Enabled && (write.EventId != 0 || write.Kind is EndOfPipeWriteKind.InterruptOnly || LabelTrace.IsWatched(write.Destination)))
+                LabelTrace.Note(LabelTrace.Kind.EopFront, _queueId, write.Destination, write.Value, (ulong)write.Kind | ((ulong)(uint)write.EventId << 8));
             var copy = write;
             queue.Enqueue(() => presenter.RecordEndOfPipe(in copy), _pauseAlias, _resumeAlias);
         }
 
-        public void TriggerInterrupt(int eventId, uint contextId) =>
+        public void TriggerInterrupt(int eventId, uint contextId)
+        {
+            if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.FrontTrigger, _queueId, 0, (ulong)(uint)eventId, contextId);
             queue.Enqueue(() => presenter.TriggerInterrupt(eventId, contextId), _pauseAlias, _resumeAlias);
+        }
 
         public bool HasFlipSlot() => presenter.HasFlipSlot();
 
@@ -632,15 +698,37 @@ internal static unsafe partial class VulkanVideoPresenter
             byte[] bytes;
             using (FrontProfile.Measure(FrontProfile.Phase.WriteCopy))
                 bytes = source.ToArray();
+            var labelSerial = PendingLabels.Enabled ? presenter.FrontLabels.Add(address, bytes) : 0;
+            if (labelSerial != 0)
+                presenter.CommandStream.RetryBlocked(); // a blocked head may wait on this label
+            if (LabelTrace.Enabled && LabelTrace.IsWatched(address))
+            {
+                var traced = TraceValue(bytes);
+                var queueId = _queueId;
+                LabelTrace.Note(LabelTrace.Kind.CpQueued, queueId, address, traced);
+                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); LabelTrace.Note(LabelTrace.Kind.CpApplied, queueId, address, traced); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             if (FrontProfile.LoopEnabled)
             {
                 var queued = System.Diagnostics.Stopwatch.GetTimestamp();
-                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); FrontProfile.NoteWriteApplied(address, queued); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
+                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); FrontProfile.NoteWriteApplied(address, queued); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
+                return;
+            }
+
+            if (labelSerial != 0)
+            {
+                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
                 return;
             }
 
             queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
         }
+
+        // [local] SHARPEMU_FRONT_PENDING_LABELS=1: a memory wait also sees the label writes this front queued and the
+        // render thread has not applied yet (see PendingLabels).
+        public bool TryReadPendingLabel(ulong address, int size, out ulong value) => presenter.FrontLabels.TryRead(address, size, out value);
 
         // Data the stream reads back at once: the queued work captures what it replaces first.
         public void WriteGuestNow(ulong address, ReadOnlySpan<byte> source)
@@ -660,15 +748,25 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var serial = presenter.FrontOverlay.Add(address, bytes);
+            var traceNow = LabelTrace.Enabled && LabelTrace.IsWatched(address);
+            if (traceNow) LabelTrace.Note(LabelTrace.Kind.NowQueued, _queueId, address, TraceValue(bytes));
             queue.Enqueue(() =>
             {
                 presenter.WriteGuest(address, bytes);
+                if (traceNow) LabelTrace.Note(LabelTrace.Kind.NowApplied, -1, address, TraceValue(bytes));
                 presenter.NoteGuestWriteApplied();
                 presenter.FrontOverlay.Retire(address, bytes.Length, serial);
             }, _pauseAlias, _resumeAlias);
         }
 
         private static bool WriteOverlay => PendingWriteOverlay.Mode != 0;
+
+        private static ulong TraceValue(byte[] bytes)
+        {
+            Span<byte> value = stackalloc byte[8];
+            bytes.AsSpan(0, Math.Min(8, bytes.Length)).CopyTo(value);
+            return System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(value);
+        }
 
         public void RunAfterFlush(Action work) => queue.Enqueue(work, _pauseAlias, _resumeAlias);
 
@@ -684,6 +782,7 @@ internal static unsafe partial class VulkanVideoPresenter
     {
         private FrontCommandStreamHost? _front;
         internal readonly PendingWriteOverlay FrontOverlay = new(); // [local]
+        internal readonly PendingLabels FrontLabels = new(); // [local]
         private BackQueue? _back;
         private long _frontBusyTicks;
         private long _frontWorkTicks; // [local]
@@ -756,6 +855,16 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _back!.BindBackThread();
+            if (LabelTrace.Enabled) // [local]
+            {
+                var memory = GuestMemory;
+                LabelTrace.Reader = address =>
+                {
+                    Span<byte> bytes = stackalloc byte[8];
+                    return memory.TryRead(address, bytes) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes) : ulong.MaxValue;
+                };
+            }
+
             _frontThread = new Thread(FrontLoop) { IsBackground = true, Name = "GPU front" };
             _frontThread.Start();
             Console.Error.WriteLine("[LOADER][INFO] Vulkan VideoOut interprets command streams on a front thread (SHARPEMU_RENDER_PIPELINE=1).");

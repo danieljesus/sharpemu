@@ -594,6 +594,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         lock (_operationLock)
         {
             var tick = _timeline.ReserveTick();
+            if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Seal, -1, 0, tick); // [local]
             submit.AddSignal(_timeline.Handle, tick);
             item = new SealedSubmit(buffer, submit, tick, target, new SubmissionTraceEntry(tick, _command.DebugOp,
                 _command.DebugSubmitId, _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3,
@@ -656,6 +657,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
 
         SubmitThreadStats.Submitted(joined - start, System.Diagnostics.Stopwatch.GetTimestamp() - joined);
+        if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Submitted, -1, 0, item.Tick); // [local]
         return submitted;
     }
 
@@ -853,6 +855,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             }
 
             _timeline.Wait(operation.Tick);
+            if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.PriorityDone, -1, 0, operation.Tick); // [local]
             if (!Volatile.Read(ref _stopRequested))
             {
                 RunDeferredCallback(operation.Callback);
