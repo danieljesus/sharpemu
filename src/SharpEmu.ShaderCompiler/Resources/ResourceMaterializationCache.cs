@@ -135,6 +135,7 @@ public sealed class ResourceMaterializationCache
         Misses++;
         Interlocked.Increment(ref _totalMisses);
         var recorder = TakeRecorder();
+        var missStarted = MissLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         try
         {
             var recording = new ResourceRuntimeInputs
@@ -178,7 +179,35 @@ public sealed class ResourceMaterializationCache
         }
         finally
         {
+            if (MissLog)
+                NoteMiss(plan.Hash, found, recorder.Reads.Count, System.Diagnostics.Stopwatch.GetTimestamp() - missStarted);
             ReturnRecorder(recorder);
+        }
+    }
+
+    // [local] SHARPEMU_MATERIALIZE_MISS_LOG=1: full walks by plan (time, recorded reads, whether the key was found).
+    private static readonly bool MissLog = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_MISS_LOG") == "1";
+    private static readonly Dictionary<ulong, (long Ticks, long Count, long Reads, long Found)> _missByPlan = new();
+    private static long _missSamples;
+    private static long _missWindowStart = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private static void NoteMiss(ulong planHash, bool found, int reads, long ticks)
+    {
+        lock (_missByPlan)
+        {
+            var entry = _missByPlan.GetValueOrDefault(planHash);
+            _missByPlan[planHash] = (entry.Ticks + ticks, entry.Count + 1, entry.Reads + reads, entry.Found + (found ? 1 : 0));
+            if ((++_missSamples & 8191) != 0)
+                return;
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            var seconds = (now - _missWindowStart) / (double)System.Diagnostics.Stopwatch.Frequency;
+            _missWindowStart = now;
+            var total = _missByPlan.Values.Sum(value => value.Ticks);
+            Console.Error.WriteLine(FormattableString.Invariant($"[MATERIALIZE_MISS] window_s={seconds:F1} misses=8192 total_ms={total * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}"));
+            foreach (var (plan, value) in _missByPlan.OrderByDescending(pair => pair.Value.Ticks).Take(12))
+                Console.Error.WriteLine(FormattableString.Invariant(
+                    $"[MATERIALIZE_MISS] plan=0x{plan:X16} n={value.Count} ms={value.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} us_per={value.Ticks * 1e6 / System.Diagnostics.Stopwatch.Frequency / value.Count:F1} reads_per={value.Reads / (double)value.Count:F0} found={value.Found}"));
+            _missByPlan.Clear();
         }
     }
 

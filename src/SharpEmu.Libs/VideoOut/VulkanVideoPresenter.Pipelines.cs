@@ -310,6 +310,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.WordRead);
+            FrontProfile.NoteSite(FrontProfile.Phase.WordRead);
             if (OnFrontThread)
             {
                 if (NeedsBackRead(address, sizeof(uint)))
@@ -463,6 +464,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.WordRead);
+            FrontProfile.NoteSite(FrontProfile.Phase.WordRead);
             if (OnFrontThread)
             {
                 if (NeedsBackRead(address, sizeof(uint)))

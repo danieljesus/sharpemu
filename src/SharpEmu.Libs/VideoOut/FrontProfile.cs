@@ -82,15 +82,32 @@ internal static class FrontProfile
     // Who last wrote each address the stream wrote (front thread only): 1 a queued CP write, 2 an immediate CP write,
     // 3 an end-of-pipe write. A memory wait on an address the stream never wrote waits on the guest CPU or the GPU's shaders.
     private static readonly Dictionary<ulong, byte> _writers = new();
-    private static readonly string[] WriterNames = ["?", "cp", "cpnow", "eop"];
+    // An end-of-pipe label write is a queued CP write of the value followed by the end-of-pipe record: "cp+eop".
+    private static readonly string[] WriterNames = ["?", "cp", "cpnow", "eop", "cp+eop"];
 
     internal static void NoteStreamWrite(ulong address, byte writer)
     {
-        if (LoopEnabled && address != 0)
-            _writers[address & ~3UL] = writer;
+        if (!LoopEnabled || address == 0)
+            return;
+        var key = address & ~3UL;
+        _writers[key] = writer == 3 && _writers.GetValueOrDefault(key) is 1 or 4 ? (byte)4 : writer;
     }
 
     internal static bool Active => PhasesEnabled && _active;
+
+    // Sampled call sites of a phase (one stack every 1024 calls), for the phases whose callers are not obvious.
+    private static readonly Dictionary<string, long> _sites = new();
+    [ThreadStatic] private static int _siteCounter;
+
+    internal static void NoteSite(Phase phase)
+    {
+        if (!PhasesEnabled || !_active || (++_siteCounter & 1023) != 0)
+            return;
+        var frames = new StackTrace(1, false).GetFrames();
+        var site = phase + ": " + string.Join(" < ", frames.Take(7).Select(frame => frame.GetMethod() is { } method ? $"{method.DeclaringType?.Name}.{method.Name}" : "?"));
+        lock (_sites)
+            _sites[site] = _sites.GetValueOrDefault(site) + 1024;
+    }
 
     // Materialization calls by outcome: 0 hit, 1 table refresh, 2 miss (full walk).
     private static readonly long[] _materializeTicks = new long[3];
@@ -251,5 +268,11 @@ internal static class FrontProfile
         }
 
         yield return $"[PERF][FRONT_PHASES] frames={frames} " + string.Join(" ", parts);
+        lock (_sites)
+        {
+            foreach (var (site, count) in _sites.OrderByDescending(pair => pair.Value).Take(8))
+                yield return FormattableString.Invariant($"[PERF][FRONT_SITES] per_frame={count / (double)perFrame:F0} {site}");
+            _sites.Clear();
+        }
     }
 }
