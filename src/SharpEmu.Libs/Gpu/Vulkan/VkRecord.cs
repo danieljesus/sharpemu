@@ -20,7 +20,27 @@ internal static unsafe class VkRecord
     private static CommandRing? Ring(CommandBuffer command)
     {
         var ring = CommandRing.Active;
-        return ring != null && ring.ProducerBuffer == command.Handle && command.Handle != 0 ? ring : null;
+        if (ring == null)
+        {
+            return null;
+        }
+
+        if (ring.ProducerBuffer == command.Handle && command.Handle != 0)
+        {
+            if (CommandRing.Check)
+            {
+                ring.CheckProducerThread();
+            }
+
+            return ring;
+        }
+
+        if (CommandRing.Check)
+        {
+            ring.CheckDirect(command.Handle);
+        }
+
+        return null;
     }
 
     private static void Fallback(CommandRing ring, RingOp op)

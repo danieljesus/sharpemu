@@ -27,6 +27,12 @@ internal sealed unsafe partial class CommandRing : IDisposable
     // no image or buffer appears twice.
     internal static readonly bool MergeBarriers = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_RING_MERGE") == "1";
 
+    // SHARPEMU_RECORD_RING_CHECK=1: every VkRecord call checks that a record for the ring's buffer comes from the
+    // recording thread, and that no command reaches a buffer the ring owns while that buffer is not the one being
+    // recorded (a record after its end, or before its begin). A direct vk.Cmd* call that bypasses VkRecord cannot be
+    // seen here; the source scan in CommandRingSourceTests covers that.
+    internal static readonly bool Check = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_RING_CHECK") == "1";
+
     // The ring the wrappers append to. One device, one ring.
     internal static CommandRing? Active;
 
@@ -192,6 +198,39 @@ internal sealed unsafe partial class CommandRing : IDisposable
         *(nint*)payload = buffer;
         Commit();
         ProducerBuffer = buffer;
+        if (Check)
+        {
+            lock (_owned)
+            {
+                _owned.Add(buffer);
+            }
+        }
+    }
+
+    private readonly HashSet<nint> _owned = new();
+
+    // SHARPEMU_RECORD_RING_CHECK=1: a record for the ring's buffer from another thread.
+    internal void CheckProducerThread()
+    {
+        if (Environment.CurrentManagedThreadId != _producerThread)
+        {
+            RingStats.CheckViolation($"a command for the ring's buffer from thread {Environment.CurrentManagedThreadId}, not the recording thread {_producerThread}");
+        }
+    }
+
+    // SHARPEMU_RECORD_RING_CHECK=1: a command that would go straight to the driver on a buffer the ring records.
+    internal void CheckDirect(nint buffer)
+    {
+        bool owned;
+        lock (_owned)
+        {
+            owned = _owned.Contains(buffer);
+        }
+
+        if (owned)
+        {
+            RingStats.CheckViolation($"a command for ring buffer 0x{buffer:X} while it is not being recorded (recording 0x{ProducerBuffer:X})");
+        }
     }
 
     public long EndBuffer(nint buffer)
@@ -472,6 +511,17 @@ internal static class RingStats
     private static readonly long[] _drainTicks = new long[(int)RingDrainReason.Count];
     private static readonly long[] _fallbacks = new long[(int)RingOp.Count];
     private static long _merged, _mergedCalls;
+    private static long _checkViolations;
+    private static int _checkReported;
+
+    public static void CheckViolation(string what)
+    {
+        Interlocked.Increment(ref _checkViolations);
+        if (Interlocked.Increment(ref _checkReported) <= 8)
+        {
+            Console.Error.WriteLine($"[GPU][ERROR][RING_CHECK] {what} stack={Environment.StackTrace}");
+        }
+    }
 
     public static void Replayed(int records, long ticks)
     {
@@ -545,6 +595,11 @@ internal static class RingStats
             {
                 line.Append(string.Create(CultureInfo.InvariantCulture, $" fallback_{(RingOp)index}={count / perFrame:F2}"));
             }
+        }
+
+        if (CommandRing.Check)
+        {
+            line.Append(string.Create(CultureInfo.InvariantCulture, $" check_violations={Interlocked.Exchange(ref _checkViolations, 0)}"));
         }
 
         var merged = Interlocked.Exchange(ref _merged, 0);
