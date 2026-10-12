@@ -70,7 +70,7 @@ public sealed class ResourceMaterializationCache
         var refreshes = Interlocked.Exchange(ref _totalRefreshes, 0);
         var total = hits + misses;
         return FormattableString.Invariant(
-            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)}");
+            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)}{TakeRebaseReport()}");
     }
 
     public bool Materialize(
@@ -84,6 +84,7 @@ public sealed class ResourceMaterializationCache
         CurrentPlanHash = plan.Hash; // [local] for overlay diagnostics
         var key = KeyOf(plan, inputs);
         var found = TryFind(key, plan, inputs, out var cached);
+        Entry? shifted = null; // [local] SHARPEMU_MATERIALIZE_REBASE
         if (found)
         {
             if (StaleLog) _lastStaleReason = "nomatch";
@@ -125,6 +126,37 @@ public sealed class ResourceMaterializationCache
                 return true;
             }
 
+            if (RebaseMode != 0)
+            {
+                for (var variant = cached; variant is not null && shifted is null; variant = variant.Next)
+                {
+                    if (variant.Matches(plan, inputs))
+                        shifted = TryShift(variant, inputs, residentReader);
+                }
+
+                if (shifted is not null)
+                {
+                    Interlocked.Increment(ref _rebaseCandidates);
+                    var trust = _rebaseTrust.GetValueOrDefault(plan.Hash);
+                    if (RebaseMode == 3 || (RebaseMode == 1 && trust >= RebaseConfirmations && (++_rebaseUses & RebaseSampleMask) != 0))
+                    {
+                        shifted.Next = cached;
+                        TrimVariants(shifted);
+                        Store(key, shifted);
+                        Hits++;
+                        Interlocked.Increment(ref _totalHits);
+                        Interlocked.Increment(ref _rebaseHits);
+                        snapshot = shifted.Snapshot;
+                        specialization = shifted.Specialization;
+                        failure = default;
+                        return true;
+                    }
+
+                    if (trust < 0 && RebaseMode == 1)
+                        shifted = null;
+                }
+            }
+
             Interlocked.Increment(ref _totalStale);
             if (unreadable)
                 Interlocked.Increment(ref _totalStaleUnreadable);
@@ -150,16 +182,24 @@ public sealed class ResourceMaterializationCache
                 TablePhase = recorder.TablePhase,
             };
             if (!ResourceMaterializer.Materialize(plan, recording, ref snapshot, ref specialization, out failure))
+            {
+                if (shifted is not null)
+                    NoteRebaseVerdict(plan.Hash, shifted, null, null, null, "walk_failed");
                 return false;
+            }
 
             if (recorder.Failed)
             {
+                if (shifted is not null)
+                    NoteRebaseVerdict(plan.Hash, shifted, snapshot, specialization, null, null);
                 Uncacheable++;
                 Interlocked.Increment(ref _totalUncacheable);
                 return true;
             }
 
             var built = recorder.Build(plan, inputs, snapshot, specialization);
+            if (shifted is not null)
+                NoteRebaseVerdict(plan.Hash, shifted, snapshot, specialization, built, null);
             if (found)
             {
                 built.Next = cached;
@@ -209,6 +249,403 @@ public sealed class ResourceMaterializationCache
                     $"[MATERIALIZE_MISS] plan=0x{plan:X16} n={value.Count} ms={value.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} us_per={value.Ticks * 1e6 / System.Diagnostics.Stopwatch.Frequency / value.Count:F1} reads_per={value.Reads / (double)value.Count:F0} found={value.Found}"));
             _missByPlan.Clear();
         }
+    }
+
+    // [local] SHARPEMU_MATERIALIZE_REBASE: per-frame rings. A table the draw's user-data pointer reaches moves with
+    // that pointer, and the buffer descriptors inside it point into the same ring, so their base dwords moved by the
+    // same delta and every read through them moved too. The rule: one non-zero delta D (multiple of 256) from the
+    // user-data pointers; every range based on a moved pointer, or read relative to a base address that equals
+    // (low dword) a word that moved by D, is read again at its recorded address + D, every other range at its
+    // recorded address; each word must be unchanged or exactly old + D (no carry into the high dword). The output is
+    // the cached one with the draw's user data, every buffer base dword, table word and device-address range base
+    // equal to a moved word's old value taken to its new value; a moved value seen in an image or sampler word, or in a
+    // buffer dword other than the base, refuses. Ranges read through an unknown base refuse.
+    // =2 verifies every candidate against the full walk (the walk's result is used); =1 uses a plan's candidates
+    // once RebaseConfirmations of them agreed with the walk, rejects the plan for good on one disagreement, and
+    // keeps verifying one use in RebaseSampleMask + 1; =3 uses every candidate unverified (measurement only).
+    internal static readonly int RebaseMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_REBASE"), out var rebaseMode) ? rebaseMode : 0;
+    private static readonly bool SplitByBaseAddress = RebaseMode != 0;
+    private static readonly bool RebaseLog = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_REBASE_LOG") == "1";
+    private const ulong ConflictingBaseAddress = ulong.MaxValue;
+    private const int RebaseConfirmations = 4;
+    private const long RebaseSampleMask = 63;
+    private long _rebaseUses;
+    private readonly Dictionary<ulong, int> _rebaseTrust = new();
+    private static long _rebaseCandidates, _rebaseHits, _rebaseAgreed, _rebaseMismatches, _rebaseUnverifiable, _rebaseRejectedPlans;
+    private static readonly Dictionary<string, long> _rebaseRefusals = new();
+    private static readonly Dictionary<ulong, (long Agreed, long Mismatched)> _rebaseByPlan = new();
+    private static int _rebaseMismatchLogs;
+
+    private static string TakeRebaseReport()
+    {
+        if (RebaseMode == 0)
+            return string.Empty;
+        string refusals;
+        lock (_rebaseRefusals)
+        {
+            refusals = string.Join(",", _rebaseRefusals.OrderByDescending(pair => pair.Value).Take(8).Select(pair => $"{pair.Key}:{pair.Value}"));
+            _rebaseRefusals.Clear();
+        }
+
+        string plans;
+        lock (_rebaseByPlan)
+        {
+            plans = string.Join(",", _rebaseByPlan.OrderByDescending(pair => pair.Value.Agreed + pair.Value.Mismatched).Take(6)
+                .Select(pair => $"{pair.Key:X16}:{pair.Value.Agreed}/{pair.Value.Mismatched}"));
+            _rebaseByPlan.Clear();
+        }
+
+        return FormattableString.Invariant(
+            $" rebase_candidates={Interlocked.Exchange(ref _rebaseCandidates, 0)} rebase_hits={Interlocked.Exchange(ref _rebaseHits, 0)} rebase_agreed={Interlocked.Exchange(ref _rebaseAgreed, 0)} rebase_mismatches={Interlocked.Exchange(ref _rebaseMismatches, 0)} rebase_unverifiable={Interlocked.Exchange(ref _rebaseUnverifiable, 0)} rebase_rejected_plans={Interlocked.Read(ref _rebaseRejectedPlans)} rebase_refusals=[{refusals}] rebase_plans=[{plans}]");
+    }
+
+    private static void Refuse(string reason)
+    {
+        if (!RebaseLog)
+            return;
+        lock (_rebaseRefusals)
+            _rebaseRefusals[reason] = _rebaseRefusals.GetValueOrDefault(reason) + 1;
+    }
+
+    private static void TrimVariants(Entry head)
+    {
+        var depth = 1;
+        for (var variant = head; variant.Next is not null; variant = variant.Next)
+        {
+            if (++depth >= MaxVariants)
+            {
+                variant.Next = null;
+                break;
+            }
+        }
+    }
+
+    private Entry? TryShift(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader)
+    {
+        var count = entry.RangeAddresses.Length;
+        if (entry.RangeReadBase is not { } readBases)
+        {
+            Refuse("no_bases");
+            return null;
+        }
+
+        var addresses = new ulong[count];
+        var userBased = new bool[count];
+        var delta = 0L;
+        var movedBases = new HashSet<uint>();
+        for (var index = 0; index < count; index++)
+        {
+            if (entry.RangeBase[index] < 0)
+                continue;
+            if (!entry.TryRebase(index, inputs, out var address))
+            {
+                Refuse("rebase");
+                return null;
+            }
+
+            userBased[index] = true;
+            addresses[index] = address;
+            var moved = (long)(address - entry.RangeAddresses[index]);
+            if (moved == 0)
+                continue;
+            if (delta != 0 && moved != delta)
+            {
+                Refuse("two_deltas");
+                return null;
+            }
+
+            delta = moved;
+            var register = entry.RangeBase[index] - (int)entry.Plan.UserDataBase;
+            movedBases.Add(entry.UserData[register]);
+        }
+
+        if (delta == 0)
+        {
+            Refuse("no_delta");
+            return null;
+        }
+
+        if ((delta & 0xFF) != 0)
+        {
+            Refuse("unaligned_delta");
+            return null;
+        }
+
+        var current = new byte[entry.Bytes.Length];
+        var substitutions = new Dictionary<uint, uint>();
+        var movedThrough = new bool[count];
+        for (var pass = 0; ; pass++)
+        {
+            if (pass == 4)
+            {
+                Refuse("unstable");
+                return null;
+            }
+
+            substitutions.Clear();
+            for (var index = 0; index < count; index++)
+            {
+                var recorded = entry.RangeAddresses[index];
+                if (!userBased[index])
+                {
+                    var readBase = readBases[index];
+                    if (readBase == 0 || readBase == ConflictingBaseAddress)
+                    {
+                        Refuse("unknown_base");
+                        return null;
+                    }
+
+                    movedThrough[index] = movedBases.Contains((uint)readBase);
+                    addresses[index] = movedThrough[index] ? (ulong)((long)recorded + delta) : recorded;
+                }
+
+                var length = entry.RangeLengths[index];
+                var offset = entry.RangeOffsets[index];
+                var span = current.AsSpan(offset, length);
+                if (!residentReader(addresses[index], span, entry.RangeClean[index]))
+                {
+                    Refuse("unreadable");
+                    return null;
+                }
+
+                for (var word = 0; word < length; word += sizeof(uint))
+                {
+                    var now = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(span[word..]);
+                    var was = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(entry.Bytes.AsSpan(offset + word));
+                    if (now == was)
+                        continue;
+                    var expected = (long)was + delta;
+                    if (expected < 0 || expected > uint.MaxValue || (uint)expected != now)
+                    {
+                        Refuse("word_changed");
+                        return null;
+                    }
+
+                    if (substitutions.TryGetValue(was, out var other) && other != now)
+                    {
+                        Refuse("ambiguous_word");
+                        return null;
+                    }
+
+                    substitutions[was] = now;
+                }
+            }
+
+            var grown = false;
+            foreach (var was in substitutions.Keys)
+                grown |= movedBases.Add(was);
+            if (!grown)
+                break;
+        }
+
+        var bufferMap = new Dictionary<uint, uint>(substitutions);
+        foreach (var was in movedBases)
+        {
+            var now = (long)was + delta;
+            if (now >= 0 && now <= uint.MaxValue)
+                bufferMap.TryAdd(was, (uint)now);
+        }
+
+        var cachedSnapshot = entry.Snapshot;
+        foreach (var image in cachedSnapshot.Images)
+            foreach (var word in image)
+                if (substitutions.ContainsKey(word))
+                {
+                    Refuse("image_word");
+                    return null;
+                }
+
+        foreach (var sampler in cachedSnapshot.Samplers)
+            foreach (var word in sampler)
+                if (substitutions.ContainsKey(word))
+                {
+                    Refuse("sampler_word");
+                    return null;
+                }
+
+        if (entry.SnapshotFor(inputs, _noPatches) is not { } snapshot)
+        {
+            Refuse("snapshot");
+            return null;
+        }
+
+        var buffers = (uint[][])snapshot.Buffers.Clone();
+        for (var buffer = 0; buffer < buffers.Length; buffer++)
+        {
+            var original = cachedSnapshot.Buffers[buffer];
+            for (var dword = 0; dword < original.Length; dword++)
+            {
+                if (!substitutions.TryGetValue(original[dword], out var now) || buffers[buffer][dword] != original[dword])
+                    continue;
+                if (dword != 0)
+                {
+                    Refuse("buffer_dword");
+                    return null;
+                }
+
+                if (ReferenceEquals(buffers[buffer], snapshot.Buffers[buffer]))
+                    buffers[buffer] = (uint[])buffers[buffer].Clone();
+                buffers[buffer][dword] = now;
+            }
+        }
+
+        var table = snapshot.FlattenedResourceTable;
+        for (var slot = 0; slot < table.Length; slot++)
+        {
+            if (!substitutions.TryGetValue(cachedSnapshot.FlattenedResourceTable[slot], out var now) ||
+                table[slot] != cachedSnapshot.FlattenedResourceTable[slot])
+                continue;
+            if (ReferenceEquals(table, snapshot.FlattenedResourceTable))
+                table = (uint[])table.Clone();
+            table[slot] = now;
+        }
+
+        var ranges = snapshot.DeviceAddressRanges;
+        for (var index = 0; index < ranges.Length; index++)
+        {
+            var range = ranges[index];
+            if (!bufferMap.ContainsKey((uint)range.Base))
+                continue;
+            if (ReferenceEquals(ranges, snapshot.DeviceAddressRanges))
+                ranges = (DeviceAddressRange[])ranges.Clone();
+            ranges[index] = range with { Base = (ulong)((long)range.Base + delta) };
+        }
+
+        var sorted = true;
+        for (var index = 1; index < count && sorted; index++)
+            sorted = addresses[index - 1] < addresses[index];
+        var shiftedBases = new ulong[count];
+        for (var index = 0; index < count; index++)
+            shiftedBases[index] = userBased[index] || movedThrough[index] ? (ulong)((long)readBases[index] + delta) : readBases[index];
+        var userData = new uint[inputs.UserData.Count];
+        for (var index = 0; index < userData.Length; index++)
+            userData[index] = inputs.UserData[index];
+        return new Entry
+        {
+            Plan = entry.Plan,
+            UserData = userData,
+            ShaderBase = entry.ShaderBase,
+            ComputeState = entry.ComputeState,
+            RangeAddresses = addresses,
+            RangeOffsets = entry.RangeOffsets,
+            RangeLengths = entry.RangeLengths,
+            RangeClean = entry.RangeClean,
+            RangeBase = entry.RangeBase,
+            RangeReadBase = shiftedBases,
+            ExactUserData = entry.ExactUserData,
+            WordTableOnly = entry.WordTableOnly,
+            WordPatches = entry.WordPatches,
+            TableRefreshable = entry.TableRefreshable && sorted,
+            Bytes = current,
+            Snapshot = new ResourceSnapshot
+            {
+                Buffers = buffers,
+                Images = snapshot.Images,
+                Samplers = snapshot.Samplers,
+                FlattenedResourceTable = table,
+                UserData = snapshot.UserData,
+                DeviceAddressRanges = ranges,
+            },
+            Specialization = entry.Specialization,
+        };
+    }
+
+    private readonly List<(int Word, uint Value)> _noPatches = new();
+
+    // A rebase candidate against the full walk of the same draw: the outputs, and with a built entry the reads.
+    private void NoteRebaseVerdict(ulong planHash, Entry shifted, ResourceSnapshot? snapshot, ResourceSpecialization? specialization, Entry? built, string? unverifiable)
+    {
+        string? difference = unverifiable is not null ? null : SnapshotDifference(shifted.Snapshot, snapshot!) ??
+            (Equals(shifted.Specialization, specialization) ? null : "specialization") ??
+            (built is null ? null : ReadsDifference(shifted, built));
+        if (unverifiable is not null)
+        {
+            Interlocked.Increment(ref _rebaseUnverifiable);
+            return;
+        }
+
+        var trust = _rebaseTrust.GetValueOrDefault(planHash);
+        lock (_rebaseByPlan)
+        {
+            var entry = _rebaseByPlan.GetValueOrDefault(planHash);
+            _rebaseByPlan[planHash] = difference is null ? (entry.Agreed + 1, entry.Mismatched) : (entry.Agreed, entry.Mismatched + 1);
+        }
+
+        if (difference is null)
+        {
+            Interlocked.Increment(ref _rebaseAgreed);
+            if (trust >= 0)
+                _rebaseTrust[planHash] = trust + 1;
+            return;
+        }
+
+        Interlocked.Increment(ref _rebaseMismatches);
+        if (trust >= 0)
+        {
+            _rebaseTrust[planHash] = -1;
+            Interlocked.Increment(ref _rebaseRejectedPlans);
+        }
+
+        if (Interlocked.Increment(ref _rebaseMismatchLogs) <= 64)
+            Console.Error.WriteLine($"[MATERIALIZE_REBASE_MISMATCH] plan=0x{planHash:X16} {difference}");
+    }
+
+    private static string? SnapshotDifference(ResourceSnapshot shifted, ResourceSnapshot walked)
+    {
+        static string? Jagged(string name, uint[][] left, uint[][] right)
+        {
+            if (left.Length != right.Length)
+                return $"{name}_count {left.Length}!={right.Length}";
+            for (var index = 0; index < left.Length; index++)
+                if (!left[index].AsSpan().SequenceEqual(right[index]))
+                    return $"{name}[{index}] {string.Join(",", left[index].Select(word => word.ToString("X8")))} != {string.Join(",", right[index].Select(word => word.ToString("X8")))}";
+            return null;
+        }
+
+        if (Jagged("buffer", shifted.Buffers, walked.Buffers) is { } buffers)
+            return buffers;
+        if (Jagged("image", shifted.Images, walked.Images) is { } images)
+            return images;
+        if (Jagged("sampler", shifted.Samplers, walked.Samplers) is { } samplers)
+            return samplers;
+        if (!shifted.FlattenedResourceTable.AsSpan().SequenceEqual(walked.FlattenedResourceTable))
+        {
+            var first = 0;
+            while (first < Math.Min(shifted.FlattenedResourceTable.Length, walked.FlattenedResourceTable.Length) &&
+                   shifted.FlattenedResourceTable[first] == walked.FlattenedResourceTable[first])
+                first++;
+            return $"table len {shifted.FlattenedResourceTable.Length}/{walked.FlattenedResourceTable.Length} first_diff={first}";
+        }
+
+        if (!shifted.UserData.AsSpan().SequenceEqual(walked.UserData))
+            return "user_data";
+        if (!shifted.DeviceAddressRanges.AsSpan().SequenceEqual(walked.DeviceAddressRanges))
+            return $"device_ranges {string.Join(",", shifted.DeviceAddressRanges.Select(range => $"{range.Handle}:{range.Base:X}+{range.Size:X}"))} != {string.Join(",", walked.DeviceAddressRanges.Select(range => $"{range.Handle}:{range.Base:X}+{range.Size:X}"))}";
+        return null;
+    }
+
+    // The same words read, at the same addresses, with the same bytes.
+    private static string? ReadsDifference(Entry shifted, Entry built)
+    {
+        static List<(ulong Address, uint Word)> Words(Entry entry)
+        {
+            var words = new List<(ulong, uint)>(entry.Bytes.Length / sizeof(uint));
+            for (var range = 0; range < entry.RangeAddresses.Length; range++)
+                for (var offset = 0; offset < entry.RangeLengths[range]; offset += sizeof(uint))
+                    words.Add((entry.RangeAddresses[range] + (ulong)offset,
+                        System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(entry.Bytes.AsSpan(entry.RangeOffsets[range] + offset))));
+            words.Sort();
+            return words;
+        }
+
+        var left = Words(shifted);
+        var right = Words(built);
+        if (left.Count != right.Count)
+            return $"reads_count {left.Count}!={right.Count}";
+        for (var index = 0; index < left.Count; index++)
+            if (left[index] != right[index])
+                return $"read[{index}] 0x{left[index].Address:X}={left[index].Word:X8} != 0x{right[index].Address:X}={right[index].Word:X8}";
+        return null;
     }
 
     // Most stale entries in Demon's Souls differ only in words the shader reads through scalar
@@ -273,7 +710,7 @@ public sealed class ResourceMaterializationCache
             if (!evaluated || recorder.Failed || table.Length != cachedTable.Length)
                 return false;
 
-            foreach (var (address, word, _, _, _, _) in recorder.Reads)
+            foreach (var (address, word, _, _, _, _, _) in recorder.Reads)
             {
                 if (!TryFindWord(cached, address, out var offset) ||
                     System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(current.AsSpan(offset, sizeof(uint))) != word)
@@ -296,6 +733,7 @@ public sealed class ResourceMaterializationCache
                 RangeLengths = cached.RangeLengths,
                 RangeClean = cached.RangeClean,
                 RangeBase = cached.RangeBase,
+                RangeReadBase = cached.RangeReadBase,
                 ExactUserData = cached.ExactUserData,
                 WordTableOnly = cached.WordTableOnly,
                 WordPatches = cached.WordPatches,
@@ -523,6 +961,8 @@ public sealed class ResourceMaterializationCache
         // Per range: the user-data register pair its address was based on, AbsoluteBase when the
         // address does not move with the user data, UnknownBase when the reader could not tell.
         public required int[] RangeBase { get; init; }
+        // [local] Per range: the base address its reads were relative to (0 unknown), with SHARPEMU_MATERIALIZE_REBASE.
+        public ulong[]? RangeReadBase { get; init; }
         // A range read through an unknown base keeps the entry to draws with the same user data.
         public required bool ExactUserData { get; init; }
         // Per recorded dword: read only while the flattened table was evaluated.
@@ -687,7 +1127,7 @@ public sealed class ResourceMaterializationCache
 
     private sealed class ReadRecorder
     {
-        private readonly List<(ulong Address, uint Word, bool Clean, bool Table, int Base, int Node)> _reads = new();
+        private readonly List<(ulong Address, uint Word, bool Clean, bool Table, int Base, int Node, ulong BaseAddress)> _reads = new();
         private bool _inTable;
         private GuestWordReader? _reader;
         private GuestWordReader? _cleanReader;
@@ -726,7 +1166,7 @@ public sealed class ResourceMaterializationCache
 
         public bool Failed { get; private set; }
 
-        public List<(ulong Address, uint Word, bool Clean, bool Table, int Base, int Node)> Reads => _reads;
+        public List<(ulong Address, uint Word, bool Clean, bool Table, int Base, int Node, ulong BaseAddress)> Reads => _reads;
 
         public Action<bool> TablePhase { get; }
 
@@ -771,7 +1211,7 @@ public sealed class ResourceMaterializationCache
                 }
             }
 
-            _reads.Add((address, word, clean, _inTable, RuntimeValueEvaluator.CurrentReadBase, RuntimeValueEvaluator.CurrentReadNode));
+            _reads.Add((address, word, clean, _inTable, RuntimeValueEvaluator.CurrentReadBase, RuntimeValueEvaluator.CurrentReadNode, RuntimeValueEvaluator.CurrentReadBaseAddress));
             return true;
         }
 
@@ -791,7 +1231,7 @@ public sealed class ResourceMaterializationCache
             for (var offset = 0; offset + sizeof(uint) <= destination.Length; offset += sizeof(uint))
                 _reads.Add((address + (ulong)offset,
                     System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(destination[offset..]), clean, _inTable,
-                    RuntimeValueEvaluator.CurrentReadBase, RuntimeValueEvaluator.CurrentReadNode));
+                    RuntimeValueEvaluator.CurrentReadBase, RuntimeValueEvaluator.CurrentReadNode, 0UL));
             return true;
         }
 
@@ -807,15 +1247,18 @@ public sealed class ResourceMaterializationCache
             ulong end = 0;
             var previous = ulong.MaxValue;
             var previousBase = UserDataUseAnalysis.UnknownBase;
+            var previousBaseAddress = 0UL;
             var exactUserData = false;
             foreach (var read in _reads)
             {
                 exactUserData |= read.Base == UserDataUseAnalysis.UnknownBase;
                 if (read.Address == previous) continue;
-                if (wordCount == 0 || read.Address != end || read.Base != previousBase) rangeCount++;
+                if (wordCount == 0 || read.Address != end || read.Base != previousBase ||
+                    (SplitByBaseAddress && read.BaseAddress != previousBaseAddress)) rangeCount++;
                 wordCount++;
                 previous = read.Address;
                 previousBase = read.Base;
+                previousBaseAddress = read.BaseAddress;
                 end = read.Address + sizeof(uint);
             }
 
@@ -824,6 +1267,7 @@ public sealed class ResourceMaterializationCache
             var lengths = new int[rangeCount];
             var clean = new bool[rangeCount];
             var bases = new int[rangeCount];
+            var readBases = SplitByBaseAddress ? new ulong[rangeCount] : null;
             var bytes = new byte[wordCount * sizeof(uint)];
             var tableOnly = new bool[wordCount];
             var patchableReads = plan.UserDataUse.PatchableReads;
@@ -833,11 +1277,14 @@ public sealed class ResourceMaterializationCache
             end = 0;
             previous = ulong.MaxValue;
             previousBase = UserDataUseAnalysis.UnknownBase;
-            foreach (var (address, word, wordClean, table, readBase, node) in _reads)
+            previousBaseAddress = 0;
+            foreach (var (address, word, wordClean, table, readBase, node, baseAddress) in _reads)
             {
                 if (address == previous)
                 {
                     clean[rangeIndex] |= wordClean;
+                    if (readBases is not null && readBases[rangeIndex] != baseAddress)
+                        readBases[rangeIndex] = ConflictingBaseAddress;
                     tableOnly[wordIndex] &= table;
                     // The same word read through two bases cannot follow either: keep it in place.
                     if (bases[rangeIndex] != readBase)
@@ -852,15 +1299,19 @@ public sealed class ResourceMaterializationCache
                 wordIndex++;
                 if (node != RuntimeValueEvaluator.NoReadNode && patchableReads.TryGetValue(node, out var targets))
                     (patches ??= new Dictionary<int, UserDataUseAnalysis.PatchTarget[]>())[wordIndex] = targets;
-                if (rangeIndex < 0 || address != end || readBase != previousBase)
+                if (rangeIndex < 0 || address != end || readBase != previousBase ||
+                    (readBases is not null && baseAddress != previousBaseAddress))
                 {
                     rangeIndex++;
                     addresses[rangeIndex] = address;
                     offsets[rangeIndex] = wordIndex * sizeof(uint);
                     bases[rangeIndex] = readBase;
+                    if (readBases is not null)
+                        readBases[rangeIndex] = baseAddress;
                 }
 
                 previousBase = readBase;
+                previousBaseAddress = baseAddress;
                 lengths[rangeIndex] += sizeof(uint);
                 clean[rangeIndex] |= wordClean;
                 tableOnly[wordIndex] = table;
@@ -884,6 +1335,7 @@ public sealed class ResourceMaterializationCache
                 RangeLengths = lengths,
                 RangeClean = clean,
                 RangeBase = bases,
+                RangeReadBase = readBases,
                 ExactUserData = exactUserData,
                 WordTableOnly = tableOnly,
                 WordPatches = patches is { Count: > 0 } ? patches : null,

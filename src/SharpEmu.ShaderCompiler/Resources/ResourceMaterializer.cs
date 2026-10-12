@@ -581,7 +581,24 @@ public static class ResourceMaterializer
             return false;
         }
 
-        return inputs.ReadCleanMemory is not null && inputs.ReadCleanMemory(baseAddress + aligned, out word);
+        return ReadCleanWithBase(baseAddress, aligned, inputs, out word);
+    }
+
+    // [local] The read records the base it is relative to (SHARPEMU_MATERIALIZE_REBASE).
+    private static bool ReadCleanWithBase(ulong baseAddress, ulong offset, ResourceRuntimeInputs inputs, out uint word)
+    {
+        word = 0;
+        if (inputs.ReadCleanMemory is null)
+            return false;
+        var previous = RuntimeValueEvaluator.ExchangeReadBaseAddress(baseAddress);
+        try
+        {
+            return inputs.ReadCleanMemory(baseAddress + offset, out word);
+        }
+        finally
+        {
+            RuntimeValueEvaluator.ExchangeReadBaseAddress(previous);
+        }
     }
 
     // Enumerates every material key that can pass the table's bounds and reads the
@@ -716,7 +733,7 @@ public static class ResourceMaterializer
             {
                 var relative = entry + dword * sizeof(uint);
                 if (relative > AddressMask || baseAddress > AddressMask - relative ||
-                    !inputs.ReadCleanMemory(baseAddress + relative, out candidate[dword]))
+                    !ReadCleanWithBase(baseAddress, relative, inputs, out candidate[dword]))
                     return false;
             }
 
@@ -796,7 +813,7 @@ public static class ResourceMaterializer
     {
         word = 0;
         return offset <= AddressMask && baseAddress <= AddressMask - offset &&
-            inputs.ReadCleanMemory is not null && inputs.ReadCleanMemory(baseAddress + offset, out word);
+            ReadCleanWithBase(baseAddress, offset, inputs, out word);
     }
 
     private static bool FinishIndirectImage(

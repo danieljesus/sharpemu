@@ -244,6 +244,20 @@ public sealed class RuntimeValueEvaluator
         return previous;
     }
 
+    // [local] The base address (48 bits) the raw read in progress is relative to, 0 when unknown, for the
+    // rebase rule of ResourceMaterializationCache (SHARPEMU_MATERIALIZE_REBASE).
+    [ThreadStatic]
+    private static ulong _currentReadBaseAddress;
+
+    internal static ulong CurrentReadBaseAddress => _currentReadBaseAddress;
+
+    internal static ulong ExchangeReadBaseAddress(ulong baseAddress)
+    {
+        var previous = _currentReadBaseAddress;
+        _currentReadBaseAddress = baseAddress;
+        return previous;
+    }
+
     // The graph node (ScalarValue.Id) whose raw read is in progress, NoReadNode outside one.
     [ThreadStatic]
     private static int _currentReadNodeBiased;
@@ -274,6 +288,7 @@ public sealed class RuntimeValueEvaluator
         uint word = 0;
         var previousBase = ExchangeReadBase(baseRegister);
         var previousNode = ExchangeReadNode(node);
+        var previousBaseAddress = ExchangeReadBaseAddress(baseAddress);
         try
         {
             read = _inputs.ReadMemory is not null && _inputs.ReadMemory(address, out word);
@@ -282,6 +297,7 @@ public sealed class RuntimeValueEvaluator
         {
             ExchangeReadBase(previousBase);
             ExchangeReadNode(previousNode);
+            ExchangeReadBaseAddress(previousBaseAddress);
         }
 
         if (!read)
