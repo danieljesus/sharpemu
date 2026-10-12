@@ -65,6 +65,11 @@ public sealed class RecordingBuffer
 
             // A caller can record native commands after it obtains the handle.
             _handleWasRequested = true;
+            if (Vulkan.VkCallProbe.Enabled) // [local]
+            {
+                Vulkan.VkCallProbe.CountHandle();
+            }
+
             return Buffer;
         }
     }

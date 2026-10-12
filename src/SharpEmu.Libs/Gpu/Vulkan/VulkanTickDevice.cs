@@ -346,7 +346,9 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
                 }
             }
 
+            var vkProbe = VkCallProbe.Start(); // [local]
             var result = _vk.QueueSubmit2(_queue, 1, &submitInfo, fence);
+            VkCallProbe.Stop(VkCallProbe.Kind.Submit, vkProbe); // [local]
             if (fence.Handle != 0 && result != Result.Success)
             {
                 lock (_fenceGate)

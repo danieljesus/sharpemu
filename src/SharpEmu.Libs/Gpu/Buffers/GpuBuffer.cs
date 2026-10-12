@@ -317,7 +317,9 @@ public unsafe class GpuBuffer : IDisposable
             native, GetAccessStage(sourceBefore | destinationBefore), PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
             0, null, 2, before, 0, null);
         var copy = new BufferCopy(sourceOffset, destinationOffset, size);
+        var vkProbe320 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
         vk.CmdCopyBuffer(native, source.Handle, Handle, 1, &copy);
+        SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.CopyBuffer, vkProbe320); // [local]
         var after = stackalloc BufferMemoryBarrier2[2];
         after[0] = source.CreateBarrier(sourceOffset, size, AccessFlags.TransferReadBit, sourceAfter);
         after[1] = CreateBarrier(destinationOffset, size, AccessFlags.TransferWriteBit, destinationAfter);
@@ -343,7 +345,9 @@ public unsafe class GpuBuffer : IDisposable
         VulkanSynchronization.PipelineBarrier(vk,
             native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
             0, null, 1, &before, 0, null);
+        var vkProbe346 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
         vk.CmdFillBuffer(native, Handle, offset, size, value);
+        SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.FillBuffer, vkProbe346); // [local]
         var after = CreateBarrier(offset, size, AccessFlags.TransferWriteBit, MemoryAccess);
         VulkanSynchronization.PipelineBarrier(vk,
             native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,

@@ -51,6 +51,8 @@ internal static unsafe class VulkanSynchronization
             ImageMemoryBarrierCount = imageMemoryBarrierCount,
             PImageMemoryBarriers = imageMemoryBarriers,
         };
+        var vkProbe54 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
         vk.CmdPipelineBarrier2(command, &dependencyInfo);
+        SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe54); // [local]
     }
 }

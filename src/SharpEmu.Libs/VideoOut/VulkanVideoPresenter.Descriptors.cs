@@ -1621,7 +1621,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (hasPushData)
                 {
                     var pushStages = bindPoint == PipelineBindPoint.Graphics ? ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit : ShaderStageFlags.ComputeBit;
+                    var vkProbe1624 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
                     _vk.CmdPushConstants(command, entry.Layout, pushStages, 0, PushData.ByteSize, pushData);
+                    SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.PushConstants, vkProbe1624); // [local]
                 }
 
                 if (writeIndex != 0)
@@ -1630,7 +1632,9 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         if (entry.UsesPushDescriptors)
                         {
+                            var vkProbe1633 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
                             _pushDescriptorApi.CmdPushDescriptorSet(command, bindPoint, entry.Layout, 0, (uint)writeIndex, writePointer);
+                            SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.PushDescriptors, vkProbe1633); // [local]
                             ShaderCacheCounters.CountPushSet();
                         }
                         else
@@ -1642,7 +1646,9 @@ internal static unsafe partial class VulkanVideoPresenter
                             }
 
                             _vk.UpdateDescriptorSets(_device, (uint)writeIndex, writePointer, 0, null);
+                            var vkProbe1645 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
                             _vk.CmdBindDescriptorSets(command, bindPoint, entry.Layout, 0, 1, &set, 0, null);
+                            SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindDescriptorSets, vkProbe1645); // [local]
                             ShaderCacheCounters.CountHeapSet();
                         }
                     }
