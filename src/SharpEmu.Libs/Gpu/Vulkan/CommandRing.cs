@@ -12,14 +12,15 @@ using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Vulkan;
 
-// [local] SHARPEMU_RECORD_RING=1 (plan-grabador-lineal-2026-10-12.md §4): the recording thread appends compact
+// [local] SHARPEMU_RECORD_RING (on by default, =0 disables; plan-grabador-lineal-2026-10-12.md §4): the recording thread appends compact
 // commands for the scheduler's command buffers to a linear stream of blocks, and a replay thread issues the real
 // vkBegin/vkCmd*/vkEnd calls in order. Every vkCmd* of the codebase goes through VkRecord, which appends when the
 // command buffer is the one the ring is recording and calls the driver otherwise. The submit thread waits for the
 // replay of a buffer's end before it submits that buffer.
 internal sealed unsafe partial class CommandRing : IDisposable
 {
-    public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_RING") == "1";
+    // A/B of 2026-10-12, 3+3: 16.96 -> 18.29 FPS, 57.2 -> 53.3 ms/frame, same image, 0 drains per frame.
+    public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_RING") != "0";
 
     // SHARPEMU_RECORD_RING_MERGE=1: the replay thread merges a run of barriers into one vkCmdPipelineBarrier2 when
     // no barrier of the run could chain with an earlier one (its source stages miss their destination stages) and
