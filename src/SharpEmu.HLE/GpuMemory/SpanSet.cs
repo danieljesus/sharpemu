@@ -79,6 +79,16 @@ public sealed class SpanSet
         return index > 0 && _spans.GetValueAtIndex(index - 1) > address;
     }
 
+    // [local] An immutable copy for readers that must not take the writer's lock.
+    public SpanSetSnapshot Snapshot()
+    {
+        var starts = new ulong[_spans.Count];
+        var ends = new ulong[_spans.Count];
+        _spans.Keys.CopyTo(starts, 0);
+        _spans.Values.CopyTo(ends, 0);
+        return new SpanSetSnapshot(starts, ends);
+    }
+
     public void ForEach(Action<ulong, ulong> visit)
     {
         foreach (var (start, end) in _spans)

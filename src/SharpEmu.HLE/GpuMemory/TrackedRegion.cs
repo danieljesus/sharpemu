@@ -46,6 +46,13 @@ public sealed class TrackedRegion
         return GetDirtyMask(side).AnyInRange(start, end);
     }
 
+    // [local] Every page of the range is CPU-dirty. Read without the lock by GuestPageTracker.InvalidateRegion.
+    public bool IsCpuDirtyThroughout(ulong offset, ulong size)
+    {
+        var (start, end) = GetPageRange(BaseAddress + offset, size);
+        return _cpuDirty.AllInRange(start, end);
+    }
+
     public bool IsCpuWriteHot(ulong offset, ulong size)
     {
         var (start, end) = GetPageRange(BaseAddress + offset, size);

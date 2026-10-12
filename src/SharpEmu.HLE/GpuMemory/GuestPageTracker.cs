@@ -180,6 +180,16 @@ public sealed class GuestPageTracker
         return tracked;
     }
 
+    // [local] SHARPEMU_CPU_DIRTY_SKIP (on by default): a CPU write to pages that are all CPU-dirty already changes
+    // nothing (a page is never CPU- and GPU-dirty at once, and MarkCpuWrite skips dirty pages), so it is answered
+    // without the region lock. 0 always takes the lock. The counters are approximate (unsynchronized).
+    private static readonly bool SkipCpuDirtyWrites = Environment.GetEnvironmentVariable("SHARPEMU_CPU_DIRTY_SKIP") != "0";
+    private static long _invalidations;
+    private static long _cpuDirtySkips;
+
+    public static (long Invalidations, long CpuDirtySkips) TakeInvalidationCounters() =>
+        (Interlocked.Exchange(ref _invalidations, 0), Interlocked.Exchange(ref _cpuDirtySkips, 0));
+
     // Marks the CPU write in every region whose bytes the GPU has not modified and
     // reports whether any region still holds GPU data the caller must download first
     // (one download of the whole range covers them all). Allocation-free: guest
@@ -199,6 +209,23 @@ public sealed class GuestPageTracker
             if (Volatile.Read(ref _regions[index]) is { } region)
             {
                 tracked = true;
+                _invalidations++;
+                if (SkipCpuDirtyWrites)
+                {
+                    // Pairs with the region lock an upload takes before clearing CPU-dirty bits and reading the
+                    // bytes: a writer that stored its bytes before this check either sees the cleared bit and takes
+                    // the lock, or saw the bit before it was cleared and the upload reads its bytes afterwards.
+                    Interlocked.MemoryBarrier();
+                    if (region.IsCpuDirtyThroughout(offset, bytes))
+                    {
+                        _cpuDirtySkips++;
+                        remaining -= bytes;
+                        offset = 0;
+                        index++;
+                        continue;
+                    }
+                }
+
                 using (region.Lock.Hold())
                 {
                     if (region.IsModified(WriteOrigin.Gpu, offset, bytes))

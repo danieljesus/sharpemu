@@ -102,4 +102,24 @@ public sealed class PageMaskTests
         Assert.Equal((1024, 1024), mask.FindFirstSetRangeFrom(1024));
         Assert.Equal((0, 0), mask.FindLastSetRangeBefore(2));
     }
+
+    // [local]
+    [Fact]
+    public void AllInRange_NeedsEveryBitAcrossWords()
+    {
+        var mask = new PageMask();
+        mask.SetRange(60, 200);
+        Assert.True(mask.AllInRange(60, 200));
+        Assert.True(mask.AllInRange(63, 65));
+        Assert.True(mask.AllInRange(128, 129));
+        Assert.False(mask.AllInRange(59, 200));
+        Assert.False(mask.AllInRange(60, 201));
+        Assert.False(mask.AllInRange(100, 100));
+        Assert.False(mask.AllInRange(0, TrackerLayout.PagesPerBlock + 1));
+        mask.Unset(130);
+        Assert.False(mask.AllInRange(60, 200));
+        Assert.True(mask.AllInRange(131, 200));
+        mask.Fill();
+        Assert.True(mask.AllInRange(0, TrackerLayout.PagesPerBlock));
+    }
 }

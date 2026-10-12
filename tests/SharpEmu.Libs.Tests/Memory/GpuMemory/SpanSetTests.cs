@@ -84,4 +84,34 @@ public sealed class SpanSetTests
         set.Clear();
         Assert.True(set.IsEmpty);
     }
+
+    // [local] The lock-free snapshot answers Contains like the set it was taken from.
+    [Fact]
+    public void Snapshot_ContainsMatchesTheSet()
+    {
+        var random = new Random(1234);
+        var set = new SpanSet();
+        Assert.False(set.Snapshot().Contains(0x1000, 1));
+        for (var step = 0; step < 400; step++)
+        {
+            var address = (ulong)random.Next(0, 256) * 0x100;
+            var size = (ulong)random.Next(1, 16) * 0x80;
+            if (random.Next(3) == 0)
+            {
+                set.Remove(address, size);
+            }
+            else
+            {
+                set.Add(address, size);
+            }
+
+            var snapshot = set.Snapshot();
+            for (var probe = 0; probe < 32; probe++)
+            {
+                var probeAddress = (ulong)random.Next(0, 0x10000);
+                var probeSize = (ulong)random.Next(1, 0x1000);
+                Assert.Equal(set.Contains(probeAddress, probeSize), snapshot.Contains(probeAddress, probeSize));
+            }
+        }
+    }
 }

@@ -307,6 +307,35 @@ public sealed class GuestPageTrackerTests : IDisposable
         Release(address, size);
     }
 
+    // [local] A write to pages that are all CPU-dirty changes nothing; one that reaches a clean page still marks it.
+    [NativePageProtectionFact]
+    public void CpuDirtyWritesKeepTheirStateAndMixedWritesMarkCleanPages()
+    {
+        var address = Allocate(3);
+        _tracker.ForEachUploadRange(address, 3 * Page, false, NoRange, NoUpload, preserveCpuWriteHotPages: false);
+        _tracker.MarkCpuDirtyPages(address, Page);
+        Assert.False(IsWritable(address + Page));
+
+        Assert.True(_tracker.InvalidateRegion(address + 16, 32, out var dirtyFlush));
+        Assert.False(dirtyFlush);
+        Assert.True(_tracker.HasCpuDirtyPages(address, Page));
+        Assert.False(_tracker.HasCpuDirtyPages(address + Page, Page));
+
+        Assert.True(_tracker.InvalidateRegion(address + Page - 16, 32, out var mixedFlush));
+        Assert.False(mixedFlush);
+        Assert.True(_tracker.HasCpuDirtyPages(address + Page, Page));
+        Assert.True(IsWritable(address + Page));
+        Assert.False(_tracker.HasCpuDirtyPages(address + 2 * Page, Page));
+
+        _tracker.ForEachUploadRange(address + 2 * Page, Page, true, NoRange, NoUpload);
+        Assert.True(_tracker.InvalidateRegion(address + 2 * Page - 16, 32, out var gpuFlush));
+        Assert.True(gpuFlush);
+
+        _tracker.ClearGpuDirtyPages(address, 3 * Page);
+        _tracker.UntrackMemory(address, 3 * Page);
+        Release(address, 3 * Page);
+    }
+
     [NativePageProtectionFact]
     public void InvalidationAcceptsANewGenerationOfGpuOwnership()
     {
