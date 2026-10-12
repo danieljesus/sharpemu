@@ -1591,7 +1591,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static long _reportedRetried;
 
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
-        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} uniform_image_sources={TakeUniformImageSources()} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
+        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} published_pieces={Interlocked.Exchange(ref _reportedPublishedPieces, 0)} stale_pieces={Interlocked.Exchange(ref _reportedStalePieces, 0)}uniform_image_sources={TakeUniformImageSources()} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)}");
 
     private sealed record PendingDownload
     {
@@ -1774,7 +1774,142 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         Array.Clear(_readbackClassTicks);
     }
 
-    private bool CompleteReadMemoryOnGpu(PendingDownload pending, bool retrySynchronously)
+    // [local] SHARPEMU_READBACK_PIECES (on by default): a finished download publishes every piece whose bytes the GPU
+    // has not written again since it started, and keeps only the rewritten pieces GPU-modified; the readback counts
+    // as applied once the requested range is clean, and only then is not retried. 0 restores all-or-nothing: one
+    // rewritten piece discarded the whole download.
+    private static readonly bool PublishCurrentPieces = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_PIECES") != "0";
+    private static long _reportedPublishedPieces;
+    private static long _reportedStalePieces;
+
+    private bool CompleteReadMemoryOnGpu(PendingDownload pending, bool retrySynchronously) =>
+        PublishCurrentPieces ? CompleteCurrentPieces(pending, retrySynchronously) : CompleteWholeDownload(pending, retrySynchronously);
+
+    private bool CompleteCurrentPieces(PendingDownload pending, bool retrySynchronously)
+    {
+        using var readbackScope = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.BufferReadback);
+        var readback = AsyncReadback ?? throw SubmissionScheduler.Fatal("The pending readback lost its queue.");
+        try
+        {
+            var copies = pending.Copies;
+            var current = new bool[copies.Count];
+            var published = 0;
+            for (var index = 0; index < copies.Count; index++)
+            {
+                current[index] = IsPieceCurrent(pending, index);
+                published += current[index] ? 1 : 0;
+            }
+
+            readback.Complete(pending.Ticket, published == 0 ? null : (index, bytes) =>
+            {
+                if (current[index] && !_backing.TryWriteBacking(copies[index].Address, bytes))
+                {
+                    throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
+                }
+            });
+            for (var index = 0; index < copies.Count; index++)
+            {
+                if (current[index])
+                {
+                    RemoveGpuModified(copies[index].Address, copies[index].Size);
+                }
+            }
+
+            var windowSize = pending.WindowEnd - pending.WindowBegin;
+            if (published == copies.Count && !_gpuModifiedRanges.Overlaps(pending.WindowBegin, windowSize))
+            {
+                _tracker.ClearGpuDirtyPages(pending.WindowBegin, windowSize);
+            }
+            else
+            {
+                for (var index = 0; index < copies.Count; index++)
+                {
+                    if (current[index])
+                    {
+                        ClearPagesOfPublishedPiece(copies[index].Address, copies[index].Size,
+                            page => _gpuModifiedRanges.Overlaps(page, TrackerLayout.PageBytes),
+                            (address, size) => _tracker.ClearGpuDirtyPages(address, size));
+                    }
+                }
+            }
+
+            var stale = copies.Count - published;
+            Interlocked.Add(ref _reportedPublishedPieces, published);
+            Interlocked.Add(ref _reportedStalePieces, stale);
+            var clean = pending.IsWrite
+                ? !_tracker.HasGpuDirtyPages(pending.GuestAddress, pending.Size)
+                : !HasGpuDirtyBytes(pending.GuestAddress, pending.Size);
+            if (!clean)
+            {
+                if (retrySynchronously)
+                {
+                    PendingReadbacksRetried++;
+                    Interlocked.Increment(ref _reportedRetried);
+                    ReadMemoryOnGpu(pending.GuestAddress, pending.Size, pending.IsWrite, pending.Source);
+                }
+
+                return false;
+            }
+
+            PendingReadbacksApplied++;
+            Interlocked.Increment(ref _reportedApplied);
+            if (pending.IsWrite)
+            {
+                _tracker.MarkCpuDirtyPages(pending.GuestAddress, pending.Size);
+            }
+
+            RecordReadback(pending.WindowBegin, pending.WindowEnd, pending.IsWrite, copies, pending.Started, pending.Source);
+            return true;
+        }
+        finally
+        {
+            foreach (var copy in pending.Copies)
+            {
+                copy.Buffer.ReleaseForeignRead();
+            }
+        }
+    }
+
+    // [local] After a published piece left the GPU-modified set: the pages wholly inside it are clean, and a page it
+    // only partly covers is clean unless another GPU-modified range still overlaps it.
+    internal static void ClearPagesOfPublishedPiece(ulong address, ulong size, Func<ulong, bool> pageHasModifiedBytes, Action<ulong, ulong> clearPages)
+    {
+        if (size == 0)
+        {
+            return;
+        }
+
+        const ulong pageBytes = TrackerLayout.PageBytes;
+        var end = address + size;
+        var headPage = address & ~(pageBytes - 1);
+        var tailPage = (end - 1) & ~(pageBytes - 1);
+        var innerBegin = address == headPage ? headPage : headPage + pageBytes;
+        var innerEnd = end == tailPage + pageBytes ? end : tailPage;
+        if (innerBegin < innerEnd)
+        {
+            clearPages(innerBegin, innerEnd - innerBegin);
+        }
+
+        if (address != headPage && !pageHasModifiedBytes(headPage))
+        {
+            clearPages(headPage, pageBytes);
+        }
+
+        if (end != tailPage + pageBytes && (tailPage != headPage || address == headPage) && !pageHasModifiedBytes(tailPage))
+        {
+            clearPages(tailPage, pageBytes);
+        }
+    }
+
+    private bool IsPieceCurrent(PendingDownload pending, int index)
+    {
+        var copy = pending.Copies[index];
+        return copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size) == pending.WriteTicks[index] &&
+               _gpuModifiedRanges.Contains(copy.Address, copy.Size) &&
+               ReferenceEquals(FindOwner(copy.Address, copy.Size), copy.Buffer);
+    }
+
+    private bool CompleteWholeDownload(PendingDownload pending, bool retrySynchronously)
     {
         using var readbackScope = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.BufferReadback);
         var readback = AsyncReadback ?? throw SubmissionScheduler.Fatal("The pending readback lost its queue.");
