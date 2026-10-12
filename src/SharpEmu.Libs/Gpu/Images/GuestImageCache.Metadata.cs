@@ -11,7 +11,7 @@ namespace SharpEmu.Libs.Gpu.Images;
 // Surface metadata (HTile, DCC, CMask, FMask) keyed by its guest address.
 public sealed partial class GuestImageCache
 {
-    private unsafe void MaterializeDccClear(
+    private void MaterializeDccClear(
         ResourceSlotIdentifier imageIdentifier,
         in ImageRequest request,
         uint metadataBaseLayer)
@@ -23,8 +23,25 @@ public sealed partial class GuestImageCache
         }
 
         _dccClearCounts[(int)DccClearCount.Dcc]++;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var cleared = _dccClearCounts[(int)DccClearCount.Cleared];
+        MaterializeDccClearCore(imageIdentifier, request, metadataBaseLayer);
+        var ticks = System.Diagnostics.Stopwatch.GetTimestamp() - started;
+        _dccClearCounts[cleared == _dccClearCounts[(int)DccClearCount.Cleared] ? (int)DccClearCount.NoClearTicks : (int)DccClearCount.ClearTicks] += ticks;
+    }
 
-        var description = request.Description;
+    // [local] SHARPEMU_DCC_CLEAR_LEAN (on by default): the slices' keys are read first, and only when one decodes to a
+    // clear does the lookup rent the scan buffer and run the scan-and-clear loop, which reads the keys again. Lookups
+    // whose keys are not clears (about 98 % of the DCC ones in GTA V) skip the buffer rent and the per-slice setup.
+    // 0 always runs the scan-and-clear loop.
+    private static readonly bool DccClearLean = Environment.GetEnvironmentVariable("SHARPEMU_DCC_CLEAR_LEAN") != "0";
+
+    private unsafe void MaterializeDccClearCore(
+        ResourceSlotIdentifier imageIdentifier,
+        in ImageRequest request,
+        uint metadataBaseLayer)
+    {
+        ref readonly var description = ref request.Description;
         var range = description.Metadata.Range;
         using (var held = _lock.Hold())
         {
@@ -77,6 +94,12 @@ public sealed partial class GuestImageCache
             using var readbackScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ImageLookupDccReadback); // [local]
             _dccClearCounts[(int)DccClearCount.Readbacks]++;
             _bufferCache.ReadMemory(synchronizedAddress, synchronizedSize, isWrite: false);
+        }
+
+        if (DccClearLean && !AnyDccKeyDecodesToClear(request, range.Address, sliceSize, first, count))
+        {
+            _dccClearCounts[(int)DccClearCount.Slices] += count;
+            return;
         }
 
         const int metadataScanChunkSize = 64 * 1024;
@@ -165,10 +188,47 @@ public sealed partial class GuestImageCache
         }
     }
 
+    // [local] Whether the key byte of any of the slices decodes to a clear for this request.
+    private bool AnyDccKeyDecodesToClear(in ImageRequest request, ulong metadataAddress, ulong sliceSize, uint first, uint count)
+    {
+        Span<byte> key = stackalloc byte[1];
+        for (uint slice = 0; slice < count; slice++)
+        {
+            var address = metadataAddress + sliceSize * (first + slice);
+            byte code;
+            if (TryScanInPlace(address, sliceSize, scan: false, 0, out var aliasCode) is null)
+            {
+                if (!_backing.TryReadBacking(address, key))
+                {
+                    throw SubmissionScheduler.Fatal($"Could not read DCC metadata key: address=0x{address:X16}.");
+                }
+
+                code = key[0];
+            }
+            else
+            {
+                code = aliasCode;
+            }
+
+            if (PackedClearValue.TryDecodeDccColor(
+                    request.View.Format,
+                    code * 0x01010101u,
+                    request.Description.Metadata,
+                    allowClearToRegister: request.Role == ImageRole.ColorTarget,
+                    out _))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     // [local] Where MaterializeDccClear's calls go, for [PERF][DCC_CLEAR]: every call, DCC requests, those past the
     // single-level/sized early-outs, GPU-dirty readbacks, slices whose key was read, keys that decode to a clear,
-    // the bytes scanned for them, and slices cleared. Unsynchronized (render thread only).
-    private enum DccClearCount { Calls, Dcc, Eligible, Readbacks, Slices, KeyClear, ScannedBytes, Cleared, Count }
+    // the bytes scanned for them, slices cleared, and the time of the DCC calls that cleared nothing and of those
+    // that cleared. Unsynchronized (render thread only).
+    private enum DccClearCount { Calls, Dcc, Eligible, Readbacks, Slices, KeyClear, ScannedBytes, Cleared, NoClearTicks, ClearTicks, Count }
 
     private static readonly long[] _dccClearCounts = new long[(int)DccClearCount.Count];
 
@@ -181,7 +241,7 @@ public sealed partial class GuestImageCache
         }
 
         return FormattableString.Invariant(
-            $"[PERF][DCC_CLEAR] calls={counts[0]} dcc={counts[1]} eligible={counts[2]} readbacks={counts[3]} slices={counts[4]} key_clear={counts[5]} scanned_kb={counts[6] / 1024} cleared={counts[7]}");
+            $"[PERF][DCC_CLEAR] calls={counts[0]} dcc={counts[1]} eligible={counts[2]} readbacks={counts[3]} slices={counts[4]} key_clear={counts[5]} scanned_kb={counts[6] / 1024} cleared={counts[7]} noclear_us={counts[8] * 1_000_000 / System.Diagnostics.Stopwatch.Frequency} clear_us={counts[9] * 1_000_000 / System.Diagnostics.Stopwatch.Frequency}");
     }
 
     // [local] SHARPEMU_DCC_SCAN_IN_PLACE (on by default): the metadata key, or whether the whole slice repeats it, read
