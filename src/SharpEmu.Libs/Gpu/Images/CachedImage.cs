@@ -84,6 +84,8 @@ public sealed unsafe partial class CachedImage : IDisposable
     public ResourceSlotIdentifier DepthOwner;
     public ulong LastAccessTick;
     public int RecencyEntryIndex;
+    // [local] The collection tick of the last recency touch, mirrored from the recency entry.
+    public ulong RecencyTick;
 
     public CachedImage(GpuDeviceInfo device, SubmissionScheduler scheduler, IGuestBackedSpace guestBacking, in ImageDescription description,
         ImageBackingPool? pool = null)

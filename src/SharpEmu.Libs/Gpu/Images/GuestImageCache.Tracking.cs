@@ -33,6 +33,7 @@ public sealed partial class GuestImageCache
         image.Registered = true;
         InvalidateLookups(first, lastExclusive);
         image.RecencyEntryIndex = _recencyQueue.Insert(imageIdentifier, _collectionTick);
+        image.RecencyTick = _collectionTick;
         _totalUsedMemory += image.AccountedSize;
     }
 
@@ -205,10 +206,27 @@ public sealed partial class GuestImageCache
         DeleteImage(imageIdentifier);
     }
 
+    // [local] SHARPEMU_TOUCH_ONCE_PER_TICK (on by default): the recency entry is touched only when the image's mirrored
+    // tick is older, so repeated touches in one collection tick do not load the entry. 0 touches the entry every time.
+    private static readonly bool TouchOncePerTick = Environment.GetEnvironmentVariable("SHARPEMU_TOUCH_ONCE_PER_TICK") != "0";
+
     private void TouchImage(CachedImage image)
     {
-        if (image.Registered)
+        if (!image.Registered)
         {
+            return;
+        }
+
+        if (!TouchOncePerTick)
+        {
+            _recencyQueue.Touch(image.RecencyEntryIndex, _collectionTick);
+            image.RecencyTick = Math.Max(image.RecencyTick, _collectionTick);
+            return;
+        }
+
+        if (image.RecencyTick < _collectionTick)
+        {
+            image.RecencyTick = _collectionTick;
             _recencyQueue.Touch(image.RecencyEntryIndex, _collectionTick);
         }
     }

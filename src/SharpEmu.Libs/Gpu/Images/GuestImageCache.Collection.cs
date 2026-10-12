@@ -143,6 +143,7 @@ public sealed partial class GuestImageCache
             {
                 owner.LastAccessTick = 0;
                 owner.RecencyEntryIndex = _recencyQueue.Insert(imageIdentifier, 0);
+                owner.RecencyTick = 0;
             }
         }
 
@@ -151,6 +152,7 @@ public sealed partial class GuestImageCache
             if (oldest.IndexOf(imageIdentifier) < 0)
             {
                 _slots[imageIdentifier].RecencyEntryIndex = _recencyQueue.Insert(imageIdentifier, tick);
+                _slots[imageIdentifier].RecencyTick = tick;
             }
         }
     }
