@@ -101,7 +101,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 },
                 ImageExtent = new Extent3D(_extent.Width, _extent.Height, 1),
             };
-            _vk.CmdCopyBufferToImage(
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBufferToImage(_vk, // [local]
                 _commandBuffer,
                 _frameUploadBuffers[frameSlot],
                 presentationTarget,
@@ -424,7 +424,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var clearColor = new ClearColorValue(0f, 0f, 0f, 1f);
                 var clearRange = ColorSubresourceRange();
-                _vk.CmdClearColorImage(
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearColorImage(_vk, // [local]
                     _commandBuffer,
                     encodeForPresent ? encodeImage : presentationTarget,
                     ImageLayout.TransferDstOptimal,
@@ -504,7 +504,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         0),
                     Extent = new Extent3D(sourceWidth, sourceHeight, 1),
                 };
-                _vk.CmdCopyImage(
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_vk, // [local]
                     _commandBuffer,
                     source.Image,
                     ImageLayout.TransferSrcOptimal,
@@ -515,7 +515,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             else
             {
-                _vk.CmdBlitImage(
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBlitImage(_vk, // [local]
                     _commandBuffer,
                     source.Image,
                     ImageLayout.TransferSrcOptimal,
@@ -577,7 +577,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 VulkanSynchronization.PipelineBarrier(_vk,
                     _commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit,
                     0, 0, null, 0, null, 1, &bounceToTransferDst);
-                _vk.CmdCopyImage(
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_vk, // [local]
                     _commandBuffer,
                     encodeImage,
                     ImageLayout.TransferSrcOptimal,
@@ -600,7 +600,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 VulkanSynchronization.PipelineBarrier(_vk,
                     _commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit,
                     0, 0, null, 0, null, 1, &bounceToTransferSrc);
-                _vk.CmdCopyImage(
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_vk, // [local]
                     _commandBuffer,
                     bounceImage,
                     ImageLayout.TransferSrcOptimal,
@@ -645,7 +645,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     },
                     ImageExtent = new Extent3D(_extent.Width, _extent.Height, 1),
                 };
-                _vk.CmdCopyImageToBuffer(
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImageToBuffer(_vk, // [local]
                     _commandBuffer,
                     presentationTarget,
                     ImageLayout.TransferSrcOptimal,

@@ -17,7 +17,11 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
     private readonly CommandPool _pool;
     private readonly VkSemaphore _timeline;
 
-    public VulkanTickDevice(Vk vk, Device device, Queue queue, uint queueFamilyIndex, object queueGate, PhysicalDevice profilePhysicalDevice = default)
+    private readonly CommandRing? _ring; // [local]
+    private long _recorded; // [local]
+
+    public VulkanTickDevice(Vk vk, Device device, Queue queue, uint queueFamilyIndex, object queueGate, PhysicalDevice profilePhysicalDevice = default,
+        bool recordRing = false) // [local]
     {
         _vk = vk;
         _device = device;
@@ -44,7 +48,16 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         RequireSuccess(_vk.CreateSemaphore(_device, &createInfo, null, out _timeline), "vkCreateSemaphore(scheduler timeline)");
         if (profilePhysicalDevice.Handle != 0)
             CommandProfile = new VulkanCommandProfile(vk, profilePhysicalDevice, device, queueFamilyIndex);
+        if (recordRing) // [local]
+        {
+            _ring = new CommandRing(vk);
+            CommandRing.Active = _ring;
+        }
     }
+
+    public long RecordedPosition => _recorded; // [local]
+
+    public void WaitRecorded(long position) => _ring?.WaitReplayed(position); // [local]
 
     public VulkanCommandProfile? CommandProfile { get; }
 
@@ -232,6 +245,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public nint[] AllocateBuffers(int count)
     {
+        _ring?.Drain(RingDrainReason.Allocate); // [local] the replay thread records from the same pool
         var allocateInfo = new CommandBufferAllocateInfo
         {
             SType = StructureType.CommandBufferAllocateInfo,
@@ -256,6 +270,13 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public void BeginBuffer(nint buffer)
     {
+        if (_ring != null) // [local]
+        {
+            _ring.BeginBuffer(buffer);
+            CommandProfile?.BeginBuffer(new CommandBuffer(buffer));
+            return;
+        }
+
         var beginInfo = new CommandBufferBeginInfo
         {
             SType = StructureType.CommandBufferBeginInfo,
@@ -268,6 +289,12 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
     public void EndBuffer(nint buffer)
     {
         CommandProfile?.WriteMarker(new CommandBuffer(buffer), VulkanCommandProfile.IntervalKind.Tail);
+        if (_ring != null) // [local]
+        {
+            _recorded = _ring.EndBuffer(buffer);
+            return;
+        }
+
         RequireSuccess(_vk.EndCommandBuffer(new CommandBuffer(buffer)), "vkEndCommandBuffer(scheduler)");
     }
 
@@ -372,6 +399,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public void Dispose()
     {
+        _ring?.Dispose(); // [local]
         CommandProfile?.Dispose();
         lock (_fenceGate)
         {

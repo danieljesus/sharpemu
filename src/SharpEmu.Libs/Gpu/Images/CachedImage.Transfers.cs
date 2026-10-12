@@ -252,7 +252,7 @@ public sealed unsafe partial class CachedImage
         RecordBarriers(command, sourceStages | PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, &bufferBarrier, imageBarriers);
         fixed (BufferImageCopy* regions = uploadCopies)
         {
-            _device.Vk.CmdCopyBufferToImage(command, buffer, Backing.Handle, ImageLayout.TransferDstOptimal, (uint)uploadCopies.Length, regions);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBufferToImage(_device.Vk, command, buffer, Backing.Handle, ImageLayout.TransferDstOptimal, (uint)uploadCopies.Length, regions); // [local]
         }
 
         bufferBarrier = BufferBarrier(buffer, offset, size, AccessFlags.TransferReadBit, MemoryAccess);
@@ -268,7 +268,7 @@ public sealed unsafe partial class CachedImage
         RecordBarriers(command, sourceStages | PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, &bufferBarrier, imageBarriers);
         fixed (BufferImageCopy* regions = copies)
         {
-            _device.Vk.CmdCopyImageToBuffer(command, Backing.Handle, ImageLayout.TransferSrcOptimal, buffer, (uint)copies.Length, regions);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImageToBuffer(_device.Vk, command, Backing.Handle, ImageLayout.TransferSrcOptimal, buffer, (uint)copies.Length, regions); // [local]
         }
 
         bufferBarrier = BufferBarrier(buffer, offset, size, AccessFlags.TransferWriteBit, MemoryAccess);
@@ -360,7 +360,7 @@ public sealed unsafe partial class CachedImage
         Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
         fixed (ImageCopy* regions = copies)
         {
-            _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, (uint)copies.Length, regions);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_device.Vk, command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, (uint)copies.Length, regions); // [local]
         }
 
         Transition(ReadyLayout, ReadyAccess, null, command);
@@ -404,12 +404,12 @@ public sealed unsafe partial class CachedImage
         if (copy)
         {
             var region = new ImageCopy { SrcSubresource = sourceLayers, DstSubresource = destinationLayers, Extent = extent };
-            _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &region);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_device.Vk, command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &region); // [local]
         }
         else
         {
             var region = new ImageResolve { SrcSubresource = sourceLayers, DstSubresource = destinationLayers, Extent = extent };
-            _device.Vk.CmdResolveImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &region);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdResolveImage(_device.Vk, command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &region); // [local]
         }
     }
 
@@ -449,7 +449,7 @@ public sealed unsafe partial class CachedImage
             regions[count++] = new ImageCopy { SrcSubresource = layers, DstSubresource = layers, Extent = extent };
         }
 
-        _device.Vk.CmdCopyImage(
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_device.Vk, // [local]
             command,
             source.Backing.Handle,
             ImageLayout.TransferSrcOptimal,
@@ -567,10 +567,10 @@ public sealed unsafe partial class CachedImage
                     destinationCopy.ImageOffset.Z = Backing.ImageType == ImageType.Type3D ? (int)slice : 0;
                     var barrier = BufferBarrier(buffer.Handle, 0, copySize, AccessFlags.TransferReadBit, AccessFlags.TransferWriteBit);
                     VulkanSynchronization.PipelineBarrier(_device.Vk,command, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit, 0, null, 1, &barrier, 0, null);
-                    _device.Vk.CmdCopyImageToBuffer(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, buffer.Handle, 1, &sourceCopy);
+                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImageToBuffer(_device.Vk, command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, buffer.Handle, 1, &sourceCopy); // [local]
                     barrier = BufferBarrier(buffer.Handle, 0, copySize, AccessFlags.TransferWriteBit, AccessFlags.TransferReadBit);
                     VulkanSynchronization.PipelineBarrier(_device.Vk,command, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit, 0, null, 1, &barrier, 0, null);
-                    _device.Vk.CmdCopyBufferToImage(command, buffer.Handle, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &destinationCopy);
+                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBufferToImage(_device.Vk, command, buffer.Handle, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &destinationCopy); // [local]
                 }
             }
         }
@@ -622,7 +622,7 @@ public sealed unsafe partial class CachedImage
         var command = new CommandBuffer(_scheduler.Current.Handle);
         Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
         source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, command);
-        _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, copyCount, copies);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_device.Vk, command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, copyCount, copies); // [local]
         Transition(ReadyLayout, ReadyAccess, null, command);
     }
 
@@ -647,7 +647,7 @@ public sealed unsafe partial class CachedImage
         var command = new CommandBuffer(_scheduler.Current.Handle);
         Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, null, command);
         source.Transition(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, null, command);
-        _device.Vk.CmdCopyImage(command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &copy);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_device.Vk, command, source.Backing.Handle, ImageLayout.TransferSrcOptimal, Backing.Handle, ImageLayout.TransferDstOptimal, 1, &copy); // [local]
         Transition(ReadyLayout, ReadyAccess, null, command);
         source.Transition(ReadyLayout, ReadyAccess, null, command);
     }

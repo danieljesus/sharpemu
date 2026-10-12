@@ -231,13 +231,13 @@ internal sealed unsafe class ReadbackMirror(GpuDeviceInfo device, SubmissionSche
         };
         var beforeDependency = new DependencyInfo { SType = StructureType.DependencyInfo, MemoryBarrierCount = 1, PMemoryBarriers = &before };
         Vulkan.VkCallProbe.CountBarrier(command.Handle, 1, 0, 0); // [local]
-        vk.CmdPipelineBarrier2(command, &beforeDependency);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(vk, command, &beforeDependency); // [local]
         foreach (var (source, regions) in bySource)
         {
             var span = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(regions);
             fixed (BufferCopy* pointer = span)
             {
-                vk.CmdCopyBuffer(command, source.Handle, _host.Handle, (uint)span.Length, pointer);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBuffer(vk, command, source.Handle, _host.Handle, (uint)span.Length, pointer); // [local]
             }
 
             _copies += span.Length;
@@ -253,7 +253,7 @@ internal sealed unsafe class ReadbackMirror(GpuDeviceInfo device, SubmissionSche
         };
         var afterDependency = new DependencyInfo { SType = StructureType.DependencyInfo, MemoryBarrierCount = 1, PMemoryBarriers = &after };
         Vulkan.VkCallProbe.CountBarrier(command.Handle, 1, 0, 0); // [local]
-        vk.CmdPipelineBarrier2(command, &afterDependency);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(vk, command, &afterDependency); // [local]
     }
 
     private void Add(ulong line)

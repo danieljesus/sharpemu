@@ -541,7 +541,7 @@ public sealed unsafe class GpuTiler : IDisposable
     }
 
     private void BindDescriptorSet(CommandBuffer command, DescriptorSet set) =>
-        _device.Vk.CmdBindDescriptorSets(command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(_device.Vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null); // [local]
 
     private void Record(bool tile, VkBuffer source, ulong sourceOffset, ulong sourceCapacity, VkBuffer target, ulong targetOffset, ulong targetCapacity, List<TransferDispatch> dispatches, bool clearTarget)
     {
@@ -573,7 +573,7 @@ public sealed unsafe class GpuTiler : IDisposable
             PipelineStageFlags.ComputeShaderBit | PipelineStageFlags.TransferBit, 0, 0, null, 3, barriers, 0, null);
         if (clearTarget)
         {
-            vk.CmdFillBuffer(command, target, targetOffset, targetCapacity, 0);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdFillBuffer(vk, command, target, targetOffset, targetCapacity, 0); // [local]
             barriers[1].SrcAccessMask = AccessFlags2.TransferWriteBit;
             barriers[1].DstAccessMask = AccessFlags2.ShaderReadBit | AccessFlags2.ShaderWriteBit;
             VulkanSynchronization.PipelineBarrier(vk,command, PipelineStageFlags.TransferBit, PipelineStageFlags.ComputeShaderBit, 0, 0, null, 1, barriers + 1, 0, null);
@@ -586,8 +586,8 @@ public sealed unsafe class GpuTiler : IDisposable
         {
             infos[2] = new DescriptorBufferInfo(dispatch.ArgumentsBuffer, dispatch.ArgumentsOffset, TileTransferArguments.Size);
             BindDescriptorSet(command, WriteDescriptorSet(infos, 2));
-            vk.CmdBindPipeline(command, PipelineBindPoint.Compute, GetPipeline(dispatch.PipelineSlot));
-            vk.CmdDispatch(command, (dispatch.Arguments.Width + 7) / 8, (dispatch.Arguments.Height + 7) / 8, dispatch.Arguments.Depth);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, GetPipeline(dispatch.PipelineSlot)); // [local]
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, (dispatch.Arguments.Width + 7) / 8, (dispatch.Arguments.Height + 7) / 8, dispatch.Arguments.Depth); // [local]
         }
 
         barriers[1].SrcAccessMask = AccessFlags2.ShaderWriteBit;
@@ -696,7 +696,7 @@ public sealed unsafe class GpuTiler : IDisposable
     {
         fixed (TileTransferArguments* pointer = &arguments)
         {
-            _device.Vk.CmdPushConstants(command, _pipelineLayout, ShaderStageFlags.ComputeBit, 0, TileTransferArguments.Size, pointer);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPushConstants(_device.Vk, command, _pipelineLayout, ShaderStageFlags.ComputeBit, 0, TileTransferArguments.Size, pointer); // [local]
         }
     }
 
@@ -742,7 +742,7 @@ public sealed unsafe class GpuTiler : IDisposable
             AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit | AccessFlags.HostWriteBit | AccessFlags.TransferWriteBit | AccessFlags.ShaderWriteBit,
             AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit);
         VulkanSynchronization.PipelineBarrier(vk,command, PipelineStageFlags.AllCommandsBit | PipelineStageFlags.HostBit, PipelineStageFlags.ComputeShaderBit, 0, 0, null, 2, barriers, 0, null);
-        vk.CmdBindPipeline(command, PipelineBindPoint.Compute, pipeline);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, pipeline); // [local]
 
         var descriptorAlignment = StorageAlignment;
         var groupLimit = _device.MaxComputeWorkGroupCount;
@@ -794,7 +794,7 @@ public sealed unsafe class GpuTiler : IDisposable
                     PitchBytes = (uint)layout.SourceRowStride,
                     SliceBytes = (uint)layout.TargetRowStride,
                 });
-                vk.CmdDispatch(command, (uint)groupsX, rows, 1);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, (uint)groupsX, rows, 1); // [local]
                 row += rows;
             }
         }
@@ -829,10 +829,10 @@ public sealed unsafe class GpuTiler : IDisposable
         _scheduler.EndRendering();
         var command = new CommandBuffer(_scheduler.Current.Handle);
         VulkanSynchronization.PipelineBarrier(vk,command, PipelineStageFlags.AllCommandsBit | PipelineStageFlags.HostBit, PipelineStageFlags.ComputeShaderBit, 0, 0, null, 2, barriers, 0, null);
-        vk.CmdBindPipeline(command, PipelineBindPoint.Compute, _swapBgra16);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, _swapBgra16); // [local]
         BindDescriptorSet(command, WriteDescriptorSet(infos, -1));
         PushArguments(command, new TileTransferArguments { SourceBase = inputBinding.Base, DestinationBase = outputBinding.Base, Width = pixels });
-        vk.CmdDispatch(command, (pixels + 63) / 64, 1, 1);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, (pixels + 63) / 64, 1, 1); // [local]
         barriers[1].SrcAccessMask = AccessFlags2.ShaderWriteBit;
         barriers[1].DstAccessMask = AccessFlags2.TransferReadBit;
         VulkanSynchronization.PipelineBarrier(vk,command, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.TransferBit, 0, 0, null, 1, barriers + 1, 0, null);

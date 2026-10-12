@@ -732,7 +732,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
                     Extent = new Extent3D(extent.Width, extent.Height, 1),
                 };
-                _vk.CmdCopyImage(
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_vk, // [local]
                     commandBuffer, source.Backing.Handle, ImageLayout.TransferSrcOptimal, snapshot.Image, ImageLayout.TransferDstOptimal, 1, &copy);
                 var toShaderRead = new ImageMemoryBarrier2
                 {

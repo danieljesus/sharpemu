@@ -359,8 +359,8 @@ public sealed partial class GuestImageCache
                 ColorAttachmentCount = 1,
                 PColorAttachments = &attachment,
             };
-            _device.Vk.CmdBeginRendering(command, &rendering);
-            _device.Vk.CmdEndRendering(command);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRendering(_device.Vk, command, &rendering); // [local]
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRendering(_device.Vk, command); // [local]
         }
         else
         {
@@ -372,7 +372,7 @@ public sealed partial class GuestImageCache
                 description.IsVolume ? 0u : range.BaseLayer,
                 description.IsVolume ? 1u : range.LayerCount);
             var nativeClear = clear;
-            _device.Vk.CmdClearColorImage(
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearColorImage(_device.Vk, // [local]
                 command,
                 image.Backing.Handle,
                 ImageLayout.TransferDstOptimal,

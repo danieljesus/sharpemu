@@ -54,7 +54,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     // present and the readback queue wait for the submit first. A/B of 2026-10-12: -1.5 ms/frame, +0.47 FPS.
     internal static readonly bool SubmitThreadDefault = Environment.GetEnvironmentVariable("SHARPEMU_SUBMIT_THREAD") != "0";
 
-    private readonly record struct SealedSubmit(nint Buffer, SubmitBundle Bundle, ulong Tick, long Target, SubmissionTraceEntry Trace);
+    private readonly record struct SealedSubmit(nint Buffer, SubmitBundle Bundle, ulong Tick, long Target, SubmissionTraceEntry Trace,
+        long Recorded = 0);
 
     [ThreadStatic]
     private static bool _onSubmitThread;
@@ -534,11 +535,14 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
         _command.End();
         var buffer = _command.Buffer;
+        var recorded = _device.RecordedPosition; // [local]
         _device.MarkSealed(buffer); // [local]
         if (_submitThread != null)
         {
-            return SealForSubmitThread(buffer, submit, target);
+            return SealForSubmitThread(buffer, submit, target, recorded);
         }
+
+        _device.WaitRecorded(recorded); // [local]
 
         bool submitted;
         string failure;
@@ -582,7 +586,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     // [local] Reserve the tick and queue the sealed buffer for the submit thread. The tick is reserved and queued under
     // one lock, so the thread submits in tick order and the sealed tick is the submitted tick.
-    private ulong SealForSubmitThread(nint buffer, SubmitBundle submit, long target)
+    private ulong SealForSubmitThread(nint buffer, SubmitBundle submit, long target, long recorded)
     {
         SealedSubmit item;
         bool inline;
@@ -593,7 +597,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             submit.AddSignal(_timeline.Handle, tick);
             item = new SealedSubmit(buffer, submit, tick, target, new SubmissionTraceEntry(tick, _command.DebugOp,
                 _command.DebugSubmitId, _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3,
-                _command.DebugArg4));
+                _command.DebugArg4), recorded);
             lock (_submitLock)
             {
                 // After shutdown stopped the thread, a late submit runs inline; the queue is empty by then.
@@ -642,6 +646,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     private bool SubmitSealed(in SealedSubmit item, out string failure)
     {
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
+        _device.WaitRecorded(item.Recorded); // [local]
         WaitSubmitTarget?.Invoke(item.Target);
         var joined = System.Diagnostics.Stopwatch.GetTimestamp();
         bool submitted;

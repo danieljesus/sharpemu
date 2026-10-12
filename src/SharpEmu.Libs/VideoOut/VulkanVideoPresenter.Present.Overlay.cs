@@ -117,7 +117,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
                 ImageExtent = new Extent3D(PerfOverlay.PixelBufferWidth, PerfOverlay.PixelBufferHeight, 1),
             };
-            _vk.CmdCopyBufferToImage(
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBufferToImage(_vk, // [local]
                 _commandBuffer,
                 _overlayStagingBuffers[frameSlot],
                 _overlayImage,
@@ -172,7 +172,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 DstOffset = new Offset3D(rectangle.Left, rectangle.Top, 0),
                 Extent = new Extent3D((uint)panelWidth, (uint)panelHeight, 1),
             };
-            _vk.CmdCopyImage(
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImage(_vk, // [local]
                 _commandBuffer,
                 _overlayImage,
                 ImageLayout.TransferSrcOptimal,

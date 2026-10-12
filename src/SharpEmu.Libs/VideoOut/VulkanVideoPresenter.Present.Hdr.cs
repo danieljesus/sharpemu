@@ -349,18 +349,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 ClearValueCount = 1,
                 PClearValues = &clearValue,
             };
-            _vk.CmdBeginRenderPass(
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRenderPass(_vk, // [local]
                 _commandBuffer,
                 &renderPassInfo,
                 SubpassContents.Inline);
-            _vk.CmdBindPipeline(
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, // [local]
                 _commandBuffer,
                 PipelineBindPoint.Graphics,
                 isHdr ? _hdrPqPipeline : _hdrPipeline);
             var descriptorSet = isHdr
                 ? _hdrPqDescriptorSets[imageIndex]
                 : _hdrDescriptorSets[imageIndex];
-            _vk.CmdBindDescriptorSets(
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(_vk, // [local]
                 _commandBuffer,
                 PipelineBindPoint.Graphics,
                 _hdrPipelineLayout,
@@ -369,8 +369,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 &descriptorSet,
                 0,
                 null);
-            _vk.CmdDraw(_commandBuffer, 3, 1, 0, 0);
-            _vk.CmdEndRenderPass(_commandBuffer);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDraw(_vk, _commandBuffer, 3, 1, 0, 0); // [local]
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRenderPass(_vk, _commandBuffer); // [local]
         }
     }
 }

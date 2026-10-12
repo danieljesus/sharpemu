@@ -905,7 +905,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 new SubresourceRange(view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount), command);
             var range = new ImageSubresourceRange(aspects, view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
             var value = new ClearDepthStencilValue(depth.ClearDepthValue, depth.ClearStencilValue);
-            _vk.CmdClearDepthStencilImage(command, depth.Image.Backing.Handle, ImageLayout.TransferDstOptimal, &value, 1, &range);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearDepthStencilImage(_vk, command, depth.Image.Backing.Handle, ImageLayout.TransferDstOptimal, &value, 1, &range); // [local]
         }
 
         private void RecordDrawTextureTransitions(TextureResource[] bindings, DepthAttachment? depth, GuestDepthState depthState)
@@ -1039,7 +1039,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     ImageSubresource = new ImageSubresourceLayers { AspectMask = ImageAspectFlags.ColorBit, MipLevel = 0, LayerCount = 1 },
                     ImageExtent = new Extent3D(texture.Width, texture.Height, 1),
                 };
-                _vk.CmdCopyBufferToImage(_commandBuffer, texture.StagingBuffer, texture.Image, ImageLayout.TransferDstOptimal, 1, &copyRegion);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBufferToImage(_vk, _commandBuffer, texture.StagingBuffer, texture.Image, ImageLayout.TransferDstOptimal, 1, &copyRegion); // [local]
                 var toShaderRead = new ImageMemoryBarrier2
                 {
                     SType = StructureType.ImageMemoryBarrier2,
@@ -1105,7 +1105,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     var range = new SubresourceRange(view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
                     target.Image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
                     var vkRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
-                    _vk.CmdClearColorImage(command, target.Image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange);
+                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearColorImage(_vk, command, target.Image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange); // [local]
                 }
 
                 if (_traceVulkanShaderEnabled)

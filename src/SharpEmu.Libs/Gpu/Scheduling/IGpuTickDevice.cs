@@ -27,4 +27,12 @@ public interface IGpuTickDevice : IDisposable
     void MarkSealed(nint buffer)
     {
     }
+
+    // [local] Position of the last ended buffer in the device's record ring (0 without one), and a wait until the
+    // ring has replayed up to a position. A buffer is submitted only after its end has been replayed.
+    long RecordedPosition => 0;
+
+    void WaitRecorded(long position)
+    {
+    }
 }

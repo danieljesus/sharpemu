@@ -226,10 +226,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         VulkanSynchronization.PipelineBarrier(vk, native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit, 0, null, 1, &barrier, 0, null);
         var v0 = value0; var v1 = value1;
         var vkProbe228 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-        vk.CmdUpdateBuffer(native, buffer.Handle, buffer.Offset(guestAddress), 4, &v0);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdUpdateBuffer(vk, native, buffer.Handle, buffer.Offset(guestAddress), 4, &v0); // [local]
         SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.UpdateBuffer, vkProbe228); // [local]
         var vkProbe229 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-        vk.CmdUpdateBuffer(native, buffer.Handle, buffer.Offset(guestAddress1), 4, &v1);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdUpdateBuffer(vk, native, buffer.Handle, buffer.Offset(guestAddress1), 4, &v1); // [local]
         SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.UpdateBuffer, vkProbe229); // [local]
         var after = barrier;
         after.SrcAccessMask = AccessFlags2.TransferWriteBit;
@@ -2633,7 +2633,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             fixed (BufferCopy* pointer = regions)
             {
                 var vkProbe2631 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                vk.CmdCopyBuffer(native, source.Handle, buffer.Handle, (uint)regions.Length, pointer);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBuffer(vk, native, source.Handle, buffer.Handle, (uint)regions.Length, pointer); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.CopyBuffer, vkProbe2631); // [local]
             }
 

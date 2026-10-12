@@ -428,7 +428,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var vkProbe430 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdBindVertexBuffers(command, 0, (uint)bindings.Length, buffers, offsets);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindVertexBuffers(_vk, command, 0, (uint)bindings.Length, buffers, offsets); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindVertexBuffers, vkProbe430); // [local]
         }
 
@@ -436,7 +436,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var command = BeginBatchedGuestCommands();
             var vkProbe = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdBindIndexBuffer(command, new VkBuffer(binding.Handle), binding.Offset, type);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindIndexBuffer(_vk, command, new VkBuffer(binding.Handle), binding.Offset, type); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindIndexBuffer, vkProbe); // [local]
         }
 
@@ -654,7 +654,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     var range = new SubresourceRange(0, 1, layer, 1);
                     image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
                     var vkRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, layer, 1);
-                    _vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange);
+                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearColorImage(_vk, command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange); // [local]
                     if (!tracked)
                     {
                         _bufferCache.FillDccMetadata(guestSlice, sliceSize, uint.MaxValue);
@@ -694,7 +694,7 @@ internal static unsafe partial class VulkanVideoPresenter
             image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
             var vkRange = new ImageSubresourceRange(aspects, view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
             var value = new ClearDepthStencilValue(_boundDepthLoadState.DepthClearValue, _boundDepthLoadState.StencilClearValue);
-            _vk.CmdClearDepthStencilImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &value, 1, &vkRange);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearDepthStencilImage(_vk, command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &value, 1, &vkRange); // [local]
         }
 
         // [local] SHARPEMU_DYNAMIC_STATE_FILTER: dynamic state lasts across draws, pipeline binds (every guest
@@ -718,7 +718,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var viewport = new Viewport(state.ViewportX, state.ViewportY, state.ViewportWidth, state.ViewportHeight, state.ViewportMinDepth, state.ViewportMaxDepth);
                 var vkProbe713 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetViewport(command, 0, 1, &viewport);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetViewport(_vk, command, 0, 1, &viewport); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe713); // [local]
             }
 
@@ -728,14 +728,14 @@ internal static unsafe partial class VulkanVideoPresenter
                     new Offset2D(state.Scissor.Left, state.Scissor.Top),
                     new Extent2D((uint)(state.Scissor.Right - state.Scissor.Left), (uint)(state.Scissor.Bottom - state.Scissor.Top)));
                 var vkProbe721 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetScissor(command, 0, 1, &scissor);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetScissor(_vk, command, 0, 1, &scissor); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe721); // [local]
             }
 
             if (!known || state.LineWidth != last.LineWidth)
             {
                 var vkProbe726 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetLineWidth(command, state.LineWidth);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetLineWidth(_vk, command, state.LineWidth); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe726); // [local]
             }
 
@@ -743,35 +743,35 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var blendConstants = stackalloc float[4] { state.BlendRed, state.BlendGreen, state.BlendBlue, state.BlendAlpha };
                 var vkProbe732 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetBlendConstants(command, blendConstants);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetBlendConstants(_vk, command, blendConstants); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe732); // [local]
             }
 
             if (!known || state.DepthTestEnabled != last.DepthTestEnabled)
             {
                 var vkProbe737 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetDepthTestEnable(command, state.DepthTestEnabled);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetDepthTestEnable(_vk, command, state.DepthTestEnabled); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe737); // [local]
             }
 
             if (!known || state.DepthWriteEnabled != last.DepthWriteEnabled)
             {
                 var vkProbe742 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetDepthWriteEnable(command, state.DepthWriteEnabled);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetDepthWriteEnable(_vk, command, state.DepthWriteEnabled); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe742); // [local]
             }
 
             if (!known || state.DepthCompare != last.DepthCompare)
             {
                 var vkProbe747 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetDepthCompareOp(command, state.DepthCompare);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetDepthCompareOp(_vk, command, state.DepthCompare); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe747); // [local]
             }
 
             if (!known || state.DepthBiasEnabled != last.DepthBiasEnabled)
             {
                 var vkProbe752 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetDepthBiasEnable(command, state.DepthBiasEnabled);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetDepthBiasEnable(_vk, command, state.DepthBiasEnabled); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe752); // [local]
             }
 
@@ -781,29 +781,29 @@ internal static unsafe partial class VulkanVideoPresenter
                 state.DepthBiasSlopeFactor != last.DepthBiasSlopeFactor))
             {
                 var vkProbe760 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetDepthBias(command, state.DepthBiasConstantFactor, _supportsDepthBiasClamp ? state.DepthBiasClamp : 0f, state.DepthBiasSlopeFactor);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetDepthBias(_vk, command, state.DepthBiasConstantFactor, _supportsDepthBiasClamp ? state.DepthBiasClamp : 0f, state.DepthBiasSlopeFactor); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe760); // [local]
             }
 
             if (state.StencilTestEnabled && (!known || !last.StencilTestEnabled || state.FrontStencil != last.FrontStencil || state.BackStencil != last.BackStencil))
             {
                 var vkProbe765 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetStencilCompareMask(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.CompareMask);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetStencilCompareMask(_vk, command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.CompareMask); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe765); // [local]
                 var vkProbe766 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetStencilCompareMask(command, StencilFaceFlags.FaceBackBit, state.BackStencil.CompareMask);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetStencilCompareMask(_vk, command, StencilFaceFlags.FaceBackBit, state.BackStencil.CompareMask); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe766); // [local]
                 var vkProbe767 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetStencilWriteMask(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.WriteMask);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetStencilWriteMask(_vk, command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.WriteMask); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe767); // [local]
                 var vkProbe768 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetStencilWriteMask(command, StencilFaceFlags.FaceBackBit, state.BackStencil.WriteMask);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetStencilWriteMask(_vk, command, StencilFaceFlags.FaceBackBit, state.BackStencil.WriteMask); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe768); // [local]
                 var vkProbe769 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetStencilReference(command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.Reference);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetStencilReference(_vk, command, StencilFaceFlags.FaceFrontBit, state.FrontStencil.Reference); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe769); // [local]
                 var vkProbe770 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                _vk.CmdSetStencilReference(command, StencilFaceFlags.FaceBackBit, state.BackStencil.Reference);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetStencilReference(_vk, command, StencilFaceFlags.FaceBackBit, state.BackStencil.Reference); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe770); // [local]
             }
 
@@ -817,7 +817,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 var vkProbe782 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                colorWriteEnable.CmdSetColorWriteEnable(command, state.ColorWriteCount, enables);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetColorWriteEnable(colorWriteEnable, command, state.ColorWriteCount, enables); // [local]
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe782); // [local]
             }
 
@@ -1029,7 +1029,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 PStencilAttachment = depthStencil.HasStencil ? &stencil : null,
             };
             var vkProbe992 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdBeginRendering(command, &rendering);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRendering(_vk, command, &rendering); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BeginRendering, vkProbe992); // [local]
             _renderingScopesBegun++;
             _renderingActive = true;
@@ -1047,7 +1047,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _renderingState = default;
             var command = new CommandBuffer(_scheduler.Current.Handle);
             var vkProbe1008 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdEndRendering(command);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRendering(_vk, command); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.EndRendering, vkProbe1008); // [local]
             foreach (var (sourceStages, destinationStages, barriers) in _barriersAfterRendering)
             {
@@ -1090,7 +1090,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (!entry.RectangleList)
                 {
                     var vkProbe1049 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                    _vk.CmdBindPipeline(command, bindPoint, entry.Pipeline);
+                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, bindPoint, entry.Pipeline); // [local]
                     SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1049); // [local]
                 }
 
@@ -1098,7 +1098,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var vkProbe1055 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdBindPipeline(command, bindPoint, entry.Pipeline);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, bindPoint, entry.Pipeline); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1055); // [local]
             _profileComputePipeline = entry.Id;
         }
@@ -1124,7 +1124,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var vkProbe1079 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdBindPipeline(command, PipelineBindPoint.Graphics, variant);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, PipelineBindPoint.Graphics, variant); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1079); // [local]
         }
 
@@ -1137,7 +1137,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var vkProbe1090 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdBindPipeline(command, PipelineBindPoint.Graphics, entry.RectangleVariant);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, PipelineBindPoint.Graphics, entry.RectangleVariant); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1090); // [local]
         }
 
@@ -1170,7 +1170,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1121 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdDraw(command, count, instanceCount, firstVertex, firstInstance);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDraw(_vk, command, count, instanceCount, firstVertex, firstInstance); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Draw, vkProbe1121); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
                 _boundGraphicsPipeline?.Id ?? 0, count, instanceCount);
@@ -1195,7 +1195,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1144 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdDrawIndexed(command, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDrawIndexed(_vk, command, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DrawIndexed, vkProbe1144); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, indexCount, instanceCount);
@@ -1220,7 +1220,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1167 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdDrawIndexedIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 20);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDrawIndexedIndirect(_vk, command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 20); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DrawIndirect, vkProbe1167); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, 0, 0);
@@ -1234,7 +1234,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1179 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdDispatch(command, groupsX, groupsY, groupsZ);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(_vk, command, groupsX, groupsY, groupsZ); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Dispatch, vkProbe1179); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch,
                 _profileComputePipeline, groupsX, groupsY, groupsZ);
@@ -1259,7 +1259,7 @@ internal static unsafe partial class VulkanVideoPresenter
             };
             VulkanSynchronization.PipelineBarrier(_vk,command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.DrawIndirectBit, 0, 0, null, 1, &barrier, 0, null);
             var vkProbe1202 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdDispatchIndirect(command, buffer.Handle, offset);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatchIndirect(_vk, command, buffer.Handle, offset); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DispatchIndirect, vkProbe1202); // [local]
             CountDraw();
             return true;
@@ -1298,7 +1298,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var beforeInfo = new DependencyInfo { SType = StructureType.DependencyInfo, BufferMemoryBarrierCount = 1, PBufferMemoryBarriers = &before };
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.CountBarrier(command.Handle, 0, 1, 0); // [local]
             var vkProbe1238 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdPipelineBarrier2(command, &beforeInfo);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(_vk, command, &beforeInfo); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe1238); // [local]
             var region = new BufferCopy
             {
@@ -1307,7 +1307,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Size = 3u * sizeof(uint),
             };
             var vkProbe1245 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdCopyBuffer(command, buffer.Handle, shaderData.Buffer, 1, &region);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBuffer(_vk, command, buffer.Handle, shaderData.Buffer, 1, &region); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.CopyBuffer, vkProbe1245); // [local]
             var after = new BufferMemoryBarrier2
             {
@@ -1325,10 +1325,10 @@ internal static unsafe partial class VulkanVideoPresenter
             var afterInfo = new DependencyInfo { SType = StructureType.DependencyInfo, BufferMemoryBarrierCount = 1, PBufferMemoryBarriers = &after };
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.CountBarrier(command.Handle, 0, 1, 0); // [local]
             var vkProbe1260 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdPipelineBarrier2(command, &afterInfo);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(_vk, command, &afterInfo); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe1260); // [local]
             var vkProbe1261 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            _vk.CmdDispatchIndirect(command, buffer.Handle, offset);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatchIndirect(_vk, command, buffer.Handle, offset); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DispatchIndirect, vkProbe1261); // [local]
             CountDraw();
             return true;
@@ -1400,7 +1400,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var range = new SubresourceRange(view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
                 attachment.Image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
                 var vkRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, view.BaseLevel, view.LevelCount, view.BaseLayer, view.LayerCount);
-                _vk.CmdClearColorImage(command, attachment.Image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearColorImage(_vk, command, attachment.Image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange); // [local]
             }
 
             CountDraw();

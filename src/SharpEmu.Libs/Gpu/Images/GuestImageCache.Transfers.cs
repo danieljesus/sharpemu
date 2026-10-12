@@ -925,12 +925,12 @@ public sealed unsafe partial class GuestImageCache
             : new ImageSubresourceRange(aspect, 0, Vk.RemainingMipLevels, 0, image.Backing.Layers);
         if (aspect == ImageAspectFlags.ColorBit)
         {
-            _device.Vk.CmdClearColorImage(native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &colorClear, 1, &range);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearColorImage(_device.Vk, native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &colorClear, 1, &range); // [local]
         }
         else
         {
             var clear = new ClearDepthStencilValue(depthClear, stencilClear);
-            _device.Vk.CmdClearDepthStencilImage(native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clear, 1, &range);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearDepthStencilImage(_device.Vk, native, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clear, 1, &range); // [local]
         }
 
         TakeGpuOwnership(image);

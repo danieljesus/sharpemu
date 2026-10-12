@@ -266,11 +266,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         VulkanSynchronization.PipelineBarrier(vk,
             command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.ComputeShaderBit, DependencyFlags.ByRegionBit,
             0, null, 1, &preBarrier, 0, null);
-        vk.CmdBindPipeline(command, PipelineBindPoint.Compute, _pipeline);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, _pipeline); // [local]
         var set = _sets[_currentArea];
-        vk.CmdBindDescriptorSets(command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null); // [local]
         var threads = _pageCount / 32;
-        vk.CmdDispatch(command, (uint)((threads + 63) / 64), 1, 1);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, (uint)((threads + 63) / 64), 1, 1); // [local]
         VulkanSynchronization.PipelineBarrier(vk,
             command, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
             0, null, 1, &postBarrier, 0, null);

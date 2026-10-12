@@ -64,7 +64,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void CreateScheduler()
         {
             var tickDevice = new VulkanTickDevice(_vk, _device, _queue, _queueFamilyIndex, _queueGate,
-                RenderPhaseProfile.Enabled ? _physicalDevice : default);
+                RenderPhaseProfile.Enabled ? _physicalDevice : default, Gpu.Vulkan.CommandRing.Enabled); // [local]
             _gpuCommandProfile = tickDevice.CommandProfile;
             _scheduler = new SubmissionScheduler(
                 tickDevice,

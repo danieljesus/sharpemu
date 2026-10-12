@@ -303,16 +303,16 @@ public sealed unsafe class ColorToMultisampleDepthBlit : IDisposable
             ClearValueCount = 1,
             PClearValues = &clear,
         };
-        vk.CmdBeginRenderPass(command, &begin, SubpassContents.Inline);
-        vk.CmdBindDescriptorSets(command, PipelineBindPoint.Graphics, _pipelineLayout, 0, 1, &set, 0, null);
-        vk.CmdBindPipeline(command, PipelineBindPoint.Graphics, cached.Pipeline);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRenderPass(vk, command, &begin, SubpassContents.Inline); // [local]
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Graphics, _pipelineLayout, 0, 1, &set, 0, null); // [local]
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Graphics, cached.Pipeline); // [local]
         // [local] This pipeline's static states replace the guest draws' dynamic ones.
         Interlocked.Increment(ref DynamicStateEpoch);
         var viewport = new Viewport(0.0f, 0.0f, extent.Width, extent.Height, 0.0f, 1.0f);
         var scissor = new Rect2D(new Offset2D(0, 0), extent);
-        vk.CmdSetViewport(command, 0, 1, &viewport);
-        vk.CmdSetScissor(command, 0, 1, &scissor);
-        vk.CmdDraw(command, 3, 1, 0, 0);
-        vk.CmdEndRenderPass(command);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetViewport(vk, command, 0, 1, &viewport); // [local]
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetScissor(vk, command, 0, 1, &scissor); // [local]
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDraw(vk, command, 3, 1, 0, 0); // [local]
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRenderPass(vk, command); // [local]
     }
 }
