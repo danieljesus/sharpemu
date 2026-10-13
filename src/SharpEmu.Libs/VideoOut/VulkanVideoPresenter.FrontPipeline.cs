@@ -733,30 +733,36 @@ internal static unsafe partial class VulkanVideoPresenter
                 bytes = source.ToArray();
             var labelSerial = PendingLabels.Enabled ? presenter.FrontLabels.Add(address, bytes) : 0;
             if (labelSerial != 0)
-                presenter.CommandStream.RetryBlocked(); // a blocked head may wait on this label
+            {
+                // A blocked head may wait on this label; with SHARPEMU_FRONT_WAKE only the heads parked on it retry.
+                if (CommandStreamQueue.WakeOnWrite)
+                    presenter.CommandStream.NotifyGuestWrite(address, bytes.Length);
+                else
+                    presenter.CommandStream.RetryBlocked();
+            }
             if (LabelTrace.Enabled && LabelTrace.IsWatched(address))
             {
                 var traced = TraceValue(bytes);
                 var queueId = _queueId;
                 LabelTrace.Note(LabelTrace.Kind.CpQueued, queueId, address, traced);
-                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); LabelTrace.Note(LabelTrace.Kind.CpApplied, queueId, address, traced); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
+                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); LabelTrace.Note(LabelTrace.Kind.CpApplied, queueId, address, traced); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
                 return;
             }
 
             if (FrontProfile.LoopEnabled)
             {
                 var queued = System.Diagnostics.Stopwatch.GetTimestamp();
-                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); FrontProfile.NoteWriteApplied(address, queued); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
+                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); FrontProfile.NoteWriteApplied(address, queued); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
                 return;
             }
 
             if (labelSerial != 0)
             {
-                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
+                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
                 return;
             }
 
-            queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(); }, _pauseAlias, _resumeAlias);
+            queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
         }
 
         // [local] SHARPEMU_FRONT_PENDING_LABELS=1: a memory wait also sees the label writes this front queued and the
@@ -776,7 +782,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!WriteOverlay)
             {
                 FrontSyncStats.Note(2);
-                queue.Run(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(); return true; }, _pauseAlias, _resumeAlias);
+                queue.Run(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(address, bytes.Length); return true; }, _pauseAlias, _resumeAlias);
                 return;
             }
 
@@ -787,7 +793,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 presenter.WriteGuest(address, bytes);
                 if (traceNow) LabelTrace.Note(LabelTrace.Kind.NowApplied, -1, address, TraceValue(bytes));
-                presenter.NoteGuestWriteApplied();
+                presenter.NoteGuestWriteApplied(address, bytes.Length);
                 presenter.FrontOverlay.Retire(address, bytes.Length, serial);
             }, _pauseAlias, _resumeAlias);
         }
@@ -854,8 +860,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var cpu = cpuNow - _frontCpuReported;
             _frontCpuReported = cpuNow;
             var frontLines = string.Join("\n", FrontProfile.TakeReport(RenderPhaseProfile.LastReportFrames));
+            var wake = _commandStream.TakeWakeReport(); // [local] SHARPEMU_FRONT_WAKE / wake-latency probe
             return (frontLines.Length != 0 ? frontLines + "\n" : string.Empty) + FormattableString.Invariant(
-                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth} deferred_preps={Interlocked.Exchange(ref DeferredPreparations, 0)} skipped_preps={Interlocked.Exchange(ref SkippedPreparations, 0)} discarded_preps={Interlocked.Exchange(ref DiscardedFrontPreparations, 0)} front_stale_reads={Interlocked.Exchange(ref FrontStaleReads, 0)} front_stale_pages={Interlocked.Exchange(ref FrontStalePages, 0)} indirect_direct={Interlocked.Exchange(ref IndirectDirect, 0)} indirect_deferred={Interlocked.Exchange(ref IndirectDeferred, 0)}");
+                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth} deferred_preps={Interlocked.Exchange(ref DeferredPreparations, 0)} skipped_preps={Interlocked.Exchange(ref SkippedPreparations, 0)} discarded_preps={Interlocked.Exchange(ref DiscardedFrontPreparations, 0)} front_stale_reads={Interlocked.Exchange(ref FrontStaleReads, 0)} front_stale_pages={Interlocked.Exchange(ref FrontStalePages, 0)} indirect_direct={Interlocked.Exchange(ref IndirectDirect, 0)} indirect_deferred={Interlocked.Exchange(ref IndirectDeferred, 0)} write_wakes={wake.Wakes} write_notices={wake.Notices} wake_race_retries={wake.RaceRetries} wake_lat_n={wake.Count} wake_lat_first_ms={wake.FirstMs:F3} wake_lat_last_ms={wake.LastMs:F3}");
         }
 
         internal ICpuMemory GuestMemory => _guestMemory;
@@ -1106,8 +1113,9 @@ internal static unsafe partial class VulkanVideoPresenter
         // the next completed GPU tick or the 100 ms timer.
         private static readonly bool RetryOnGuestWrite = Environment.GetEnvironmentVariable("SHARPEMU_RETRY_ON_GUEST_WRITE") == "1";
 
-        internal void NoteGuestWriteApplied()
+        internal void NoteGuestWriteApplied(ulong address, int length)
         {
+            _commandStream.NotifyGuestWrite(address, length); // [local] SHARPEMU_FRONT_WAKE, wake-latency probe
             if (RetryOnGuestWrite)
                 _commandStream.RetryBlocked();
         }

@@ -44,6 +44,21 @@ public sealed class CommandStreamQueue
     // step). The scan ran for every slice and every wake of the front, ~13 ms per frame of its time in GTA V.
     private static readonly bool QueueMask = Environment.GetEnvironmentVariable("SHARPEMU_QUEUE_MASK") != "0";
     private ulong _occupied;
+    // [local] SHARPEMU_FRONT_WAKE=1: a head blocked on a memory wait (WAIT_REG_MEM, memory semaphore, atomic compare) is
+    // parked with its wait address, and a stream write the render thread applies (NotifyGuestWrite) unblocks the heads
+    // parked on an overlapping address at once, instead of leaving them until the next completed slice, completed GPU
+    // tick, presentation or 100 ms retry. It only adds wake-ups: every earlier trigger stays, so nothing that ran
+    // before can be left blocked. With SHARPEMU_FRONT_PENDING_LABELS=1 a queued label retries only the heads parked on
+    // its address instead of every head (only memory waits read pending labels).
+    internal static readonly bool WakeOnWrite = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_WAKE") == "1";
+    // The parked set is also kept for the wake-latency probe (SHARPEMU_PROFILE_FRONT).
+    private static readonly bool TrackParked = WakeOnWrite || SharpEmu.Libs.VideoOut.FrontProfile.LoopEnabled;
+    private ulong _parked;
+    private readonly ulong[] _parkedAddress = new ulong[QueueCount];
+    private readonly long[] _parkedFirstWrite = new long[QueueCount];
+    private readonly long[] _parkedLastWrite = new long[QueueCount];
+    private long _wakeLatencyFirstTicks, _wakeLatencyLastTicks, _wakeLatencyCount, _writeWakes, _writeNotices, _raceRetries;
+    private long _appliedWrites;
     private readonly GpuCommandInterpreter?[] _interpreters = new GpuCommandInterpreter?[QueueCount];
     private readonly Queue<ControlBarrier> _controlBarriers = new();
     private int _nextQueue;
@@ -432,6 +447,10 @@ public sealed class CommandStreamQueue
                 {
                     _occupied &= ~(1UL << selected);
                 }
+                if (TrackParked)
+                {
+                    UnparkLocked(selected);
+                }
                 LastRunBlockedKind = submission.BlockedKind;
                 LastRunBlockedAddress = submission.BlockedWaitAddress;
                 LastRunBlockedSince = submission.BlockedKind == SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.None ? 0 : submission.BlockedSinceTicks;
@@ -478,6 +497,7 @@ public sealed class CommandStreamQueue
         }
 
         bool complete;
+        var writesBefore = Volatile.Read(ref _appliedWrites); // [local] SHARPEMU_FRONT_WAKE
         try
         {
             complete = RunSlice(submission!);
@@ -512,6 +532,18 @@ public sealed class CommandStreamQueue
                         ? SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Other : interpreter.LastSuspendKind;
                     submission.BlockedWaitAddress = interpreter.LastSuspendAddress;
                 }
+                if (TrackParked && submission.BlockedWaitAddress != 0 && submission.BlockedKind is SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Memory
+                        or SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Semaphore or SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Atomic)
+                {
+                    ParkLocked(submission.QueueId, submission.BlockedWaitAddress);
+                    // A write applied while the slice ran may already satisfy the wait it just parked on, and its
+                    // notice found nothing parked: run the head once more.
+                    if (WakeOnWrite && Volatile.Read(ref _appliedWrites) != writesBefore)
+                    {
+                        submission.Blocked = false;
+                        _raceRetries++;
+                    }
+                }
                 _queues[submission.QueueId].AddFirst(submission);
                 _occupied |= 1UL << submission.QueueId;
                 _submissionCount++;
@@ -526,6 +558,104 @@ public sealed class CommandStreamQueue
             _processing = false;
             Monitor.PulseAll(_gate);
             return result;
+        }
+    }
+
+    private void ParkLocked(int queueId, ulong address)
+    {
+        _parkedAddress[queueId] = address;
+        _parkedFirstWrite[queueId] = 0;
+        _parkedLastWrite[queueId] = 0;
+        Volatile.Write(ref _parked, _parked | (1UL << queueId));
+    }
+
+    // The head of the queue runs again. A head that was parked on a memory wait and saw a write to its address since
+    // charges the time from that write (the first and the last one) to now: the wake-up latency the probe reports.
+    private void UnparkLocked(int queueId)
+    {
+        if ((_parked & (1UL << queueId)) == 0)
+        {
+            return;
+        }
+
+        if (_parkedFirstWrite[queueId] != 0)
+        {
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            _wakeLatencyFirstTicks += now - _parkedFirstWrite[queueId];
+            _wakeLatencyLastTicks += now - _parkedLastWrite[queueId];
+            _wakeLatencyCount++;
+        }
+
+        Volatile.Write(ref _parked, _parked & ~(1UL << queueId));
+    }
+
+    // [local] A stream write the render thread applied (labels, WRITE_DATA, event stores): heads parked on an
+    // overlapping address are stamped for the probe and, with SHARPEMU_FRONT_WAKE=1, unblocked. A wait reads at most
+    // 8 bytes at its address.
+    public void NotifyGuestWrite(ulong address, int length)
+    {
+        if (WakeOnWrite)
+        {
+            Interlocked.Increment(ref _appliedWrites);
+        }
+
+        if (Volatile.Read(ref _parked) == 0 || length <= 0)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            var woke = false;
+            var now = 0L;
+            for (var bits = _parked; bits != 0; bits &= bits - 1)
+            {
+                var queueId = System.Numerics.BitOperations.TrailingZeroCount(bits);
+                var wait = _parkedAddress[queueId];
+                if (wait >= address + (ulong)length || address >= wait + sizeof(ulong))
+                {
+                    continue;
+                }
+
+                if (now == 0)
+                {
+                    now = System.Diagnostics.Stopwatch.GetTimestamp();
+                }
+
+                if (_parkedFirstWrite[queueId] == 0)
+                {
+                    _parkedFirstWrite[queueId] = now;
+                }
+
+                _parkedLastWrite[queueId] = now;
+                _writeNotices++;
+                if (WakeOnWrite && _queues[queueId].First is { } head && head.Value.Blocked)
+                {
+                    head.Value.Blocked = false;
+                    _writeWakes++;
+                    woke = true;
+                }
+            }
+
+            if (woke)
+            {
+                Monitor.PulseAll(_gate);
+            }
+        }
+    }
+
+    // [local] For [PERF][FRONT]: wake-ups by applied writes and the mean latency from the first / last write to a
+    // parked head's address until it ran again, since the last call.
+    internal (long Wakes, long Notices, long RaceRetries, long Count, double FirstMs, double LastMs) TakeWakeReport()
+    {
+        lock (_gate)
+        {
+            var count = _wakeLatencyCount;
+            var report = (_writeWakes, _writeNotices, _raceRetries, count,
+                count == 0 ? 0 : _wakeLatencyFirstTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency / count,
+                count == 0 ? 0 : _wakeLatencyLastTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency / count);
+            _writeWakes = _writeNotices = _raceRetries = _wakeLatencyCount = _wakeLatencyFirstTicks = _wakeLatencyLastTicks = 0;
+            return report;
         }
     }
 
@@ -684,6 +814,7 @@ public sealed class CommandStreamQueue
             }
 
             RecomputeOccupiedLocked();
+            _parked = 0;
             Monitor.PulseAll(_gate);
         }
     }
@@ -960,6 +1091,7 @@ public sealed class CommandStreamQueue
         }
 
         _occupied = 0;
+        _parked = 0;
         _submissionCount = 0;
         _pendingBoundaries = 0;
     }

@@ -43,6 +43,14 @@ internal sealed unsafe partial class CommandRing : IDisposable
     // once). SHARPEMU_RECORD_RING_SPIN_US: how long the replay thread spins on an empty ring before it parks.
     private static readonly int WakeEvery = Math.Max(1, EnvInt("SHARPEMU_RECORD_RING_WAKE", 1));
     private static readonly long SpinTicks = EnvInt("SHARPEMU_RECORD_RING_SPIN_US", 1000) * Stopwatch.Frequency / 1_000_000;
+    // [local] SHARPEMU_RECORD_RING_HYBRID=1: the replay thread spins only while the producer is appending (it found
+    // records within the last SHARPEMU_RECORD_RING_ACTIVE_US, default 200 µs, and never longer than the spin above);
+    // once a park times out with the ring still empty it parks again without spinning. The default spins up to the
+    // full spin after every empty ring and again after every 1 ms park, ~75-89 % of a logical CPU in GTA V.
+    private static readonly bool Hybrid = Environment.GetEnvironmentVariable("SHARPEMU_RECORD_RING_HYBRID") == "1";
+    private static readonly long ActiveTicks = EnvInt("SHARPEMU_RECORD_RING_ACTIVE_US", 200) * Stopwatch.Frequency / 1_000_000;
+    private long _lastData;
+    private bool _idleSincePark;
 
     private static int EnvInt(string name, int fallback) =>
         int.TryParse(Environment.GetEnvironmentVariable(name), out var value) && value >= 0 ? value : fallback;
@@ -352,6 +360,7 @@ internal sealed unsafe partial class CommandRing : IDisposable
                 if (_readPos < published)
                 {
                     var start = Stopwatch.GetTimestamp();
+                    _idleSincePark = false;
                     var records = 0;
                     while (_readPos < published)
                     {
@@ -393,7 +402,8 @@ internal sealed unsafe partial class CommandRing : IDisposable
                         }
                     }
 
-                    RingStats.Replayed(records, Stopwatch.GetTimestamp() - start);
+                    _lastData = Stopwatch.GetTimestamp();
+                    RingStats.Replayed(records, _lastData - start);
                     if (Volatile.Read(ref _waiting) != 0)
                     {
                         SignalWaiters();
@@ -428,6 +438,8 @@ internal sealed unsafe partial class CommandRing : IDisposable
     private void Idle(Block block)
     {
         var spinStart = Stopwatch.GetTimestamp();
+        // Hybrid: spin until ActiveTicks after the last records (capped by the spin), not at all after an idle park.
+        var spinTicks = !Hybrid ? SpinTicks : _idleSincePark ? 0 : Math.Min(SpinTicks, Math.Max(0, _lastData + ActiveTicks - spinStart));
         do
         {
             for (var index = 0; index < 16; index++)
@@ -440,7 +452,7 @@ internal sealed unsafe partial class CommandRing : IDisposable
                 Thread.SpinWait(8);
             }
         }
-        while (Stopwatch.GetTimestamp() - spinStart < SpinTicks);
+        while (Stopwatch.GetTimestamp() - spinStart < spinTicks);
 
         var start = Stopwatch.GetTimestamp();
         Volatile.Write(ref _parked, 1);
@@ -455,9 +467,13 @@ internal sealed unsafe partial class CommandRing : IDisposable
             return;
         }
 
-        if (!_wake.Wait(1) && Interlocked.Exchange(ref _parked, 0) == 0)
+        if (!_wake.Wait(1))
         {
-            _wake.Wait();
+            _idleSincePark = true;
+            if (Interlocked.Exchange(ref _parked, 0) == 0)
+            {
+                _wake.Wait();
+            }
         }
 
         RingStats.Parked(Stopwatch.GetTimestamp() - start);
