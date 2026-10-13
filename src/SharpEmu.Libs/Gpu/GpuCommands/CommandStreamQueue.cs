@@ -39,6 +39,11 @@ public sealed class CommandStreamQueue
     private readonly ICommandStreamHost _host;
     private readonly object _gate = new();
     private readonly LinkedList<CommandSubmission>[] _queues = new LinkedList<CommandSubmission>[QueueCount];
+    // [local] SHARPEMU_QUEUE_MASK (on by default; =0 disables): bit q is set while queue q holds a submission, and the
+    // selection, the unblocking and the barrier checks visit only those queues instead of all 57 (with a modulo per
+    // step). The scan ran for every slice and every wake of the front, ~13 ms per frame of its time in GTA V.
+    private static readonly bool QueueMask = Environment.GetEnvironmentVariable("SHARPEMU_QUEUE_MASK") != "0";
+    private ulong _occupied;
     private readonly GpuCommandInterpreter?[] _interpreters = new GpuCommandInterpreter?[QueueCount];
     private readonly Queue<ControlBarrier> _controlBarriers = new();
     private int _nextQueue;
@@ -216,6 +221,7 @@ public sealed class CommandStreamQueue
 
         submission.AdmissionOrdinal = ++_admissionOrdinal;
         _queues[submission.QueueId].AddLast(submission);
+        _occupied |= 1UL << submission.QueueId;
         _submissionCount++;
         if (submission.Kind is not (CommandSubmissionKind.FlipPreparation or CommandSubmissionKind.FrameBoundary))
             SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.Enqueued, submission.QueueId,
@@ -388,14 +394,7 @@ public sealed class CommandStreamQueue
     {
         lock (_gate)
         {
-            foreach (var queue in _queues)
-            {
-                if (queue.First is { } head)
-                {
-                    head.Value.Blocked = false;
-                }
-            }
-
+            UnblockHeadsLocked();
             BlockedRetries++;
             Monitor.PulseAll(_gate);
         }
@@ -429,6 +428,10 @@ public sealed class CommandStreamQueue
                 var queue = _queues[selected];
                 submission = queue.First!.Value;
                 queue.RemoveFirst();
+                if (queue.Count == 0)
+                {
+                    _occupied &= ~(1UL << selected);
+                }
                 LastRunBlockedKind = submission.BlockedKind;
                 LastRunBlockedAddress = submission.BlockedWaitAddress;
                 LastRunBlockedSince = submission.BlockedKind == SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.None ? 0 : submission.BlockedSinceTicks;
@@ -510,19 +513,13 @@ public sealed class CommandStreamQueue
                     submission.BlockedWaitAddress = interpreter.LastSuspendAddress;
                 }
                 _queues[submission.QueueId].AddFirst(submission);
+                _occupied |= 1UL << submission.QueueId;
                 _submissionCount++;
                 result = submission.Commands.MadeProgress ? SliceResult.Progressed : SliceResult.BlockedWithoutProgress;
             }
             else
             {
-                foreach (var queue in _queues)
-                {
-                    if (queue.First is { } head)
-                    {
-                        head.Value.Blocked = false;
-                    }
-                }
-
+                UnblockHeadsLocked();
                 result = SliceResult.Completed;
             }
 
@@ -686,6 +683,7 @@ public sealed class CommandStreamQueue
                 }
             }
 
+            RecomputeOccupiedLocked();
             Monitor.PulseAll(_gate);
         }
     }
@@ -768,7 +766,75 @@ public sealed class CommandStreamQueue
         }
     }
 
+    // [local] The occupied queues from _nextQueue upwards, then from 0: the order of the full scan.
+    private (ulong High, ulong Low) OccupiedInScanOrder()
+    {
+        var start = _nextQueue;
+        var high = _occupied & (ulong.MaxValue << start);
+        var low = start == 0 ? 0 : _occupied & ((1UL << start) - 1);
+        return (high, low);
+    }
+
+    private void UnblockHeadsLocked()
+    {
+        if (!QueueMask)
+        {
+            foreach (var queue in _queues)
+            {
+                if (queue.First is { } head)
+                {
+                    head.Value.Blocked = false;
+                }
+            }
+
+            return;
+        }
+
+        for (var bits = _occupied; bits != 0; bits &= bits - 1)
+        {
+            if (_queues[System.Numerics.BitOperations.TrailingZeroCount(bits)].First is { } head)
+            {
+                head.Value.Blocked = false;
+            }
+        }
+    }
+
+    private void RecomputeOccupiedLocked() => _occupied = ComputeOccupiedLocked();
+
+    private ulong ComputeOccupiedLocked()
+    {
+        var occupied = 0UL;
+        for (var queueId = 0; queueId < QueueCount; queueId++)
+        {
+            if (_queues[queueId].Count != 0)
+            {
+                occupied |= 1UL << queueId;
+            }
+        }
+
+        return occupied;
+    }
+
+    // [local] SHARPEMU_QUEUE_MASK_CHECK=1: every selection also runs the full scan and stops on a difference.
+    private static readonly bool QueueMaskCheck = Environment.GetEnvironmentVariable("SHARPEMU_QUEUE_MASK_CHECK") == "1";
+
     private int SelectQueueLocked()
+    {
+        if (QueueMask)
+        {
+            var selected = SelectOccupiedQueueLocked();
+            if (QueueMaskCheck && (selected != ScanQueuesLocked() || _occupied != ComputeOccupiedLocked()))
+            {
+                throw _host.Fatal($"The queue mask selected queue {selected}, the scan {ScanQueuesLocked()}: occupied=0x{_occupied:X} actual=0x{ComputeOccupiedLocked():X} next={_nextQueue}.");
+            }
+
+            return selected;
+        }
+
+        return ScanQueuesLocked();
+    }
+
+    private int ScanQueuesLocked()
     {
         if (_controlBarriers.TryPeek(out var control))
         {
@@ -796,6 +862,46 @@ public sealed class CommandStreamQueue
         return -1;
     }
 
+    private int SelectOccupiedQueueLocked()
+    {
+        if (_occupied == 0)
+        {
+            return -1;
+        }
+
+        var (high, low) = OccupiedInScanOrder();
+        if (_controlBarriers.TryPeek(out var control))
+        {
+            foreach (var part in (ReadOnlySpan<ulong>)[high, low])
+            {
+                for (var bits = part; bits != 0; bits &= bits - 1)
+                {
+                    var queueId = System.Numerics.BitOperations.TrailingZeroCount(bits);
+                    if (_queues[queueId].First is { } head &&
+                        head.Value.AdmissionOrdinal <= control.CutoffOrdinal &&
+                        !head.Value.Blocked)
+                    {
+                        return queueId;
+                    }
+                }
+            }
+        }
+
+        foreach (var part in (ReadOnlySpan<ulong>)[high, low])
+        {
+            for (var bits = part; bits != 0; bits &= bits - 1)
+            {
+                var queueId = System.Numerics.BitOperations.TrailingZeroCount(bits);
+                if (_queues[queueId].First is { } head && !head.Value.Blocked)
+                {
+                    return queueId;
+                }
+            }
+        }
+
+        return -1;
+    }
+
     private bool HasRunnableWorkLocked() => IsControlBarrierReadyLocked() || SelectQueueLocked() >= 0;
 
     private bool IsControlBarrierReadyLocked()
@@ -803,6 +909,20 @@ public sealed class CommandStreamQueue
         if (!_controlBarriers.TryPeek(out var control))
         {
             return false;
+        }
+
+        if (QueueMask)
+        {
+            for (var bits = _occupied; bits != 0; bits &= bits - 1)
+            {
+                if (_queues[System.Numerics.BitOperations.TrailingZeroCount(bits)].First is { } head &&
+                    head.Value.AdmissionOrdinal <= control.CutoffOrdinal)
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         foreach (var queue in _queues)
@@ -839,6 +959,7 @@ public sealed class CommandStreamQueue
             queue.Clear();
         }
 
+        _occupied = 0;
         _submissionCount = 0;
         _pendingBoundaries = 0;
     }
