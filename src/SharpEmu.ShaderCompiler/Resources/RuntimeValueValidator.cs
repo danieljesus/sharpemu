@@ -15,6 +15,10 @@ public sealed class RuntimeValueValidator
     private readonly int _tableReadCount;
     private readonly ScalarValue? _activeMask;
     private readonly HashSet<ScalarValue> _visiting = [];
+    // A value is accepted only when nothing under it closes a cycle back onto the path,
+    // so an accepted value is valid on every path. Remembering it keeps values shared
+    // across a large shader from being walked once per path, which grows exponentially.
+    private readonly HashSet<ScalarValue> _accepted = [];
 
     // Set when a failure traces back to a phi that isn't loop-invariant (e.g. a
     // hash-table/linear-probe bindless lookup): the value genuinely has no single
@@ -63,7 +67,7 @@ public sealed class RuntimeValueValidator
 
     public bool Validate(ScalarValue value)
     {
-        if (value.IsConstant)
+        if (value.IsConstant || _accepted.Contains(value))
         {
             return true;
         }
@@ -76,6 +80,11 @@ public sealed class RuntimeValueValidator
         try
         {
             var result = ValidateNode(value);
+            if (result)
+            {
+                _accepted.Add(value);
+            }
+
             return result;
         }
         finally

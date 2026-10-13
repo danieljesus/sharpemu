@@ -677,47 +677,39 @@ public sealed partial class ResourceTracker
         }
     }
 
-    private static bool HasRuntimeRead(ScalarValue value) => HasRuntimeRead(value, []);
+    private static bool HasRuntimeRead(ScalarValue value) =>
+        Reaches(value, static candidate => candidate.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord);
 
-    private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind) => HasRuntimeReadKind(value, kind, []);
+    private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind) =>
+        Reaches(value, candidate => candidate.Kind == kind);
 
-    private static bool HasRuntimeReadKind(ScalarValue value, ScalarValueKind kind, HashSet<ScalarValue> visiting)
+    // True when the value or any value it is computed from matches. This only asks what
+    // is reachable, so each value is visited once: walking every path instead grows
+    // exponentially with the values large shaders share, minutes for one program.
+    internal static bool Reaches(ScalarValue value, Func<ScalarValue, bool> matches)
     {
-        if (!visiting.Add(value))
+        var visited = new HashSet<ScalarValue>();
+        var pending = new Stack<ScalarValue>();
+        pending.Push(value);
+        while (pending.TryPop(out var current))
         {
-            return false;
-        }
+            if (!visited.Add(current))
+            {
+                continue;
+            }
 
-        try
-        {
-            return value.Kind == kind || value.Operands.Any(operand => HasRuntimeReadKind(operand, kind, visiting));
-        }
-        finally
-        {
-            visiting.Remove(value);
-        }
-    }
-
-    private static bool HasRuntimeRead(ScalarValue value, HashSet<ScalarValue> visiting)
-    {
-        if (!visiting.Add(value))
-        {
-            return false;
-        }
-
-        try
-        {
-            if (value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord)
+            if (matches(current))
             {
                 return true;
             }
 
-            return value.Operands.Any(operand => HasRuntimeRead(operand, visiting));
+            foreach (var operand in current.Operands)
+            {
+                pending.Push(operand);
+            }
         }
-        finally
-        {
-            visiting.Remove(value);
-        }
+
+        return false;
     }
 
     // ---- dense tables ----
