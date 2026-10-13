@@ -380,10 +380,9 @@ public static partial class Gen5SpirvTranslator
                     if (!TryStoreDoubleResult(
                             instruction,
                             destination,
-                            Ext(
-                                instruction.Opcode == "VFractF64" ? 10u : 31u,
-                                DoubleType(),
-                                source),
+                            instruction.Opcode == "VFractF64"
+                                ? FractBelowOne(Ext(10u, DoubleType(), source), DoubleType(), Double(1d), Double(Math.BitDecrement(1d)))
+                                : Ext(31u, DoubleType(), source),
                             out result,
                             out error))
                     {
@@ -549,7 +548,9 @@ public static partial class Gen5SpirvTranslator
                     result = EmitFloat16Result(instruction, destination, Ext(2, _floatType, GetFloat16Source(instruction, 0)));
                     break;
                 case "VFractF16":
-                    result = EmitFloat16Result(instruction, destination, Ext(10, _floatType, GetFloat16Source(instruction, 0)));
+                    // The f32 fraction is clamped to the largest half below one before it is narrowed.
+                    result = EmitFloat16Result(instruction, destination, FractBelowOne(Ext(10, _floatType, GetFloat16Source(instruction, 0)),
+                        _floatType, Float((float)BitConverter.UInt16BitsToHalf(0x3BFF)), Float((float)BitConverter.UInt16BitsToHalf(0x3BFF)), above: true));
                     break;
                 case "VSinF16":
                     result = EmitFloat16Result(instruction, destination, Ext(13, _floatType, _module.AddInstruction(SpirvOp.FMul, _floatType, GetFloat16Source(instruction, 0), Float(MathF.Tau))));
@@ -566,7 +567,7 @@ public static partial class Gen5SpirvTranslator
                 case "VFractF32":
                     result = EmitFloatResult(
                         instruction,
-                        Ext(10, _floatType, GetFloatSource(instruction, 0)));
+                        FractBelowOne(Ext(10, _floatType, GetFloatSource(instruction, 0)), _floatType, Float(1f), Float(MathF.BitDecrement(1f))));
                     break;
                 case "VTruncF32":
                     result = EmitFloatResult(
@@ -1948,6 +1949,24 @@ public static partial class Gen5SpirvTranslator
         {
             var half = highLane ? ShiftRightLogical(raw, UInt(16)) : raw;
             return Bitcast(_floatType, EmitHalfToFloat(half));
+        }
+
+        // [local] V_FRACT_F16/F32/F64 clamp x - floor(x) below 1.0 (a tiny negative input rounds it to exactly 1.0);
+        // FRACT keeps a NaN, so the ordered compare leaves it alone. With above, values greater than the limit are
+        // clamped (the f16 case, whose f32 fraction may lie between the largest half below one and one).
+        // Clean-room after the idea of KytyPS5-GTA e9d652e.
+        // SHARPEMU_FRACT_CLAMP=0 restores the unclamped fraction (for image comparisons).
+        private static readonly bool FractClamp = Environment.GetEnvironmentVariable("SHARPEMU_FRACT_CLAMP") != "0";
+
+        private uint FractBelowOne(uint fraction, uint type, uint limit, uint belowOne, bool above = false)
+        {
+            if (!FractClamp)
+            {
+                return fraction;
+            }
+
+            var tooLarge = _module.AddInstruction(above ? SpirvOp.FOrdGreaterThan : SpirvOp.FOrdGreaterThanEqual, _boolType, fraction, limit);
+            return _module.AddInstruction(SpirvOp.Select, type, tooLarge, belowOne, fraction);
         }
 
         // Saturates an f32 bit pattern to [0, 1] the way the VOP3P clamp modifier
