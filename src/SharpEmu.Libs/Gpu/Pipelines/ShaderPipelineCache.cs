@@ -21,9 +21,10 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private const uint MaxPixelInputs = 32;
     private const uint MaxViewportDimension = 16384;
 
-    // [local] SHARPEMU_DEPTH_BOUNDS_KEY (0 = bounds always in the pipeline key, the old behaviour).
+    // [local] SHARPEMU_DEPTH_BOUNDS_KEY, 2 (dynamic depth bounds) by default; 0 = bounds always in the pipeline key,
+    // the old behaviour (resolve2 batch 1: pan creations 155/s -> 0, static +0.05 +- 0.19, pan +0.63 +- 0.42 fps).
     internal static readonly int DepthBoundsKeyMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEPTH_BOUNDS_KEY"), out var depthBoundsKey) ? depthBoundsKey : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEPTH_BOUNDS_KEY"), out var depthBoundsKey) ? depthBoundsKey : 2;
 
     private readonly CpuContext _context;
     private readonly IShaderPipelineHost _host;
