@@ -376,6 +376,20 @@ internal static unsafe class VkRecord
         vk.CmdSetDepthBias(command, constant, clamp, slope);
     }
 
+    public static void CmdSetDepthBounds(Vk vk, CommandBuffer command, float min, float max)
+    {
+        if (Ring(command) is { } ring)
+        {
+            var args = (RingArgs.Floats*)ring.Reserve(RingOp.SetDepthBounds, sizeof(RingArgs.Floats));
+            args->A = min;
+            args->B = max;
+            ring.Commit();
+            return;
+        }
+
+        vk.CmdSetDepthBounds(command, min, max);
+    }
+
     private static void PutStencil(CommandRing ring, RingOp op, StencilFaceFlags faces, uint value)
     {
         var args = (RingArgs.Four*)ring.Reserve(op, sizeof(RingArgs.Four));

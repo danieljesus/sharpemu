@@ -21,6 +21,10 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private const uint MaxPixelInputs = 32;
     private const uint MaxViewportDimension = 16384;
 
+    // [local] SHARPEMU_DEPTH_BOUNDS_KEY (0 = bounds always in the pipeline key, the old behaviour).
+    internal static readonly int DepthBoundsKeyMode =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEPTH_BOUNDS_KEY"), out var depthBoundsKey) ? depthBoundsKey : 0;
+
     private readonly CpuContext _context;
     private readonly IShaderPipelineHost _host;
     private readonly ShaderHeaderRegistry _registry;
@@ -695,8 +699,16 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         parameters.SampleShadingEnable = pixelActive && samples > 1 && pixelInput!.SampleShading;
         parameters.WithDepth = withDepth;
         parameters.DepthBoundsTestEnable = depthState.DepthBoundsTestEnabled;
-        parameters.DepthMinBounds = depthState.DepthMinBounds;
-        parameters.DepthMaxBounds = depthState.DepthMaxBounds;
+        // [local] SHARPEMU_DEPTH_BOUNDS_KEY: 1 keeps the bounds out of the key while the test is off (they are
+        // ignored then); 2 keeps them out always and the draw sets them as dynamic state.
+        var boundsInKey = DepthBoundsKeyMode switch
+        {
+            1 => depthState.DepthBoundsTestEnabled,
+            2 => false,
+            _ => true,
+        };
+        parameters.DepthMinBounds = boundsInKey ? depthState.DepthMinBounds : 0f;
+        parameters.DepthMaxBounds = boundsInKey ? depthState.DepthMaxBounds : 0f;
         parameters.StencilTestEnable = depthState.StencilTestEnabled;
         parameters.StencilFront = withDepth ? depthState.FrontOperations : StencilOperations.Default;
         parameters.StencilBack = withDepth ? depthState.BackOperations : StencilOperations.Default;

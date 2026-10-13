@@ -721,6 +721,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // pipeline declares the same dynamic states) and rendering scopes of one command buffer, so each group
         // is recorded only when it differs from what this command buffer last recorded.
         private static readonly bool DynamicStateFilter = Environment.GetEnvironmentVariable("SHARPEMU_DYNAMIC_STATE_FILTER") != "0";
+        // [local] SHARPEMU_DEPTH_BOUNDS_KEY=2: every guest pipeline takes the depth bounds as dynamic state.
+        private bool DynamicDepthBounds => _supportsDepthBounds && Gpu.Pipelines.ShaderPipelineCache.DepthBoundsKeyMode == 2;
         private nint _dynamicStateCommand;
         private ulong _dynamicStateTick;
         private int _dynamicStateEpoch;
@@ -827,6 +829,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe770); // [local]
             }
 
+            if (state.DepthBoundsTestEnabled && DynamicDepthBounds && (!known || !last.DepthBoundsTestEnabled ||
+                state.DepthBoundsMin != last.DepthBoundsMin || state.DepthBoundsMax != last.DepthBoundsMax))
+            {
+                var vkProbeBounds = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetDepthBounds(_vk, command, state.DepthBoundsMin, state.DepthBoundsMax); // [local]
+                SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbeBounds); // [local]
+            }
+
             if (_colorWriteEnableApi is { } colorWriteEnable && state.ColorWriteCount != 0 &&
                 (!known || state.ColorWriteCount != last.ColorWriteCount || state.ColorWriteEnableMask != last.ColorWriteEnableMask))
             {
@@ -861,6 +871,11 @@ internal static unsafe partial class VulkanVideoPresenter
             if (known && !state.StencilTestEnabled)
             {
                 recorded = recorded with { FrontStencil = last.FrontStencil, BackStencil = last.BackStencil };
+            }
+
+            if (known && !state.DepthBoundsTestEnabled)
+            {
+                recorded = recorded with { DepthBoundsMin = last.DepthBoundsMin, DepthBoundsMax = last.DepthBoundsMax };
             }
 
             if (known && (state.ColorWriteCount == 0 || _colorWriteEnableApi is null))

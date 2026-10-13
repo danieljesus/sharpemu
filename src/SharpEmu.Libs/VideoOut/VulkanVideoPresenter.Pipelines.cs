@@ -1106,12 +1106,30 @@ internal static unsafe partial class VulkanVideoPresenter
             return layout;
         }
 
+        // [local] What tells a graphics pipeline apart from the others of its program pair: the depth bounds and a
+        // hash of the rest of the static state (bounds zeroed), the rendering formats and the vertex input.
+        private static string DescribeKeyForProfile(GraphicsPipelineDescription? description)
+        {
+            if (description is null)
+            {
+                return string.Empty;
+            }
+
+            var parameters = description.StaticParameters;
+            var rest = parameters.Clone();
+            rest.DepthMinBounds = 0f;
+            rest.DepthMaxBounds = 0f;
+            var staticHash = System.IO.Hashing.XxHash64.HashToUInt64(rest.Bytes);
+            return FormattableString.Invariant(
+                $" dbt={(parameters.DepthBoundsTestEnable ? 1 : 0)} dbmin={parameters.DepthMinBounds:R} dbmax={parameters.DepthMaxBounds:R} static=0x{staticHash:X16} rendering=0x{(uint)description.Rendering.GetHashCode():X8} vertex_input=0x{(uint)description.VertexInput.GetHashCode():X8}");
+        }
+
         private PipelineHandle RegisterPipeline(RenderPipelineEntry entry)
         {
             entry.Id = ++_nextPipelineId;
             _pipelineEntries.Add(entry.Id, entry);
             if (_gpuCommandProfile is not null)
-                Console.Error.WriteLine($"[PERF][GPU_PIPELINE] pipeline={entry.Id} vertex=0x{entry.ProfileVertexHash:X16} pixel=0x{entry.ProfilePixelHash:X16} compute=0x{entry.ProfileComputeHash:X16}");
+                Console.Error.WriteLine($"[PERF][GPU_PIPELINE] pipeline={entry.Id} vertex=0x{entry.ProfileVertexHash:X16} pixel=0x{entry.ProfilePixelHash:X16} compute=0x{entry.ProfileComputeHash:X16}{DescribeKeyForProfile(entry.Description)}");
             return new PipelineHandle(entry.Id, entry.Layout.Handle, entry.UsesPushDescriptors);
         }
 
@@ -1419,7 +1437,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         MinDepthBounds = parameters.DepthMinBounds,
                         MaxDepthBounds = parameters.DepthMaxBounds,
                     };
-                    var dynamicStates = stackalloc DynamicState[13];
+                    var dynamicStates = stackalloc DynamicState[14];
                     dynamicStates[0] = DynamicState.Viewport;
                     dynamicStates[1] = DynamicState.Scissor;
                     dynamicStates[2] = DynamicState.LineWidth;
@@ -1433,6 +1451,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     dynamicStates[10] = DynamicState.StencilWriteMask;
                     dynamicStates[11] = DynamicState.BlendConstants;
                     var dynamicStateCount = 12u;
+                    if (DynamicDepthBounds)
+                    {
+                        dynamicStates[dynamicStateCount++] = DynamicState.DepthBounds; // [local] SHARPEMU_DEPTH_BOUNDS_KEY=2
+                    }
+
                     // Last so a pipeline without color attachments can leave it out.
                     if (_colorWriteEnableApi is not null && colorCount != 0)
                     {
