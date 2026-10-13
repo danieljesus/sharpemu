@@ -71,6 +71,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private long _serial;
         private int _count;
 
+        public int Count => Volatile.Read(ref _count);
+
         public long Add(ulong address, byte[] bytes)
         {
             if (bytes.Length is not (4 or 8))
@@ -261,6 +263,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // Read without the gate: the render thread asks while it holds its own gate, and the
         // front wakes the render thread (taking that gate) only after releasing this one.
         public bool HasQueuedWork => Volatile.Read(ref _count) != 0;
+
+        public int Count => Volatile.Read(ref _count); // [local] GpuStallReport
 
         private bool OnBackThread => _backThreadId == Environment.CurrentManagedThreadId;
 

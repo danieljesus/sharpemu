@@ -59,6 +59,14 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public void WaitRecorded(long position) => _ring?.WaitReplayed(position); // [local]
 
+    // [local] GpuStallReport: the raw main timeline (its result too, a lost device shows here) and the ring.
+    public string DescribeStall()
+    {
+        ulong value = 0;
+        var result = _vk.GetSemaphoreCounterValue(_device, _timeline, &value);
+        return $"timeline_raw={value} timeline_result={result} ring_recorded={_recorded} {_ring?.DescribeStall() ?? "ring=off"}";
+    }
+
     public VulkanCommandProfile? CommandProfile { get; }
 
     // MoltenVK records Metal command buffers with unretained references and signals the timeline
@@ -236,7 +244,15 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         var probeStart = System.Diagnostics.Stopwatch.GetTimestamp(); // [local]
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GpuCompletionWait))
         {
-            result = _vk.WaitSemaphores(_device, &waitInfo, ulong.MaxValue);
+            // [local] A wait over GpuStallReport.TimeoutNs reports where the queues stand, then keeps waiting.
+            var reports = 0;
+            while ((result = _vk.WaitSemaphores(_device, &waitInfo, GpuStallReport.TimeoutNs)) == Result.Timeout)
+            {
+                if (reports++ < GpuStallReport.MaxReportsPerWait)
+                {
+                    GpuStallReport.Report($"timeline wait over {GpuStallReport.TimeoutNs / 1_000_000_000 * (ulong)reports} s: wait_tick={tick}");
+                }
+            }
         }
         RenderWaitProbe.Record("timeline", probeStart);
         failure = result.ToString();

@@ -35,4 +35,7 @@ public interface IGpuTickDevice : IDisposable
     void WaitRecorded(long position)
     {
     }
+
+    // [local] For GpuStallReport: the raw timeline value and the record ring's positions.
+    string DescribeStall() => "";
 }

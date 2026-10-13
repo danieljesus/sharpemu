@@ -27,16 +27,11 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
     private readonly VkSemaphore _timeline;
     private readonly object _gate = new();
 
-    // [local] SHARPEMU_READBACK_SUBMIT_GUARD (on by default; =0 restores 2484f3fa): before a copy that waits on the main
-    // timeline for waitTick is submitted, wait until the submit thread has handed waitTick to the main queue, so the
-    // readback queue never holds a wait-before-signal. The GTA V intro hang (2026-10-12, ~1 in 50-140 sessions) left
-    // the submit thread, the record ring and the deferred uploads idle with empty queues and the render thread in the
-    // readback wait: every sealed tick was submitted, so the only GPU dependency left outstanding was such a cross-queue
-    // wait. It costs the render thread's own reads little: their copy cannot run before waitTick completes anyway.
-    internal static readonly bool SubmitGuard = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_SUBMIT_GUARD") != "0";
-
-    // [local] A readback wait longer than this reports where the ticks stand (timelines, sealed and submitted ticks).
-    private const ulong StallReportNs = 5_000_000_000;
+    // [local] SHARPEMU_READBACK_SUBMIT_GUARD=1 (off by default): before a copy that waits on the main timeline for
+    // waitTick is submitted, wait until the submit thread has handed waitTick to the main queue, so the readback queue
+    // never holds a wait-before-signal (legal for timeline semaphores). Tried for the GTA V intro freeze of 2026-10-12
+    // and refuted: the freeze reproduced with it on; FPS neutral.
+    internal static readonly bool SubmitGuard = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_SUBMIT_GUARD") == "1";
     private ulong _signaled;
     private int _waiters;
     private bool _disposed;
@@ -229,11 +224,14 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             var probeStart = System.Diagnostics.Stopwatch.GetTimestamp(); // [local]
             using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.GpuCompletionWait))
             {
-                var result = vk.WaitSemaphores(_device.Device, &waitInfo, StallReportNs);
-                if (result == Result.Timeout)
+                var reports = 0;
+                Result result;
+                while ((result = vk.WaitSemaphores(_device.Device, &waitInfo, GpuStallReport.TimeoutNs)) == Result.Timeout)
                 {
-                    ReportStall(ticket);
-                    result = vk.WaitSemaphores(_device.Device, &waitInfo, ulong.MaxValue);
+                    if (reports++ < GpuStallReport.MaxReportsPerWait)
+                    {
+                        ReportStall(ticket, reports);
+                    }
                 }
 
                 Require(result, "vkWaitSemaphores(readback)");
@@ -250,17 +248,26 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
     }
 
     // [local] Tells which side a stalled readback waits on: the readback queue (main_completed >= wait_tick), the main
-    // queue (submitted >= wait_tick > main_completed) or the submit thread (submitted < wait_tick).
-    private void ReportStall(Ticket ticket)
+    // queue (submitted >= wait_tick > main_completed) or the submit thread (submitted < wait_tick); the rest of the line
+    // is GpuStallReport's description of every queue.
+    private void ReportStall(Ticket ticket, int reports)
+    {
+        GpuStallReport.Report($"readback wait over {GpuStallReport.TimeoutNs / 1_000_000_000 * (ulong)reports} s: ticket={ticket.Value} " +
+            $"wait_tick={ticket.WaitTick} readback=[{DescribeStall()}] guard={SubmitGuard}");
+    }
+
+    // [local] GpuStallReport: this readback timeline's value, the last value submitted and the busy slots.
+    internal string DescribeStall()
     {
         ulong value = 0;
-        _ = _device.Vk.GetSemaphoreCounterValue(_device.Device, _timeline, &value);
-        var timeline = _scheduler.Timeline;
-        timeline.RefreshCompletedTick();
-        Console.Error.WriteLine($"[GPU][STALL] readback wait over {StallReportNs / 1_000_000_000} s: ticket={ticket.Value} " +
-            $"readback_value={value} signaled={Volatile.Read(ref _signaled)} wait_tick={ticket.WaitTick} " +
-            $"main_completed={timeline.CompletedTick} submitted={_scheduler.SubmittedTick} current={timeline.CurrentTick} " +
-            $"guard={SubmitGuard} thread={Environment.CurrentManagedThreadId}");
+        var result = _device.Vk.GetSemaphoreCounterValue(_device.Device, _timeline, &value);
+        var busy = 0;
+        foreach (var slot in _slots)
+        {
+            busy += slot.Busy ? 1 : 0;
+        }
+
+        return $"value={value} result={result} signaled={Volatile.Read(ref _signaled)} busy_slots={busy} waiters={Volatile.Read(ref _waiters)}";
     }
 
     public void Complete(Ticket ticket, ReadbackConsumer? consume)

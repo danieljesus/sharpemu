@@ -100,6 +100,15 @@ internal static unsafe partial class VulkanVideoPresenter
                     _bufferCache.SyncReadback = new Gpu.Vulkan.VulkanAsyncReadback(_deviceInfo, _scheduler, _syncReadbackQueue, readbackFamily);
                 }
             }
+
+            // [local] What a [GPU][STALL] line reports after the wait it names.
+            var scheduler = _scheduler;
+            var bufferCache = _bufferCache;
+            Gpu.Scheduling.GpuStallReport.Describe = () =>
+                $"{scheduler.DescribeStall()} async_readback=[{bufferCache.AsyncReadback?.DescribeStall() ?? "none"}] " +
+                $"sync_readback=[{bufferCache.SyncReadback?.DescribeStall() ?? "none"}] back_queue={_back?.Count ?? -1} " +
+                $"pending_labels={FrontLabels.Count}";
+            Gpu.Scheduling.GpuStallReport.History = () => scheduler.FormatRecentSubmissions().ToArray();
         }
 
         // The image store follows the buffer store; readback of linear images stays off.

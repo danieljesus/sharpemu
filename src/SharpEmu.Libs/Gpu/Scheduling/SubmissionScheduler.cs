@@ -22,7 +22,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     private readonly record struct TickWork(Action Callback, ulong Tick);
     private readonly record struct SubmissionTraceEntry(ulong Tick, uint Op, ulong SubmitId,
-        uint Arg0, uint Arg1, uint Arg2, uint Arg3, ulong Arg4);
+        uint Arg0, uint Arg1, uint Arg2, uint Arg3, ulong Arg4, int Waits = 0);
     private readonly SubmissionTraceEntry[] _submissionHistory = new SubmissionTraceEntry[32];
     private int _nextSubmissionHistoryIndex;
     private int _submissionHistoryCount;
@@ -576,7 +576,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
 
         _submissionHistory[_nextSubmissionHistoryIndex] = new SubmissionTraceEntry(tick, _command.DebugOp, _command.DebugSubmitId,
-            _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3, _command.DebugArg4);
+            _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3, _command.DebugArg4, submit.WaitCount);
         _nextSubmissionHistoryIndex = (_nextSubmissionHistoryIndex + 1) % _submissionHistory.Length;
         _submissionHistoryCount = Math.Min(_submissionHistoryCount + 1, _submissionHistory.Length);
         _command.Buffer = 0;
@@ -598,7 +598,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             submit.AddSignal(_timeline.Handle, tick);
             item = new SealedSubmit(buffer, submit, tick, target, new SubmissionTraceEntry(tick, _command.DebugOp,
                 _command.DebugSubmitId, _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3,
-                _command.DebugArg4), recorded);
+                _command.DebugArg4, submit.WaitCount), recorded);
             lock (_submitLock)
             {
                 // After shutdown stopped the thread, a late submit runs inline; the queue is empty by then.
@@ -782,9 +782,21 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                 _submitWaiters++;
                 try
                 {
+                    var reports = 0;
                     while (_submittedTick < tick && _submitFailure == null)
                     {
-                        Monitor.Wait(_submitLock);
+                        if (!Monitor.Wait(_submitLock, GpuStallReport.TimeoutMs) && reports++ < GpuStallReport.MaxReportsPerWait)
+                        {
+                            Monitor.Exit(_submitLock);
+                            try
+                            {
+                                GpuStallReport.Report($"submit wait over {GpuStallReport.TimeoutMs / 1000} s: wait_submitted={tick}");
+                            }
+                            finally
+                            {
+                                Monitor.Enter(_submitLock);
+                            }
+                        }
                     }
                 }
                 finally
@@ -819,6 +831,84 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
     }
 
+    // [local] For GpuStallReport: where the recording, submit and priority sides stand. Locks are only tried, so a
+    // report never blocks behind the thread that is stuck.
+    internal string DescribeStall()
+    {
+        var builder = new System.Text.StringBuilder();
+        _timeline.RefreshCompletedTick();
+        var completed = _timeline.CompletedTick;
+        var submitted = SubmittedTick;
+        builder.Append($"main: recording_tick={CurrentTick} open={!_command.IsInvalid} submitted={submitted} completed={completed}");
+        if (Monitor.TryEnter(_submitLock, 100))
+        {
+            try
+            {
+                builder.Append($" sealed_queued={_sealed.Count}");
+                if (_sealed.Count != 0)
+                {
+                    builder.Append($" sealed_head={_sealed.Peek().Tick}");
+                }
+
+                builder.Append($" submit_parked={_submitWorkerParked} submit_waiters={_submitWaiters}");
+            }
+            finally
+            {
+                Monitor.Exit(_submitLock);
+            }
+        }
+        else
+        {
+            builder.Append(" submit_lock=busy");
+        }
+
+        if (Monitor.TryEnter(_operationLock, 100))
+        {
+            try
+            {
+                builder.Append($" priority_queued={_priority.Count} priority_active={_priorityActive} priority_active_tick={_priorityActiveTick}");
+                if (_priority.Count != 0)
+                {
+                    builder.Append($" priority_head={_priority.Peek().Tick}");
+                }
+
+                builder.Append($" pending_ops={_pending.Count}");
+            }
+            finally
+            {
+                Monitor.Exit(_operationLock);
+            }
+        }
+        else
+        {
+            builder.Append(" operation_lock=busy");
+        }
+
+        builder.Append($" device=[{_device.DescribeStall()}]");
+        if (submitted > completed)
+        {
+            builder.Append($" busy=[{_command.DescribeTick(completed + 1)}]");
+            if (completed + 2 <= submitted)
+            {
+                builder.Append($" next=[{_command.DescribeTick(completed + 2)}]");
+            }
+
+            // The main queue holds work it has not finished: name the oldest unfinished submission.
+            for (var index = 0; index < _submissionHistoryCount; index++)
+            {
+                var slot = (_nextSubmissionHistoryIndex - _submissionHistoryCount + index + _submissionHistory.Length) % _submissionHistory.Length;
+                var entry = _submissionHistory[slot];
+                if (entry.Tick == completed + 1)
+                {
+                    builder.Append($" gpu_busy_tick={entry.Tick} last_op={(RecordedOperation)entry.Op} submit={entry.SubmitId} " +
+                        $"args={entry.Arg0},{entry.Arg1},{entry.Arg2},{entry.Arg3},0x{entry.Arg4:X16}{(entry.Waits != 0 ? $" waits={entry.Waits}" : "")}");
+                }
+            }
+        }
+
+        return builder.ToString();
+    }
+
     // Report the last operation in each saved submission. Earlier GPU work can cause device loss.
     internal IEnumerable<string> FormatRecentSubmissions()
     {
@@ -827,7 +917,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             var slot = (_nextSubmissionHistoryIndex - _submissionHistoryCount + index + _submissionHistory.Length) % _submissionHistory.Length;
             var entry = _submissionHistory[slot];
             yield return $"tick={entry.Tick} op={(RecordedOperation)entry.Op} submit={entry.SubmitId} " +
-                $"args={entry.Arg0},{entry.Arg1},{entry.Arg2},{entry.Arg3},0x{entry.Arg4:X16}";
+                $"args={entry.Arg0},{entry.Arg1},{entry.Arg2},{entry.Arg3},0x{entry.Arg4:X16}{(entry.Waits != 0 ? $" waits={entry.Waits}" : "")}";
         }
     }
 

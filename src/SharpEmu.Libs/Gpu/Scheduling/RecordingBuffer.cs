@@ -85,6 +85,35 @@ public sealed class RecordingBuffer
         DebugArg2 = arg2;
         DebugArg3 = arg3;
         DebugArg4 = arg4;
+        _opHistory[(int)(_opHistoryNext++ & (OpHistorySize - 1))] = new RecordedOp(Owner.CurrentTick, op, arg4, arg0, arg1, arg2); // [local]
+    }
+
+    // [local] GpuStallReport: the last operations recorded and the tick each went into. Written by the recording
+    // thread only; a report reads it racily, which is enough to name the shaders in a tick the GPU does not finish.
+    private const int OpHistorySize = 8192;
+    private readonly record struct RecordedOp(ulong Tick, uint Op, ulong Shader, uint Arg0, uint Arg1, uint Arg2);
+    private readonly RecordedOp[] _opHistory = new RecordedOp[OpHistorySize];
+    private long _opHistoryNext;
+
+    internal string DescribeTick(ulong tick)
+    {
+        var counts = new Dictionary<(uint Op, ulong Shader), (int Count, uint Arg0, uint Arg1, uint Arg2)>();
+        var seen = 0;
+        foreach (var entry in _opHistory)
+        {
+            if (entry.Tick != tick)
+            {
+                continue;
+            }
+
+            seen++;
+            var key = (entry.Op, entry.Shader);
+            var known = counts.GetValueOrDefault(key);
+            counts[key] = (known.Count + 1, entry.Arg0, entry.Arg1, entry.Arg2);
+        }
+
+        return $"ops_in_tick_{tick}={seen} " + string.Join(" ", counts.OrderByDescending(pair => pair.Value.Count).Take(24).Select(pair =>
+            $"{(RecordedOperation)pair.Key.Op}:0x{pair.Key.Shader:X}x{pair.Value.Count}(last={pair.Value.Arg0},{pair.Value.Arg1},{pair.Value.Arg2})"));
     }
 
     public void EndRendering()

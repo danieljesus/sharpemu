@@ -283,6 +283,8 @@ internal sealed unsafe partial class CommandRing : IDisposable
             return;
         }
 
+        var waitStart = Stopwatch.GetTimestamp();
+        var reports = 0;
         lock (_waitLock)
         {
             _waiting++;
@@ -291,6 +293,11 @@ internal sealed unsafe partial class CommandRing : IDisposable
                 while (Volatile.Read(ref _consumed) < position && _failure == null)
                 {
                     Monitor.Wait(_waitLock, 1);
+                    if (Stopwatch.GetElapsedTime(waitStart).TotalMilliseconds >= GpuStallReport.TimeoutMs * (reports + 1) &&
+                        reports++ < GpuStallReport.MaxReportsPerWait)
+                    {
+                        GpuStallReport.Report($"ring replay wait over {GpuStallReport.TimeoutMs / 1000 * reports} s: wait_position={position}");
+                    }
                 }
             }
             finally
@@ -301,6 +308,10 @@ internal sealed unsafe partial class CommandRing : IDisposable
 
         ThrowIfFailed();
     }
+
+    // [local] GpuStallReport: records appended, records replayed, whether the replay thread is parked.
+    internal string DescribeStall() =>
+        $"ring_produced={_produced} ring_consumed={Volatile.Read(ref _consumed)} ring_parked={Volatile.Read(ref _parked)} ring_waiting={Volatile.Read(ref _waiting)} ring_failure={_failure ?? "none"}";
 
     private void ThrowIfFailed()
     {
