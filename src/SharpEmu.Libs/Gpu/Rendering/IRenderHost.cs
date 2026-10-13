@@ -69,7 +69,11 @@ public readonly record struct DynamicDrawState(
     StencilMasks FrontStencil,
     StencilMasks BackStencil,
     uint ColorWriteCount,
-    byte ColorWriteEnableMask);
+    byte ColorWriteEnableMask,
+    // [local] Dynamic in the pipelines that enable the test, so its bounds do not split pipelines.
+    bool DepthBoundsTestEnabled = false,
+    float DepthMinBounds = 0f,
+    float DepthMaxBounds = 1f);
 
 // The host-side descriptors of one shader stage, prepared before the draw or dispatch records.
 public interface IPreparedBindings

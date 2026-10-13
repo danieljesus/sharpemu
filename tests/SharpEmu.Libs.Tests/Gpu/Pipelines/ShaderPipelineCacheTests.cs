@@ -143,6 +143,23 @@ public sealed class ShaderPipelineCacheTests : IDisposable
     }
 
     [Fact]
+    public void DepthBounds_AreLeftOutOfThePipelineKey()
+    {
+        static void Bounds(RegisterBanks banks, float min, float max)
+        {
+            banks.Context.DepthTarget = banks.Context.DepthTarget with { DepthControl = banks.Context.DepthTarget.DepthControl | 0x8 };
+            banks.Context.DepthBoundsMin = min;
+            banks.Context.DepthBoundsMax = max;
+        }
+
+        var near = Describe(banks => Bounds(banks, 0.1f, 0.4f), withDepth: true);
+        var far = Describe(banks => Bounds(banks, 0.6f, 0.9f), withDepth: true);
+
+        Assert.True(near.StaticParameters.DepthBoundsTestEnable);
+        Assert.Equal(near.StaticParameters, far.StaticParameters);
+    }
+
+    [Fact]
     public void VertexInputState_FoldsEveryBindingAndAttribute()
     {
         var defaults = Programs();

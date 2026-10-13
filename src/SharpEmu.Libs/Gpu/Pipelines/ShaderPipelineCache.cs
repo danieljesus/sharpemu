@@ -695,8 +695,10 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         parameters.SampleShadingEnable = pixelActive && samples > 1 && pixelInput!.SampleShading;
         parameters.WithDepth = withDepth;
         parameters.DepthBoundsTestEnable = depthState.DepthBoundsTestEnabled;
-        parameters.DepthMinBounds = depthState.DepthMinBounds;
-        parameters.DepthMaxBounds = depthState.DepthMaxBounds;
+        // [local] The bounds are dynamic state: GTA V moves them for nearly every light volume, and in the
+        // key every such draw made a pipeline of its own.
+        parameters.DepthMinBounds = 0f;
+        parameters.DepthMaxBounds = 1f;
         parameters.StencilTestEnable = depthState.StencilTestEnabled;
         parameters.StencilFront = withDepth ? depthState.FrontOperations : StencilOperations.Default;
         parameters.StencilBack = withDepth ? depthState.BackOperations : StencilOperations.Default;

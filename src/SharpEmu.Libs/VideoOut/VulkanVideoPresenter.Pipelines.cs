@@ -1411,7 +1411,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         MinDepthBounds = parameters.DepthMinBounds,
                         MaxDepthBounds = parameters.DepthMaxBounds,
                     };
-                    var dynamicStates = stackalloc DynamicState[13];
+                    var dynamicStates = stackalloc DynamicState[14];
                     dynamicStates[0] = DynamicState.Viewport;
                     dynamicStates[1] = DynamicState.Scissor;
                     dynamicStates[2] = DynamicState.LineWidth;
@@ -1425,6 +1425,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     dynamicStates[10] = DynamicState.StencilWriteMask;
                     dynamicStates[11] = DynamicState.BlendConstants;
                     var dynamicStateCount = 12u;
+                    if (_supportsDepthBounds && parameters.DepthBoundsTestEnable)
+                    {
+                        dynamicStates[dynamicStateCount++] = DynamicState.DepthBounds; // [local]
+                    }
+
                     // Last so a pipeline without color attachments can leave it out.
                     if (_colorWriteEnableApi is not null && colorCount != 0)
                     {

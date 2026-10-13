@@ -842,6 +842,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DynamicState, vkProbe770); // [local]
             }
 
+            // [local] Set by every draw whose pipeline enables the test: a pipeline without it in between
+            // (last.DepthBoundsTestEnabled false) leaves the bounds undefined.
+            if (_supportsDepthBounds && state.DepthBoundsTestEnabled && (!known || !last.DepthBoundsTestEnabled ||
+                state.DepthMinBounds != last.DepthMinBounds || state.DepthMaxBounds != last.DepthMaxBounds))
+            {
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetDepthBounds(_vk, command, state.DepthMinBounds, state.DepthMaxBounds); // [local]
+            }
+
             if (_colorWriteEnableApi is { } colorWriteEnable && state.ColorWriteCount != 0 &&
                 (!known || state.ColorWriteCount != last.ColorWriteCount || state.ColorWriteEnableMask != last.ColorWriteEnableMask))
             {

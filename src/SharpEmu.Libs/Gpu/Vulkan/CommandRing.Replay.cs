@@ -34,6 +34,7 @@ internal enum RingOp : ushort
     SetDepthCompareOp,
     SetDepthBiasEnable,
     SetDepthBias,
+    SetDepthBounds,
     SetStencilCompareMask,
     SetStencilWriteMask,
     SetStencilReference,
@@ -340,6 +341,12 @@ internal sealed unsafe partial class CommandRing
             {
                 var args = (RingArgs.Floats*)payload;
                 vk.CmdSetDepthBias(command, args->A, args->B, args->C);
+                break;
+            }
+            case RingOp.SetDepthBounds:
+            {
+                var args = (RingArgs.Floats*)payload;
+                vk.CmdSetDepthBounds(command, args->A, args->B);
                 break;
             }
             case RingOp.SetStencilCompareMask:
