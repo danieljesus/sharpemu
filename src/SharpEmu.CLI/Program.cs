@@ -42,10 +42,29 @@ internal static partial class Program
     private const uint FILE_SHARE_WRITE = 0x00000002;
     private const uint OPEN_EXISTING = 3;
 
+    // [local] SHARPEMU_GC_GEN0_MB (default 64; 0 keeps the runtime's own budget): the minimum gen0 budget of the
+    // processes this one starts (the mitigated emulator child), passed as DOTNET_GCgen0size, which the GC reads at
+    // startup. The renderer allocates ~230 MB/s static and ~380 MB/s in camera moves; the default budget then means
+    // ~20 gen0 collections and ~40-47 ms of pauses per second. An explicit DOTNET_GCgen0size is left alone.
+    private static void ApplyChildGcBudget()
+    {
+        if (Environment.GetEnvironmentVariable("DOTNET_GCgen0size") is not null)
+        {
+            return;
+        }
+
+        var megabytes = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_GC_GEN0_MB"), out var value) ? value : 64;
+        if (megabytes > 0)
+        {
+            Environment.SetEnvironmentVariable("DOTNET_GCgen0size", ((ulong)megabytes << 20).ToString("X"));
+        }
+    }
+
     [STAThread]
     private static int Main(string[] args)
     {
         ConfigureManagedPluginResolution();
+        ApplyChildGcBudget();
 
         if (args.Length > 0 && args[0] == SharpEmu.Core.Diagnostics.WindowsCrashCapture.HelperArgument)
             return SharpEmu.Core.Diagnostics.WindowsCrashCapture.RunHelper(args);
