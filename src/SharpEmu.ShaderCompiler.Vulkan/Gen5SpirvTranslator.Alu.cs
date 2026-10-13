@@ -351,10 +351,9 @@ public static partial class Gen5SpirvTranslator
                     if (!TryStoreDoubleResult(
                             instruction,
                             destination,
-                            Ext(
-                                instruction.Opcode == "VFractF64" ? 10u : 31u,
-                                DoubleType(),
-                                source),
+                            instruction.Opcode == "VFractF64"
+                                ? ClampFract(DoubleType(), Ext(10, DoubleType(), source), Double(1.0), Double(BitConverter.Int64BitsToDouble(0x3FEF_FFFF_FFFF_FFFF)))
+                                : Ext(31, DoubleType(), source),
                             out result,
                             out error))
                     {
@@ -520,7 +519,8 @@ public static partial class Gen5SpirvTranslator
                     result = EmitFloat16Result(instruction, destination, Ext(2, _floatType, GetFloat16Source(instruction, 0)));
                     break;
                 case "VFractF16":
-                    result = EmitFloat16Result(instruction, destination, Ext(10, _floatType, GetFloat16Source(instruction, 0)));
+                    result = EmitFloat16Result(instruction, destination,
+                        ClampFract(_floatType, Ext(10, _floatType, GetFloat16Source(instruction, 0)), Float(1f), Float((float)BitConverter.UInt16BitsToHalf(0x3BFF))));
                     break;
                 case "VSinF16":
                     result = EmitFloat16Result(instruction, destination, Ext(13, _floatType, _module.AddInstruction(SpirvOp.FMul, _floatType, GetFloat16Source(instruction, 0), Float(MathF.Tau))));
@@ -537,7 +537,7 @@ public static partial class Gen5SpirvTranslator
                 case "VFractF32":
                     result = EmitFloatResult(
                         instruction,
-                        Ext(10, _floatType, GetFloatSource(instruction, 0)));
+                        ClampFract(_floatType, Ext(10, _floatType, GetFloatSource(instruction, 0)), Float(1f), Float(BitConverter.Int32BitsToSingle(0x3F7F_FFFF))));
                     break;
                 case "VTruncF32":
                     result = EmitFloatResult(
@@ -4428,6 +4428,16 @@ public static partial class Gen5SpirvTranslator
             _module.AddCapability(SpirvCapability.Float64);
             return _module.TypeFloat(64);
         }
+
+        // V_FRACT returns at most the largest value below 1: x - floor(x) of a tiny negative x rounds to 1
+        // (GTA V's shadow-ray shader 0x4EE720FC4678FA19 then indexes past its table). NaN passes through.
+        private uint ClampFract(uint type, uint fract, uint one, uint belowOne) =>
+            _module.AddInstruction(
+                SpirvOp.Select,
+                type,
+                _module.AddInstruction(SpirvOp.FOrdGreaterThanEqual, _boolType, fract, one),
+                belowOne,
+                fract);
 
         private uint Double(double value) =>
             _module.Constant64(
