@@ -348,7 +348,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            var pages = _cleanReadPages ??= new CleanReadPages();
+            var pages = _frontCleanReadPages ??= new CleanReadPages();
             if (pages.Tags[slot] != page + 1)
             {
                 pages.Tags[slot] = page + 1;
@@ -619,6 +619,12 @@ internal static unsafe partial class VulkanVideoPresenter
         private const ulong CleanReadPageBytes = 0x1000;
         private const int CleanReadPageSlots = 64;
         private CleanReadPages? _cleanReadPages;
+        // [local] The front thread's own clean-page notes. One shared table let each thread retag a slot under the
+        // other (a tag of one page with the alias of another), and let the render thread trust a page the front
+        // noted without the GPU-dirty check its own notes make.
+        private CleanReadPages? _frontCleanReadPages;
+
+        private CleanReadPages? ThreadCleanReadPages => OnFrontThread ? _frontCleanReadPages : _cleanReadPages;
         private bool _backingAliasAccess;
 
         private sealed class CleanReadPages
@@ -632,7 +638,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool TryGetAliasPointer(ulong address, ulong size, out byte* pointer)
         {
             pointer = null;
-            if (!_backingAliasAccess || _cleanReadPages is not { } pages ||
+            if (!_backingAliasAccess || ThreadCleanReadPages is not { } pages ||
                 !TryGetCleanReadPage(address, size, out var page, out var slot) || pages.Tags[slot] != page + 1 ||
                 _guestBacking.BackingAliasSnapshot is not { } snapshot)
             {
@@ -662,7 +668,7 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         private bool IsCleanReadPage(ulong address, ulong size) =>
-            _cleanReadPages is { } pages &&
+            ThreadCleanReadPages is { } pages &&
             TryGetCleanReadPage(address, size, out var page, out var slot) &&
             pages.Tags[slot] == page + 1 &&
             pages.Versions[slot] == _bufferCache.GpuModifiedVersion;

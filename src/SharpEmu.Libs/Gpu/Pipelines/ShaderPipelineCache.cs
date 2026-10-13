@@ -81,9 +81,11 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     // every draw still establishes: the same hash at the same address is the same binary, so its
     // registered header, vertex tables and input semantics are reused. A different hash means
     // the game put another shader there, and everything is read again.
-    private readonly Dictionary<ulong, KnownShader> _knownShaders = new();
-    private readonly Dictionary<RegisteredShader, VertexTableMetadata> _vertexTables = new(ReferenceEqualityComparer.Instance);
-    private readonly Dictionary<(RegisteredShader Shader, uint InputCount), uint> _pixelCustomMasks = new(PixelMaskKeyComparer.Instance);
+    // [local] These tables (and the pixel facts below) are read and filled outside the program gate, by the front
+    // thread and the render thread at once, so they are concurrent; every value is a pure function of its key.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, KnownShader> _knownShaders = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<RegisteredShader, VertexTableMetadata> _vertexTables = new(ReferenceEqualityComparer.Instance);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(RegisteredShader Shader, uint InputCount), uint> _pixelCustomMasks = new(PixelMaskKeyComparer.Instance);
 
     private sealed record KnownShader(ulong Hash, RegisteredShader Registered, (ulong Address, uint SizeBytes)[] CodeRanges);
 
@@ -136,7 +138,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             throw SubmissionScheduler.Fatal($"The vertex program header is invalid: shader=0x{shader.CodeAddress:X16} error={error}.");
         }
 
-        _vertexTables.Add(shader, tables);
+        _vertexTables.TryAdd(shader, tables);
         return tables;
     }
 
@@ -148,7 +150,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         }
 
         mask = PixelStageInputResolver.ReadCustomInterpolationMask(_context, shader, inputCount);
-        _pixelCustomMasks.Add((shader, inputCount), mask);
+        _pixelCustomMasks.TryAdd((shader, inputCount), mask);
         return mask;
     }
 
@@ -296,7 +298,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     // these on each draw was a measurable share of the render thread.
     private sealed record PixelProgramFacts(uint InterpolatedAttributeCount, uint[] InterpolatedAttributes);
 
-    private readonly Dictionary<Gen5ShaderProgram, PixelProgramFacts> _pixelFacts = new(ReferenceEqualityComparer.Instance);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Gen5ShaderProgram, PixelProgramFacts> _pixelFacts = new(ReferenceEqualityComparer.Instance);
 
     private PixelProgramFacts PixelFactsOf(Gen5ShaderProgram program)
     {
@@ -313,7 +315,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             .Order()
             .ToArray();
         facts = new PixelProgramFacts(attributes.Length == 0 ? 0 : attributes[^1] + 1, attributes);
-        _pixelFacts.Add(program, facts);
+        _pixelFacts.TryAdd(program, facts);
         return facts;
     }
 

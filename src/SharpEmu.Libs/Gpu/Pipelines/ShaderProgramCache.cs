@@ -148,8 +148,10 @@ internal sealed class ShaderProgramCache
     private readonly IGuestGpuBackend _compiler;
     private readonly IShaderPipelineHost _host;
     private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new(ProgramKeyComparer.Instance);
-    private readonly Dictionary<(ulong Hash, uint CodeSize), Gen5ShaderProgram> _decoded = new();
-    private readonly Dictionary<(ulong Hash, uint CodeSize), ShaderCodeCapture> _codeCaptures = new();
+    // [local] Decode runs outside ShaderPipelineCache's program gate, from the front thread and the render thread at
+    // once: both tables are concurrent (a plain Dictionary threw "same key already added" here, 2026-10-12 p1a).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Hash, uint CodeSize), Gen5ShaderProgram> _decoded = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Hash, uint CodeSize), ShaderCodeCapture> _codeCaptures = new();
     private readonly List<uint> _staticState = new(StageStaticKey.MaxWords);
     // Draws that re-bind unchanged resources reuse the last materialization.
     // SHARPEMU_RESOURCE_CACHE=0 materializes every draw, for A/B comparisons.
@@ -211,10 +213,18 @@ internal sealed class ShaderProgramCache
         .Select(h => Convert.ToUInt64(h.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? h[2..] : h, 16)).ToHashSet();
     private readonly HashSet<ulong> _dumpedHashes = new(); // [local]
 
+    private bool AddDumpedHash(ulong hash)
+    {
+        lock (_dumpedHashes)
+        {
+            return _dumpedHashes.Add(hash);
+        }
+    }
+
     // The decoded instructions of a program, shared by every static variant of the same code.
     public Gen5ShaderProgram Decode(ShaderSource source)
     {
-        if (DumpHashes.Contains(source.Hash) && _dumpedHashes.Add(source.Hash)) { DumpFailedShader(source); Console.Error.WriteLine($"[DUMPHASH] hash=0x{source.Hash:X16} address=0x{source.Address:X} size={source.CodeSize}"); } // [local]
+        if (DumpHashes.Contains(source.Hash) && AddDumpedHash(source.Hash)) { DumpFailedShader(source); Console.Error.WriteLine($"[DUMPHASH] hash=0x{source.Hash:X16} address=0x{source.Address:X} size={source.CodeSize}"); } // [local]
         var key = (source.Hash, source.CodeSize);
         if (_decoded.TryGetValue(key, out var program))
         {
@@ -235,7 +245,12 @@ internal sealed class ShaderProgramCache
             throw SubmissionScheduler.Fatal($"The shader program cannot be decoded: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} error={error}.");
         }
 
-        _decoded.Add(key, program);
+        if (!_decoded.TryAdd(key, program))
+        {
+            // Another thread decoded the same code meanwhile: every caller shares its program.
+            return _decoded[key];
+        }
+
         if (Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local] programs that store through global/flat addresses
         {
             var stores = program.Instructions.Where(static i => i.Opcode.StartsWith("GlobalStore", StringComparison.Ordinal) || i.Opcode.StartsWith("FlatStore", StringComparison.Ordinal) || i.Opcode.StartsWith("GlobalAtomic", StringComparison.Ordinal) || i.Opcode.StartsWith("FlatAtomic", StringComparison.Ordinal)).Select(static i => i.Opcode).Distinct().ToArray();
