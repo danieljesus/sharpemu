@@ -64,7 +64,10 @@ internal static unsafe partial class VulkanVideoPresenter
     // this the front stalls until the render thread reaches the write (the back's backlog, 6-11 ms per hop in GTA V).
     internal sealed class PendingLabels
     {
-        internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PENDING_LABELS") == "1";
+        // On by default since 2026-10-13 (=0 disables): on the queue-mask build it wins static +0.60 ± 0.21 and pan
+        // +1.14 ± 0.26 FPS (3+3, 8+8), 0 failures in 18 sessions with it on (despertar-2026-10-13.md). The earlier pan loss was
+        // measured before the queue mask, when every label retried all heads through the 57-queue scan.
+        internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PENDING_LABELS") != "0";
         internal static long Reads, Satisfied;
 
         private readonly Dictionary<ulong, (ulong Value, int Length, long Serial)> _labels = new();
