@@ -572,6 +572,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     var censusTicks = default((ulong Own, ulong Window, ulong Precise, ulong Current, ulong Completed));
                     var censusPre = 0u;
                     var censusStarted = 0L;
+                    var earlyPre = 0u; // [local] SHARPEMU_EARLY_WRITER_SUBMIT=2
+                    if (Gpu.Buffers.GuestBufferCache.EarlyWriterMode == 2)
+                    {
+                        Span<byte> pre = stackalloc byte[sizeof(uint)];
+                        earlyPre = _guestMemory.TryRead(address, pre) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(pre) : 0;
+                    }
+
                     if (census)
                     {
                         Span<byte> pre = stackalloc byte[sizeof(uint)];
@@ -592,6 +599,13 @@ internal static unsafe partial class VulkanVideoPresenter
                         Span<byte> post = stackalloc byte[sizeof(uint)];
                         var postWord = _guestMemory.TryRead(address, post) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(post) : censusPre;
                         Diagnostics.TableReadCensus.Record(address, postWord != censusPre, ms, censusTicks.Own, censusTicks.Window, censusTicks.Precise, censusTicks.Current, censusTicks.Completed);
+                    }
+
+                    if (Gpu.Buffers.GuestBufferCache.EarlyWriterMode == 2)
+                    {
+                        Span<byte> post = stackalloc byte[sizeof(uint)];
+                        var postWord = _guestMemory.TryRead(address, post) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(post) : earlyPre;
+                        _bufferCache.NoteSyncTableResult(address, postWord != earlyPre);
                     }
 
                     synchronized = true;

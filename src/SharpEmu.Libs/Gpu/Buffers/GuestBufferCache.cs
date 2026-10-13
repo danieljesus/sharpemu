@@ -1787,7 +1787,26 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // [local] SHARPEMU_EARLY_WRITER_SUBMIT=1: table words the render thread had to read while their writer was still in
     // the batch being recorded are remembered; the next dispatch that writes one of them submits the batch right
     // after it is recorded, so the GPU is already running it when the read comes.
-    internal static readonly bool EarlyWriterSubmit = Environment.GetEnvironmentVariable("SHARPEMU_EARLY_WRITER_SUBMIT") == "1";
+    // =2 (2026-10-13): only words whose last synchronous read changed the value (a real producer -> reader dependency,
+    // e.g. 0xB198's 0x1AE362D00 and 0x02F1's +0x8C words) count; words the GPU never changes (0xF43B's blob+0x48,
+    // 0x994A's +0x28) no longer submit early.
+    internal static readonly int EarlyWriterMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_EARLY_WRITER_SUBMIT"), out var earlyMode) ? earlyMode : 0;
+    internal static readonly bool EarlyWriterSubmit = EarlyWriterMode != 0;
+    private readonly HashSet<ulong> _changedReadWords = new();
+
+    internal void NoteSyncTableResult(ulong address, bool changed)
+    {
+        if (changed)
+        {
+            if (_changedReadWords.Count >= 4096)
+                _changedReadWords.Clear();
+            _changedReadWords.Add(address);
+        }
+        else
+        {
+            _changedReadWords.Remove(address);
+        }
+    }
     internal static bool EarlySubmitPending;
     internal static Action? EarlySubmit;
     private const int HotReadWordCount = 16;
@@ -1808,6 +1827,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _earlyReport = System.Diagnostics.Stopwatch.GetTimestamp();
             Console.Error.WriteLine($"[EARLY_WRITER_SUBMIT] submits={_earlySubmits} hot_words={string.Join(",", _hotReadWords.Where(word => word != 0).Select(word => $"0x{word:X}"))}");
             _earlySubmits = 0;
+        }
+
+        if (EarlyWriterMode == 2 && !_changedReadWords.Contains(address))
+        {
+            return;
         }
 
         if (address == 0 || FindOwner(address, size) is not { } owner ||
