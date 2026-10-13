@@ -200,6 +200,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             _waiters++;
         }
 
+        if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.GpuWait, Environment.CurrentManagedThreadId, 1, ticket.WaitTick, ticket.Value); // [local]
         try
         {
             var vk = _device.Vk;
@@ -240,6 +241,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         }
         finally
         {
+            if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.GpuWaitEnd, Environment.CurrentManagedThreadId, 1, ticket.WaitTick, ticket.Value); // [local]
             lock (_gate)
             {
                 _waiters--;

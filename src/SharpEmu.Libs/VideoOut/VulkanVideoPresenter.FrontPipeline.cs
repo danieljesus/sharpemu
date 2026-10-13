@@ -747,8 +747,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var traced = TraceValue(bytes);
                 var queueId = _queueId;
-                LabelTrace.Note(LabelTrace.Kind.CpQueued, queueId, address, traced);
-                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); LabelTrace.Note(LabelTrace.Kind.CpApplied, queueId, address, traced); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
+                LabelTrace.Note(LabelTrace.Kind.CpQueued, queueId, address, traced, (ulong)Volatile.Read(ref queue.Enqueued));
+                queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); LabelTrace.Note(LabelTrace.Kind.CpApplied, queueId, address, traced, (ulong)Volatile.Read(ref queue.Executed)); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
                 return;
             }
 
@@ -938,6 +938,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // GPU tick, a presentation, a finished submission or after 100 ms without progress, so a label the guest CPU
         // writes is seen late.
         private static readonly bool PollBlocked = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_POLL_BLOCKED") == "1";
+        private int _traceFrontState = -1; // [local] SHARPEMU_LABEL_TRACE: the front state last noted
 
         // The front: the slices the render thread ran before, on their own thread.
         private void FrontLoop()
@@ -978,6 +979,19 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (result is SliceResult.Progressed or SliceResult.Completed)
                     {
                         Interlocked.Add(ref _frontWorkTicks, System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted);
+                    }
+
+                    if (LabelTrace.Enabled)
+                    {
+                        // [local] Critical-path timeline: the front's state on every change, stamped at the slice's start.
+                        var state = result is SliceResult.Progressed or SliceResult.Completed ? 0 : result == SliceResult.NoWork ? 2 : 1;
+                        if (state != _traceFrontState)
+                        {
+                            var kind = state == 0 ? _commandStream.LastRunBlockedKind : FrontProfile.SuspendKind.None;
+                            LabelTrace.NoteAt(sliceStarted, LabelTrace.Kind.FrontState, (int)kind,
+                                state == 0 ? _commandStream.LastRunBlockedAddress : 0, (ulong)state, (ulong)_back!.Count);
+                            _traceFrontState = state;
+                        }
                     }
 
                     if (FrontProfile.LoopEnabled)

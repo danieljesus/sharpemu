@@ -225,6 +225,25 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public bool TryWaitTimeline(ulong tick, out string failure)
     {
+        if (!LabelTrace.Enabled)
+        {
+            return TryWaitTimelineCore(tick, out failure);
+        }
+
+        // [local] SHARPEMU_LABEL_TRACE: the wait's start and end on the critical-path timeline.
+        LabelTrace.Note(LabelTrace.Kind.GpuWait, Environment.CurrentManagedThreadId, 2, tick);
+        try
+        {
+            return TryWaitTimelineCore(tick, out failure);
+        }
+        finally
+        {
+            LabelTrace.Note(LabelTrace.Kind.GpuWaitEnd, Environment.CurrentManagedThreadId, 2, tick);
+        }
+    }
+
+    private bool TryWaitTimelineCore(ulong tick, out string failure)
+    {
         var target = tick;
         if (GpuWaitSpin.TrySpin(() => ReadTimeline() >= target))
         {

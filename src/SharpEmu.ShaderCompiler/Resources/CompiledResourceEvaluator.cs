@@ -46,12 +46,27 @@ internal sealed class CompiledResourceEvaluator
     private static readonly SemaphoreSlim PendingSignal = new(0);
     private static int _compilerStarted;
 
+    // [local] SHARPEMU_SRT_COMPILER_PRIORITY=normal|above raises the compiler thread (default below normal), and with
+    // SHARPEMU_PROFILE_RENDER=1 the thread reports what it compiled every 5 s ([PERF][SRT_COMPILE]: plans compiled,
+    // compile ms, plans still queued, the longest a plan waited in the queue), to tell whether the evaluators arrive late.
+    private static readonly ThreadPriority CompilerPriority = Environment.GetEnvironmentVariable("SHARPEMU_SRT_COMPILER_PRIORITY") switch
+    {
+        "normal" => ThreadPriority.Normal,
+        "above" => ThreadPriority.AboveNormal,
+        _ => ThreadPriority.BelowNormal,
+    };
+    private static readonly bool ReportCompiles = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_RENDER") == "1";
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<long> PendingSince = new();
+    private static int _pendingCount;
+
     internal static void Enqueue(ShaderResourcePlan plan)
     {
+        if (ReportCompiles) PendingSince.Enqueue(System.Diagnostics.Stopwatch.GetTimestamp());
+        Interlocked.Increment(ref _pendingCount);
         Pending.Enqueue(plan);
         if (Interlocked.Exchange(ref _compilerStarted, 1) == 0)
         {
-            new Thread(CompilePending) { IsBackground = true, Priority = ThreadPriority.BelowNormal, Name = "SRT compiler" }.Start();
+            new Thread(CompilePending) { IsBackground = true, Priority = CompilerPriority, Name = "SRT compiler" }.Start();
         }
 
         PendingSignal.Release();
@@ -59,10 +74,45 @@ internal sealed class CompiledResourceEvaluator
 
     private static void CompilePending()
     {
+        var compiled = 0;
+        var compileTicks = 0L;
+        var maxWaitTicks = 0L;
+        var reported = System.Diagnostics.Stopwatch.GetTimestamp();
         while (true)
         {
-            PendingSignal.Wait();
-            while (Pending.TryDequeue(out var plan)) plan.CompileEvaluatorNow();
+            if (!ReportCompiles)
+            {
+                PendingSignal.Wait();
+            }
+            else if (!PendingSignal.Wait(5000) && compiled == 0)
+            {
+                continue;
+            }
+
+            while (Pending.TryDequeue(out var plan))
+            {
+                var started = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (ReportCompiles && PendingSince.TryDequeue(out var queued))
+                {
+                    maxWaitTicks = Math.Max(maxWaitTicks, started - queued);
+                }
+
+                plan.CompileEvaluatorNow();
+                Interlocked.Decrement(ref _pendingCount);
+                compiled++;
+                compileTicks += System.Diagnostics.Stopwatch.GetTimestamp() - started;
+            }
+
+            if (ReportCompiles && System.Diagnostics.Stopwatch.GetElapsedTime(reported).TotalSeconds >= 5)
+            {
+                var frequency = (double)System.Diagnostics.Stopwatch.Frequency;
+                Console.Error.WriteLine(FormattableString.Invariant(
+                    $"[PERF][SRT_COMPILE] compiled={compiled} compile_ms={compileTicks * 1000 / frequency:F1} pending={Volatile.Read(ref _pendingCount)} max_wait_ms={maxWaitTicks * 1000 / frequency:F1}"));
+                compiled = 0;
+                compileTicks = 0;
+                maxWaitTicks = 0;
+                reported = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
         }
     }
 

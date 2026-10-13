@@ -35,6 +35,15 @@ internal static class LabelTrace
         GuestSubmit,
         RetryOnTick,
         FrontTrigger,
+        // [local] Critical-path states (2026-10-14): the front loop's state on every change (value = 0 work,
+        // 1 every head blocked, 2 no work; on blocked -> work the address and kind of the wait the progressing head
+        // left), the render thread's idle waits (value = phase) and its GPU waits (value = waited tick or ticket,
+        // extra = recording tick; address 1 = readback, 2 = timeline, 3 = buffer download).
+        FrontState,
+        RenderIdle,
+        RenderIdleEnd,
+        GpuWait,
+        GpuWaitEnd,
     }
 
     private struct Event
@@ -98,9 +107,11 @@ internal static class LabelTrace
         }
     }
 
-    internal static void Note(Kind kind, int queue, ulong address, ulong value, ulong extra = 0)
+    internal static void Note(Kind kind, int queue, ulong address, ulong value, ulong extra = 0) =>
+        NoteAt(Stopwatch.GetTimestamp(), kind, queue, address, value, extra);
+
+    internal static void NoteAt(long now, Kind kind, int queue, ulong address, ulong value, ulong extra = 0)
     {
-        var now = Stopwatch.GetTimestamp();
         if (!InWindow(now))
             return;
         var index = Interlocked.Increment(ref _count) - 1;
