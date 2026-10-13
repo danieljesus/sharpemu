@@ -570,7 +570,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal("The GPU flip submission returned an invalid request ID of zero.");
             }
 
-            queue.Enqueue(() => presenter.CompleteQueuedFlip(handle, index, flipMode, flipArgument, requestId), _pauseAlias, _resumeAlias);
+            Diagnostics.InjectedDelay.Spin(Diagnostics.InjectedDelay.FrontTicks); // [local] critical-path sensitivity probe
+            queue.Enqueue(() =>
+            {
+                Diagnostics.InjectedDelay.Spin(Diagnostics.InjectedDelay.RenderTicks); // [local] critical-path sensitivity probe
+                presenter.CompleteQueuedFlip(handle, index, flipMode, flipArgument, requestId);
+            }, _pauseAlias, _resumeAlias);
             return requestId;
         }
 
