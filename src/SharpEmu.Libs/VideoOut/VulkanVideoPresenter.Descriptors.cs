@@ -1621,12 +1621,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (hasPushData)
                 {
                     var pushStages = bindPoint == PipelineBindPoint.Graphics ? ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit : ShaderStageFlags.ComputeBit;
-                    var vkProbe1624 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPushConstants(_vk, command, entry.Layout, pushStages, 0, PushData.ByteSize, pushData); // [local]
-                    SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.PushConstants, vkProbe1624); // [local]
+                    if (!PushConstantsAlreadyRecorded(command, entry.Layout, pushStages, pushData)) // [local] SHARPEMU_NATIVE_STATE_REUSE
+                    {
+                        var vkProbe1624 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+                        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPushConstants(_vk, command, entry.Layout, pushStages, 0, PushData.ByteSize, pushData); // [local]
+                        SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.PushConstants, vkProbe1624); // [local]
+                        AcceptOwnBind();
+                    }
                 }
 
-                if (writeIndex != 0)
+                if (writeIndex != 0 && !DescriptorsAlreadyBound(command, bindPoint, entry.Layout, writes[..writeIndex])) // [local] SHARPEMU_NATIVE_STATE_REUSE
                 {
                     fixed (WriteDescriptorSet* writePointer = writes)
                     {
@@ -1635,6 +1639,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             var vkProbe1633 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
                             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPushDescriptorSet(_pushDescriptorApi, command, bindPoint, entry.Layout, 0, (uint)writeIndex, writePointer); // [local]
                             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.PushDescriptors, vkProbe1633); // [local]
+                            AcceptOwnBind();
                             ShaderCacheCounters.CountPushSet();
                         }
                         else
@@ -1649,6 +1654,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             var vkProbe1645 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
                             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(_vk, command, bindPoint, entry.Layout, 0, 1, &set, 0, null); // [local]
                             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindDescriptorSets, vkProbe1645); // [local]
+                            AcceptOwnBind();
                             ShaderCacheCounters.CountHeapSet();
                         }
                     }

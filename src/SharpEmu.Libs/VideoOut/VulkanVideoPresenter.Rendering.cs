@@ -439,6 +439,11 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (bindings.IsEmpty) return;
             var command = BeginBatchedGuestCommands();
+            if (VertexBuffersAlreadyBound(command, bindings)) // [local] SHARPEMU_NATIVE_STATE_REUSE
+            {
+                return;
+            }
+
             var buffers = stackalloc VkBuffer[bindings.Length];
             var offsets = stackalloc ulong[bindings.Length];
             for (var index = 0; index < bindings.Length; index++)
@@ -450,14 +455,21 @@ internal static unsafe partial class VulkanVideoPresenter
             var vkProbe430 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindVertexBuffers(_vk, command, 0, (uint)bindings.Length, buffers, offsets); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindVertexBuffers, vkProbe430); // [local]
+            AcceptOwnBind();
         }
 
         public void BindIndexBuffer(BufferBinding binding, IndexType type)
         {
             var command = BeginBatchedGuestCommands();
+            if (IndexBufferAlreadyBound(command, new VkBuffer(binding.Handle), binding.Offset, type)) // [local] SHARPEMU_NATIVE_STATE_REUSE
+            {
+                return;
+            }
+
             var vkProbe = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindIndexBuffer(_vk, command, new VkBuffer(binding.Handle), binding.Offset, type); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindIndexBuffer, vkProbe); // [local]
+            AcceptOwnBind();
         }
 
         public IResourcePreparation BeginPreparation()
@@ -1125,7 +1137,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (!entry.RectangleList)
                 {
                     var vkProbe1049 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, bindPoint, entry.Pipeline); // [local]
+                    BindPipelineShadowed(command, bindPoint, entry.Pipeline); // [local] SHARPEMU_NATIVE_STATE_REUSE
                     SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1049); // [local]
                 }
 
@@ -1133,7 +1145,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var vkProbe1055 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, bindPoint, entry.Pipeline); // [local]
+            BindPipelineShadowed(command, bindPoint, entry.Pipeline); // [local] SHARPEMU_NATIVE_STATE_REUSE
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1055); // [local]
             _profileComputePipeline = entry.Id;
         }
@@ -1159,7 +1171,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var vkProbe1079 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, PipelineBindPoint.Graphics, variant); // [local]
+            BindPipelineShadowed(command, PipelineBindPoint.Graphics, variant); // [local] SHARPEMU_NATIVE_STATE_REUSE
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1079); // [local]
         }
 
@@ -1172,7 +1184,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var vkProbe1090 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, PipelineBindPoint.Graphics, entry.RectangleVariant); // [local]
+            BindPipelineShadowed(command, PipelineBindPoint.Graphics, entry.RectangleVariant); // [local] SHARPEMU_NATIVE_STATE_REUSE
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1090); // [local]
         }
 

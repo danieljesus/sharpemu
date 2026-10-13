@@ -114,6 +114,7 @@ internal static unsafe class VkRecord
 
     public static void CmdBindPipeline(Vk vk, CommandBuffer command, PipelineBindPoint bindPoint, Pipeline pipeline)
     {
+        NativeBindingEpoch.Advance(); // [local]
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.BindPipeline*)ring.Reserve(RingOp.BindPipeline, sizeof(RingArgs.BindPipeline));
@@ -128,6 +129,7 @@ internal static unsafe class VkRecord
 
     public static void CmdBindVertexBuffers(Vk vk, CommandBuffer command, uint first, uint count, VkBuffer* buffers, ulong* offsets)
     {
+        NativeBindingEpoch.Advance(); // [local]
         if (Ring(command) is { } ring)
         {
             var payloadSize = sizeof(RingArgs.Range) + (int)count * (sizeof(VkBuffer) + sizeof(ulong));
@@ -152,6 +154,7 @@ internal static unsafe class VkRecord
 
     public static void CmdBindIndexBuffer(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset, IndexType type)
     {
+        NativeBindingEpoch.Advance(); // [local]
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.IndexBuffer*)ring.Reserve(RingOp.BindIndexBuffer, sizeof(RingArgs.IndexBuffer));
@@ -514,6 +517,7 @@ internal static unsafe class VkRecord
 
     public static void CmdPushConstants(Vk vk, CommandBuffer command, PipelineLayout layout, ShaderStageFlags stages, uint offset, uint size, void* values)
     {
+        NativeBindingEpoch.Advance(); // [local]
         if (Ring(command) is { } ring && Fits(sizeof(RingArgs.PushConstants) + (int)size))
         {
             var payload = ring.Reserve(RingOp.PushConstants, sizeof(RingArgs.PushConstants) + (int)size);
@@ -552,6 +556,7 @@ internal static unsafe class VkRecord
     public static void CmdPushDescriptorSet(KhrPushDescriptor api, CommandBuffer command, PipelineBindPoint bindPoint, PipelineLayout layout,
         uint set, uint count, WriteDescriptorSet* writes)
     {
+        NativeBindingEpoch.Advance(); // [local]
         if (Ring(command) is { } ring)
         {
             var payloadSize = sizeof(RingArgs.DescriptorSets) + (int)count * sizeof(WriteDescriptorSet);
@@ -633,6 +638,7 @@ internal static unsafe class VkRecord
     public static void CmdBindDescriptorSets(Vk vk, CommandBuffer command, PipelineBindPoint bindPoint, PipelineLayout layout, uint first,
         uint count, DescriptorSet* sets, uint dynamicCount, uint* dynamicOffsets)
     {
+        NativeBindingEpoch.Advance(); // [local]
         var payloadSize = sizeof(RingArgs.DescriptorSets) + (int)count * sizeof(DescriptorSet) + (int)dynamicCount * sizeof(uint);
         if (Ring(command) is { } ring && Fits(payloadSize))
         {

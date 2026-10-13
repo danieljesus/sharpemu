@@ -548,6 +548,7 @@ internal static class RenderPhaseProfile
         if (Gpu.Rendering.RenderExecutor.TakeTargetMemoReport() is { } targetMemo) Console.Error.WriteLine(targetMemo); // [local]
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeDccClearReport()); // [local]
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.GuestBufferCache.TakeObtainReport()); // [local]
+        if (VulkanVideoPresenter.TakeNativeStateReport() is { } nativeState) Console.Error.WriteLine(nativeState); // [local]
         var (invalidations, cpuDirtySkips) =SharpEmu.HLE.GpuMemory.GuestPageTracker.TakeInvalidationCounters(); // [local]
         Console.Error.WriteLine(FormattableString.Invariant($"[PERF][PAGE_TRACKER] invalidations={invalidations} cpu_dirty_skips={cpuDirtySkips}"));
         SharpEmu.ShaderCompiler.Resources.ResourceMaterializationProfile.WriteReport();
