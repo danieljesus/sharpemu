@@ -256,11 +256,12 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool DeferFrontPreparation = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_DEFER_PREP") != "0";
         internal long DeferredPreparations;
 
-        // [local] SHARPEMU_FRONT_SKIP_DEFERRING=1: programs whose last front preparations all came back empty (the
-        // render thread prepared them again, usually because they read GPU-written data) are left to the render
-        // thread without trying; one attempt in SkipRetryEvery checks whether that still holds. The render thread
-        // prepares a draw or dispatch the front did not, as it does for every preparation that came back empty.
-        private static readonly bool SkipDeferring = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SKIP_DEFERRING") == "1";
+        // [local] SHARPEMU_FRONT_SKIP_DEFERRING (on by default, =0 disables): programs whose last front preparations
+        // all came back empty (the render thread prepared them again, usually because they read GPU-written data) are
+        // left to the render thread without trying; one attempt in SkipRetryEvery checks whether that still holds. The
+        // render thread prepares a draw or dispatch the front did not, as it does for every preparation that came back
+        // empty.
+        private static readonly bool SkipDeferring = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SKIP_DEFERRING") != "0";
         private const int SkipAfterEmpty = 4;
         private const int SkipRetryEvery = 32;
         private readonly Dictionary<ulong, int> _frontEmptyPreparations = new();

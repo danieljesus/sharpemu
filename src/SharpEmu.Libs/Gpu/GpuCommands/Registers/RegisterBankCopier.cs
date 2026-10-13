@@ -29,10 +29,10 @@ internal static class RegisterBankCopier
         internal static readonly Action<object, object> Copier = DirectFor(typeof(T));
     }
 
-    // [local] SHARPEMU_REGISTER_COPY_DIRECT=1: copiers that call the copier of a sealed nested type directly and
+    // [local] SHARPEMU_REGISTER_COPY_DIRECT (on by default, =0 disables): copiers that call the copier of a sealed nested type directly and
     // copy value-type arrays through spans, instead of looking the nested copier up and creating the nested
     // object by reflection on every copy. Same fields, same order, same results.
-    internal static readonly bool Direct = Environment.GetEnvironmentVariable("SHARPEMU_REGISTER_COPY_DIRECT") == "1";
+    internal static readonly bool Direct = Environment.GetEnvironmentVariable("SHARPEMU_REGISTER_COPY_DIRECT") != "0";
 
     private sealed class Holder
     {

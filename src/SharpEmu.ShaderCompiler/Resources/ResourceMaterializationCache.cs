@@ -251,7 +251,7 @@ public sealed class ResourceMaterializationCache
         }
     }
 
-    // [local] SHARPEMU_MATERIALIZE_REBASE: per-frame rings. A table the draw's user-data pointer reaches moves with
+    // [local] SHARPEMU_MATERIALIZE_REBASE (=1 by default since 2026-10-13, =0 disables): per-frame rings. A table the draw's user-data pointer reaches moves with
     // that pointer, and the buffer descriptors inside it point into the same ring, so their base dwords moved by the
     // same delta and every read through them moved too. The rule: one non-zero delta D (multiple of 256) from the
     // user-data pointers; every range based on a moved pointer, or read relative to a base address that equals
@@ -263,7 +263,7 @@ public sealed class ResourceMaterializationCache
     // =2 verifies every candidate against the full walk (the walk's result is used); =1 uses a plan's candidates
     // once RebaseConfirmations of them agreed with the walk, rejects the plan for good on one disagreement, and
     // keeps verifying one use in RebaseSampleMask + 1; =3 uses every candidate unverified (measurement only).
-    internal static readonly int RebaseMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_REBASE"), out var rebaseMode) ? rebaseMode : 0;
+    internal static readonly int RebaseMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_REBASE"), out var rebaseMode) ? rebaseMode : 1;
     private static readonly bool SplitByBaseAddress = RebaseMode != 0;
     private static readonly bool RebaseLog = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_REBASE_LOG") == "1";
     private const ulong ConflictingBaseAddress = ulong.MaxValue;
@@ -275,6 +275,7 @@ public sealed class ResourceMaterializationCache
     private static readonly Dictionary<string, long> _rebaseRefusals = new();
     private static readonly Dictionary<ulong, (long Agreed, long Mismatched)> _rebaseByPlan = new();
     private static int _rebaseMismatchLogs;
+    private static long _rebaseMismatchTotal;
 
     private static string TakeRebaseReport()
     {
@@ -296,7 +297,7 @@ public sealed class ResourceMaterializationCache
         }
 
         return FormattableString.Invariant(
-            $" rebase_candidates={Interlocked.Exchange(ref _rebaseCandidates, 0)} rebase_hits={Interlocked.Exchange(ref _rebaseHits, 0)} rebase_agreed={Interlocked.Exchange(ref _rebaseAgreed, 0)} rebase_mismatches={Interlocked.Exchange(ref _rebaseMismatches, 0)} rebase_unverifiable={Interlocked.Exchange(ref _rebaseUnverifiable, 0)} rebase_rejected_plans={Interlocked.Read(ref _rebaseRejectedPlans)} rebase_refusals=[{refusals}] rebase_plans=[{plans}]");
+            $" rebase_candidates={Interlocked.Exchange(ref _rebaseCandidates, 0)} rebase_hits={Interlocked.Exchange(ref _rebaseHits, 0)} rebase_agreed={Interlocked.Exchange(ref _rebaseAgreed, 0)} rebase_mismatches={Interlocked.Exchange(ref _rebaseMismatches, 0)} rebase_mismatches_total={Interlocked.Read(ref _rebaseMismatchTotal)} rebase_unverifiable={Interlocked.Exchange(ref _rebaseUnverifiable, 0)} rebase_rejected_plans={Interlocked.Read(ref _rebaseRejectedPlans)} rebase_refusals=[{refusals}] rebase_plans=[{plans}]");
     }
 
     private static void Refuse(string reason)
@@ -580,14 +581,16 @@ public sealed class ResourceMaterializationCache
         }
 
         Interlocked.Increment(ref _rebaseMismatches);
+        var total = Interlocked.Increment(ref _rebaseMismatchTotal);
         if (trust >= 0)
         {
             _rebaseTrust[planHash] = -1;
             Interlocked.Increment(ref _rebaseRejectedPlans);
         }
 
-        if (Interlocked.Increment(ref _rebaseMismatchLogs) <= 64)
-            Console.Error.WriteLine($"[MATERIALIZE_REBASE_MISMATCH] plan=0x{planHash:X16} {difference}");
+        // Always printed (the first 64, then every 1024th), with or without SHARPEMU_PROFILE_RENDER: grep for it.
+        if (Interlocked.Increment(ref _rebaseMismatchLogs) <= 64 || (total & 1023) == 0)
+            Console.Error.WriteLine($"[MATERIALIZE_REBASE_MISMATCH] plan=0x{planHash:X16} total={total} {difference}");
     }
 
     private static string? SnapshotDifference(ResourceSnapshot shifted, ResourceSnapshot walked)
