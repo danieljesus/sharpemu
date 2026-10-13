@@ -671,19 +671,21 @@ public sealed partial class RenderExecutor
     private void ResolveShaderPrograms(RegisterBanks banks, ref DrawState state)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawProgramResolution);
-        var context = banks.Context;
-        Span<ColorComponentMapArray> mappingStorage = stackalloc ColorComponentMapArray[1];
-        Span<ColorComponentMap> targetExportMapping = mappingStorage[0];
-        targetExportMapping.Fill(ColorComponentMap.Identity);
+        var inputs = GraphicsProgramInputs.Create();
+        Span<ColorComponentMap> targetExportMapping = inputs.Mapping;
         foreach (ref readonly var color in BoundColors(ref state))
         {
             targetExportMapping[(int)color.Slot] = color.Resolution.ExportMapping;
         }
 
+        inputs.PixelActive = state.PixelActive;
+        inputs.DepthBound = state.Depth.HasTarget;
+        // [local] Programs the front thread prepared from the draw's registers.
         if (_preparedPrograms is { } prepared)
         {
             _preparedPrograms = null;
-            var actual = new DrawProgramInputs { PixelActive = state.PixelActive, DepthBound = state.Depth.HasTarget, ExportMapping = mappingStorage[0] };
+            var actual = new DrawProgramInputs { PixelActive = inputs.PixelActive, DepthBound = inputs.DepthBound };
+            ((ReadOnlySpan<ColorComponentMap>)inputs.Mapping).CopyTo(actual.ExportMapping);
             if (actual.Equals(_preparedInputs))
             {
                 PreparedProgramsUsed++;
@@ -695,14 +697,13 @@ public sealed partial class RenderExecutor
             PreparedProgramsRejected++;
         }
 
-        state.Programs = _pipelines.GetGraphicsPrograms(
-            banks.Shader.Vertex,
-            banks.Shader.Pixel,
-            context.ShaderInterface,
-            context,
-            targetExportMapping,
-            state.PixelActive,
-            state.Depth.HasTarget);
+        if (Prefetch is { } prefetch && prefetch.TryTakeGraphics(banks, in inputs, out var prefetched))
+        {
+            state.Programs = prefetched;
+            return;
+        }
+
+        state.Programs = ResolveGraphicsPrograms(banks, in inputs);
     }
 
     [System.Runtime.CompilerServices.InlineArray(RenderingState.ColorAttachmentCapacity)]

@@ -443,8 +443,8 @@ public static partial class Gen5SpirvTranslator
             if (_maxDispatcherSteps > 0)
             {
                 // The guest counts each TLAS iteration on the same (wave-uniform) budget.
-                var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
-                Store(_iterationGuard, steps);
+                var steps = IAdd(Load(_uintType, IterationGuard()), UInt(1));
+                Store(IterationGuard(), steps);
                 var within = _module.AddInstruction(SpirvOp.ULessThan, _boolType, steps, UInt((uint)_maxDispatcherSteps));
                 Store(_tlasCapped, SelectU(LogicalAnd(again, LogicalNot(within)), UInt(1), UInt(0)));
                 again = LogicalAnd(again, within);
@@ -697,7 +697,7 @@ public static partial class Gen5SpirvTranslator
 
                 if (_maxDispatcherSteps > 0)
                 {
-                    _tlasVariableShadows.Add((_iterationGuard, NativeVariable("nativeTlasSavedSteps")));
+                    _tlasVariableShadows.Add((IterationGuard(), NativeVariable("nativeTlasSavedSteps")));
                 }
 
                 if (_bvhTestCount != 0)

@@ -12,6 +12,7 @@ using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 using SharpEmu.Libs.Gpu.Images;
 using SharpEmu.Libs.Gpu.Pipelines;
 using SharpEmu.Libs.Gpu.Rendering;
+using SharpEmu.Libs.Gpu.Vulkan;
 using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Gpu.Vulkan;
 using Silk.NET.Core;
@@ -340,12 +341,13 @@ internal static unsafe partial class VulkanVideoPresenter
             _boundGraphicsPipeline = null;
         }
 
-        // One record serves every draw's color targets; it only lives through the acquisition.
-        private ColorAttachment? _drawColorAttachment;
+        // The acquisition below reads the attachment back into its result and keeps no reference to it,
+        // so one render-thread instance serves every draw.
+        private ColorAttachment? _colorAttachmentScratch;
 
         ColorAttachmentAcquisition IRenderHost.AcquireColorAttachment(in ColorTargetState target)
         {
-            var attachment = _drawColorAttachment ??= new ColorAttachment();
+            var attachment = _colorAttachmentScratch ??= new ColorAttachment();
             attachment.ImageIdentifier = target.Image;
             attachment.Request = target.Resolution.Request;
             attachment.Resolution = target.Resolution;
@@ -439,6 +441,11 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (bindings.IsEmpty) return;
             var command = BeginBatchedGuestCommands();
+            if (VertexBuffersAlreadyBound(command, bindings))
+            {
+                return;
+            }
+
             var buffers = stackalloc VkBuffer[bindings.Length];
             var offsets = stackalloc ulong[bindings.Length];
             for (var index = 0; index < bindings.Length; index++)
@@ -455,9 +462,12 @@ internal static unsafe partial class VulkanVideoPresenter
         public void BindIndexBuffer(BufferBinding binding, IndexType type)
         {
             var command = BeginBatchedGuestCommands();
-            var vkProbe = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindIndexBuffer(_vk, command, new VkBuffer(binding.Handle), binding.Offset, type); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindIndexBuffer, vkProbe); // [local]
+            if (!IndexBufferAlreadyBound(command, new VkBuffer(binding.Handle), binding.Offset, type))
+            {
+                var vkProbe = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindIndexBuffer(_vk, command, new VkBuffer(binding.Handle), binding.Offset, type); // [local]
+                SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindIndexBuffer, vkProbe); // [local]
+            }
         }
 
         public IResourcePreparation BeginPreparation()
@@ -472,6 +482,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (_batchDrawCount >= (_renderingActive ? DrawsPerBatchInRenderPass : DrawsPerBatch))
             {
+                if (GpuSyncProfile.Enabled)
+                {
+                    GpuSyncProfile.CountBatchFlush();
+                }
+
                 EndRendering();
                 FlushBatchedGuestCommands();
             }
@@ -723,7 +738,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool DynamicStateFilter = Environment.GetEnvironmentVariable("SHARPEMU_DYNAMIC_STATE_FILTER") != "0";
         private nint _dynamicStateCommand;
         private ulong _dynamicStateTick;
-        private int _dynamicStateEpoch;
+        private long _dynamicStateEpoch;
         private DynamicDrawState _dynamicState;
 
         public void SetDynamicState(in DynamicDrawState state)
@@ -731,7 +746,7 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawDynamicStateRecording);
             var command = BeginBatchedGuestCommands();
             var known = DynamicStateFilter && _dynamicStateCommand == command.Handle && _dynamicStateTick == _scheduler.CurrentTick &&
-                _dynamicStateEpoch == Volatile.Read(ref Gpu.Images.ColorToMultisampleDepthBlit.DynamicStateEpoch);
+                _dynamicStateEpoch == GraphicsDynamicStateEpoch.Value;
             var last = _dynamicState;
             if (!known || state.ViewportX != last.ViewportX || state.ViewportY != last.ViewportY || state.ViewportWidth != last.ViewportWidth ||
                 state.ViewportHeight != last.ViewportHeight || state.ViewportMinDepth != last.ViewportMinDepth || state.ViewportMaxDepth != last.ViewportMaxDepth)
@@ -871,7 +886,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _dynamicState = recorded;
             _dynamicStateCommand = command.Handle;
             _dynamicStateTick = _scheduler.CurrentTick;
-            _dynamicStateEpoch = Volatile.Read(ref Gpu.Images.ColorToMultisampleDepthBlit.DynamicStateEpoch);
+            _dynamicStateEpoch = GraphicsDynamicStateEpoch.Value;
         }
 
 
@@ -974,12 +989,17 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             EndRendering();
-            var command = BeginBatchedGuestCommands();
-            _commandBuffer = command;
-            if (DeferGlobalBarriers)
+            if (DeferGlobalBarriers && BatchBarriers)
             {
                 // A guest cache flush inside this scope may be deferred to its end; this keeps
                 // everything recorded before the scope ordered before its draws either way.
+                RequestGuestMemoryBarrier(GlobalMemoryBarrier);
+            }
+
+            var command = BeginBatchedGuestCommands();
+            _commandBuffer = command;
+            if (DeferGlobalBarriers && !BatchBarriers)
+            {
                 RecordGlobalBarrier(command);
             }
 
@@ -1052,6 +1072,11 @@ internal static unsafe partial class VulkanVideoPresenter
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRendering(_vk, command, &rendering); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BeginRendering, vkProbe992); // [local]
             _renderingScopesBegun++;
+            if (GpuSyncProfile.Enabled)
+            {
+                GpuSyncProfile.CountRenderingScope();
+            }
+
             _renderingActive = true;
             _renderingState = state;
         }
@@ -1103,23 +1128,19 @@ internal static unsafe partial class VulkanVideoPresenter
         public void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline)
         {
             var entry = RequirePipelineEntry(in pipeline);
-            var command = BeginBatchedGuestCommands();
+            var command = BeginBatchedGuestStateCommands();
             if (bindPoint == PipelineBindPoint.Graphics)
             {
                 _boundGraphicsPipeline = entry;
                 if (!entry.RectangleList)
                 {
-                    var vkProbe1049 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, bindPoint, entry.Pipeline); // [local]
-                    SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1049); // [local]
+                    BindPipelineShadowed(command, bindPoint, entry.Pipeline);
                 }
 
                 return;
             }
 
-            var vkProbe1055 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, bindPoint, entry.Pipeline); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1055); // [local]
+            BindPipelineShadowed(command, bindPoint, entry.Pipeline);
             _profileComputePipeline = entry.Id;
         }
 
@@ -1143,9 +1164,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 variant = CreateRenderPipeline(entry.Description!, strip ? PrimitiveTopology.TriangleStrip : PrimitiveTopology.TriangleList, entry.Layout);
             }
 
-            var vkProbe1079 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, PipelineBindPoint.Graphics, variant); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1079); // [local]
+            BindPipelineShadowed(command, PipelineBindPoint.Graphics, variant);
         }
 
         private void BindNativeRectangleList(RenderPipelineEntry entry, CommandBuffer command)
@@ -1156,9 +1175,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     entry.Layout, PolygonMode.FillRectangleNV);
             }
 
-            var vkProbe1090 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, command, PipelineBindPoint.Graphics, entry.RectangleVariant); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BindPipeline, vkProbe1090); // [local]
+            BindPipelineShadowed(command, PipelineBindPoint.Graphics, entry.RectangleVariant);
         }
 
         // Rectangle2D consumes three vertices and fills their projected bounding box.
@@ -1354,9 +1371,24 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        private static readonly bool BatchBarriers =
+            Environment.GetEnvironmentVariable("SHARPEMU_BATCH_BARRIERS") != "0";
+
+        private static readonly MemoryBarrierRequest GlobalMemoryBarrier = new(
+            PipelineStageFlags.AllCommandsBit,
+            PipelineStageFlags.AllCommandsBit,
+            AccessFlags.MemoryWriteBit,
+            AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit);
+
         private void RecordMemoryBarrier(PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, AccessFlags sourceAccess, AccessFlags destinationAccess)
         {
             EndRendering();
+            if (BatchBarriers)
+            {
+                RequestGuestMemoryBarrier(new MemoryBarrierRequest(sourceStages, destinationStages, sourceAccess, destinationAccess));
+                return;
+            }
+
             var command = BeginBatchedGuestCommands();
             var barrier = new MemoryBarrier2
             {
@@ -1488,13 +1520,23 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryFillDccMetadata(ulong address, ulong size, uint fillValue)
         {
-            if (!_imageCache.OverlapsDccMetadata(address, size))
+            if (!_imageCache.OverlapsDccMetadata(address, size) && !IsMetadataShapedFill(address, size, fillValue))
             {
                 return false;
             }
 
             _bufferCache.FillDccMetadata(address, size, fillValue);
             return true;
+        }
+
+        private bool IsMetadataShapedFill(ulong address, ulong size, uint fillValue)
+        {
+            const ulong metadataBlockSize = 0x1000;
+            const ulong maxMetadataFill = 0x100000;
+            return address != 0 && size != 0 && size <= maxMetadataFill &&
+                   address % metadataBlockSize == 0 && size % metadataBlockSize == 0 &&
+                   fillValue == (fillValue & 0xFF) * 0x01010101u &&
+                   !_imageCache.QueryRegion(address, size).ImageBytes;
         }
 
         public bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words) =>

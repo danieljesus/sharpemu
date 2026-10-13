@@ -242,6 +242,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         };
         Result result;
         var probeStart = System.Diagnostics.Stopwatch.GetTimestamp(); // [local]
+        var waitStart = GpuWaitSiteProfile.Begin();
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GpuCompletionWait))
         {
             // [local] A wait over GpuStallReport.TimeoutNs reports where the queues stand, then keeps waiting.
@@ -255,6 +256,8 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             }
         }
         RenderWaitProbe.Record("timeline", probeStart);
+
+        GpuWaitSiteProfile.End(waitStart);
         failure = result.ToString();
         return result == Result.Success && WaitRetired(tick);
     }

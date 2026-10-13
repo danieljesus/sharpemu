@@ -546,7 +546,7 @@ public sealed class CommandStreamQueue
         if (submission.Kind == CommandSubmissionKind.FrameBoundary)
         {
             SlicesRun++;
-            _host.Flush();
+            _host.FlushFrame();
             // The boundary counts as done once that flush ran on the host's queue.
             _host.RunAfterFlush(CompleteFrameBoundary);
             return true;

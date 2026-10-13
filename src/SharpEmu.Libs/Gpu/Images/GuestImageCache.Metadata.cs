@@ -11,7 +11,15 @@ namespace SharpEmu.Libs.Gpu.Images;
 // Surface metadata (HTile, DCC, CMask, FMask) keyed by its guest address.
 public sealed partial class GuestImageCache
 {
-    private void MaterializeDccClear(
+    private static long _dccSyncs;
+    private static long _dccSlicesUndecodable;
+    private static long _dccSlicesMixed;
+    private static long _dccSlicesCleared;
+
+    public static string TakeDccReport() => FormattableString.Invariant(
+        $"[PERF][DCC_SYNC] gpu_syncs={Interlocked.Exchange(ref _dccSyncs, 0)} cleared={Interlocked.Exchange(ref _dccSlicesCleared, 0)} mixed={Interlocked.Exchange(ref _dccSlicesMixed, 0)} undecodable={Interlocked.Exchange(ref _dccSlicesUndecodable, 0)}");
+
+    private unsafe void MaterializeDccClear(
         ResourceSlotIdentifier imageIdentifier,
         in ImageRequest request,
         uint metadataBaseLayer)
@@ -128,6 +136,7 @@ public sealed partial class GuestImageCache
                         allowClearToRegister: request.Role == ImageRole.ColorTarget,
                         out var clear))
                 {
+                    Interlocked.Increment(ref _dccSlicesUndecodable);
                     continue;
                 }
 
@@ -157,10 +166,12 @@ public sealed partial class GuestImageCache
 
                 if (!uniform)
                 {
+                    Interlocked.Increment(ref _dccSlicesMixed);
                     continue;
                 }
 
                 _dccClearCounts[(int)DccClearCount.Cleared]++;
+                Interlocked.Increment(ref _dccSlicesCleared);
 
                 using (var held = _lock.Hold())
                 {
@@ -405,13 +416,20 @@ public sealed partial class GuestImageCache
 
     public bool IsMetadataCleared(ulong address, uint slice) => IsMetadataCleared(address, slice, out _);
 
+    // DCC metadata of a bound target, or the range of a DCC fill seen before its target: both are
+    // filled on the host, which keeps them CPU-readable instead of GPU-written.
     public bool OverlapsDccMetadata(ulong address, ulong size)
     {
         using var held = _lock.Hold();
         foreach (var (start, metadata) in _surfaceMetadata)
         {
-            if (metadata.Kind == SurfaceMetadataKind.Dcc && metadata.Size != 0 &&
-                address < start + metadata.Size && start < address + size)
+            var extent = metadata.Kind switch
+            {
+                SurfaceMetadataKind.Dcc => metadata.Size,
+                SurfaceMetadataKind.PendingDcc => metadata.FillSize,
+                _ => 0UL,
+            };
+            if (extent != 0 && address < start + extent && start < address + size)
             {
                 return true;
             }
@@ -539,6 +557,12 @@ public sealed partial class GuestImageCache
         if (!SkipDccSync && IsValidRange(address, size) && _bufferCache.HasGpuDirtyBytes(address, size)) // [local] A/B switch
         {
             if (DccSyncLog && _dccSyncLogs++ < 40) Console.Error.WriteLine($"[DCC_SYNC] address=0x{address:X} size=0x{size:X}"); // [local]
+            Interlocked.Increment(ref _dccSyncs);
+            if (Diagnostics.DccWriterTrace.Enabled)
+            {
+                Diagnostics.DccWriterTrace.ReportSync(address, size);
+            }
+
             _ = _bufferCache.TrySynchronizeCpuRead(address, size);
         }
     }

@@ -180,10 +180,9 @@ public sealed class GuestPageTracker
         return tracked;
     }
 
-    // [local] SHARPEMU_CPU_DIRTY_SKIP (on by default): a CPU write to pages that are all CPU-dirty already changes
-    // nothing (a page is never CPU- and GPU-dirty at once, and MarkCpuWrite skips dirty pages), so it is answered
-    // without the region lock. 0 always takes the lock. The counters are approximate (unsynchronized).
-    private static readonly bool SkipCpuDirtyWrites = Environment.GetEnvironmentVariable("SHARPEMU_CPU_DIRTY_SKIP") != "0";
+    // A CPU write to pages that are all CPU-dirty already changes nothing (a page is never CPU- and GPU-dirty at
+    // once, and MarkCpuWrite skips dirty pages), so it is answered without the region lock. The counters are
+    // approximate (unsynchronized).
     private static long _invalidations;
     private static long _cpuDirtySkips;
 
@@ -210,22 +209,19 @@ public sealed class GuestPageTracker
             {
                 tracked = true;
                 _invalidations++;
-                if (SkipCpuDirtyWrites)
+                // A writer that stored its bytes before this check either sees a bit an upload cleared and takes
+                // the lock, or saw the bit before it was cleared, and then the upload reads its bytes afterwards.
+                // The fence keeps the writer's byte stores ahead of this load; on the upload side the host
+                // protection change (a kernel call) between clearing the bits and reading the bytes, directly
+                // or through ApplyDeferredProtection, keeps the read after the clear.
+                Interlocked.MemoryBarrier();
+                if (region.IsCpuDirtyThroughout(offset, bytes))
                 {
-                    // A writer that stored its bytes before this check either sees a bit an upload cleared and takes
-                    // the lock, or saw the bit before it was cleared, and then the upload reads its bytes afterwards.
-                    // The fence keeps the writer's byte stores ahead of this load; on the upload side the host
-                    // protection change (a kernel call) between clearing the bits and reading the bytes, directly
-                    // or through ApplyDeferredProtection, keeps the read after the clear.
-                    Interlocked.MemoryBarrier();
-                    if (region.IsCpuDirtyThroughout(offset, bytes))
-                    {
-                        _cpuDirtySkips++;
-                        remaining -= bytes;
-                        offset = 0;
-                        index++;
-                        continue;
-                    }
+                    _cpuDirtySkips++;
+                    remaining -= bytes;
+                    offset = 0;
+                    index++;
+                    continue;
                 }
 
                 using (region.Lock.Hold())

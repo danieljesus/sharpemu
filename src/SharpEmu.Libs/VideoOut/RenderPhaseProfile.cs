@@ -537,6 +537,7 @@ internal static class RenderPhaseProfile
         if (Gpu.Scheduling.SubmitThreadStats.TakeReport(seconds, frames) is { } submitReport) Console.Error.WriteLine(submitReport); // [local]
         foreach (var vkCallLine in Gpu.Vulkan.VkCallProbe.TakeReport(seconds, frames)) Console.Error.WriteLine(vkCallLine); // [local]
         foreach (var ringLine in Gpu.Vulkan.CommandRing.TakeReport(seconds, frames)) Console.Error.WriteLine(ringLine); // [local]
+        GpuWaitSiteProfile.Report();
         ReportImageUploads();
         BufferUploadProfile.Report();
         Console.Error.WriteLine(SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.TakeReport());
@@ -544,12 +545,14 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(FormattableString.Invariant(
             $"[PERF][PREPARED_PROGRAMS] used={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsUsed, 0)} rejected={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsRejected, 0)} dynamic_state_rebuilt={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedDynamicStateMismatches, 0)}"));
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.GuestBufferCache.TakeAsyncReadbackReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Vulkan.GpuSyncProfile.TakeReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeLookupReport());
         if (Gpu.Rendering.RenderExecutor.TakeTargetMemoReport() is { } targetMemo) Console.Error.WriteLine(targetMemo); // [local]
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeDccClearReport()); // [local]
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.GuestBufferCache.TakeObtainReport()); // [local]
         var (invalidations, cpuDirtySkips) =SharpEmu.HLE.GpuMemory.GuestPageTracker.TakeInvalidationCounters(); // [local]
         Console.Error.WriteLine(FormattableString.Invariant($"[PERF][PAGE_TRACKER] invalidations={invalidations} cpu_dirty_skips={cpuDirtySkips}"));
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeDccReport());
         SharpEmu.ShaderCompiler.Resources.ResourceMaterializationProfile.WriteReport();
         SharpEmu.Libs.Diagnostics.AgcRegisterPacketProfile.WriteReport();
         SharpEmu.HLE.GpuMemory.GpuMemoryAccessProfile.WriteReport();

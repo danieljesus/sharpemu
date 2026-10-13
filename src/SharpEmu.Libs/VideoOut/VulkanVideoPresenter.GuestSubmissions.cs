@@ -47,13 +47,32 @@ internal static unsafe partial class VulkanVideoPresenter
         private CommandBuffer BeginBatchedGuestCommands()
         {
             var commandBuffer = CurrentRecordingBuffer();
+            OpenGuestBatch();
+            return commandBuffer;
+        }
+
+        private CommandBuffer BeginBatchedGuestStateCommands()
+        {
+            var recording = CurrentRecording();
+            OpenGuestBatch();
+            return new CommandBuffer(recording.StateHandle);
+        }
+
+        private void RequestGuestMemoryBarrier(in MemoryBarrierRequest request)
+        {
+            var recording = CurrentRecording();
+            OpenGuestBatch();
+            _scheduler.MemoryBarrierRecorder ??= RecordRequestedMemoryBarrier;
+            recording.RequestMemoryBarrier(request);
+        }
+
+        private void OpenGuestBatch()
+        {
             if (!_batchOpen)
             {
                 _batchOpen = true;
                 _batchDrawCount = 0;
             }
-
-            return commandBuffer;
         }
 
         // Submits the current recording buffer with everything the batch lists own.
@@ -108,22 +127,27 @@ internal static unsafe partial class VulkanVideoPresenter
                     retireBuffers));
         }
 
-        // [local] SHARPEMU_COMPLETION_POLL_US: completed submissions are collected at most this often before draws
-        // (each poll reads the timeline and runs the deferred tick work); a full queue always collects. 0 polls every draw.
-        private static readonly long CompletionPollTicks = (long)(System.Diagnostics.Stopwatch.Frequency / 1e6 *
+        // Collecting completed submissions polls the GPU timeline twice and may wait for the priority
+        // worker. Every draw used to pay that; completed work only frees resources and runs deferred
+        // callbacks, so a collection a few hundred microseconds later changes nothing but how long
+        // those resources stay reserved. A full in-flight queue still collects, and waits, at once.
+        // [local] SHARPEMU_COMPLETION_POLL_US sets the interval (100 by default); 0 collects before every draw.
+        private static readonly long CollectIntervalTicks = (long)(System.Diagnostics.Stopwatch.Frequency / 1e6 *
             (double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_COMPLETION_POLL_US"), System.Globalization.CultureInfo.InvariantCulture, out var poll) && poll >= 0 ? poll : 100));
-        private long _lastCompletionPoll;
+        private long _lastCollectTicks;
 
-        private void EnsureGuestSubmissionCapacity()
+        private void EnsureGuestSubmissionCapacity(bool collectNow = false)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.SubmissionCapacity);
-            if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions || CompletionPollTicks == 0 ||
-                System.Diagnostics.Stopwatch.GetTimestamp() - _lastCompletionPoll >= CompletionPollTicks)
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (!collectNow && _pendingGuestSubmissions.Count < MaxInFlightGuestSubmissions && CollectIntervalTicks != 0 &&
+                now - _lastCollectTicks < CollectIntervalTicks)
             {
-                CollectCompletedGuestSubmissions(waitForOldest: false);
-                _lastCompletionPoll = System.Diagnostics.Stopwatch.GetTimestamp();
+                return;
             }
 
+            _lastCollectTicks = now;
+            CollectCompletedGuestSubmissions(waitForOldest: false);
             if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
             {
                 CollectCompletedGuestSubmissions(waitForOldest: true);
@@ -161,6 +185,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _commandStream.NotifyCompletedGpuTick(_scheduler.Timeline.CompletedTick);
+            PublishLodStatistics();
 
             ProcessDeferredTextureDestroys();
         }

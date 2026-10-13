@@ -167,7 +167,9 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (!ShaderProgramCache.TryCompilePrewarm(
                     record, code, compiler, sharedInt64Atomics, bufferInt64Atomics, float16Conversions, execGuardElision,
-                    _supportsShaderSignedZeroInfNanPreserveFloat32, out var compiled, out var layout, out var error))
+                    _supportsShaderSignedZeroInfNanPreserveFloat32, out var compiled, out var layout, out var error,
+                    ((IShaderPipelineHost)this).ComputeWave64SubgroupNative,
+                    ((IShaderPipelineHost)this).ComputeRunsOn32LaneSubgroups(record.Info)))
             {
                 NoteShaderPrewarmFailure(record, error);
                 return;
@@ -185,7 +187,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 setLayout = CreateDescriptorSetLayout(bindings, out _, out _);
                 pipelineLayout = CreatePipelineLayout(setLayout, ShaderStageFlags.ComputeBit);
                 module = CreateShaderModule(payload);
-                var pipeline = CompileComputePipeline(_vk, _device, _pipelineCache, module, pipelineLayout, 0);
+                var pipeline = CompileComputePipeline(_vk, _device, _pipelineCache, module, pipelineLayout, ComputeRequiredSubgroupSize(record.Info), 0);
                 _vk.DestroyPipeline(_device, pipeline, null);
                 Interlocked.Increment(ref _shaderPrewarmCompiled);
             }

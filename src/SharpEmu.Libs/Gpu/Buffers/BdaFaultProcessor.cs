@@ -269,6 +269,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, _pipeline); // [local]
         var set = _sets[_currentArea];
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null); // [local]
+        NativeBindingEpoch.Advance();
         var threads = _pageCount / 32;
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, (uint)((threads + 63) / 64), 1, 1); // [local]
         VulkanSynchronization.PipelineBarrier(vk,

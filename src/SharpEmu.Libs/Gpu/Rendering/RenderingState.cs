@@ -21,16 +21,26 @@ public readonly record struct RenderingAttachment(
     bool HasStencil,
     bool StencilClear)
 {
-    // The generated comparison boxed the view handle on every draw; compare the handle itself.
+    // Compared by handle value: the generated comparison goes through the object comparer of ImageView
+    // and boxes both views, which a draw pays for every attachment it re-checks.
     public bool Equals(RenderingAttachment other) =>
-        View.Handle == other.View.Handle && Layout == other.Layout && Format == other.Format &&
-        ClearWord0 == other.ClearWord0 && ClearWord1 == other.ClearWord1 && ClearWord2 == other.ClearWord2 && ClearWord3 == other.ClearWord3 &&
-        IsClear == other.IsClear && HasDepth == other.HasDepth && DepthClear == other.DepthClear &&
-        HasStencil == other.HasStencil && StencilClear == other.StencilClear;
+        View.Handle == other.View.Handle &&
+        Layout == other.Layout &&
+        Format == other.Format &&
+        ClearWord0 == other.ClearWord0 &&
+        ClearWord1 == other.ClearWord1 &&
+        ClearWord2 == other.ClearWord2 &&
+        ClearWord3 == other.ClearWord3 &&
+        IsClear == other.IsClear &&
+        HasDepth == other.HasDepth &&
+        DepthClear == other.DepthClear &&
+        HasStencil == other.HasStencil &&
+        StencilClear == other.StencilClear;
 
-    public override int GetHashCode() =>
-        HashCode.Combine(View.Handle, (int)Layout, (int)Format, ClearWord0 ^ ClearWord1 ^ ClearWord2 ^ ClearWord3,
-            (IsClear ? 1 : 0) | (HasDepth ? 2 : 0) | (DepthClear ? 4 : 0) | (HasStencil ? 8 : 0) | (StencilClear ? 16 : 0));
+    public override int GetHashCode() => HashCode.Combine(
+        View.Handle,
+        HashCode.Combine(Layout, Format, ClearWord0, ClearWord1, ClearWord2, ClearWord3),
+        HashCode.Combine(IsClear, HasDepth, DepthClear, HasStencil, StencilClear));
 }
 
 [InlineArray(RenderingState.ColorAttachmentCapacity)]

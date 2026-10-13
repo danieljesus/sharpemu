@@ -114,43 +114,36 @@ internal static unsafe partial class VulkanVideoPresenter
             Atomic: image.Atomic);
 
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _tracedTextureBindings = new();
-
-        // Render-state discovery for one shader image; the view is acquired later with the draw.
-        // [local, from #1077] The last lookup of one image of one program. A draw binds the same descriptor as
-        // the previous draw of its program most of the time; while no image the lookup could find has changed
-        // (the cache's lookup generation), the request and the image found are the same.
+        // The last lookup of one image of one program. A draw binds the same descriptor as the
+        // previous draw of its program most of the time; while no image the lookup could find has
+        // changed (the cache's lookup generation), the request and the image found are the same.
         private struct ImageBindingMemo
         {
             public uint[]? Words;
             public ulong Generation;
             public TextureRequestResolution Resolution;
             public ResourceSlotIdentifier Found;
+            public uint MetadataBaseLayer;
+            public bool CompletesLookup;
 
-            public readonly bool Matches(uint[] words, GuestImageCache cache) =>
-                Words is not null && words.AsSpan().SequenceEqual(Words) &&
-                cache.RangeGeneration(Resolution.Request.Description.Data.Address, Resolution.Request.Description.Data.Size) <= Generation;
+            public readonly bool Matches(uint[] words, ulong generation) =>
+                Words is not null && Generation == generation && words.AsSpan().SequenceEqual(Words);
         }
 
-        // [local] SHARPEMU_IMAGE_BINDING_MEMO_WAYS: remembered lookups per image slot of a program (a program binds
-        // different textures across draws); replaced round robin.
-        private static readonly int ImageBindingMemoWays =
-            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_BINDING_MEMO_WAYS"), out var ways) && ways is > 0 and <= 64 ? ways : 1;
-
-        private static readonly bool ImageBindingMemoEnabled = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_BINDING_MEMO") == "1";
         private Dictionary<ShaderProgramInfo, ImageBindingMemo[]>? _imageBindingMemos;
         private ShaderProgramInfo? _lastMemoProgram;
         private ImageBindingMemo[] _lastMemos = [];
 
-        // The remembered lookups of one image slot, ImageBindingMemoWays wide.
-        private Span<ImageBindingMemo> ImageBindingMemosOf(ShaderProgramInfo program, int index)
+        // A draw's images resolve one after another for one program, so the last program's memos
+        // are kept at hand.
+        private ref ImageBindingMemo ImageBindingMemoOf(ShaderProgramInfo program, int index)
         {
-            var stride = ImageBindingMemoWays;
-            if (!ReferenceEquals(program, _lastMemoProgram) || (index + 1) * stride > _lastMemos.Length)
+            if (!ReferenceEquals(program, _lastMemoProgram) || index >= _lastMemos.Length)
             {
                 var all = _imageBindingMemos ??= new Dictionary<ShaderProgramInfo, ImageBindingMemo[]>(ReferenceEqualityComparer.Instance);
-                if (!all.TryGetValue(program, out var memos) || (index + 1) * stride > memos.Length)
+                if (!all.TryGetValue(program, out var memos) || index >= memos.Length)
                 {
-                    Array.Resize(ref memos, Math.Max(index + 1, program.Resources?.Info.Images.Count ?? 0) * stride);
+                    Array.Resize(ref memos, Math.Max(index + 1, program.Resources?.Info.Images.Count ?? 0));
                     all[program] = memos;
                 }
 
@@ -158,32 +151,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 _lastMemos = memos;
             }
 
-            return _lastMemos.AsSpan(index * stride, stride);
+            return ref _lastMemos[index];
         }
 
-        private Dictionary<ShaderProgramInfo, byte[]>? _imageBindingMemoCursors;
-
-        private int NextWay(ShaderProgramInfo program, int index)
-        {
-            if (ImageBindingMemoWays == 1)
-            {
-                return 0;
-            }
-
-            var all = _imageBindingMemoCursors ??= new Dictionary<ShaderProgramInfo, byte[]>(ReferenceEqualityComparer.Instance);
-            if (!all.TryGetValue(program, out var cursors) || index >= cursors.Length)
-            {
-                Array.Resize(ref cursors, Math.Max(index + 1, program.Resources?.Info.Images.Count ?? 0));
-                all[program] = cursors;
-            }
-
-            var way = cursors[index];
-            cursors[index] = (byte)((way + 1) % ImageBindingMemoWays);
-            return way;
-        }
-
+        // Render-state discovery for one shader image; the view is acquired later with the draw.
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
+            ref var memo = ref ImageBindingMemoOf(program, index);
             if (words.Length < 4)
             {
                 throw SubmissionScheduler.Fatal($"An image descriptor is too short: image={index} words={words.Length} hash=0x{program.Hash:X16}.");
@@ -191,103 +165,39 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var storage = image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage;
             _ = BeginBatchedGuestCommands();
-            ImageRequest request;
-            ResourceSlotIdentifier imageIdentifier;
-            Format viewFormat;
-            uint swizzle;
-            if (LeanTexturePath && !ImageBindingMemoEnabled)
-            {
-                // [local] One working copy of the request: the lookup adjusts its view in place.
-                ref readonly var built = ref ImageRequestBuilders.TextureRef(words, ShapeOf(image));
-                request = built.Request;
-                var exactFormat = built.ExactFormat;
-                viewFormat = built.ViewFormat;
-                swizzle = built.Swizzle;
-                imageIdentifier = _imageCache.FindImage(ref request, exactFormat);
-                return FinishImageBinding(image, words, program, index, storage, in request, imageIdentifier, viewFormat, swizzle);
-            }
-
             TextureRequestResolution resolution;
-            var memoHit = -1;
-            if (ImageBindingMemoEnabled)
+            ResourceSlotIdentifier imageIdentifier;
+            if (memo.Matches(words, _imageCache.LookupGeneration) && _imageCache.TryTouchRemembered(memo.Found))
             {
-                var memos = ImageBindingMemosOf(program, index);
-                var outcome = 0;
-                for (var way = 0; way < memos.Length; way++)
+                resolution = memo.Resolution;
+                imageIdentifier = memo.Found;
+                if (memo.CompletesLookup)
                 {
-                    ref readonly var memo = ref memos[way];
-                    if (memo.Words is null || !words.AsSpan().SequenceEqual(memo.Words))
-                    {
-                        outcome = Math.Max(outcome, memo.Words is null ? 0 : 1);
-                        continue;
-                    }
-
-                    if (memo.Matches(words, _imageCache) && _imageCache.TryTouchRemembered(memo.Found))
-                    {
-                        memoHit = way;
-                        outcome = 3;
-                    }
-                    else
-                    {
-                        outcome = 2;
-                    }
-
-                    break;
+                    _imageCache.CompleteLookup(imageIdentifier, resolution.Request, memo.MetadataBaseLayer);
                 }
-
-                if (BindingRepeatProbe.Enabled) BindingRepeatProbe.CountMemo(outcome);
-            }
-
-            if (memoHit >= 0)
-            {
-                ref readonly var cachedMemo = ref ImageBindingMemosOf(program, index)[memoHit];
-                resolution = cachedMemo.Resolution;
-                imageIdentifier = cachedMemo.Found;
             }
             else
             {
                 resolution = ImageRequestBuilders.Texture(words, ShapeOf(image));
-                var lookupRequest = resolution.Request;
-                imageIdentifier = _imageCache.FindImage(ref lookupRequest, resolution.ExactFormat);
-                resolution = resolution with { Request = lookupRequest };
-                if (ImageBindingMemoEnabled)
-                {
-                    // An empty range or DCC metadata needs the full lookup on every draw. A stale entry for the
-                    // same words is replaced in place.
-                    var memos = ImageBindingMemosOf(program, index);
-                    var target = -1;
-                    for (var way = 0; way < memos.Length && target < 0; way++)
+                var request = resolution.Request;
+                var metadataBaseLayer = request.View.BaseLayer;
+                imageIdentifier = _imageCache.FindImage(ref request, resolution.ExactFormat);
+                resolution = resolution with { Request = request };
+                memo = !ImageDescription.IsEmptyRange(request.Description.Data)
+                    ? new ImageBindingMemo
                     {
-                        if (memos[way].Words is { } remembered && words.AsSpan().SequenceEqual(remembered)) target = way;
+                        Words = (uint[])words.Clone(),
+                        Generation = _imageCache.LookupGeneration,
+                        Resolution = resolution,
+                        Found = imageIdentifier,
+                        MetadataBaseLayer = metadataBaseLayer,
+                        CompletesLookup = request.Description.Metadata.Kind == MetadataKind.Dcc ||
+                            _imageCache.GetImage(imageIdentifier).Description.DccSliceSize != 0,
                     }
-
-                    if (target < 0) target = NextWay(program, index);
-                    ImageBindingMemosOf(program, index)[target] = !ImageDescription.IsEmptyRange(lookupRequest.Description.Data) &&
-                        _imageCache.GetImage(imageIdentifier).Description.DccSliceSize == 0
-                        ? new ImageBindingMemo
-                        {
-                            Words = (uint[])words.Clone(),
-                            Generation = _imageCache.LookupGeneration,
-                            Resolution = resolution,
-                            Found = imageIdentifier,
-                        }
-                        : default;
-                }
+                    : default;
             }
 
-            request = resolution.Request;
-            viewFormat = resolution.ViewFormat;
-            swizzle = resolution.Swizzle;
-            return FinishImageBinding(image, words, program, index, storage, in request, imageIdentifier, viewFormat, swizzle);
-        }
-
-        // [local] SHARPEMU_LEAN_TEXTURE_PATH (on by default): ResolveImageBinding without the resolution copies.
-        private static readonly bool LeanTexturePath = Environment.GetEnvironmentVariable("SHARPEMU_LEAN_TEXTURE_PATH") != "0";
-
-        private TextureResource FinishImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index, bool storage,
-            in ImageRequest request, ResourceSlotIdentifier imageIdentifier, Format viewFormat, uint swizzle)
-        {
-            imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, in request, viewFormat, swizzle);
+            imageIdentifier = ImageRequestBuilders.ValidateTextureOwner(_imageCache, imageIdentifier, resolution);
             BindImage(imageIdentifier, storage);
             var descriptor = new TextureDescriptorWords(words);
             if (ShouldTraceTextureBindings() &&
@@ -312,16 +222,47 @@ internal static unsafe partial class VulkanVideoPresenter
                     Console.Error.WriteLine(line);
                 }
             }
-            return new TextureResource
+            var texture = RentTextureResource();
+            texture.Address = descriptor.BaseAddress;
+            texture.ImageIdentifier = imageIdentifier;
+            texture.Request = resolution.Request;
+            texture.IsStorage = storage;
+            texture.DestinationSelect = words[3] & 0xFFFu;
+            texture.Width = descriptor.Width;
+            texture.Height = descriptor.Height;
+            return texture;
+        }
+
+        // Binding descriptions are large (an image request carries its whole mip layout) and one is made
+        // per shader image per draw, so they are reused once the submission that read them has retired.
+        // Only the render thread rents and returns them.
+        // Sized for the bindings of every draw still in flight (a few frames of a thousand draws each);
+        // a smaller cap drops returns during busy scenes and the pool allocates again.
+        private const int MaxPooledTextureResources = 32768;
+        private Stack<TextureResource>? _texturePool;
+
+        private TextureResource RentTextureResource()
+        {
+            if (_texturePool is not null && _texturePool.TryPop(out var texture))
             {
-                Address = descriptor.BaseAddress,
-                ImageIdentifier = imageIdentifier,
-                Request = request,
-                IsStorage = storage,
-                DestinationSelect = words[3] & 0xFFFu,
-                Width = descriptor.Width,
-                Height = descriptor.Height,
-            };
+                texture.InPool = false;
+                return texture;
+            }
+
+            return new TextureResource { Pooled = true };
+        }
+
+        private void ReturnTextureResource(TextureResource texture)
+        {
+            _texturePool ??= new Stack<TextureResource>();
+            if (!texture.Pooled || texture.InPool || _texturePool.Count >= MaxPooledTextureResources)
+            {
+                return;
+            }
+
+            texture.Reset();
+            texture.InPool = true;
+            _texturePool.Push(texture);
         }
 
         // Compare bits stay only on depth-compare samplers; a forced point sampler drops its filters.
@@ -1157,6 +1098,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             prepared.Descriptors.Buffers = views;
+            if (layout.MipStatisticsCount != 0)
+            {
+                LodStatistics().EnsureInitialized();
+                WriteMipStatisticsFields(shaderData, layout, info, snapshot.Images);
+            }
+
             if (layout.Find(DescriptorBindingKind.FlattenedResourceTable) is not null)
             {
                 prepared.Descriptors.FlattenedTable = UploadDwords(snapshot.FlattenedResourceTable, "flattened resource table", program);
@@ -1409,7 +1356,7 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorCommit);
             var preparation = RequirePreparation();
             var entry = RequirePipelineEntry(in pipeline);
-            var command = BeginBatchedGuestCommands();
+            var command = BeginBatchedGuestStateCommands();
             _commandBuffer = command;
             var writeCount = 0;
             var bufferCount = 0;
@@ -1426,10 +1373,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     throw SubmissionScheduler.Fatal($"A stage does not belong to the bind point: stage={stage.Program.Stage} bindPoint={bindPoint}.");
                 }
 
-                var layoutDescriptors = stage.Layout.Descriptors;
-                for (var descriptorIndex = 0; descriptorIndex < layoutDescriptors.Count; descriptorIndex++)
+                // Indexed loops over the layout's lists: a foreach on IReadOnlyList allocates an enumerator per draw.
+                var countedBindings = stage.Layout.Descriptors;
+                for (var bindingIndex = 0; bindingIndex < countedBindings.Count; bindingIndex++)
                 {
-                    var binding = layoutDescriptors[descriptorIndex];
+                    var binding = countedBindings[bindingIndex];
                     writeCount++;
                     var count = (int)DescriptorWriter.DescriptorCount(binding);
                     if (ImageDescriptorBinding.ResourceClass(binding.Kind) != ShaderCompiler.Resources.ImageResourceClass.None || binding.Kind == DescriptorBindingKind.Samplers)
@@ -1494,10 +1442,10 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     var occurrences = occurrenceScratch[..descriptors.Images.Length];
                     occurrences.Clear();
-                    var layoutDescriptors = stage.Layout.Descriptors;
-                    for (var descriptorIndex = 0; descriptorIndex < layoutDescriptors.Count; descriptorIndex++)
+                    var bindings = stage.Layout.Descriptors;
+                    for (var bindingIndex = 0; bindingIndex < bindings.Count; bindingIndex++)
                     {
-                        var binding = layoutDescriptors[descriptorIndex];
+                        var binding = bindings[bindingIndex];
                         var resources = binding.Resources;
                         var write = new WriteDescriptorSet
                         {
@@ -1510,9 +1458,9 @@ internal static unsafe partial class VulkanVideoPresenter
                         var imageStart = imageIndex;
                         if (ImageDescriptorBinding.ResourceClass(binding.Kind) != ShaderCompiler.Resources.ImageResourceClass.None)
                         {
-                            for (var slot = 0; slot < resources.Count; slot++)
+                            for (var resourceIndex = 0; resourceIndex < resources.Count; resourceIndex++)
                             {
-                                var resource = resources[slot];
+                                var resource = resources[resourceIndex];
                                 imageInfos[imageIndex++] = ImageInfo(descriptors.Images[(int)resource], occurrences[(int)resource]++, program, (int)resource);
                             }
                         }
@@ -1521,9 +1469,9 @@ internal static unsafe partial class VulkanVideoPresenter
                             switch (binding.Kind)
                             {
                                 case DescriptorBindingKind.Buffers:
-                                    for (var slot = 0; slot < resources.Count; slot++)
+                                    for (var resourceIndex = 0; resourceIndex < resources.Count; resourceIndex++)
                                     {
-                                        var resource = resources[slot];
+                                        var resource = resources[resourceIndex];
                                         var view = descriptors.Buffers[(int)resource];
                                         if (view.Buffer.Handle == 0)
                                         {
@@ -1533,6 +1481,9 @@ internal static unsafe partial class VulkanVideoPresenter
                                         bufferInfos[bufferIndex++] = new DescriptorBufferInfo { Buffer = view.Buffer, Offset = view.Offset, Range = view.Range };
                                     }
 
+                                    break;
+                                case DescriptorBindingKind.MipStatistics:
+                                    bufferInfos[bufferIndex++] = MipStatisticsDescriptor();
                                     break;
                                 case DescriptorBindingKind.DeviceAddressPageTable:
                                 case DescriptorBindingKind.FaultBuffer:
@@ -1562,9 +1513,9 @@ internal static unsafe partial class VulkanVideoPresenter
                                 }
 
                                 case DescriptorBindingKind.Samplers:
-                                    for (var slot = 0; slot < resources.Count; slot++)
+                                    for (var resourceIndex = 0; resourceIndex < resources.Count; resourceIndex++)
                                     {
-                                        var resource = resources[slot];
+                                        var resource = resources[resourceIndex];
                                         var sampler = descriptors.Samplers[(int)resource];
                                         if (sampler.Handle == 0)
                                         {
@@ -1621,12 +1572,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (hasPushData)
                 {
                     var pushStages = bindPoint == PipelineBindPoint.Graphics ? ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit : ShaderStageFlags.ComputeBit;
-                    var vkProbe1624 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPushConstants(_vk, command, entry.Layout, pushStages, 0, PushData.ByteSize, pushData); // [local]
-                    SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.PushConstants, vkProbe1624); // [local]
+                    PushConstantsShadowed(command, entry.Layout, pushStages, pushData);
                 }
 
-                if (writeIndex != 0)
+                if (writeIndex != 0 && !DescriptorsAlreadyBound(command, bindPoint, entry.Layout, writes[..writeIndex]))
                 {
                     fixed (WriteDescriptorSet* writePointer = writes)
                     {

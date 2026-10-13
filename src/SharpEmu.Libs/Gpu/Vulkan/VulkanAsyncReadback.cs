@@ -222,6 +222,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
                 PValues = &signalValue,
             };
             var probeStart = System.Diagnostics.Stopwatch.GetTimestamp(); // [local]
+            var waitStart = VideoOut.GpuWaitSiteProfile.Begin();
             using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.GpuCompletionWait))
             {
                 var reports = 0;
@@ -237,6 +238,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
                 Require(result, "vkWaitSemaphores(readback)");
             }
             VideoOut.RenderWaitProbe.Record("readback", probeStart);
+
+            VideoOut.GpuWaitSiteProfile.End(waitStart);
         }
         finally
         {

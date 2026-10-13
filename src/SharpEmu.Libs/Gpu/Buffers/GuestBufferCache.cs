@@ -666,7 +666,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static readonly bool WrittenSyncCpuDirty = Environment.GetEnvironmentVariable("SHARPEMU_WRITTEN_SYNC_CPU_DIRTY") == "1";
     private static readonly bool HostWriteMarkDirty = Environment.GetEnvironmentVariable("SHARPEMU_HOSTWRITE_MARK_DIRTY") == "1"; // [local]
 
-    public void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds)
+    public void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds) =>
+        FillBuffer(guestAddress, size, value, isGds, publishFill: false);
+
+    // publishFill also writes the value into guest memory, so the range does not stay GPU-modified
+    // (metadata-shaped fills the guest reads back otherwise cost a readback each).
+    private void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds, bool publishFill)
     {
         if ((guestAddress & 3) != 0 || size == 0 || (size & 3) != 0 || size > ulong.MaxValue - guestAddress)
         {
@@ -824,7 +829,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 _fillGpu = _fillGpuBytes = _fillCpu = 0; _fillInvalidate = _fillObtain = _fillRecord = 0; _fillClearMeta = _fillQuery = _fillImageInvalidate = _fillImageCount = _fillWrite = 0; Array.Clear(_fillBuckets);
             }
         }
-        if (images.OverlapsDccMetadata(guestAddress, size) && TryWriteFillToBacking(guestAddress, size, value))
+        if ((publishFill || images.OverlapsDccMetadata(guestAddress, size)) && TryWriteFillToBacking(guestAddress, size, value))
         {
             RemoveGpuModified(guestAddress, size);
             var firstPage = guestAddress & ~(TrackerLayout.PageBytes - 1);
@@ -841,17 +846,32 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     public void FillDccMetadata(ulong guestAddress, ulong size, uint value)
     {
         if (guestAddress == 0 || (guestAddress & 3) != 0 || size == 0 || (size & 3) != 0 || size > ulong.MaxValue - guestAddress ||
-            HasGpuDirtyBytes(guestAddress, size) || RequireImageCache().QueryRegion(guestAddress, size).ImageBytes)
+            HasGpuDirtyBytes(guestAddress, size))
         {
-            FillBuffer(guestAddress, size, value, false);
+            FillBuffer(guestAddress, size, value, false, publishFill: true);
             return;
+        }
+
+        // Images over the range read it again; only GPU-owned image bytes need the general fill.
+        // The buffer copy is filled on the GPU rather than uploaded from the written bytes.
+        var images = RequireImageCache();
+        var region = images.QueryRegion(guestAddress, size);
+        if (region.GpuImageBytes)
+        {
+            FillBuffer(guestAddress, size, value, false, publishFill: true);
+            return;
+        }
+
+        if (region.ImageBytes)
+        {
+            images.InvalidateMemory(guestAddress, size);
         }
 
         var (destination, destinationOffset) = ObtainBuffer(guestAddress, size, false, false, FindBuffer(guestAddress, size));
         destination.Fill(destinationOffset, size, value);
         if (!TryWriteFillToBacking(guestAddress, size, value))
         {
-            FillBuffer(guestAddress, size, value, false);
+            FillBuffer(guestAddress, size, value, false, publishFill: true);
         }
     }
 
@@ -1429,6 +1449,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     internal long EagerReadbacksUsed { get; private set; }
 
+    // Eager downloads the GPU overwrote before their read came.
+    internal long EagerReadbacksWasted { get; private set; }
+
+    // Pieces of finished downloads kept GPU-modified because the GPU wrote them again meanwhile.
+    internal long StalePiecesKept { get; private set; }
+
     private void NoteHotReadback(ulong guestAddress, ulong size)
     {
         _hotWindows[guestAddress & ~(ReadbackWindowBytes - 1)] = new HotWindow(guestAddress, size, _batchSerial);
@@ -1525,6 +1551,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private void NoteEagerOutcome(PendingDownload pending, bool wasted)
     {
+        if (pending.Eager && wasted)
+        {
+            EagerReadbacksWasted++;
+        }
+
         if (MuteStaleEagerWindows && pending.Eager && _eagerMute.Note(pending.HotKey, wasted, _batchSerial))
         {
             Interlocked.Increment(ref _reportedEagerMuted);
@@ -2222,6 +2253,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var stale = copies.Count - published;
             Interlocked.Add(ref _reportedPublishedPieces, published);
             Interlocked.Add(ref _reportedStalePieces, stale);
+            StalePiecesKept += stale;
             NoteEagerOutcome(pending, wasted: stale != 0);
             var clean = pending.IsWrite
                 ? !_tracker.HasGpuDirtyPages(pending.GuestAddress, pending.Size)

@@ -48,16 +48,7 @@ public sealed class PipelineStaticParameters : IEquatable<PipelineStaticParamete
         Reset();
     }
 
-    public ReadOnlySpan<byte> Bytes => _bytes;
-
-    public static PipelineStaticParameters FromBytes(ReadOnlySpan<byte> bytes)
-    {
-        var parameters = new PipelineStaticParameters();
-        bytes[..ByteSize].CopyTo(parameters._bytes);
-        return parameters;
-    }
-
-    // Back to the defaults of a new instance.
+    // The state of a new instance, for a lookup object reused across draws.
     public void Reset()
     {
         Array.Clear(_bytes);
@@ -66,6 +57,15 @@ public sealed class PipelineStaticParameters : IEquatable<PipelineStaticParamete
         ColorCount = 1;
         StencilFront = StencilOperations.Default;
         StencilBack = StencilOperations.Default;
+    }
+
+    public ReadOnlySpan<byte> Bytes => _bytes;
+
+    public static PipelineStaticParameters FromBytes(ReadOnlySpan<byte> bytes)
+    {
+        var parameters = new PipelineStaticParameters();
+        bytes[..ByteSize].CopyTo(parameters._bytes);
+        return parameters;
     }
 
     public PipelineStaticParameters Clone() => FromBytes(_bytes);
@@ -155,6 +155,7 @@ public sealed class PipelineRenderingState : IEquatable<PipelineRenderingState>
     public Format StencilFormat { get; set; } = Format.Undefined;
     public uint ColorCount { get; set; }
 
+    // The state of a new instance, for a lookup object reused across draws.
     public void Reset()
     {
         Array.Clear(ColorFormats);
@@ -203,6 +204,7 @@ public sealed class PipelineVertexInputState : IEquatable<PipelineVertexInputSta
     public byte BindingCount { get; set; }
     public byte AttributeCount { get; set; }
 
+    // The state of a new instance, for a lookup object reused across draws.
     public void Reset()
     {
         Array.Clear(Bindings);
@@ -248,6 +250,7 @@ public sealed class PipelineVertexInputState : IEquatable<PipelineVertexInputSta
 public sealed class GraphicsPipelineKey : IEquatable<GraphicsPipelineKey>
 {
     public required PipelineRenderingState Rendering { get; init; }
+    // Settable for the lookup key reused across draws; a key in the cache is never changed.
     public ulong VertexProgramId { get; set; }
     public ulong PixelProgramId { get; set; }
     public required PipelineVertexInputState VertexInput { get; init; }

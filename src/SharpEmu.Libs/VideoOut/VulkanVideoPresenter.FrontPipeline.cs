@@ -917,6 +917,23 @@ internal static unsafe partial class VulkanVideoPresenter
             _back!.RunPending(renderWorkDeadline);
         }
 
+        // Blocked heads retry every AllBlockedRetryMilliseconds without progress.
+        private long _lastCommandStreamProgressTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        private static readonly long _blockedRetryTicks =
+            CommandStreamQueue.AllBlockedRetryMilliseconds * System.Diagnostics.Stopwatch.Frequency / 1000L;
+
+        private void RetryBlockedCommandStreamIfDue()
+        {
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now - _lastCommandStreamProgressTicks < _blockedRetryTicks)
+            {
+                return;
+            }
+
+            _commandStream.RetryBlocked();
+            _lastCommandStreamProgressTicks = now;
+        }
+
         // [local] SHARPEMU_FRONT_POLL_BLOCKED=1: with every head blocked, the front retries them after each 1 ms wait,
         // as the command processor polls its wait addresses. Without it a blocked head runs again only on a completed
         // GPU tick, a presentation, a finished submission or after 100 ms without progress, so a label the guest CPU

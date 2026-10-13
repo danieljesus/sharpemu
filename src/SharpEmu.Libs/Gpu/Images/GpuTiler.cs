@@ -540,8 +540,11 @@ public sealed unsafe class GpuTiler : IDisposable
         return set;
     }
 
-    private void BindDescriptorSet(CommandBuffer command, DescriptorSet set) =>
+    private void BindDescriptorSet(CommandBuffer command, DescriptorSet set)
+    {
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(_device.Vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null); // [local]
+        Vulkan.NativeBindingEpoch.Advance();
+    }
 
     private void Record(bool tile, VkBuffer source, ulong sourceOffset, ulong sourceCapacity, VkBuffer target, ulong targetOffset, ulong targetCapacity, List<TransferDispatch> dispatches, bool clearTarget)
     {
@@ -587,6 +590,7 @@ public sealed unsafe class GpuTiler : IDisposable
             infos[2] = new DescriptorBufferInfo(dispatch.ArgumentsBuffer, dispatch.ArgumentsOffset, TileTransferArguments.Size);
             BindDescriptorSet(command, WriteDescriptorSet(infos, 2));
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, GetPipeline(dispatch.PipelineSlot)); // [local]
+            Vulkan.NativeBindingEpoch.Advance();
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, (dispatch.Arguments.Width + 7) / 8, (dispatch.Arguments.Height + 7) / 8, dispatch.Arguments.Depth); // [local]
         }
 
@@ -697,6 +701,7 @@ public sealed unsafe class GpuTiler : IDisposable
         fixed (TileTransferArguments* pointer = &arguments)
         {
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPushConstants(_device.Vk, command, _pipelineLayout, ShaderStageFlags.ComputeBit, 0, TileTransferArguments.Size, pointer); // [local]
+            Vulkan.NativeBindingEpoch.Advance();
         }
     }
 
@@ -743,6 +748,7 @@ public sealed unsafe class GpuTiler : IDisposable
             AccessFlags.ShaderReadBit | AccessFlags.ShaderWriteBit);
         VulkanSynchronization.PipelineBarrier(vk,command, PipelineStageFlags.AllCommandsBit | PipelineStageFlags.HostBit, PipelineStageFlags.ComputeShaderBit, 0, 0, null, 2, barriers, 0, null);
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, pipeline); // [local]
+        Vulkan.NativeBindingEpoch.Advance();
 
         var descriptorAlignment = StorageAlignment;
         var groupLimit = _device.MaxComputeWorkGroupCount;
@@ -830,6 +836,7 @@ public sealed unsafe class GpuTiler : IDisposable
         var command = new CommandBuffer(_scheduler.Current.Handle);
         VulkanSynchronization.PipelineBarrier(vk,command, PipelineStageFlags.AllCommandsBit | PipelineStageFlags.HostBit, PipelineStageFlags.ComputeShaderBit, 0, 0, null, 2, barriers, 0, null);
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, _swapBgra16); // [local]
+        Vulkan.NativeBindingEpoch.Advance();
         BindDescriptorSet(command, WriteDescriptorSet(infos, -1));
         PushArguments(command, new TileTransferArguments { SourceBase = inputBinding.Base, DestinationBase = outputBinding.Base, Width = pixels });
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, (pixels + 63) / 64, 1, 1); // [local]

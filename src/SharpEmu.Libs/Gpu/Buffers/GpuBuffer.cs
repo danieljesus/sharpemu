@@ -175,77 +175,52 @@ public unsafe class GpuBuffer : IDisposable
     // [local] Told the guest range of every GPU write recorded into this buffer (the readback mirror).
     internal Action<ulong, ulong>? GpuWriteObserver { get; set; }
 
+    // The last writer tick of every written range, so a readback of bytes written in an earlier,
+    // finished batch does not wait for the batch being recorded.
+    private readonly WriteTickMap _writeTicks = new();
+    private int _writeTickPruneCount = 64;
+
     // Called by every path that records a GPU write into this buffer.
-    public void NoteGpuWrite()
-    {
-        GpuWriteObserver?.Invoke(CpuAddress, Size);
-        var tick = _scheduler.CurrentTick;
-        GpuWriteHistory.Note(CpuAddress, Size, tick); // [local]
-        if (tick > LastGpuWriteTick)
-        {
-            LastGpuWriteTick = tick;
-        }
-
-        if (tick > _wholeWriteTick)
-        {
-            _wholeWriteTick = tick;
-        }
-    }
-
-    // [local] Last writer tick per 16 KB block (SHARPEMU_RANGE_WRITE_TICKS=0 keeps one tick per buffer), so a readback of bytes
-    // written in an earlier, finished batch does not wait for the batch being recorded (rt418: ~70 % of the
-    // readbacks that waited for the current batch read blocks last written in a completed one).
-    public static readonly bool RangeWriteTicks = Environment.GetEnvironmentVariable("SHARPEMU_RANGE_WRITE_TICKS") != "0"; // on by default (rt420)
-    private const int WriteTickBlockShift = 14;
-    private ulong[]? _blockWriteTicks;
-    private ulong _wholeWriteTick;
+    public void NoteGpuWrite() => NoteGpuWrite(0, Size);
 
     public void NoteGpuWrite(ulong offset, ulong size)
     {
-        if (!RangeWriteTicks || size == 0)
-        {
-            NoteGpuWrite();
-            return;
-        }
-
-        GpuWriteObserver?.Invoke(CpuAddress + offset, size);
-
         var tick = _scheduler.CurrentTick;
-        GpuWriteHistory.Note(CpuAddress + offset, size, tick); // [local]
         if (tick > LastGpuWriteTick)
         {
             LastGpuWriteTick = tick;
         }
 
-        _blockWriteTicks ??= new ulong[(int)((Size + (1UL << WriteTickBlockShift) - 1) >> WriteTickBlockShift)];
-        var first = (int)(offset >> WriteTickBlockShift);
-        var last = (int)(Math.Min(offset + size - 1, Size - 1) >> WriteTickBlockShift);
-        for (var block = first; block <= last; block++)
+        if (size == 0 || offset >= Size)
         {
-            _blockWriteTicks[block] = tick;
+            return;
+        }
+
+        size = Math.Min(size, Size - offset);
+        GpuWriteObserver?.Invoke(CpuAddress + offset, size);
+        GpuWriteHistory.Note(CpuAddress + offset, size, tick); // [local]
+        _writeTicks.Assign(offset, size, tick);
+        if (_writeTicks.Count >= _writeTickPruneCount)
+        {
+            if (Volatile.Read(ref _foreignReads) == 0)
+            {
+                _writeTicks.Prune(_scheduler.Timeline.CompletedTick + 1);
+            }
+
+            _writeTickPruneCount = Math.Max(64, _writeTicks.Count * 2);
         }
     }
 
     // The tick a readback of [offset, offset + size) has to wait for.
     public ulong GpuWriteTick(ulong offset, ulong size)
     {
-        if (!RangeWriteTicks || _blockWriteTicks is not { } ticks || size == 0)
+        if (size == 0)
         {
             return LastGpuWriteTick;
         }
 
-        var tick = _wholeWriteTick;
-        var first = (int)(offset >> WriteTickBlockShift);
-        var last = (int)(Math.Min(offset + size - 1, Size - 1) >> WriteTickBlockShift);
-        for (var block = first; block <= last; block++)
-        {
-            if (ticks[block] > tick)
-            {
-                tick = ticks[block];
-            }
-        }
-
-        if (GpuWriteHistory.Narrows) // [local] never later than the block tick
+        var tick = LastGpuWriteTickIn(offset, size);
+        if (GpuWriteHistory.Narrows) // [local] never later than the range tick
         {
             var precise = GpuWriteHistory.LastWriteTick(CpuAddress + offset, size);
             if (precise != 0 && precise < tick)
@@ -257,24 +232,11 @@ public unsafe class GpuBuffer : IDisposable
         return tick;
     }
 
-    // [local] The block tick without the precise history (the verification of SHARPEMU_PRECISE_WRITE_TICKS=2).
-    internal ulong BlockWriteTick(ulong offset, ulong size)
-    {
-        if (!RangeWriteTicks || _blockWriteTicks is not { } ticks || size == 0)
-        {
-            return LastGpuWriteTick;
-        }
+    // [local] The range tick without the precise history (the verification of SHARPEMU_PRECISE_WRITE_TICKS=2).
+    internal ulong BlockWriteTick(ulong offset, ulong size) =>
+        size == 0 ? LastGpuWriteTick : LastGpuWriteTickIn(offset, size);
 
-        var tick = _wholeWriteTick;
-        var first = (int)(offset >> WriteTickBlockShift);
-        var last = (int)(Math.Min(offset + size - 1, Size - 1) >> WriteTickBlockShift);
-        for (var block = first; block <= last; block++)
-        {
-            tick = Math.Max(tick, ticks[block]);
-        }
-
-        return tick;
-    }
+    public ulong LastGpuWriteTickIn(ulong offset, ulong size) => _writeTicks.MaxTick(offset, size);
 
     public void Write(ulong offset, ReadOnlySpan<byte> source)
     {

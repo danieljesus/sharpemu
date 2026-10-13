@@ -3,6 +3,22 @@
 
 namespace SharpEmu.HLE.GpuMemory;
 
+public sealed class SpanSnapshot(ulong[] starts, ulong[] ends)
+{
+    public static readonly SpanSnapshot Empty = new([], []);
+
+    public bool Contains(ulong address, ulong size)
+    {
+        var index = Array.BinarySearch(starts, address);
+        if (index < 0)
+        {
+            index = ~index - 1;
+        }
+
+        return index >= 0 && ends[index] >= address + size;
+    }
+}
+
 public sealed class SpanSet
 {
     private readonly SortedList<ulong, ulong> _spans = new();
@@ -79,14 +95,17 @@ public sealed class SpanSet
         return index > 0 && _spans.GetValueAtIndex(index - 1) > address;
     }
 
-    // [local] An immutable copy for readers that must not take the writer's lock.
-    public SpanSetSnapshot Snapshot()
+    public SpanSnapshot Snapshot()
     {
         var starts = new ulong[_spans.Count];
         var ends = new ulong[_spans.Count];
-        _spans.Keys.CopyTo(starts, 0);
-        _spans.Values.CopyTo(ends, 0);
-        return new SpanSetSnapshot(starts, ends);
+        for (var index = 0; index < starts.Length; index++)
+        {
+            starts[index] = _spans.GetKeyAtIndex(index);
+            ends[index] = _spans.GetValueAtIndex(index);
+        }
+
+        return new SpanSnapshot(starts, ends);
     }
 
     public void ForEach(Action<ulong, ulong> visit)

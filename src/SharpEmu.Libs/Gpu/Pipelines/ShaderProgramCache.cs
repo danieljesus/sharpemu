@@ -83,9 +83,9 @@ public sealed class ProgramKey : IEquatable<ProgramKey>
     public override int GetHashCode() => HashCode.Combine(Stage, Hash, UserDataCount, CodeSize, StaticState.Length);
 }
 
-// The same key over a span of state words, so that a lookup copies nothing: every draw looks
-// its programs up, and a key with its own array is only made when a program is first seen.
-internal readonly ref struct ProgramKeyLookup(ShaderStage stage, ulong hash, uint userDataCount, uint codeSize, ReadOnlySpan<uint> staticState)
+// A program key as a lookup sees it: the static state words stay in the caller's list, so a draw
+// that finds its program does not build a key object or copy the words.
+internal readonly ref struct ProgramKeyProbe(ShaderStage stage, ulong hash, uint userDataCount, uint codeSize, ReadOnlySpan<uint> staticState)
 {
     public readonly ShaderStage Stage = stage;
     public readonly ulong Hash = hash;
@@ -94,7 +94,7 @@ internal readonly ref struct ProgramKeyLookup(ShaderStage stage, ulong hash, uin
     public readonly ReadOnlySpan<uint> StaticState = staticState;
 }
 
-internal sealed class ProgramKeyComparer : IEqualityComparer<ProgramKey>, IAlternateEqualityComparer<ProgramKeyLookup, ProgramKey>
+internal sealed class ProgramKeyComparer : IEqualityComparer<ProgramKey>, IAlternateEqualityComparer<ProgramKeyProbe, ProgramKey>
 {
     public static readonly ProgramKeyComparer Instance = new();
 
@@ -102,14 +102,15 @@ internal sealed class ProgramKeyComparer : IEqualityComparer<ProgramKey>, IAlter
 
     public int GetHashCode(ProgramKey key) => key.GetHashCode();
 
-    public bool Equals(ProgramKeyLookup alternate, ProgramKey other) =>
-        alternate.Stage == other.Stage && alternate.Hash == other.Hash && alternate.UserDataCount == other.UserDataCount &&
-        alternate.CodeSize == other.CodeSize && alternate.StaticState.SequenceEqual(other.StaticState);
+    public bool Equals(ProgramKeyProbe alternate, ProgramKey key) =>
+        alternate.Stage == key.Stage && alternate.Hash == key.Hash && alternate.UserDataCount == key.UserDataCount &&
+        alternate.CodeSize == key.CodeSize && alternate.StaticState.SequenceEqual(key.StaticState);
 
-    public int GetHashCode(ProgramKeyLookup alternate) =>
+    // The same value as ProgramKey.GetHashCode.
+    public int GetHashCode(ProgramKeyProbe alternate) =>
         HashCode.Combine(alternate.Stage, alternate.Hash, alternate.UserDataCount, alternate.CodeSize, alternate.StaticState.Length);
 
-    public ProgramKey Create(ProgramKeyLookup alternate) =>
+    public ProgramKey Create(ProgramKeyProbe alternate) =>
         new(alternate.Stage, alternate.Hash, alternate.UserDataCount, alternate.CodeSize, alternate.StaticState.ToArray());
 }
 
@@ -321,11 +322,9 @@ internal sealed class ShaderProgramCache
         using (SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramKey))
         {
             BuildStaticState(source.Stage, options);
-            var lookup = new ProgramKeyLookup(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, CollectionsMarshal.AsSpan(_staticState));
-            if (!_programs.GetAlternateLookup<ProgramKeyLookup>().TryGetValue(lookup, out entry))
-            {
-                key = ProgramKeyComparer.Instance.Create(lookup);
-            }
+            var probe = new ProgramKeyProbe(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize,
+                CollectionsMarshal.AsSpan(_staticState));
+            _programs.GetAlternateLookup<ProgramKeyProbe>().TryGetValue(probe, out entry);
         }
         var sourceWasCached = entry is not null;
         if (RenderTrace.Enabled && RenderTrace.Pipeline())
@@ -344,12 +343,14 @@ internal sealed class ShaderProgramCache
         if (entry is null)
         {
             entry = CreateEntry(source, options);
-            _programs.Add(key!, entry);
+            key = BuildProgramKey(source);
+            _programs.Add(key, entry);
             ShaderCacheCounters.CountProgram();
         }
 
-        var snapshot = EmptySnapshot;
-        var specialization = EmptySpecialization;
+        // Both are assigned by the materialization that follows; a failed one throws.
+        ResourceSnapshot snapshot = null!;
+        ResourceSpecialization specialization = null!;
         var captureIndirectImageFailure = _spirvDumpEnabled ? ShaderPermutationDump.CreateFailureCapture(source) : null;
         if (Diagnostics.GpuReadTrace.Enabled || Diagnostics.TableReadCensus.Enabled) // [local] census
         {
@@ -411,8 +412,7 @@ internal sealed class ShaderProgramCache
             }
         }
 
-        key ??= new ProgramKey(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, _staticState.ToArray());
-        var permutation = CompilePermutation(source, options, entry, specialization, pushDataCursor, key, sourceWasCached);
+        var permutation = CompilePermutation(source, options, entry, specialization, pushDataCursor, key ?? BuildProgramKey(source), sourceWasCached);
         entry.Permutations.Add(permutation);
         ShaderCacheCounters.CountPermutation();
         stage = CreateStageResources(permutation.Program, snapshot, source, options);
@@ -424,6 +424,10 @@ internal sealed class ShaderProgramCache
 
         return permutation.Handle;
     }
+
+    // The key of the entry the static state was just built for.
+    private ProgramKey BuildProgramKey(ShaderSource source) =>
+        new(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, _staticState.ToArray());
 
     private static ShaderStageResources CreateStageResources(
         ShaderProgramInfo program, ResourceSnapshot snapshot, ShaderSource source, StageCompileOptions options)
@@ -765,12 +769,14 @@ internal sealed class ShaderProgramCache
                     SupportsPerVertexPixelInputs = _host.PerVertexPixelInputsSupported,
                     PixelInputAddress = options.PixelInputAddress,
                     PixelInputCntl = interpolators,
+                    MipStatisticsSubgroupReduction = _host.MipStatisticsSubgroupReduction,
                 };
             }
 
             default:
                 return BuildComputeRequest(entry.Plan, resources, layout, options.ComputeInfo!, options.ComputeSystemRegisters,
-                    sharedInt64Atomics, bufferInt64Atomics, float16Conversions, _host.ExecGuardElisionEnabled, signedZeroInfNanPreserve);
+                    sharedInt64Atomics, bufferInt64Atomics, float16Conversions, _host.ExecGuardElisionEnabled, signedZeroInfNanPreserve,
+                    _host.ComputeWave64SubgroupNative, _host.ComputeRunsOn32LaneSubgroups(options.ComputeInfo!));
         }
     }
 
@@ -804,10 +810,12 @@ internal sealed class ShaderProgramCache
 
     private static ShaderCompileRequest BuildComputeRequest(ShaderResourcePlan plan, SpecializedResourceInfo resources, BindingLayout layout,
         ComputeInputInfo info, Gen5ComputeSystemRegisters? systemRegisters, bool sharedInt64Atomics, bool bufferInt64Atomics, bool float16Conversions,
-        bool execGuardElision, bool signedZeroInfNanPreserve) =>
+        bool execGuardElision, bool signedZeroInfNanPreserve, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false) =>
         new(plan, resources, layout)
         {
             WaveSize = info.WaveSize,
+            HostWave64Supported = info.WaveSize == 64 && hostWave64Supported,
+            HostComputeSubgroup32 = info.WaveSize == 64 && !hostWave64Supported && hostComputeSubgroup32,
             EnableExecGuardElision = info.WaveSize != 64 || execGuardElision,
             TraceDeviceAddressFaults = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TraceEnabled,
             ScratchDwords = info.ScratchDwords,
@@ -824,7 +832,7 @@ internal sealed class ShaderProgramCache
 
     internal static bool TryCompilePrewarm(ComputePrewarmRecord record, ShaderCodeCapture code, IGuestGpuBackend compiler,
         bool sharedInt64Atomics, bool bufferInt64Atomics, bool float16Conversions, bool execGuardElision, bool signedZeroInfNanPreserve,
-        out IGuestCompiledShader? compiled, out BindingLayout? layout, out string error)
+        out IGuestCompiledShader? compiled, out BindingLayout? layout, out string error, bool hostWave64Supported = false, bool hostComputeSubgroup32 = false)
     {
         compiled = null;
         layout = null;
@@ -841,7 +849,7 @@ internal sealed class ShaderProgramCache
             layout = AllocateLayout(program, plan, resources, record.UserDataBase, record.UserDataCount, record.PushDataCursor,
                 record.Info.DispatchThreadDimensions, IsIndirectThreadDispatch(record.Info));
             var request = BuildComputeRequest(plan, resources, layout, record.Info, record.SystemRegisters,
-                sharedInt64Atomics, bufferInt64Atomics, float16Conversions, execGuardElision, signedZeroInfNanPreserve);
+                sharedInt64Atomics, bufferInt64Atomics, float16Conversions, execGuardElision, signedZeroInfNanPreserve, hostWave64Supported, hostComputeSubgroup32);
             return compiler.TryCompileProgram(request, out compiled, out error) && compiled is not null;
         }
         catch (Exception exception)
