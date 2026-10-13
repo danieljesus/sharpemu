@@ -105,7 +105,20 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             _everGpuWrittenLock.ExitUpgradeableReadLock();
         }
+
+        Interlocked.Increment(ref _everGpuWrittenVersion);
+        FirstGpuWrite?.Invoke(guestAddress, size);
     }
+
+    // [local] Bumped after every range is added to the ever-GPU-written set (any thread may read it). A front
+    // preparation taken at version V read guest memory directly only where no GPU write had been recorded; while the
+    // version is still V when the render thread executes it, no range became GPU-written in between.
+    private long _everGpuWrittenVersion;
+
+    public long EverGpuWrittenVersion => Volatile.Read(ref _everGpuWrittenVersion);
+
+    // [local] SHARPEMU_FRONT_STALE_CHECK: a range a GPU binding writes for the first time (render thread).
+    internal static Action<ulong, ulong>? FirstGpuWrite;
 
     public bool EverGpuWritten(ulong guestAddress, ulong size)
     {

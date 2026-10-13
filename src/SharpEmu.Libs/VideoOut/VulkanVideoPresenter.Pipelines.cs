@@ -168,6 +168,86 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool _backReadForPendingWrite;
 
+        // [local] SHARPEMU_FRONT_PREP_CHECK (on by default, =0 disables): the front reads guest memory directly only
+        // where no GPU write has been recorded (NeedsBackRead), but it runs ahead of the render thread, so a write that
+        // comes earlier in stream order may not be recorded yet when the front reads; most often the first write of a
+        // range (the intro, new rings), and further ahead with SHARPEMU_FRONT_PENDING_LABELS, which lets a queue pass
+        // its wait before the render thread has recorded the other queue's work. A front preparation is used only if
+        // no range became GPU-written between its start and its execution; otherwise the render thread prepares the
+        // draw or dispatch itself, in stream order and through the synchronized reads.
+        private static readonly bool FrontPrepCheck = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_CHECK") != "0";
+        internal long DiscardedFrontPreparations;
+
+        internal long FrontPreparationVersion => _bufferCache.EverGpuWrittenVersion;
+
+        internal bool FrontPreparationStillValid(long version)
+        {
+            if (!FrontPrepCheck || _bufferCache.EverGpuWrittenVersion == version)
+                return true;
+            DiscardedFrontPreparations++;
+            return false;
+        }
+
+        // [local] SHARPEMU_FRONT_STALE_CHECK=1 (diagnostic): the front notes each page it reads directly with the back
+        // queue's item count at that moment; when the render thread records the first GPU write of a range, a page of it
+        // the front read for an item still queued behind that write was read stale (the write comes first in stream
+        // order, but the front read guest memory before the render thread had even recorded it).
+        internal static readonly bool FrontStaleCheck = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_STALE_CHECK") == "1";
+        private const int FrontReadSlots = 1 << 16;
+        private readonly ulong[] _frontReadTags = FrontStaleCheck ? new ulong[FrontReadSlots] : [];
+        private readonly long[] _frontReadSerials = FrontStaleCheck ? new long[FrontReadSlots] : [];
+        private readonly ulong[] _frontReadAddresses = FrontStaleCheck ? new ulong[FrontReadSlots] : [];
+        private readonly ulong[] _frontReadSizes = FrontStaleCheck ? new ulong[FrontReadSlots] : [];
+        internal long FrontStalePages;
+        internal long FrontStaleReads;
+        private int _frontStaleLogs;
+
+        private void NoteFrontDirectRead(ulong address, ulong size)
+        {
+            if (!FrontStaleCheck || _back is not { } back || size == 0)
+                return;
+            var serial = Volatile.Read(ref back.Enqueued);
+            for (var page = address >> 12; page <= (address + size - 1) >> 12; page++)
+            {
+                var slot = (int)(page & (FrontReadSlots - 1));
+                Volatile.Write(ref _frontReadSerials[slot], serial);
+                Volatile.Write(ref _frontReadAddresses[slot], address);
+                Volatile.Write(ref _frontReadSizes[slot], size);
+                Volatile.Write(ref _frontReadTags[slot], page + 1);
+            }
+        }
+
+        // On the render thread, for a range the GPU writes for the first time.
+        private void CheckFrontStaleReads(ulong address, ulong size)
+        {
+            if (_back is not { } back || size == 0)
+                return;
+            var executed = Volatile.Read(ref back.Executed);
+            var first = address >> 12;
+            var last = (address + size - 1) >> 12;
+            if (last - first >= FrontReadSlots)
+                last = first + FrontReadSlots - 1;
+            for (var page = first; page <= last; page++)
+            {
+                var slot = (int)(page & (FrontReadSlots - 1));
+                if (Volatile.Read(ref _frontReadTags[slot]) != page + 1)
+                    continue;
+                var serial = Volatile.Read(ref _frontReadSerials[slot]);
+                if (serial <= executed)
+                    continue;
+                // The page's last front read: stale for certain when its bytes overlap the write.
+                var readAddress = Volatile.Read(ref _frontReadAddresses[slot]);
+                var readSize = Volatile.Read(ref _frontReadSizes[slot]);
+                var exact = readAddress < address + size && address < readAddress + readSize;
+                FrontStalePages++;
+                if (exact)
+                    FrontStaleReads++;
+                if (_frontStaleLogs++ < 60)
+                    Console.Error.WriteLine($"[FRONT_STALE_READ] {(exact ? "bytes" : "page")} read=0x{readAddress:X}+0x{readSize:X} write=0x{address:X}+0x{size:X} read_serial={serial} executed={executed} " +
+                        $"enqueued={Volatile.Read(ref back.Enqueued)} tick={_scheduler.CurrentTick} pending_labels={FrontLabels.Count}");
+            }
+        }
+
         // [local] While the front prepares a program, a read of GPU-written data does not wait
         // for the render thread: the preparation is dropped and the render thread prepares the
         // program itself when it executes the draw or dispatch, in stream order.
@@ -315,6 +395,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool TryReadGuestWordDirect(ulong address, out uint word)
         {
+            if (FrontStaleCheck) NoteFrontDirectRead(address, sizeof(uint)); // [local]
             // A page read before through its alias: no mapping check, no copy.
             if (IsCleanReadPage(address, sizeof(uint)) && TryGetAliasPointer(address, sizeof(uint), out var alias))
             {
@@ -578,6 +659,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (OnFrontThread)
             {
+                if (FrontStaleCheck) NoteFrontDirectRead(address, size); // [local]
                 if (IsCleanReadPage(address, size) && TryGetAliasPointer(address, size, out var frontAlias))
                 {
                     new ReadOnlySpan<byte>(frontAlias, destination.Length).CopyTo(destination);

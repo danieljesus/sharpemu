@@ -101,13 +101,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
+            if (FrontStaleCheck) // [local]
+            {
+                Gpu.Buffers.GuestBufferCache.FirstGpuWrite = CheckFrontStaleReads;
+            }
+
             // [local] What a [GPU][STALL] line reports after the wait it names.
             var scheduler = _scheduler;
             var bufferCache = _bufferCache;
             Gpu.Scheduling.GpuStallReport.Describe = () =>
                 $"{scheduler.DescribeStall()} async_readback=[{bufferCache.AsyncReadback?.DescribeStall() ?? "none"}] " +
                 $"sync_readback=[{bufferCache.SyncReadback?.DescribeStall() ?? "none"}] back_queue={_back?.Count ?? -1} " +
-                $"pending_labels={FrontLabels.Count}";
+                $"pending_labels={FrontLabels.Count} front_stale_reads={FrontStaleReads}";
             Gpu.Scheduling.GpuStallReport.History = () => scheduler.FormatRecentSubmissions().ToArray();
         }
 
