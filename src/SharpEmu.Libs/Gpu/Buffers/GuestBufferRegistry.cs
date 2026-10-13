@@ -46,6 +46,11 @@ internal sealed class GuestBufferRegistry<TBuffer> : IDisposable where TBuffer :
     }
 
     public int RegisteredCount => _registered.Count;
+
+    // [local] Advances whenever ownership changes (a buffer registered or retired), so a caller can tell that an
+    // earlier lookup still names the same owner.
+    private long _epoch;
+    public long Epoch => Volatile.Read(ref _epoch);
     public ulong RegisteredBytes { get; private set; }
 
     public ResourceSlotIdentifier AllocateBuffer(TBuffer resource, ulong address, ulong size)
@@ -117,6 +122,7 @@ internal sealed class GuestBufferRegistry<TBuffer> : IDisposable where TBuffer :
         _recency.AddLast(node);
         entry.State = BufferLifetimeState.Registered;
         RegisteredBytes += entry.Size;
+        Interlocked.Increment(ref _epoch);
     }
 
     public void BeginRetirement(ResourceSlotIdentifier identifier)
@@ -138,6 +144,7 @@ internal sealed class GuestBufferRegistry<TBuffer> : IDisposable where TBuffer :
         _recency.Remove(entry.RecencyNode!);
         RegisteredBytes -= entry.Size;
         entry.State = BufferLifetimeState.Retiring;
+        Interlocked.Increment(ref _epoch);
     }
 
     // Late or repeated callbacks cannot release a replacement allocation.
@@ -147,6 +154,7 @@ internal sealed class GuestBufferRegistry<TBuffer> : IDisposable where TBuffer :
         if (entry == null || entry.State == BufferLifetimeState.Released) return false;
         if (entry.State != BufferLifetimeState.Retiring)
             throw SubmissionScheduler.Fatal("The buffer has not begun retirement.");
+        Interlocked.Increment(ref _epoch);
         ReleaseResource(entry);
         return true;
     }

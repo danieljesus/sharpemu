@@ -74,7 +74,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         _gpuModifiedRanges.Remove(address, size);
         _preciseGpuModifiedRanges.Remove(address, size); // [local]
+        Interlocked.Increment(ref _gpuModifiedRemovals); // [local] invalidates the written-obtain memo
     }
+
+    private long _gpuModifiedRemovals; // [local]
 
     // [local] experiment: writes through bindings of 16 MB or more are tracked as "broad";
     // a word dirty only through broad bindings may be read speculatively by table reads.
@@ -394,7 +397,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // [local] Where ObtainBuffer's calls go, for [PERF][BUFFER_OBTAIN]: the stream ring (with or without a buffer the
     // caller already looked up), a failed stream map, or the cache buffer (prefound or looked up here); a cached
     // result that was a stream candidate too large or not hot enough to stream is counted again.
-    private enum ObtainOutcome { Stream, StreamPrefound, StreamFailed, CachedPrefound, CachedLookup, CachedStreamCandidate, Count }
+    private enum ObtainOutcome
+    {
+        Stream, StreamPrefound, StreamFailed, CachedPrefound, CachedLookup, CachedStreamCandidate,
+        Written, WrittenMemoHit, WrittenMemoVerified, WrittenMemoMismatch, Count,
+    }
 
     private static readonly long[] _obtainCounts = new long[(int)ObtainOutcome.Count];
 
@@ -407,7 +414,45 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         return FormattableString.Invariant(
-            $"[PERF][BUFFER_OBTAIN] stream={counts[0]} stream_prefound={counts[1]} stream_failed={counts[2]} cached_prefound={counts[3]} cached_lookup={counts[4]} cached_stream_candidate={counts[5]}");
+            $"[PERF][BUFFER_OBTAIN] stream={counts[0]} stream_prefound={counts[1]} stream_failed={counts[2]} cached_prefound={counts[3]} cached_lookup={counts[4]} cached_stream_candidate={counts[5]} ") +
+            FormattableString.Invariant($"written={counts[6]} written_memo_hits={counts[7]} written_memo_verified={counts[8]} written_memo_mismatches={counts[9]} written_memo_mismatches_total={Interlocked.Read(ref _writtenMemoMismatchTotal)}");
+    }
+
+    // [local] SHARPEMU_WRITTEN_OBTAIN_MEMO (idea from a Kyty fork, todojuegos67-bot c128d6b9): a written, unformatted
+    // binding obtained again in the same command buffer, with no ownership change, no GPU-modified range removed
+    // (readbacks, CPU invalidations) and the same collection tick, returns the buffer and offset of the first obtain.
+    // Everything the full path would do again is already done: the range is in the GPU-modified set (so the dirty
+    // sync stops at its first check), the block write ticks and the ever-written set hold the current tick and range,
+    // and the buffer was touched at this collection tick. 1 = use the memo; 2 = verify: run the full path on every hit
+    // and count a different buffer or offset, or a full path that uploaded or changed the GPU-modified set, as a
+    // mismatch. Off while any diagnostic that observes each written obtain is on.
+    internal static readonly int WrittenObtainMemoMode =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_WRITTEN_OBTAIN_MEMO"), out var writtenMemo) ? writtenMemo : 0;
+
+    private static bool WrittenObtainMemoAllowed => !WrittenSyncCpuDirty && !EagerReadbacks && !ReadbackTickLog && DirtyWatch == 0 &&
+        !EarlyWriterSubmit && !Diagnostics.TableReadCensus.Enabled && !Diagnostics.DccWriterTrace.Enabled && ReadbackMirror.Mode == 0 &&
+        !GpuWriteHistory.Enabled;
+
+    private readonly Dictionary<(ulong Address, ulong Size), (GpuBuffer Buffer, ulong Offset)> _writtenMemo = new();
+    private ulong _writtenMemoTick = ulong.MaxValue;
+    private ulong _writtenMemoCollectionTick;
+    private long _writtenMemoRegistryEpoch;
+    private long _writtenMemoRemovalEpoch;
+    private long _syncUploads;
+    private static long _writtenMemoMismatchTotal;
+    private static int _writtenMemoMismatchLogs;
+
+    private bool WrittenMemoCurrent() =>
+        _writtenMemoTick == _scheduler.CurrentTick && _writtenMemoCollectionTick == _retirementPolicy.CurrentTick &&
+        _writtenMemoRegistryEpoch == _registry.Epoch && _writtenMemoRemovalEpoch == Volatile.Read(ref _gpuModifiedRemovals);
+
+    private void ResetWrittenMemo()
+    {
+        _writtenMemo.Clear();
+        _writtenMemoTick = _scheduler.CurrentTick;
+        _writtenMemoCollectionTick = _retirementPolicy.CurrentTick;
+        _writtenMemoRegistryEpoch = _registry.Epoch;
+        _writtenMemoRemovalEpoch = Volatile.Read(ref _gpuModifiedRemovals);
     }
 
     private static readonly bool ObtainFastChecks =Environment.GetEnvironmentVariable("SHARPEMU_OBTAIN_FAST_CHECKS") != "0";
@@ -419,6 +464,36 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (command.IsInvalid || !IsValidRange(guestAddress, size))
         {
             throw SubmissionScheduler.Fatal("A buffer request requires a command buffer that is recording.");
+        }
+
+        var memoized = isWritten && !isTexelBuffer && WrittenObtainMemoMode != 0 && WrittenObtainMemoAllowed;
+        var verifying = false;
+        (GpuBuffer Buffer, ulong Offset) remembered = default;
+        long uploadsBefore = 0, modifiedBefore = 0, removalsBefore = 0;
+        if (isWritten)
+        {
+            _obtainCounts[(int)ObtainOutcome.Written]++;
+        }
+
+        if (memoized)
+        {
+            if (!WrittenMemoCurrent())
+            {
+                ResetWrittenMemo();
+            }
+            else if (_writtenMemo.TryGetValue((guestAddress, size), out remembered))
+            {
+                if (WrittenObtainMemoMode != 2)
+                {
+                    _obtainCounts[(int)ObtainOutcome.WrittenMemoHit]++;
+                    return remembered;
+                }
+
+                verifying = true;
+                uploadsBefore = _syncUploads;
+                modifiedBefore = Volatile.Read(ref _gpuModifiedVersion);
+                removalsBefore = Volatile.Read(ref _gpuModifiedRemovals);
+            }
         }
 
         // [local] SHARPEMU_OBTAIN_FAST_CHECKS (on by default): the same predicate, cheapest first. A clean range
@@ -495,7 +570,36 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             NoteHotWindowWrite(guestAddress, size);
         }
 
-        return (buffer, buffer.Offset(guestAddress));
+        var result = (Buffer: buffer, Offset: buffer.Offset(guestAddress));
+        if (memoized)
+        {
+            if (verifying)
+            {
+                _obtainCounts[(int)ObtainOutcome.WrittenMemoVerified]++;
+                var uploaded = _syncUploads != uploadsBefore;
+                var modified = Volatile.Read(ref _gpuModifiedVersion) != modifiedBefore || Volatile.Read(ref _gpuModifiedRemovals) != removalsBefore;
+                if (!ReferenceEquals(remembered.Buffer, buffer) || remembered.Offset != result.Offset || uploaded || modified)
+                {
+                    _obtainCounts[(int)ObtainOutcome.WrittenMemoMismatch]++;
+                    Interlocked.Increment(ref _writtenMemoMismatchTotal);
+                    if (_writtenMemoMismatchLogs++ < 40)
+                    {
+                        Console.Error.WriteLine(
+                            $"[GPU][WRITTEN_MEMO_MISMATCH] range=0x{guestAddress:X}+0x{size:X} same_buffer={ReferenceEquals(remembered.Buffer, buffer)} " +
+                            $"offset=0x{remembered.Offset:X}/0x{result.Offset:X} uploaded={uploaded} modified={modified} tick={_scheduler.CurrentTick}");
+                    }
+                }
+            }
+
+            if (!WrittenMemoCurrent())
+            {
+                ResetWrittenMemo();
+            }
+
+            _writtenMemo[(guestAddress, size)] = result;
+        }
+
+        return result;
     }
 
     // [local] SHARPEMU_UNIFORM_IMAGE_SOURCE: an image source of one repeated byte (GTA V clears a 6 MB depth
@@ -2960,6 +3064,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         var source = CollectUploadRanges(buffer, guestAddress, size, isWritten, preserveCpuWriteHotPages, out var copies, out var totalSize);
         if (source != null)
         {
+            _syncUploads++; // [local] written-obtain memo verification
             if (Rendering.BatchSimulation.Enabled) Rendering.BatchSimulation.NoteUpload(); // [local]
             foreach (var copy in copies)
                 buffer.NoteGpuWrite(copy.DstOffset, copy.Size);
