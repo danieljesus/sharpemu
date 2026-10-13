@@ -1158,13 +1158,66 @@ public sealed class ResourceMaterializationCache
                 _memo.Clear();
             // Retain ordinary descriptor walks without keeping unusually large
             // tables alive for the lifetime of the renderer.
-            if (_reads.Capacity > 16384)
+            if (_reads.Capacity > KeptReads)
                 _reads.Capacity = 0;
             _reader = null;
             _cleanReader = null;
             _residentReader = null;
             _inTable = false;
             Failed = false;
+        }
+
+        // [local] SHARPEMU_RECORDER_KEEP: the read-list capacity a returned recorder keeps, in entries of 40 bytes
+        // (default 1 << 20; 0 restores the old 16384). Camera moves record walks of more than 16384 reads, so the list
+        // was dropped and grown again from empty on every such miss: ~160 MB/s of List growth on the front in pan,
+        // 43 % of all managed allocation, much of it on the large-object heap.
+        private static readonly int KeptReads = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RECORDER_KEEP"), out var kept)
+            ? kept <= 0 ? 16384 : kept
+            : 1 << 20;
+
+        // [local] SHARPEMU_RECORDER_KEYSORT (on by default; =0 disables): the recorded reads are sorted through a ulong key
+        // array and an index array instead of a Comparison over the 40-byte tuples (a delegate call and two tuple
+        // copies per comparison): 3.4 ms per frame of the front in camera moves. Array.Sort(keys, items) runs the same
+        // introsort with the same comparisons, so the resulting order, ties included, is the one the old sort gave.
+        private static readonly bool KeySort = Environment.GetEnvironmentVariable("SHARPEMU_RECORDER_KEYSORT") != "0";
+        private ulong[] _sortKeys = [];
+        private int[] _sortOrder = [];
+        private (ulong Address, uint Word, bool Clean, bool Table, int Base, int Node, ulong BaseAddress)[] _sortScratch = [];
+
+        private void SortReadsByAddress()
+        {
+            var count = _reads.Count;
+            if (!KeySort || count < 2)
+            {
+                _reads.Sort((left, right) => left.Address.CompareTo(right.Address));
+                return;
+            }
+
+            if (_sortKeys.Length < count)
+            {
+                var size = Math.Max(count, _sortKeys.Length * 2);
+                _sortKeys = new ulong[size];
+                _sortOrder = new int[size];
+                _sortScratch = new (ulong, uint, bool, bool, int, int, ulong)[size];
+            }
+
+            var reads = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_reads);
+            for (var index = 0; index < count; index++)
+            {
+                _sortKeys[index] = reads[index].Address;
+                _sortOrder[index] = index;
+            }
+
+            Array.Sort(_sortKeys, _sortOrder, 0, count);
+            for (var index = 0; index < count; index++)
+                _sortScratch[index] = reads[_sortOrder[index]];
+            _sortScratch.AsSpan(0, count).CopyTo(reads);
+            if (_sortKeys.Length > KeptReads)
+            {
+                _sortKeys = [];
+                _sortOrder = [];
+                _sortScratch = [];
+            }
         }
 
         public bool Failed { get; private set; }
@@ -1241,7 +1294,7 @@ public sealed class ResourceMaterializationCache
         public Entry Build(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, ResourceSnapshot snapshot,
             ResourceSpecialization specialization)
         {
-            _reads.Sort((left, right) => left.Address.CompareTo(right.Address));
+            SortReadsByAddress();
             // Count unique words and contiguous ranges first, then fill the
             // retained arrays directly. Temporary lists previously duplicated
             // every recorded byte and range on each cache miss.

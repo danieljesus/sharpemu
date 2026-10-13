@@ -459,17 +459,13 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool TryReadGuest(ulong address, Span<byte> destination)
         {
+            if (!Presenter.LazyBackReads) Presenter.AllocateEagerClosure(this, address); // [local]
             using var profileScope = FrontProfile.Measure(FrontProfile.Phase.CommandRead);
             // [local] Command memory the GPU may have written (indirect arguments, labels) is read
             // on the render thread, after the work queued before it, through the synchronized path.
             if (presenter.NeedsFrontCommandSync(address, (ulong)destination.Length))
             {
-                var buffer = new byte[destination.Length];
-                FrontSyncStats.Note(1);
-                FrontSyncStats.NoteSite(address, destination.Length);
-                var ok = queue.Run(() => presenter.TryReadGuest(address, buffer), _pauseAlias, _resumeAlias);
-                buffer.CopyTo(destination);
-                return ok;
+                return SyncedRead(address, destination);
             }
 
             using var readScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryRead);
@@ -485,6 +481,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     Console.Error.WriteLine($"[OVERLAY_CMD] address=0x{address:X} length={destination.Length} raw={raw} patched={Convert.ToHexString(destination[..Math.Min(destination.Length, 16)])}");
             }
             return true;
+        }
+
+        private bool SyncedRead(ulong address, Span<byte> destination)
+        {
+            var buffer = new byte[destination.Length];
+            FrontSyncStats.Note(1);
+            FrontSyncStats.NoteSite(address, destination.Length);
+            var ok = queue.Run(() => presenter.TryReadGuest(address, buffer), _pauseAlias, _resumeAlias);
+            buffer.CopyTo(destination);
+            return ok;
         }
 
         private static readonly bool CommandApply = Environment.GetEnvironmentVariable("SHARPEMU_OVERLAY_APPLY_CMD") != "0";

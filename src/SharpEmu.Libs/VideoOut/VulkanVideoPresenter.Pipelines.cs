@@ -441,8 +441,37 @@ internal static unsafe partial class VulkanVideoPresenter
             pages.Versions[slot] = _bufferCache.GpuModifiedVersion;
         }
 
+        // [local] SHARPEMU_LAZY_BACK_READS (on by default; =0 disables): a lambda that captures a parameter makes the
+        // compiler allocate its closure when the method is entered, taken branch or not. The guest readers below are
+        // called per descriptor word (front and render thread) and only rarely go to the render thread, so the
+        // closures now live in the helpers that run that branch. =0 allocates an object of the old closure's size on
+        // entry instead, to measure the difference.
+        internal static readonly bool LazyBackReads = Environment.GetEnvironmentVariable("SHARPEMU_LAZY_BACK_READS") != "0";
+
+        internal sealed class EagerClosure(object owner, ulong address)
+        {
+            public readonly object Owner = owner;
+            public readonly ulong Address = address;
+        }
+
+        private static object? _eagerClosure;
+
+        internal static void AllocateEagerClosure(object owner, ulong address) => _eagerClosure = new EagerClosure(owner, address);
+
+        private (bool Ok, uint Word) BackReadWord(ulong address) =>
+            RunBackRead(() => (TryReadGuestWord(address, out var synced), synced));
+
+        private bool BackReadResidentBytes(ulong address, Span<byte> destination)
+        {
+            var buffer = new byte[destination.Length];
+            var ok = RunBackRead(() => TryReadResidentGuestBytes(address, buffer, false));
+            buffer.CopyTo(destination);
+            return ok;
+        }
+
         public bool TryReadGuestWord(ulong address, out uint word)
         {
+            if (!LazyBackReads) AllocateEagerClosure(this, address); // [local]
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.WordRead);
             FrontProfile.NoteSite(FrontProfile.Phase.WordRead);
@@ -450,7 +479,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (NeedsBackRead(address, sizeof(uint)))
                 {
-                    var (ok, value) = RunBackRead(() => (TryReadGuestWord(address, out var synced), synced));
+                    var (ok, value) = BackReadWord(address);
                     word = value;
                     return ok;
                 }
@@ -597,6 +626,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Refused while a GPU buffer or image write may still own the range.
         public bool TryReadCleanGuestWord(ulong address, out uint word)
         {
+            if (!LazyBackReads) AllocateEagerClosure(this, address); // [local]
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.CleanGuestRead);
             using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.WordRead);
             FrontProfile.NoteSite(FrontProfile.Phase.WordRead);
@@ -604,7 +634,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (NeedsBackRead(address, sizeof(uint)))
                 {
-                    var (ok, value) = RunBackRead(() => (TryReadGuestWord(address, out var clean), clean)); // the front always answered clean reads; now with the synced value
+                    var (ok, value) = BackReadWord(address); // the front always answered clean reads; now with the synced value
                     word = value;
                     return ok;
                 }
@@ -648,14 +678,12 @@ internal static unsafe partial class VulkanVideoPresenter
         // The same ownership rules as the two word readers, checked once for a whole range.
         public bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean)
         {
+            if (!LazyBackReads) AllocateEagerClosure(this, address); // [local]
             var size = (ulong)destination.Length;
             using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.ResidentRead);
             if (OnFrontThread && NeedsBackRead(address, size))
             {
-                var buffer = new byte[destination.Length];
-                var ok = RunBackRead(() => TryReadResidentGuestBytes(address, buffer, false));
-                buffer.CopyTo(destination);
-                return ok;
+                return BackReadResidentBytes(address, destination);
             }
 
             if (OnFrontThread)
