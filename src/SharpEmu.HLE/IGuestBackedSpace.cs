@@ -27,6 +27,12 @@ public interface IGuestBackedSpace
 
     object? BackingAliasSnapshot => null;
 
+    // Owner tables and host regions over a range whose fixed mapping could not be placed.
+    string DescribeRangeForDiagnostics(ulong address, ulong size) => string.Empty;
+
+    // Host regions inside the guest window that this space does not own.
+    string DescribeGuestWindowForDiagnostics() => string.Empty;
+
     bool TryEnterBackingAliasAccess() => false;
 
     void ExitBackingAliasAccess()

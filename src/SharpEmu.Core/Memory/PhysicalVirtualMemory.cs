@@ -147,7 +147,102 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         {
             _backedSpace = new GuestSpaceOwner(viewHost, backingBytes, preReserveGuestAddressSpace);
             RunBackingSelfTest();
+            if (preReserveGuestAddressSpace)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] Guest window pre-reserved: ranges={_backedSpace.PreReservedRangeCount} " +
+                    $"bytes=0x{_backedSpace.PreReservedBytes:X} minimum=0x{_backedSpace.PreReserveMinimum:X} " +
+                    DescribeGuestWindowForDiagnostics());
+            }
         }
+    }
+
+    private const int DescribedHostRegionLimit = 16;
+    private const int MaxDescribedHostSteps = 1 << 16;
+
+    public string DescribeRangeForDiagnostics(ulong address, ulong size)
+    {
+        if (_backedSpace is not { } owner || size == 0 || size > ulong.MaxValue - address)
+        {
+            return string.Empty;
+        }
+
+        var regions = DescribeHostRegions(address, address + size, foreignOnly: false, out _, out _);
+        return $"owner {owner.DescribeRange(address, size)} host=[{regions}]";
+    }
+
+    // Counts host regions in the guest window that the backing owner never reserved. A fixed guest
+    // mapping cannot be placed over them, so each one is a range the guest may later fault in.
+    public string DescribeGuestWindowForDiagnostics()
+    {
+        // Only Windows reports host regions cheaply enough to walk the whole window.
+        if (_backedSpace is null || !OperatingSystem.IsWindows())
+        {
+            return string.Empty;
+        }
+
+        var regions = DescribeHostRegions(GuestSpaceOwner.GuestWindowStart, GuestSpaceOwner.GuestWindowEnd,
+            foreignOnly: true, out var count, out var bytes);
+        return $"foreign_regions={count} foreign_bytes=0x{bytes:X} [{regions}]";
+    }
+
+    private string DescribeHostRegions(ulong start, ulong end, bool foreignOnly, out int count, out ulong bytes)
+    {
+        count = 0;
+        bytes = 0;
+        var owner = _backedSpace;
+        if (owner is null)
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string>();
+        var cursor = start;
+        var steps = 0;
+        while (steps++ < MaxDescribedHostSteps && cursor < end &&
+            _hostMemory.Query(cursor, out var info) && info.RegionSize != 0)
+        {
+            var regionStart = Math.Max(cursor, info.BaseAddress);
+            var regionEnd = info.RegionSize > ulong.MaxValue - info.BaseAddress
+                ? end
+                : Math.Min(end, info.BaseAddress + info.RegionSize);
+            if (regionEnd <= cursor)
+            {
+                break;
+            }
+
+            var length = regionEnd - regionStart;
+            var owned = owner.OwnedBytesIn(regionStart, length) == length;
+            if (!foreignOnly || (info.State != HostRegionState.Free && !owned))
+            {
+                if (foreignOnly)
+                {
+                    count++;
+                    bytes += length;
+                }
+
+                if (parts.Count < DescribedHostRegionLimit)
+                {
+                    bool tracked;
+                    lock (_fixedAllocationGate)
+                    {
+                        tracked = _fixedGranuleReservationBases.Contains(info.AllocationBase);
+                    }
+
+                    tracked = tracked || IsTrackedRegionBase(info.AllocationBase);
+                    parts.Add($"0x{regionStart:X}+0x{length:X}:{info.State}:alloc=0x{info.AllocationBase:X}" +
+                        $":prot=0x{info.RawProtection:X}:owned={owned}:sharpemu={tracked}");
+                }
+                else if (parts.Count == DescribedHostRegionLimit)
+                {
+                    parts.Add("...");
+                }
+            }
+
+            cursor = regionEnd;
+        }
+
+        return string.Join(",", parts);
     }
 
     // Run both backing self-tests during initialization. Stop if either test fails.

@@ -26,7 +26,8 @@ public static partial class KernelMemoryCompatExports
     private static FlexibleBackingPool _flexibleBacking =
         new(GuestMemoryLayout.FlexibleOffset, GuestMemoryLayout.FlexibleBytes);
     private static IGuestBackedSpace? _backingOwner;
-    private static int _prtMapWarning;
+    private const int MaxFixedMapFailureLogs = 16;
+    private static int _fixedMapFailureLogs;
 
     internal static bool TryReadPrtBacking(IGuestBackedSpace backing, ulong address, Span<byte> destination)
     {
@@ -285,13 +286,17 @@ public static partial class KernelMemoryCompatExports
         address = 0;
         if ((flags & OrbisKernelMapFixed) != 0)
         {
-            if (!TryReplaceWithHole(space, requested, length, (flags & 0x80) != 0))
+            var noOverwrite = (flags & 0x80) != 0;
+            if (!TryReplaceWithHole(space, requested, length, noOverwrite))
             {
-                if (requested >= 0x10_0000_0000UL && requested < 0xFC_0000_0000UL &&
-                    Interlocked.Exchange(ref _prtMapWarning, 1) == 0)
+                var regions = GetMappingSlices(requested, length);
+                // MAP_NO_OVERWRITE over a live mapping is an expected refusal, not a host conflict.
+                if ((!noOverwrite || regions.Length == 0) &&
+                    Interlocked.Increment(ref _fixedMapFailureLogs) <= MaxFixedMapFailureLogs)
                     Console.Error.WriteLine(
-                        $"[LOADER][WARN] Shared mapping cannot replace the reserved aperture: address=0x{requested:X16} size=0x{length:X} flags=0x{flags:X} " +
-                        $"regions=[{string.Join(",", GetMappingSlices(requested, length).Select(region => $"0x{region.Address:X}+0x{region.Length:X}:{(region.IsReserved ? "reserved" : region.IsDirect ? "direct" : region.IsFlexible ? "flexible" : "other")}:backed={space.IsBackedView(region.Address)}"))}].");
+                        $"[LOADER][ERROR] Fixed mapping cannot claim its host range: address=0x{requested:X16} size=0x{length:X} flags=0x{flags:X} " +
+                        $"regions=[{string.Join(",", regions.Select(region => $"0x{region.Address:X}+0x{region.Length:X}:{(region.IsReserved ? "reserved" : region.IsDirect ? "direct" : region.IsFlexible ? "flexible" : "other")}:backed={space.IsBackedView(region.Address)}"))}] " +
+                        $"{space.DescribeRangeForDiagnostics(requested, length)} window: {space.DescribeGuestWindowForDiagnostics()}");
                 return false;
             }
             address = requested;

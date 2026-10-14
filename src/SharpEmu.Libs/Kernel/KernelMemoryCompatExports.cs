@@ -3363,6 +3363,8 @@ public static partial class KernelMemoryCompatExports
                     true, false, 0, block.Offset));
             GuestGpuMemoryHook.NoteMapped(address, length, mode);
             GuestGpuMemoryHook.NoteGpuWritable(address, length, (protection & OrbisProtGpuWrite) != 0); // [local]
+            if (ShouldTraceDirectMemory())
+                Console.Error.WriteLine($"[LOADER][TRACE] map_flexible applied address=0x{address:X} requested=0x{requested:X} size=0x{length:X} flags=0x{flags:X}");
             return ctx.TryWriteUInt64(pointer, address) ? 0 : MemoryFault;
         }
     }
@@ -3469,6 +3471,8 @@ public static partial class KernelMemoryCompatExports
                     _flexibleBacking.Release(region.Address, region.Length);
                 RemoveMappingLocked(region.Address, region.Length);
             }
+            if (ShouldTraceDirectMemory())
+                Console.Error.WriteLine($"[LOADER][TRACE] munmap address=0x{address:X} size=0x{length:X} regions={regions.Length}");
             return 0;
         }
     }

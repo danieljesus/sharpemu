@@ -21,7 +21,9 @@ public sealed class GuestSpaceOwner : IDisposable
     public const ulong GuestPage = 0x4000;
     private const ulong UserAddressStart = 0x10_0000_0000;
     private const ulong UserAddressEnd = 0xFC_0000_0000;
-    private const ulong MinimumPreReservedRange = 0x0100_0000;
+    // POSIX finds free space by halving failed reservations, so tiny minimums multiply its probes.
+    private const ulong PosixMinimumPreReservedRange = 0x0100_0000;
+    private const int DescribeEntryLimit = 8;
 
     private readonly IHostViewMemory _host;
     private readonly SharedBackingViews _views;
@@ -37,6 +39,8 @@ public sealed class GuestSpaceOwner : IDisposable
     {
         _host = host;
         Granularity = host.Granularity;
+        PreReserveMinimum = ResolvePreReserveMinimum(Granularity,
+            Environment.GetEnvironmentVariable("SHARPEMU_PRERESERVE_MIN"), OperatingSystem.IsWindows());
         // Create lookup views before concurrent fault handlers can read the range table.
         _ = _mapped.Keys;
         _ = _mapped.Values;
@@ -53,6 +57,47 @@ public sealed class GuestSpaceOwner : IDisposable
     }
 
     public ulong Granularity { get; }
+
+    public const ulong GuestWindowStart = UserAddressStart;
+
+    public const ulong GuestWindowEnd = UserAddressEnd;
+
+    // Smallest free host gap in the guest window that startup takes over. Any gap left to the
+    // host can later receive a thread stack or heap segment that a fixed guest mapping then hits.
+    // [local] SHARPEMU_PRERESERVE_MIN overrides it (0x1000000 restores the previous 16 MiB).
+    public ulong PreReserveMinimum { get; }
+
+    public int PreReservedRangeCount { get; private set; }
+
+    public ulong PreReservedBytes { get; private set; }
+
+    internal static ulong ResolvePreReserveMinimum(ulong granularity, string? configured, bool windows)
+    {
+        if (TryParseSize(configured, out var value) && value != 0)
+        {
+            var aligned = AlignUp(Math.Max(value, granularity), granularity);
+            if (aligned != 0)
+            {
+                return aligned;
+            }
+        }
+
+        return windows ? granularity : Math.Max(PosixMinimumPreReservedRange, granularity);
+    }
+
+    private static bool TryParseSize(string? text, out ulong value)
+    {
+        value = 0;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        text = text.Trim();
+        return text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+            ? ulong.TryParse(text.AsSpan(2), System.Globalization.NumberStyles.AllowHexSpecifier, null, out value)
+            : ulong.TryParse(text, out value);
+    }
 
     public ulong AliasBase => _views.AliasBase;
 
@@ -519,10 +564,74 @@ public sealed class GuestSpaceOwner : IDisposable
             return;
         }
 
-        foreach (var range in _host.ReserveFreeAddressRanges(UserAddressStart, UserAddressEnd, MinimumPreReservedRange))
+        PreReservedRangeCount = 0;
+        PreReservedBytes = 0;
+        foreach (var range in _host.ReserveFreeAddressRanges(UserAddressStart, UserAddressEnd, PreReserveMinimum))
         {
             _owned.Add((range.Address, range.Size));
             AddFreeRange(range.Address, range.Size);
+            PreReservedRangeCount++;
+            PreReservedBytes += range.Size;
+        }
+    }
+
+    // Bytes of the range that this owner reserved, at any time, from the host.
+    public ulong OwnedBytesIn(ulong address, ulong size)
+    {
+        if (!IsValidRange(address, size))
+        {
+            return 0;
+        }
+
+        lock (_mappingLock)
+        {
+            return OwnedBytesInLocked(address, address + size);
+        }
+    }
+
+    private ulong OwnedBytesInLocked(ulong address, ulong end)
+    {
+        ulong total = 0;
+        foreach (var range in _owned)
+        {
+            var start = Math.Max(address, range.Address);
+            var stop = Math.Min(end, range.Address + range.Size);
+            if (start < stop)
+            {
+                total += stop - start;
+            }
+        }
+
+        return total;
+    }
+
+    // Diagnostic view of the owner's tables over a range, for failed fixed mappings.
+    public string DescribeRange(ulong address, ulong size)
+    {
+        if (!IsValidRange(address, size))
+        {
+            return "invalid-range";
+        }
+
+        var end = address + size;
+        lock (_mappingLock)
+        {
+            static string Join(IEnumerable<string> items)
+            {
+                var list = items.Take(DescribeEntryLimit + 1).ToList();
+                return list.Count > DescribeEntryLimit
+                    ? string.Join(",", list.Take(DescribeEntryLimit)) + ",..."
+                    : string.Join(",", list);
+            }
+
+            var owned = Join(_owned.Where(range => range.Address < end && address < range.Address + range.Size)
+                .OrderBy(range => range.Address).Select(range => $"0x{range.Address:X}+0x{range.Size:X}"));
+            var free = Join(_free.Where(pair => pair.Key < end && address < pair.Key + pair.Value)
+                .Select(pair => $"0x{pair.Key:X}+0x{pair.Value:X}"));
+            var mapped = Join(_mapped.Values.Where(range => range.Address < end && address < range.Address + range.Size)
+                .Select(range => $"0x{range.Address:X}+0x{range.Size:X}:{range.Kind}"));
+            return $"owned_bytes=0x{OwnedBytesInLocked(address, end):X}/0x{size:X} single_free={FindFreeRangeIndex(address, size) >= 0} " +
+                $"owned=[{owned}] free=[{free}] mapped=[{mapped}]";
         }
     }
 

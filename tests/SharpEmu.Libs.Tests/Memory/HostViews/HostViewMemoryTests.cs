@@ -383,6 +383,53 @@ public sealed unsafe class HostViewMemoryTests
         }
     }
 
+    // A small gap between two host regions stays open to later host allocations unless the
+    // minimum allows it, and a fixed guest mapping over it then fails.
+    [Fact]
+    public void ReserveFreeAddressRanges_TakesSmallGapsOnlyDownToTheMinimum()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var views = HostViewMemory.Create();
+        const ulong span = 0x400_0000;
+        var granularity = views.Granularity;
+        var start = ProbeGuestAddress(views, span);
+        var first = start + span / 4;
+        var gapStart = first + granularity;
+        var gapSize = 4 * granularity;
+        var second = gapStart + gapSize;
+        Assert.Equal(first, views.ReserveHole(first, granularity));
+        Assert.Equal(second, views.ReserveHole(second, granularity));
+        try
+        {
+            foreach (var (minimum, expectGap) in new[] { (0x100_0000UL, false), (granularity, true) })
+            {
+                var ranges = views.ReserveFreeAddressRanges(start, start + span, minimum);
+                try
+                {
+                    Assert.Contains(ranges, range => range.Address == start);
+                    Assert.Equal(expectGap, ranges.Any(range =>
+                        range.Address <= gapStart && gapStart + gapSize <= range.Address + range.Size));
+                }
+                finally
+                {
+                    foreach (var range in ranges)
+                    {
+                        Assert.True(views.FreeHole(range.Address, range.Size));
+                    }
+                }
+            }
+        }
+        finally
+        {
+            Assert.True(views.FreeHole(first, granularity));
+            Assert.True(views.FreeHole(second, granularity));
+        }
+    }
+
     [DllImport("kernel32.dll")]
     private static extern nuint VirtualQuery(void* address, out MemoryBasicInformation info, nuint length);
 }
