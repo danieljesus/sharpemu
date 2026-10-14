@@ -153,8 +153,31 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     $"[LOADER][INFO] Guest window pre-reserved: ranges={_backedSpace.PreReservedRangeCount} " +
                     $"bytes=0x{_backedSpace.PreReservedBytes:X} minimum=0x{_backedSpace.PreReserveMinimum:X} " +
                     DescribeGuestWindowForDiagnostics());
+                StartGuestWindowAudit();
             }
         }
+    }
+
+    private Timer? _guestWindowAudit;
+
+    // [local] SHARPEMU_WINDOW_AUDIT_SECONDS: repeat the foreign-region walk of the guest window so host
+    // allocations that arrive after startup show up in every session, not only in one that crashes.
+    private void StartGuestWindowAudit()
+    {
+        if (!int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_WINDOW_AUDIT_SECONDS"), out var seconds) ||
+            seconds <= 0)
+        {
+            return;
+        }
+
+        var period = TimeSpan.FromSeconds(seconds);
+        _guestWindowAudit = new Timer(_ =>
+        {
+            if (!_disposed)
+            {
+                Console.Error.WriteLine($"[LOADER][INFO] Guest window audit: {DescribeGuestWindowForDiagnostics()}");
+            }
+        }, null, period, period);
     }
 
     private const int DescribedHostRegionLimit = 16;
@@ -2858,6 +2881,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     {
         if (!_disposed)
         {
+            _guestWindowAudit?.Dispose();
+            _guestWindowAudit = null;
             Clear();
             _backedSpace?.Dispose();
             _backedSpace = null;
