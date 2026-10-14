@@ -28,6 +28,15 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
     private static readonly long CursorHideDelayTicks = 2 * Stopwatch.Frequency;
     private const uint OutputDurationMs = 5_000;
 
+    // [local] SHARPEMU_SDL_POLL_MS=N (0 or unset = every window loop turn, as before): events and the gamepad are
+    // polled at most once per N ms. SHARPEMU_SDL_AUTO_JOYSTICKS=0: SDL_PollEvent no longer updates the joysticks
+    // (SDL_HINT_AUTO_UPDATE_JOYSTICKS=0); each poll calls SDL_UpdateJoysticks once while no gamepad is open (with one,
+    // SDL_UpdateGamepads does it), so hot-plug still works. R1 of plan-estructural-2026-10-14.md.
+    private static readonly long PollIntervalTicks =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SDL_POLL_MS"), out var pollMs) && pollMs > 0 ? pollMs * Stopwatch.Frequency / 1000 : 0;
+    private static readonly bool AutoUpdateJoysticks = Environment.GetEnvironmentVariable("SHARPEMU_SDL_AUTO_JOYSTICKS") != "0";
+    private long _lastPoll;
+
     private readonly HostVideoOptions _options;
     private readonly SdlGraphicsApi _graphicsApi;
     private readonly Action? _toggleBackendHud;
@@ -60,6 +69,21 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
         _graphicsApi = graphicsApi;
         _toggleBackendHud = toggleBackendHud;
         SdlGamepadStateReader.EnableSonyHidApi();
+        if (!AutoUpdateJoysticks) // [local]
+        {
+            fixed (byte* disabled = "0"u8)
+            fixed (byte* autoUpdate = SDL_HINT_AUTO_UPDATE_JOYSTICKS)
+            {
+                SDL_SetHint(autoUpdate, disabled);
+            }
+        }
+
+        if (PollIntervalTicks != 0 || !AutoUpdateJoysticks) // [local]
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] SDL polling: interval_ms={PollIntervalTicks * 1000.0 / Stopwatch.Frequency:F1} auto_update_joysticks={AutoUpdateJoysticks}");
+        }
+
         if (!SDL_InitSubSystem(InitFlags))
         {
             throw new InvalidOperationException($"SDL video initialization failed: {GetError()}");
@@ -371,9 +395,19 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
                 using var windowScope = _graphicsApi == SdlGraphicsApi.Vulkan
                     ? RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.WindowLoop)
                     : default;
+                var pollDue = PollDue(); // [local] SHARPEMU_SDL_POLL_MS
                 using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.WindowEvents))
                 {
-                    PumpEvents();
+                    if (pollDue)
+                    {
+                        if (!AutoUpdateJoysticks && _gamepad is null)
+                        {
+                            SDL_UpdateJoysticks();
+                        }
+
+                        PumpEvents();
+                    }
+
                     RefreshOverlayTitle();
                 }
                 if (Volatile.Read(ref _closeRequested) != 0)
@@ -385,9 +419,12 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
                 {
                     UpdateCursorAutoHide();
                 }
-                using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GamepadPoll))
+                if (pollDue)
                 {
-                    SampleGamepad();
+                    using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GamepadPoll))
+                    {
+                        SampleGamepad();
+                    }
                 }
                 var now = timer.Elapsed.TotalSeconds;
                 render(now - last);
@@ -439,6 +476,23 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
         }
 
         SDL_QuitSubSystem(InitFlags);
+    }
+
+    private bool PollDue()
+    {
+        if (PollIntervalTicks == 0)
+        {
+            return true;
+        }
+
+        var now = Stopwatch.GetTimestamp();
+        if (now - _lastPoll < PollIntervalTicks)
+        {
+            return false;
+        }
+
+        _lastPoll = now;
+        return true;
     }
 
     private void PumpEvents()

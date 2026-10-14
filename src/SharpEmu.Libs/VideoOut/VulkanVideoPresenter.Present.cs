@@ -395,6 +395,29 @@ internal static unsafe partial class VulkanVideoPresenter
         _thread.Start();
     }
 
+    // [local] R1 of plan-estructural-2026-10-14.md: the render thread's apartment, managed and COM
+    // (APTTYPE 0 STA, 1 MTA, 2 NA, 3 MAINSTA; hr 0x800401F0 = COM not initialized on the thread).
+    private static string DescribeApartment()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return "n/a";
+        }
+
+        try
+        {
+            var hr = CoGetApartmentType(out var type, out var qualifier);
+            return $"managed={Thread.CurrentThread.GetApartmentState()} com_hr=0x{hr:X8} type={type} qualifier={qualifier}";
+        }
+        catch (Exception exception)
+        {
+            return $"managed={Thread.CurrentThread.GetApartmentState()} com_error={exception.GetType().Name}";
+        }
+    }
+
+    [System.Runtime.InteropServices.DllImport("ole32.dll")]
+    private static extern int CoGetApartmentType(out int type, out int qualifier);
+
     /// <summary>
     /// Asks a running presenter to close its window; used at emulator
     /// shutdown so a main-thread-hosted window loop returns to the pump.
@@ -412,6 +435,7 @@ internal static unsafe partial class VulkanVideoPresenter
     {
         SharpEmu.HLE.Host.HostLaneReservation.ApplyToRenderThread();
         SharpEmu.HLE.GpuMemory.GpuMemoryAccessProfile.MarkRenderThread(); // [local]
+        var apartmentBefore = DescribeApartment(); // [local] R1: before SDL initializes COM on this thread
         uint width;
         uint height;
         lock (_gate)
@@ -423,6 +447,7 @@ internal static unsafe partial class VulkanVideoPresenter
         try
         {
             using var presenter = new Presenter(width, height);
+            Console.Error.WriteLine($"[LOADER][INFO] render thread apartment: before_sdl=[{apartmentBefore}] after_sdl=[{DescribeApartment()}]"); // [local]
             lock (_gate)
             {
                 _activePresenter = presenter;
