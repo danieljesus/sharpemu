@@ -491,15 +491,82 @@ public static partial class AgcExports
     private static bool TryAllocateCommandDwords(CpuContext ctx, ulong commandBufferAddress, uint sizeDwords, out ulong commandAddress)
         => TryPrepareCommandDwords(ctx, commandBufferAddress, sizeDwords, true, out commandAddress);
 
+    // [local] SHARPEMU_HLE_SPAN_WRITES=1 (off by default): a builder writes its packet to guest memory as one span and
+    // reads the command buffer state in one read, so the write hooks and the memory lock run once per packet instead
+    // of once per dword. Off keeps one write per dword and one read per state field.
+    // Adapted from 2838b258 by Berk (par274), co-authored by Astellou.
+    private static readonly bool SpanWritesFromEnvironment =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_HLE_SPAN_WRITES"), "1", StringComparison.Ordinal);
+
+    // 0 follows the environment, 1 forces span writes on, 2 off; per thread, for tests and benchmarks.
+    [ThreadStatic]
+    private static int t_spanWritesOverride;
+
+    internal static bool SpanWrites => t_spanWritesOverride == 0 ? SpanWritesFromEnvironment : t_spanWritesOverride == 1;
+
+    internal static void OverrideSpanWritesOnThisThread(bool? enabled) =>
+        t_spanWritesOverride = enabled is null ? 0 : enabled.Value ? 1 : 2;
+
+    private static bool TryEmitCommandDwords(CpuContext ctx, ulong commandBufferAddress, out ulong commandAddress, params ReadOnlySpan<uint> dwords)
+    {
+        return TryAllocateCommandDwords(ctx, commandBufferAddress, (uint)dwords.Length, out commandAddress) &&
+            TryWriteCommandDwords(ctx, commandAddress, dwords);
+    }
+
+    private static bool TryWriteCommandDwords(CpuContext ctx, ulong address, params ReadOnlySpan<uint> dwords)
+    {
+        if (SpanWrites)
+        {
+            return ctx.Memory.TryWrite(address, System.Runtime.InteropServices.MemoryMarshal.AsBytes(dwords));
+        }
+
+        for (var index = 0; index < dwords.Length; index++)
+        {
+            if (!TryWriteUInt32(ctx, address + ((ulong)index * sizeof(uint)), dwords[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private const int CommandBufferStateBytes = (int)(CommandBufferReservedDwOffset + sizeof(uint) - CommandBufferCursorUpOffset);
+
+    private static bool TryReadCommandBufferState(CpuContext ctx, ulong commandBufferAddress, out ulong cursorUp, out ulong cursorDown, out ulong callback, out ulong userData, out uint reservedDwords)
+    {
+        if (!SpanWrites)
+        {
+            cursorDown = callback = userData = 0;
+            reservedDwords = 0;
+            return TryReadUInt64(ctx, commandBufferAddress + CommandBufferCursorUpOffset, out cursorUp) &&
+                TryReadUInt64(ctx, commandBufferAddress + CommandBufferCursorDownOffset, out cursorDown) &&
+                TryReadUInt64(ctx, commandBufferAddress + CommandBufferCallbackOffset, out callback) &&
+                TryReadUInt64(ctx, commandBufferAddress + CommandBufferUserDataOffset, out userData) &&
+                TryReadUInt32(ctx, commandBufferAddress + CommandBufferReservedDwOffset, out reservedDwords);
+        }
+
+        Span<byte> state = stackalloc byte[CommandBufferStateBytes];
+        if (!ctx.Memory.TryRead(commandBufferAddress + CommandBufferCursorUpOffset, state))
+        {
+            cursorUp = cursorDown = callback = userData = 0;
+            reservedDwords = 0;
+            return false;
+        }
+
+        cursorUp = BinaryPrimitives.ReadUInt64LittleEndian(state);
+        cursorDown = BinaryPrimitives.ReadUInt64LittleEndian(state[(int)(CommandBufferCursorDownOffset - CommandBufferCursorUpOffset)..]);
+        callback = BinaryPrimitives.ReadUInt64LittleEndian(state[(int)(CommandBufferCallbackOffset - CommandBufferCursorUpOffset)..]);
+        userData = BinaryPrimitives.ReadUInt64LittleEndian(state[(int)(CommandBufferUserDataOffset - CommandBufferCursorUpOffset)..]);
+        reservedDwords = BinaryPrimitives.ReadUInt32LittleEndian(state[(int)(CommandBufferReservedDwOffset - CommandBufferCursorUpOffset)..]);
+        return true;
+    }
+
     private static bool TryPrepareCommandDwords(CpuContext ctx, ulong commandBufferAddress, uint sizeDwords, bool advanceCursor, out ulong commandAddress)
     {
         commandAddress = 0;
         if (sizeDwords == 0 ||
-            !TryReadUInt64(ctx, commandBufferAddress + CommandBufferCursorUpOffset, out var cursorUp) ||
-            !TryReadUInt64(ctx, commandBufferAddress + CommandBufferCursorDownOffset, out var cursorDown) ||
-            !TryReadUInt64(ctx, commandBufferAddress + CommandBufferCallbackOffset, out var callback) ||
-            !TryReadUInt64(ctx, commandBufferAddress + CommandBufferUserDataOffset, out var userData) ||
-            !TryReadUInt32(ctx, commandBufferAddress + CommandBufferReservedDwOffset, out var reservedDwords))
+            !TryReadCommandBufferState(ctx, commandBufferAddress, out var cursorUp, out var cursorDown, out var callback, out var userData, out var reservedDwords))
         {
             return false;
         }
