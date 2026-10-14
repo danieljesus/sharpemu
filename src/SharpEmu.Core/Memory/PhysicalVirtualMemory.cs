@@ -2341,6 +2341,11 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
     }
 
+    // [local] SHARPEMU_SINGLE_VIEW_WRITES=1 (off by default): managed writes that one backing view covers skip the
+    // region lock, as reads already do. Settable for tests and benchmarks.
+    internal static bool SingleViewWrites { get; set; } =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_SINGLE_VIEW_WRITES"), "1", StringComparison.Ordinal);
+
     public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
     {
         // A managed write into a page the guest-image write tracker has
@@ -2352,6 +2357,15 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         // host-identical, matching the tracker's fault addresses.
         GuestImageWriteTracker.NotifyManagedWrite(virtualAddress, (ulong)source.Length);
         GuestGpuMemoryHook.MarkCpuWrite(virtualAddress, (ulong)source.Length);
+
+        // [local] Like TryRead, a write that one backing view covers needs neither _gate nor the region lookup.
+        // Adapted from 2838b258 by Berk (par274), co-authored by Astellou.
+        if (SingleViewWrites && !source.IsEmpty && _backedSpace is { } backed && !_disposed &&
+            backed.TryWriteSingleView(virtualAddress, source))
+        {
+            NotifyGuestWriteWatch(virtualAddress, source);
+            return true;
+        }
 
         var requiresExclusiveAccess = false;
         _gate.EnterReadLock();
@@ -2450,6 +2464,14 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         // identity-mapped guest page protected by the image tracker.
         GuestImageWriteTracker.NotifyManagedWrite(destinationAddress, length);
         GuestGpuMemoryHook.MarkCpuWrite(destinationAddress, length);
+
+        // [local] SHARPEMU_SINGLE_VIEW_WRITES: a copy within single views needs neither _gate nor the backing lock.
+        if (SingleViewWrites && _backedSpace is { } backed && !_disposed &&
+            backed.TryCopySingleView(destinationAddress, sourceAddress, length))
+        {
+            NotifyBackedWriteWatch(destinationAddress, length);
+            return true;
+        }
 
         _gate.EnterReadLock();
         try

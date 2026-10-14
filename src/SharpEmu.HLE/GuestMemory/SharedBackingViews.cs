@@ -118,6 +118,58 @@ public sealed unsafe class SharedBackingViews : IDisposable
         }
     }
 
+    // [local] The lock-free single-view write only; false (with nothing written) for anything else.
+    // Adapted from 2838b258 by Berk (par274), co-authored by Astellou.
+    public bool TryWriteSingleView(ulong address, ReadOnlySpan<byte> data)
+    {
+        if (!TryAccessSingleView(address, (ulong)data.Length, out var target))
+        {
+            return false;
+        }
+
+        try
+        {
+            data.CopyTo(new Span<byte>((void*)target, data.Length));
+            return true;
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeAccesses);
+        }
+    }
+
+    // [local] A copy whose source and destination each lie in one view, without the lock; false (with nothing
+    // copied) otherwise. Both go through the backing alias, so an overlap is copied as memmove does.
+    public bool TryCopySingleView(ulong destination, ulong source, ulong size)
+    {
+        if (size > int.MaxValue || !TryAccessSingleView(source, size, out var from))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!TryAccessSingleView(destination, size, out var to))
+            {
+                return false;
+            }
+
+            try
+            {
+                Buffer.MemoryCopy((void*)from, (void*)to, size, size);
+                return true;
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeAccesses);
+            }
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeAccesses);
+        }
+    }
+
     public bool TryReadBacking(ulong address, Span<byte> data)
     {
         if (TryAccessSingleView(address, (ulong)data.Length, out var source))
