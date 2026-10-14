@@ -187,6 +187,10 @@ public sealed class GuestPageTracker
     private static long _invalidations;
     private static long _cpuDirtySkips;
 
+    // [local] SHARPEMU_STRIPED_ACCESS_COUNT=1 also stops these two counters: nothing reads them, and every guest thread's
+    // CPU write into a tracked region stored into their shared cache line.
+    private static readonly bool CountInvalidations = Environment.GetEnvironmentVariable("SHARPEMU_STRIPED_ACCESS_COUNT") != "1";
+
     public static (long Invalidations, long CpuDirtySkips) TakeInvalidationCounters() =>
         (Interlocked.Exchange(ref _invalidations, 0), Interlocked.Exchange(ref _cpuDirtySkips, 0));
 
@@ -209,7 +213,11 @@ public sealed class GuestPageTracker
             if (Volatile.Read(ref _regions[index]) is { } region)
             {
                 tracked = true;
-                _invalidations++;
+                if (CountInvalidations)
+                {
+                    _invalidations++;
+                }
+
                 if (SkipCpuDirtyWrites)
                 {
                     // A writer that stored its bytes before this check either sees a bit an upload cleared and takes
@@ -220,7 +228,11 @@ public sealed class GuestPageTracker
                     Interlocked.MemoryBarrier();
                     if (region.IsCpuDirtyThroughout(offset, bytes))
                     {
-                        _cpuDirtySkips++;
+                        if (CountInvalidations)
+                        {
+                            _cpuDirtySkips++;
+                        }
+
                         remaining -= bytes;
                         offset = 0;
                         index++;
