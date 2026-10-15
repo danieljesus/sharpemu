@@ -185,7 +185,30 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         Console.Error.WriteLine(
             $"[LOADER][INFO] {label}: ranges={owner.PreReservedRangeCount} " +
             $"bytes=0x{owner.PreReservedBytes:X} minimum=0x{owner.PreReserveMinimum:X} " +
-            DescribeGuestWindowForDiagnostics());
+            DescribeGuestWindowForDiagnostics() + " " + DescribeBelowGuestWindow());
+    }
+
+    private const ulong EbootBandStart = 0x8_0000_0000;
+
+    // With bottom-up ASLR off, host reservations pack upward from the bottom; this shows how close they get to the
+    // eboot base before the image is mapped.
+    private string DescribeBelowGuestWindow()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return string.Empty;
+        }
+
+        var low = HostWindowSurvey.Survey(_hostMemory, 0x1_0000, GuestSpaceOwner.GuestWindowStart,
+            (_, _) => false, IsSharpEmuAllocationBase);
+        var large = low.Allocations.Where(a => a.End - a.Start >= 0x1000_0000)
+            .Select(a => $"0x{a.Start:X}+0x{a.End - a.Start:X}{(a.Tracked ? ":sharpemu" : string.Empty)}");
+        var topBelowEboot = low.Allocations.Where(a => a.Start < EbootBandStart && !a.Tracked)
+            .Select(a => Math.Min(a.End, EbootBandStart)).DefaultIfEmpty(0UL).Max();
+        var ebootBand = low.Allocations.Where(a => a.End > EbootBandStart && !a.Tracked)
+            .Sum(a => (decimal)(a.End - Math.Max(a.Start, EbootBandStart)));
+        return $"below_window: host_top_below_eboot=0x{topBelowEboot:X} eboot_band_foreign=0x{(ulong)ebootBand:X} " +
+            $"large=[{string.Join(",", large)}]";
     }
 
     private Timer? _guestWindowAudit;
