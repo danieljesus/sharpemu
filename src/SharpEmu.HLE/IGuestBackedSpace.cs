@@ -33,6 +33,9 @@ public interface IGuestBackedSpace
     // Host regions inside the guest window that this space does not own.
     string DescribeGuestWindowForDiagnostics() => string.Empty;
 
+    // [local] Host memory over a range that neither the owner nor SharpEmu's own allocations hold.
+    ForeignHostMemory ForeignHostMemoryIn(ulong address, ulong size) => default;
+
     bool TryEnterBackingAliasAccess() => false;
 
     void ExitBackingAliasAccess()
@@ -45,3 +48,5 @@ public interface IGuestBackedSpace
         return false;
     }
 }
+
+public readonly record struct ForeignHostMemory(ulong Bytes, ulong CommittedBytes);

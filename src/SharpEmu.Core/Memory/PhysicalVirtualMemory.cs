@@ -147,15 +147,45 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         {
             _backedSpace = new GuestSpaceOwner(viewHost, backingBytes, preReserveGuestAddressSpace);
             RunBackingSelfTest();
+            _preReserveGuestAddressSpace = preReserveGuestAddressSpace;
             if (preReserveGuestAddressSpace)
             {
-                Console.Error.WriteLine(
-                    $"[LOADER][INFO] Guest window pre-reserved: ranges={_backedSpace.PreReservedRangeCount} " +
-                    $"bytes=0x{_backedSpace.PreReservedBytes:X} minimum=0x{_backedSpace.PreReserveMinimum:X} " +
-                    DescribeGuestWindowForDiagnostics());
+                LogGuestWindowPreReserve("Guest window pre-reserved");
                 StartGuestWindowAudit();
             }
         }
+    }
+
+    private readonly bool _preReserveGuestAddressSpace;
+    private bool _disposing;
+    private IReadOnlyList<(ulong Start, ulong End)>? _startupForeignExtents;
+
+    // [local] mapeo2: the host layout line and the deterministic collision reproducer, both before the guest
+    // window is pre-reserved (call ahead of the constructor).
+    public static void PrepareHostForGuestWindow()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var host = CrossPlatformHostMemory.Instance;
+        Console.Error.WriteLine($"[LOADER][INFO] Host layout: {HostWindowSurvey.DescribeHostLayout(host)}");
+        _ = HostWindowSurvey.ApplyTestHostBlockers(host,
+            Environment.GetEnvironmentVariable(HostWindowSurvey.TestHostBlockerVariable), Console.Error.WriteLine);
+    }
+
+    private void LogGuestWindowPreReserve(string label)
+    {
+        if (_backedSpace is not { } owner)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][INFO] {label}: ranges={owner.PreReservedRangeCount} " +
+            $"bytes=0x{owner.PreReservedBytes:X} minimum=0x{owner.PreReserveMinimum:X} " +
+            DescribeGuestWindowForDiagnostics());
     }
 
     private Timer? _guestWindowAudit;
@@ -204,9 +234,46 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             return string.Empty;
         }
 
-        var regions = DescribeHostRegions(GuestSpaceOwner.GuestWindowStart, GuestSpaceOwner.GuestWindowEnd,
-            foreignOnly: true, out var count, out var bytes);
-        return $"foreign_regions={count} foreign_bytes=0x{bytes:X} [{regions}]";
+        var owner = _backedSpace;
+        var survey = HostWindowSurvey.Survey(_hostMemory, GuestSpaceOwner.GuestWindowStart,
+            GuestSpaceOwner.GuestWindowEnd, (address, size) => owner.OwnedBytesIn(address, size) == size,
+            IsSharpEmuAllocationBase, _startupForeignExtents);
+        // The first walk is the startup footprint; later walks report the bytes that fall outside it.
+        var first = _startupForeignExtents is null;
+        _startupForeignExtents ??= survey.Allocations.Select(a => (a.Start, a.End)).ToList();
+        return $"{HostWindowSurvey.Format(survey)} foreign_new_bytes={(first ? "baseline" : $"0x{survey.BytesOutsideBaseline:X}")}";
+    }
+
+    public ForeignHostMemory ForeignHostMemoryIn(ulong address, ulong size)
+    {
+        if (_backedSpace is not { } owner || size == 0 || size > ulong.MaxValue - address)
+        {
+            return default;
+        }
+
+        var survey = HostWindowSurvey.Survey(_hostMemory, address, address + size,
+            (start, length) => owner.OwnedBytesIn(start, length) == length, IsSharpEmuAllocationBase);
+        ulong bytes = 0, committed = 0;
+        foreach (var allocation in survey.Allocations.Where(a => !a.Tracked))
+        {
+            bytes += allocation.Bytes;
+            committed += allocation.CommittedBytes;
+        }
+
+        return new ForeignHostMemory(bytes, committed);
+    }
+
+    private bool IsSharpEmuAllocationBase(ulong allocationBase)
+    {
+        lock (_fixedAllocationGate)
+        {
+            if (_fixedGranuleReservationBases.Contains(allocationBase))
+            {
+                return true;
+            }
+        }
+
+        return IsTrackedRegionBase(allocationBase);
     }
 
     private string DescribeHostRegions(ulong start, ulong end, bool foreignOnly, out int count, out ulong bytes)
@@ -1710,6 +1777,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
                     _fixedGranuleReservationBases.Clear();
                     _backedSpace?.ReleaseAddressRanges();
+                    if (_preReserveGuestAddressSpace && !_disposing)
+                    {
+                        // [local] The release above leaves the whole window unreserved for a moment.
+                        LogGuestWindowPreReserve("Guest window pre-reserved again after clear");
+                    }
+
                     _regions.Clear();
                     _pageProtections.Clear();
                     lock (_allocationSearchHintGate)
@@ -2883,6 +2956,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         {
             _guestWindowAudit?.Dispose();
             _guestWindowAudit = null;
+            _disposing = true;
             Clear();
             _backedSpace?.Dispose();
             _backedSpace = null;

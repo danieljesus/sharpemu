@@ -93,6 +93,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             ImportTraceLimit = Math.Max(0, options.ImportTraceLimit),
             DebugHook = options.DebugHook,
         };
+        PhysicalVirtualMemory.PrepareHostForGuestWindow();
         var virtualMemory = new PhysicalVirtualMemory(
             viewHost: HostViewMemory.Create(),
             preReserveGuestAddressSpace: true);

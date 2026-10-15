@@ -29,6 +29,37 @@ public static partial class KernelMemoryCompatExports
     private const int MaxFixedMapFailureLogs = 16;
     private static int _fixedMapFailureLogs;
 
+    // [local] SHARPEMU_FIXED_MAP_CONFLICT=fail stops the process when a refused fixed mapping overlaps committed
+    // host memory that SharpEmu does not own: the guest ignores the error and writes there, silently corrupting
+    // host state. fail-any also stops on reserved foreign memory. Unset keeps the guest running.
+    internal const string FixedMapConflictVariable = "SHARPEMU_FIXED_MAP_CONFLICT";
+    internal static Action<string> OnFixedMapConflictFatal = message => Environment.FailFast(message);
+
+    internal static bool ShouldFailOnForeignHostMemory(string? mode, ForeignHostMemory foreign) =>
+        mode?.Trim().ToLowerInvariant() switch
+        {
+            "fail" => foreign.CommittedBytes != 0,
+            "fail-any" => foreign.Bytes != 0,
+            _ => false,
+        };
+
+    private static void FailOnForeignHostConflict(IGuestBackedSpace space, ulong address, ulong length)
+    {
+        var mode = Environment.GetEnvironmentVariable(FixedMapConflictVariable);
+        if (string.IsNullOrWhiteSpace(mode))
+            return;
+        var foreign = space.ForeignHostMemoryIn(address, length);
+        if (!ShouldFailOnForeignHostMemory(mode, foreign))
+            return;
+        var message =
+            $"[LOADER][FATAL] Fixed guest mapping 0x{address:X}+0x{length:X} overlaps host memory SharpEmu does not own " +
+            $"(foreign=0x{foreign.Bytes:X} committed=0x{foreign.CommittedBytes:X}). The guest would write into host memory; " +
+            $"stopping ({FixedMapConflictVariable}={mode}). Host allocations landed inside the guest window before startup; relaunch.";
+        Console.Error.WriteLine(message);
+        Console.Error.Flush();
+        OnFixedMapConflictFatal(message);
+    }
+
     internal static bool TryReadPrtBacking(IGuestBackedSpace backing, ulong address, Span<byte> destination)
     {
         var size = (ulong)destination.Length;
@@ -291,12 +322,15 @@ public static partial class KernelMemoryCompatExports
             {
                 var regions = GetMappingSlices(requested, length);
                 // MAP_NO_OVERWRITE over a live mapping is an expected refusal, not a host conflict.
-                if ((!noOverwrite || regions.Length == 0) &&
-                    Interlocked.Increment(ref _fixedMapFailureLogs) <= MaxFixedMapFailureLogs)
-                    Console.Error.WriteLine(
-                        $"[LOADER][ERROR] Fixed mapping cannot claim its host range: address=0x{requested:X16} size=0x{length:X} flags=0x{flags:X} " +
-                        $"regions=[{string.Join(",", regions.Select(region => $"0x{region.Address:X}+0x{region.Length:X}:{(region.IsReserved ? "reserved" : region.IsDirect ? "direct" : region.IsFlexible ? "flexible" : "other")}:backed={space.IsBackedView(region.Address)}"))}] " +
-                        $"{space.DescribeRangeForDiagnostics(requested, length)} window: {space.DescribeGuestWindowForDiagnostics()}");
+                if (!noOverwrite || regions.Length == 0)
+                {
+                    if (Interlocked.Increment(ref _fixedMapFailureLogs) <= MaxFixedMapFailureLogs)
+                        Console.Error.WriteLine(
+                            $"[LOADER][ERROR] Fixed mapping cannot claim its host range: address=0x{requested:X16} size=0x{length:X} flags=0x{flags:X} " +
+                            $"regions=[{string.Join(",", regions.Select(region => $"0x{region.Address:X}+0x{region.Length:X}:{(region.IsReserved ? "reserved" : region.IsDirect ? "direct" : region.IsFlexible ? "flexible" : "other")}:backed={space.IsBackedView(region.Address)}"))}] " +
+                            $"{space.DescribeRangeForDiagnostics(requested, length)} window: {space.DescribeGuestWindowForDiagnostics()}");
+                    FailOnForeignHostConflict(space, requested, length);
+                }
                 return false;
             }
             address = requested;

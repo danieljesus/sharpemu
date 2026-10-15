@@ -584,7 +584,8 @@ internal static partial class Program
 
             startupInfoEx.lpAttributeList = attributeList;
 
-            var policy1 = PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF;
+            var addressSpacePlan = MitigatedChildAddressSpace.Resolve(Environment.GetEnvironmentVariable);
+            var policy1 = PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF | addressSpacePlan.Policy1Bits;
             var policy2 =
                 PROCESS_CREATION_MITIGATION_POLICY2_CET_USER_SHADOW_STACKS_ALWAYS_OFF |
                 PROCESS_CREATION_MITIGATION_POLICY2_USER_CET_SET_CONTEXT_IP_VALIDATION_ALWAYS_OFF;
@@ -610,6 +611,18 @@ internal static partial class Program
             var cmdLineBuilder = new StringBuilder(commandLine);
             nint jobHandle = 0;
             Environment.SetEnvironmentVariable(MitigatedChildEnvironment, "1");
+            if (addressSpacePlan.IsActive)
+            {
+                Console.Error.WriteLine(
+                    $"[DEBUG] Mitigated child: bottom-up and high-entropy ASLR off, " +
+                    $"{MitigatedChildAddressSpace.DotnetGcRegionRangeVariable}={addressSpacePlan.GcRegionRange ?? "unchanged"}.");
+            }
+
+            if (addressSpacePlan.GcRegionRange is { } gcRegionRange)
+            {
+                Environment.SetEnvironmentVariable(MitigatedChildAddressSpace.DotnetGcRegionRangeVariable, gcRegionRange);
+            }
+
             var created = CreateProcessW(
                 null,
                 cmdLineBuilder,
@@ -622,6 +635,10 @@ internal static partial class Program
                 ref startupInfoEx,
                 out var processInfo);
             Environment.SetEnvironmentVariable(MitigatedChildEnvironment, previousChildEnvironment);
+            if (addressSpacePlan.GcRegionRange is not null)
+            {
+                Environment.SetEnvironmentVariable(MitigatedChildAddressSpace.DotnetGcRegionRangeVariable, null);
+            }
             if (!created)
             {
                 childExitCode = 5;
