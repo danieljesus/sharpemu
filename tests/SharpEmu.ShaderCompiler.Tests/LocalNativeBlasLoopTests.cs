@@ -101,6 +101,51 @@ public sealed class LocalNativeBlasLoopTests(ITestOutputHelper output)
         }
     }
 
+    // [local] The BVH node-test switches on the pass as the game runs it (native BLAS and TLAS loops).
+    [Fact]
+    public void TranslatesWithTheBvhNodeTestSwitches()
+    {
+        if (!File.Exists(Binary))
+        {
+            return;
+        }
+
+        string[] names = ["SHARPEMU_BVH_UNIFIED_FETCH", "SHARPEMU_BVH_LEAN_SLABS"];
+        var previous = names.Select(Environment.GetEnvironmentVariable).ToArray();
+        try
+        {
+            Environment.SetEnvironmentVariable(names[0], "0");
+            Environment.SetEnvironmentVariable(names[1], "0");
+            var reference = Compile(trace: false);
+            foreach (var values in new[] { "1,0", "2,0", "3,0", "0,1", "1,1" })
+            {
+                var split = values.Split(',');
+                Environment.SetEnvironmentVariable(names[0], split[0]);
+                Environment.SetEnvironmentVariable(names[1], split[1]);
+                var spirv = Compile(trace: false);
+                Assert.NotEqual(reference.Length, spirv.Length);
+                output.WriteLine($"unified={split[0]} lean={split[1]} bytes={spirv.Length} (reference {reference.Length})");
+                if (Environment.GetEnvironmentVariable("LOCAL_SPV_OUT") is { Length: > 0 } directory)
+                {
+                    Directory.CreateDirectory(directory);
+                    File.WriteAllBytes(Path.Combine(directory, $"8395_unified{split[0]}_lean{split[1]}.spv"), spirv);
+                }
+            }
+
+            // Both switches off again: the reference module byte for byte.
+            Environment.SetEnvironmentVariable(names[0], "0");
+            Environment.SetEnvironmentVariable(names[1], "0");
+            Assert.Equal(reference, Compile(trace: false));
+        }
+        finally
+        {
+            for (var index = 0; index < names.Length; index++)
+            {
+                Environment.SetEnvironmentVariable(names[index], previous[index]);
+            }
+        }
+    }
+
     private static byte[] Compile(bool trace)
     {
         var bytes = File.ReadAllBytes(Binary);

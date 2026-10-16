@@ -133,6 +133,15 @@ public static partial class Gen5SpirvTranslator
             // out-of-range node or a node on an unmapped page return four invalid dwords.
             foreach (var variable in result)
                 Store(variable, UInt(InvalidNode));
+            if (_bvhUnifiedFetch != 0)
+            {
+                EmitUnifiedNodeTest(nodeAddress, nodeType, isTriangle, isBox16, isBox32, barycentrics, boxGrow, boxSort,
+                    extent, origin, direction, inverseDirection);
+                for (var component = 0u; component < Gen5RayIntersectControl.ResultDwords; component++)
+                    StoreV(ray.VectorData + component, Load(_uintType, result[component]));
+                return;
+            }
+
             EmitConditional(isTriangle, () =>
             {
                 var unit = ResolveNodeUnit(nodeAddress, 0);
@@ -166,6 +175,111 @@ public static partial class Gen5SpirvTranslator
 
             for (var component = 0u; component < Gen5RayIntersectControl.ResultDwords; component++)
                 StoreV(ray.VectorData + component, Load(_uintType, result[component]));
+        }
+
+        // [local] Read on every compile, so the translator tests can compare both lowerings in one process.
+        private readonly int _bvhUnifiedFetch = Environment.GetEnvironmentVariable("SHARPEMU_BVH_UNIFIED_FETCH") switch
+        {
+            "0" => 0,
+            "1" => 1,
+            "2" => 2,
+            _ => 3,
+        };
+        private readonly bool _bvhLeanSlabs = Environment.GetEnvironmentVariable("SHARPEMU_BVH_LEAN_SLABS") == "1";
+        private uint _bvhSecondPointer, _bvhSecondMapped;
+
+        // [local] SHARPEMU_BVH_UNIFIED_FETCH (3 by default, =0 off; adapted from the local hito4 experiment unified-fetch.diff):
+        // every node type resolves its first 64-byte unit through one page-table lookup and only then
+        // branches on the type, so lanes of a warp on different node types no longer run one dependent
+        // lookup chain per type in turn. A float32 box's second unit is the next 64 bytes of the same page
+        // unless the first unit ends the page; only then is the page table read again.
+        //   1: each type's branch loads the unit's dwords itself (short live ranges);
+        //   2: the unit's four 16-byte loads are issued once, before the type branch (as in hito4);
+        //   3: as 1, but a float32 box's second unit always goes through the page table (offline, the
+        //      offset shortcut is what moves the driver's register count: 128 -> 155 on 0x8395).
+        // Every path reads the same bytes as the per-type paths, so the result is bit-exact.
+        private void EmitUnifiedNodeTest(uint nodeAddress, uint nodeType, uint isTriangle, uint isBox16, uint isBox32,
+            uint barycentrics, uint boxGrow, uint boxSort, uint extent, IReadOnlyList<uint> origin,
+            IReadOnlyList<uint> direction, IReadOnlyList<uint> inverseDirection)
+        {
+            var result = _rayResult!;
+
+            void StoreResult(uint[] values)
+            {
+                for (var component = 0; component < values.Length; component++)
+                    Store(result[component], values[component]);
+            }
+
+            EmitConditional(Any(isTriangle, isBox16, isBox32), () =>
+            {
+                var resolved = ResolveNodeUnit(nodeAddress, 0);
+                EmitConditional(resolved.Valid, () =>
+                {
+                    if (_bvhUnifiedFetch == 2)
+                        PrefetchNodeUnit(resolved);
+                    // Modes 1 and 3: a fresh unit per branch, so its loads are emitted inside the branch.
+                    NodeUnit FirstUnit()
+                    {
+                        if (_bvhUnifiedFetch == 2)
+                            return resolved;
+                        var unit = new NodeUnit(resolved.Pointer, resolved.Valid);
+                        PrefetchNodeUnit(unit);
+                        return unit;
+                    }
+
+                    EmitConditional(isTriangle, () =>
+                        StoreResult(EmitRayTriangle(FirstUnit(), nodeType, barycentrics, origin, direction)));
+                    EmitConditional(isBox16, () =>
+                    {
+                        var first = FirstUnit();
+                        StoreResult(EmitRayBoxes(first, first, true, boxGrow, boxSort, extent, origin, inverseDirection));
+                    });
+                    EmitConditional(isBox32, () =>
+                    {
+                        if (_bvhUnifiedFetch == 3)
+                        {
+                            var secondUnit = ResolveNodeUnit(nodeAddress, 1);
+                            EmitConditional(secondUnit.Valid, () =>
+                            {
+                                var first = FirstUnit();
+                                PrefetchNodeUnit(secondUnit);
+                                StoreResult(EmitRayBoxes(first, secondUnit, false, boxGrow, boxSort, extent, origin, inverseDirection));
+                            });
+                            return;
+                        }
+
+                        if (_bvhSecondPointer == 0)
+                        {
+                            _bvhSecondPointer = _module.AddGlobalVariable(_module.TypePointer(SpirvStorageClass.Private, _ulongType),
+                                SpirvStorageClass.Private, _module.Constant64(_ulongType, 0));
+                            _bvhSecondMapped = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                            _module.AddName(_bvhSecondPointer, "bvhSecondUnitPointer");
+                            _module.AddName(_bvhSecondMapped, "bvhSecondUnitMapped");
+                            _interfaces.Add(_bvhSecondPointer);
+                            _interfaces.Add(_bvhSecondMapped);
+                        }
+
+                        var offset = And64(nodeAddress, ULong(DeviceAddressPageSize - 1));
+                        var endsPage = _module.AddInstruction(SpirvOp.IEqual, _boolType, offset,
+                            ULong(DeviceAddressPageSize - NodeUnitDwords * 4));
+                        Store(_bvhSecondPointer, IAdd64(resolved.Pointer, ULong(NodeUnitDwords * 4ul)));
+                        Store(_bvhSecondMapped, UInt(1));
+                        EmitConditional(endsPage, () =>
+                        {
+                            var (pointer, valid) = ResolveDeviceAddress(IAdd64(nodeAddress, ULong(NodeUnitDwords * 4ul)));
+                            Store(_bvhSecondPointer, pointer);
+                            Store(_bvhSecondMapped, SelectU(valid, UInt(1), UInt(0)));
+                        });
+                        var second = new NodeUnit(Load(_ulongType, _bvhSecondPointer), IsNotZero(Load(_uintType, _bvhSecondMapped)));
+                        EmitConditional(second.Valid, () =>
+                        {
+                            var first = FirstUnit();
+                            PrefetchNodeUnit(second);
+                            StoreResult(EmitRayBoxes(first, second, false, boxGrow, boxSort, extent, origin, inverseDirection));
+                        });
+                    });
+                });
+            });
         }
 
         // Direction and inverse direction follow the origin; A16 packs both as six halves
@@ -232,7 +346,7 @@ public static partial class Gen5SpirvTranslator
         private NodeUnit ResolveNodeUnit(uint nodeAddress, uint unit)
         {
             var address = unit == 0 ? nodeAddress : IAdd64(nodeAddress, ULong(unit * NodeUnitDwords * 4ul));
-            if (!BvhPageCache)
+            if (!_bvhPageCache)
             {
                 var (pointer, directValid) = ResolveDeviceAddress(address);
                 return new NodeUnit(pointer, directValid);
@@ -257,7 +371,7 @@ public static partial class Gen5SpirvTranslator
             return new NodeUnit(IAdd64(entry, offset), valid);
         }
 
-        private static readonly bool BvhPageCache = Environment.GetEnvironmentVariable("SHARPEMU_BVH_PAGE_CACHE") == "1"; // [local]
+        private readonly bool _bvhPageCache = Environment.GetEnvironmentVariable("SHARPEMU_BVH_PAGE_CACHE") == "1"; // [local] read per compile
         private uint _bvhCachedPage, _bvhCachedEntry, _bvhCachedMapped;
 
         private void DeclareBvhPageCache()
@@ -371,6 +485,7 @@ public static partial class Gen5SpirvTranslator
                 var pointer = LoadNodeDword(first, child);
                 var enter = Float(float.NegativeInfinity);
                 var leave = Float(float.PositiveInfinity);
+                var anyNan = 0u;
                 for (var axis = 0u; axis < 3; axis++)
                 {
                     var min = BoxBound(first, second, fp16, child, axis);
@@ -380,12 +495,31 @@ public static partial class Gen5SpirvTranslator
                     var positive = FCompare(SpirvOp.FOrdGreaterThanEqual, inverseDirection[(int)axis], zero);
                     var near = SelectF(positive, planeMin, planeMax);
                     var far = SelectF(positive, planeMax, planeMin);
+                    if (_bvhLeanSlabs)
+                    {
+                        // [local] SHARPEMU_BVH_LEAN_SLABS=1 (off by default): as written, the max3/min3 below
+                        // propagate NaN, so a NaN plane distance makes the child miss; otherwise they equal
+                        // plain max/min up to the sign of a zero, which only reaches ordered compares. This
+                        // tests the six distances once and uses plain FMax/FMin. With SignedZeroInfNanPreserve
+                        // (what the game compiles with on the RTX 5080) it matches the reference on every
+                        // lane (RayIntersectDeviceTests). Without it the driver folds the NaN select of
+                        // NanMax/NanMin into a NaN-dropping max, so in the reference a 0 * inf plane (origin
+                        // on the slab, zero direction component) or a NaN bound can still hit; here it misses.
+                        var planeNan = LogicalOr(
+                            _module.AddInstruction(SpirvOp.IsNan, _boolType, planeMin),
+                            _module.AddInstruction(SpirvOp.IsNan, _boolType, planeMax));
+                        anyNan = axis == 0 ? planeNan : LogicalOr(anyNan, planeNan);
+                        enter = axis == 0 ? near : Ext(40, _floatType, enter, near);
+                        leave = axis == 0 ? far : Ext(37, _floatType, leave, far);
+                        continue;
+                    }
+
                     // HLSL max3/min3: NaN operands propagate, so the NaN check below sees them.
                     enter = axis == 0 ? near : NanMax(enter, near);
                     leave = axis == 0 ? far : NanMin(leave, far);
                 }
 
-                var nan = _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
+                var nan = _bvhLeanSlabs ? anyNan : _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
                     _module.AddInstruction(SpirvOp.IsNan, _boolType, enter),
                     _module.AddInstruction(SpirvOp.IsNan, _boolType, leave));
                 var minT = SelectF(nan, Float(float.PositiveInfinity), Ext(40, _floatType, enter, zero));
@@ -456,6 +590,7 @@ public static partial class Gen5SpirvTranslator
             return result;
         }
 
+        private uint LogicalOr(uint left, uint right) => _module.AddInstruction(SpirvOp.LogicalOr, _boolType, left, right);
         private uint FCompare(SpirvOp op, uint left, uint right) => _module.AddInstruction(op, _boolType, left, right);
         private uint FAdd(uint left, uint right) => _module.AddInstruction(SpirvOp.FAdd, _floatType, left, right);
         private uint FSub(uint left, uint right) => _module.AddInstruction(SpirvOp.FSub, _floatType, left, right);
