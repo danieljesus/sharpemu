@@ -148,9 +148,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             _backedSpace = new GuestSpaceOwner(viewHost, backingBytes, preReserveGuestAddressSpace);
             RunBackingSelfTest();
             _preReserveGuestAddressSpace = preReserveGuestAddressSpace;
+            _ebootGuard = TakePendingEbootGuard();
             if (preReserveGuestAddressSpace)
             {
-                _ebootGuard = Interlocked.Exchange(ref s_pendingEbootGuard, null);
                 LogGuestWindowPreReserve("Guest window pre-reserved");
                 StartGuestWindowAudit();
             }
@@ -176,12 +176,34 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             Environment.GetEnvironmentVariable(HostWindowSurvey.TestHostBlockerVariable), Console.Error.WriteLine);
         if (HostWindowSurvey.ShouldGuardEbootBand(Environment.GetEnvironmentVariable))
         {
-            s_pendingEbootGuard = HostWindowSurvey.ReserveEbootGuard(host, Console.Error.WriteLine);
+            SetPendingEbootGuard(HostWindowSurvey.ReserveEbootGuard(host, Console.Error.WriteLine));
         }
     }
 
+    // Startup is single-threaded here; a lock keeps the handoff simple (Interlocked rejects a nullable struct).
+    private static readonly object s_pendingEbootGuardGate = new();
     private static HostAddressRange? s_pendingEbootGuard;
     private HostAddressRange? _ebootGuard;
+
+    internal static void SetPendingEbootGuard(HostAddressRange? guard)
+    {
+        lock (s_pendingEbootGuardGate)
+        {
+            s_pendingEbootGuard = guard;
+        }
+    }
+
+    private static HostAddressRange? TakePendingEbootGuard()
+    {
+        lock (s_pendingEbootGuardGate)
+        {
+            var guard = s_pendingEbootGuard;
+            s_pendingEbootGuard = null;
+            return guard;
+        }
+    }
+
+    internal bool HoldsEbootGuard => _ebootGuard is not null;
 
     // Gives the eboot band back just before the main image claims it. Until then it keeps first-fit host
     // allocations (the backing alias above all) from landing on the eboot base.

@@ -323,6 +323,35 @@ public sealed class HostWindowSurveyTests
         Assert.Contains("alloc=0x47FFF0000", Assert.Single(log));
     }
 
+    // Regression: m3 sessions died in the PhysicalVirtualMemory constructor on the guard handoff.
+    [Fact]
+    public void PhysicalVirtualMemoryAdoptsAPendingEbootGuardAndReleasesItOnClear()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var views = HostViewMemory.Create();
+        var memoryHost = PlatformMemory;
+        var size = 4 * views.Granularity;
+        var address = ProbeGuestAddress(views, size);
+        Assert.Equal(address, memoryHost.Reserve(address, size, HostPageProtection.NoAccess));
+        PhysicalVirtualMemory.SetPendingEbootGuard(new HostAddressRange(address, size));
+        try
+        {
+            using var memory = new PhysicalVirtualMemory(memoryHost, views, BackingSize);
+            Assert.True(memory.HoldsEbootGuard);
+            Assert.True(memoryHost.Query(address, out var held) && held.State == HostRegionState.Reserved);
+            memory.Clear();
+            Assert.False(memory.HoldsEbootGuard);
+            Assert.True(memoryHost.Query(address, out var released) && released.State == HostRegionState.Free);
+        }
+        finally
+        {
+            PhysicalVirtualMemory.SetPendingEbootGuard(null);
+        }
+
+        using var plain = new PhysicalVirtualMemory(memoryHost, views, BackingSize);
+        Assert.False(plain.HoldsEbootGuard);
+    }
+
     private static Func<string, string?> Env(params (string Name, string? Value)[] values) =>
         name => values.FirstOrDefault(value => value.Name == name).Value;
 }
