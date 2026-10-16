@@ -604,6 +604,8 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.TakeReport());
         if (SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TakeReport() is { } storeTables) // [local] SHARPEMU_PROFILE_STORE_TABLES
             Console.Error.WriteLine(storeTables);
+        foreach (var split in SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.TakeReport()) // [local] SHARPEMU_PROFILE_MATERIALIZE_SPLIT
+            Console.Error.WriteLine(split);
         Console.Error.WriteLine(Gpu.Pipelines.BackMaterializations.TakeReport()); // [local]
         Console.Error.WriteLine(FormattableString.Invariant(
             $"[PERF][PREPARED_PROGRAMS] used={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsUsed, 0)} rejected={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsRejected, 0)} dynamic_state_rebuilt={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedDynamicStateMismatches, 0)}"));
