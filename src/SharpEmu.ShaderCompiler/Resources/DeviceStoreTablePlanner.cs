@@ -93,13 +93,13 @@ public static class DeviceStoreTablePlanner
             $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} bulk_races={Interlocked.Exchange(ref _bulkRaces, 0)} keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]");
     }
 
-    // [local] SHARPEMU_STORE_TABLE_BULK=1 (off by default): a scan reads the table in 64 KB chunks through the
+    // [local] SHARPEMU_STORE_TABLE_BULK (1 by default, =0 turns it off): a scan reads the table in 64 KB chunks through the
     // resident reader, which applies the same ownership rules once per chunk, instead of four reader calls per
     // entry; a chunk the resident reader refuses is read word by word as before. The recorder keeps the same
     // words either way. =2 also reads every word through the word reader and counts the differences: a word whose
     // second resident read agrees with the word reader changed in between (a guest write racing the scan, bulk_races);
     // one that still differs is a difference between the two readers (bulk_mismatches, logged).
-    private static readonly int BulkMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_BULK"), out var bulkMode) ? bulkMode : 0;
+    private static readonly int BulkMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_BULK"), out var bulkMode) ? bulkMode : 1;
     private const int BulkChunkEntries = 4096;
 
     public static void InvalidateTables(ulong address, ulong size, int source = 0) // [local]
