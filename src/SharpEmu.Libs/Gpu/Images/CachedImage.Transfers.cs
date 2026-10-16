@@ -35,6 +35,25 @@ public sealed unsafe partial class CachedImage
     public (List<ImageMemoryBarrier2> Barriers, PipelineStageFlags SourceStages) GetBarriers(ImageLayout layout, AccessFlags access, PipelineStageFlags stage, SubresourceRange? range)
     {
         var barriers = new List<ImageMemoryBarrier2>();
+        return (barriers, GetBarriers(layout, access, stage, range, barriers));
+    }
+
+    // [local] The barrier lists of this thread's transitions and transfers, reused once their barriers are recorded;
+    // a transition nested in another (EndRendering can record its own) takes a list of its own.
+    [ThreadStatic] private static Stack<List<ImageMemoryBarrier2>>? _barrierLists;
+
+    private static List<ImageMemoryBarrier2> RentBarrierList() =>
+        (_barrierLists ??= new Stack<List<ImageMemoryBarrier2>>()).TryPop(out var list) ? list : new List<ImageMemoryBarrier2>();
+
+    private static void ReturnBarrierList(List<ImageMemoryBarrier2> list)
+    {
+        list.Clear();
+        if (list.Capacity <= 64 && _barrierLists is { Count: < 8 } lists) lists.Push(list);
+    }
+
+    // Fills barriers (empty) and returns the source stages.
+    private PipelineStageFlags GetBarriers(ImageLayout layout, AccessFlags access, PipelineStageFlags stage, SubresourceRange? range, List<ImageMemoryBarrier2> barriers)
+    {
         PipelineStageFlags sourceStages = 0;
         if ((access & (WriteAccess | AccessFlags.ColorAttachmentWriteBit | AccessFlags.DepthStencilAttachmentWriteBit)) != 0)
         {
@@ -101,7 +120,7 @@ public sealed unsafe partial class CachedImage
             var repeatedWrite = (state.Access & WriteAccess) != 0;
             if (state.Layout == layout && state.Access == access && !repeatedWrite)
             {
-                return (barriers, sourceStages);
+                return sourceStages;
             }
 
             barriers.Add(MakeBarrier(state, layout, access, 0, Vk.RemainingMipLevels, 0, Vk.RemainingArrayLayers));
@@ -109,7 +128,7 @@ public sealed unsafe partial class CachedImage
         }
 
         Backing.State = new ImageAccessState(stage, access, layout);
-        return (barriers, sourceStages);
+        return sourceStages;
     }
 
     public void Transition(ImageLayout layout, AccessFlags access, SubresourceRange? range, CommandBuffer command)
@@ -125,25 +144,33 @@ public sealed unsafe partial class CachedImage
             stage |= PipelineStageFlags.AllGraphicsBit | PipelineStageFlags.ComputeShaderBit;
         }
 
-        var (barriers, sourceStages) = GetBarriers(layout, access, stage, range);
-        if (SharpEmu.Libs.Gpu.Rendering.BatchSimulation.Enabled) // [local]
-            SharpEmu.Libs.Gpu.Rendering.BatchSimulation.NoteImage(Backing.Handle.Handle, barriers, barriers.Count != 0 && OnlyRepeatsAttachmentAccess(barriers));
-        if (barriers.Count == 0)
+        var barriers = RentBarrierList();
+        try
         {
-            return;
-        }
+            var sourceStages = GetBarriers(layout, access, stage, range, barriers);
+            if (SharpEmu.Libs.Gpu.Rendering.BatchSimulation.Enabled) // [local]
+                SharpEmu.Libs.Gpu.Rendering.BatchSimulation.NoteImage(Backing.Handle.Handle, barriers, barriers.Count != 0 && OnlyRepeatsAttachmentAccess(barriers));
+            if (barriers.Count == 0)
+            {
+                return;
+            }
 
-        // Attachment accesses inside one rendering scope are already ordered by rasterization
-        // order, so a barrier that only repeats an attachment write in the same layout matters
-        // only to what runs after the scope; it waits for the scope to end instead of ending it.
-        if (OnlyRepeatsAttachmentAccess(barriers) &&
-            _scheduler.TryDeferUntilRenderingEnds(sourceStages == 0 ? PipelineStageFlags.TopOfPipeBit : sourceStages, stage, barriers))
+            // Attachment accesses inside one rendering scope are already ordered by rasterization
+            // order, so a barrier that only repeats an attachment write in the same layout matters
+            // only to what runs after the scope; it waits for the scope to end instead of ending it.
+            if (OnlyRepeatsAttachmentAccess(barriers) &&
+                _scheduler.TryDeferUntilRenderingEnds(sourceStages == 0 ? PipelineStageFlags.TopOfPipeBit : sourceStages, stage, barriers))
+            {
+                return;
+            }
+
+            _scheduler.EndRendering();
+            RecordBarriers(command, sourceStages, stage, null, barriers);
+        }
+        finally
         {
-            return;
+            ReturnBarrierList(barriers);
         }
-
-        _scheduler.EndRendering();
-        RecordBarriers(command, sourceStages, stage, null, barriers);
     }
 
     private const AccessFlags2 AttachmentAccess =
@@ -168,7 +195,7 @@ public sealed unsafe partial class CachedImage
 
     private void RecordBarriers(CommandBuffer command, PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, BufferMemoryBarrier2* bufferBarrier, List<ImageMemoryBarrier2> imageBarriers)
     {
-        var images = imageBarriers.ToArray();
+        var images = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(imageBarriers); // [local] no copy
         fixed (ImageMemoryBarrier2* imagePointer = images)
         {
             VulkanSynchronization.PipelineBarrier(_device.Vk,
@@ -248,8 +275,10 @@ public sealed unsafe partial class CachedImage
         var sanitized = SanitizeUploadCopies(copies);
         var uploadCopies = sanitized is null ? copies : sanitized.AsSpan();
         var bufferBarrier = BufferBarrier(buffer, offset, size, AccessFlags.MemoryWriteBit, AccessFlags.TransferReadBit);
-        var (imageBarriers, sourceStages) = GetBarriers(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, PipelineStageFlags.TransferBit, null);
+        var imageBarriers = RentBarrierList(); // [local]
+        var sourceStages = GetBarriers(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, PipelineStageFlags.TransferBit, null, imageBarriers);
         RecordBarriers(command, sourceStages | PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, &bufferBarrier, imageBarriers);
+        ReturnBarrierList(imageBarriers);
         fixed (BufferImageCopy* regions = uploadCopies)
         {
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBufferToImage(_device.Vk, command, buffer, Backing.Handle, ImageLayout.TransferDstOptimal, (uint)uploadCopies.Length, regions); // [local]
@@ -264,8 +293,10 @@ public sealed unsafe partial class CachedImage
     {
         var command = BeginTransfer(copies, buffer, size);
         var bufferBarrier = BufferBarrier(buffer, offset, size, MemoryAccess, AccessFlags.TransferWriteBit);
-        var (imageBarriers, sourceStages) = GetBarriers(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, PipelineStageFlags.TransferBit, null);
+        var imageBarriers = RentBarrierList(); // [local]
+        var sourceStages = GetBarriers(ImageLayout.TransferSrcOptimal, AccessFlags.TransferReadBit, PipelineStageFlags.TransferBit, null, imageBarriers);
         RecordBarriers(command, sourceStages | PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, &bufferBarrier, imageBarriers);
+        ReturnBarrierList(imageBarriers);
         fixed (BufferImageCopy* regions = copies)
         {
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyImageToBuffer(_device.Vk, command, Backing.Handle, ImageLayout.TransferSrcOptimal, buffer, (uint)copies.Length, regions); // [local]

@@ -36,7 +36,16 @@ internal static unsafe partial class VulkanVideoPresenter
             public readonly RenderScratchPool<uint> ShaderData = new();
             public readonly RenderScratchPool<BufferView> Buffers = new();
             public readonly RenderScratchPool<(BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer)> Sources = new();
+            // [local] SHARPEMU_RENDER_POOLS: the stage objects and image bindings of closed preparations.
+            public readonly Stack<PreparedStageBindings> Stages = new();
+            public readonly Stack<TextureResource> Textures = new();
         }
+
+        // [local] SHARPEMU_RENDER_POOLS=0 allocates every preparation, prepared stage and image binding again; on, a
+        // closed preparation hands its objects to the next draw (render thread only).
+        internal static readonly bool RenderPools = Environment.GetEnvironmentVariable("SHARPEMU_RENDER_POOLS") != "0";
+        private const int MaxPooledStages = 64;
+        private const int MaxPooledTextures = 1024;
 
         private DescriptorScratch? _descriptorScratch;
         private DescriptorScratch Scratch => _descriptorScratch ??= new();
@@ -50,17 +59,55 @@ internal static unsafe partial class VulkanVideoPresenter
             public BufferView GlobalDataShare;
             public BufferView FlattenedTable;
             public BufferView ShaderData;
+
+            // [local] The state of a new instance.
+            public void Reset()
+            {
+                Buffers = [];
+                Images = [];
+                Samplers = [];
+                GlobalDataShare = default;
+                FlattenedTable = default;
+                ShaderData = default;
+            }
         }
 
-        private sealed class PreparedStageBindings(ShaderStageResources stage, ShaderProgramInfo program) : IPreparedBindings
+        private sealed class PreparedStageBindings : IPreparedBindings
         {
-            public ShaderStageResources Stage => stage;
+            private ShaderStageResources _stage;
+            private ShaderProgramInfo _program;
 
-            public ShaderProgramInfo Program => program;
+            public PreparedStageBindings(ShaderStageResources stage, ShaderProgramInfo program)
+            {
+                _stage = stage;
+                _program = program;
+            }
 
-            public SpecializedResourceInfo Resources => program.Resources!;
+            // [local] SHARPEMU_RENDER_POOLS: a pooled instance in the state of a new one for another stage.
+            public void Reset(ShaderStageResources stage, ShaderProgramInfo program)
+            {
+                _stage = stage;
+                _program = program;
+                Descriptors.Reset();
+                BufferSources = [];
+                ShaderData = [];
+                ImagesPrepared = false;
+            }
 
-            public BindingLayout Layout => program.Bindings!;
+            // [local] Drops the stage's references before the instance waits in the pool.
+            public void Release()
+            {
+                _stage = default;
+                _program = null!;
+            }
+
+            public ShaderStageResources Stage => _stage;
+
+            public ShaderProgramInfo Program => _program;
+
+            public SpecializedResourceInfo Resources => _program.Resources!;
+
+            public BindingLayout Layout => _program.Bindings!;
 
             public StageDescriptors Descriptors { get; } = new();
 
@@ -312,16 +359,38 @@ internal static unsafe partial class VulkanVideoPresenter
                     Console.Error.WriteLine(line);
                 }
             }
-            return new TextureResource
+            var texture = RentTextureResource();
+            texture.Address = descriptor.BaseAddress;
+            texture.ImageIdentifier = imageIdentifier;
+            texture.Request = request;
+            texture.IsStorage = storage;
+            texture.DestinationSelect = words[3] & 0xFFFu;
+            texture.Width = descriptor.Width;
+            texture.Height = descriptor.Height;
+            return texture;
+        }
+
+        // [local] SHARPEMU_RENDER_POOLS: a returned image binding (already reset) or a new one.
+        private TextureResource RentTextureResource()
+        {
+            if (RenderPools && Scratch.Textures.TryPop(out var texture))
             {
-                Address = descriptor.BaseAddress,
-                ImageIdentifier = imageIdentifier,
-                Request = request,
-                IsStorage = storage,
-                DestinationSelect = words[3] & 0xFFFu,
-                Width = descriptor.Width,
-                Height = descriptor.Height,
-            };
+                texture.Pooled = false;
+                return texture;
+            }
+
+            return new TextureResource();
+        }
+
+        private PreparedStageBindings RentPreparedStage(ShaderStageResources stage, ShaderProgramInfo program)
+        {
+            if (RenderPools && Scratch.Stages.TryPop(out var prepared))
+            {
+                prepared.Reset(stage, program);
+                return prepared;
+            }
+
+            return new PreparedStageBindings(stage, program);
         }
 
         // Compare bits stay only on depth-compare samplers; a forced point sampler drops its filters.
@@ -423,7 +492,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (BindingRepeatProbe.Enabled) BindingRepeatProbe.Record(program.Hash, stage); // [local]
             if (ResolveProfile.Enabled) CountResolveBindings(info, snapshot); // [local] SHARPEMU_PROFILE_RESOLVE
             using var setupScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingSetup); // [local]
-            var prepared = new PreparedStageBindings(stage, program);
+            var prepared = RentPreparedStage(stage, program);
             // Register ownership before preparation can fail halfway through.
             preparation.Stages.Add(prepared);
             var descriptors = prepared.Descriptors;
@@ -1324,9 +1393,24 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void ReturnStageScratch(PreparedStageBindings stage)
         {
-            // CommitBindings copies texture references into submission-owned
+            // CommitBindings copies the staging buffers into submission-owned
             // storage. These CPU descriptions are no longer referenced by GPU work.
-            Scratch.Images.Return(stage.Descriptors.Images);
+            var images = stage.Descriptors.Images;
+            if (RenderPools) // [local] the image bindings go back to the pool, reset
+            {
+                var pool = Scratch.Textures;
+                for (var index = 0; index < images.Length; index++)
+                {
+                    var texture = images[index];
+                    images[index] = null!;
+                    if (texture is null || texture.Pooled || pool.Count >= MaxPooledTextures) continue;
+                    texture.Reset();
+                    texture.Pooled = true;
+                    pool.Push(texture);
+                }
+            }
+
+            Scratch.Images.Return(images);
             Scratch.Samplers.Return(stage.Descriptors.Samplers);
             Scratch.Buffers.Return(stage.Descriptors.Buffers);
             Scratch.Sources.Return(stage.BufferSources);
@@ -1336,6 +1420,11 @@ internal static unsafe partial class VulkanVideoPresenter
             stage.Descriptors.Buffers = [];
             stage.BufferSources = [];
             stage.ShaderData = [];
+            if (RenderPools && Scratch.Stages.Count < MaxPooledStages) // [local]
+            {
+                stage.Release();
+                Scratch.Stages.Push(stage);
+            }
         }
 
         private static DescriptorImageInfo ImageInfo(TextureResource texture, uint element, ShaderProgramInfo program, int index)
@@ -1485,8 +1574,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var imageIndex = 0;
             var writeIndex = 0;
             var uploadStage = bindPoint == PipelineBindPoint.Compute ? PipelineStageFlags.ComputeShaderBit : PipelineStageFlags.FragmentShaderBit;
-            TextureResource[] textures = textureCount == 0 ? [] : new TextureResource[textureCount];
-            var textureIndex = 0;
+            // [local] The submission keeps only the host movie staging buffers, not the bindings.
+            (VkBuffer Buffer, DeviceMemory Memory)[]? stagingBuffers = null;
+            var stagingIndex = 0;
             fixed (DescriptorBufferInfo* bufferInfoPointer = bufferInfos)
             fixed (DescriptorImageInfo* imageInfoPointer = imageInfos)
             {
@@ -1504,7 +1594,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                     foreach (var texture in stage.Textures)
                     {
-                        textures[textureIndex++] = texture;
+                        if (texture is { StagingBuffer.Handle: not 0 })
+                        {
+                            (stagingBuffers ??= new (VkBuffer, DeviceMemory)[textureCount])[stagingIndex++] = (texture.StagingBuffer, texture.StagingMemory);
+                        }
                     }
 
                     var occurrences = occurrenceScratch[..descriptors.Images.Length];
@@ -1676,13 +1769,21 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
-            _batchResources.Add(new SubmissionUploadResources
+            var debugName = bindPoint == PipelineBindPoint.Compute ? DispatchDebugName : DrawDebugName;
+            _batchFirstDebugName ??= debugName;
+            var feedbackSnapshots = preparation.FeedbackSnapshots?.ToArray() ?? [];
+            // [local] A draw with nothing to retire adds no entry.
+            if (stagingBuffers is not null || feedbackSnapshots.Length != 0 || preparation.OverflowBuffers.Count != 0)
             {
-                DebugName = bindPoint == PipelineBindPoint.Compute ? "SharpEmu dispatch" : "SharpEmu draw",
-                Textures = textures,
-                FeedbackSnapshots = preparation.FeedbackSnapshots?.ToArray() ?? [],
-                OverflowBuffers = preparation.OverflowBuffers.Count == 0 ? null : preparation.OverflowBuffers.ToArray(),
-            });
+                _batchResources.Add(new SubmissionUploadResources
+                {
+                    DebugName = debugName,
+                    StagingBuffers = stagingBuffers is null ? [] : stagingBuffers[..stagingIndex],
+                    FeedbackSnapshots = feedbackSnapshots,
+                    OverflowBuffers = preparation.OverflowBuffers.Count == 0 ? null : preparation.OverflowBuffers.ToArray(),
+                });
+            }
+
             preparation.OverflowBuffers.Clear();
             preparation.Committed = true;
             if (RenderTrace.Enabled && RenderTrace.Pipeline())

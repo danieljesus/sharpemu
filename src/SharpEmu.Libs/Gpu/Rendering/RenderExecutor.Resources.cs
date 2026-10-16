@@ -26,7 +26,8 @@ public sealed partial class RenderExecutor
     private readonly record struct PreparedIndexBuffer(BufferBinding Binding, ulong Size, IndexType Type);
 
     // Merges the vertex ranges, obtains one host buffer per merged range and offsets every slot into it.
-    private BufferBinding[] AcquireVertexBuffers(VertexInputInfo vertexInput)
+    // [local] Fills the caller's span (VertexInputInfo.MaxBuffers long) and returns the bound slots, without an array.
+    private Span<BufferBinding> AcquireVertexBuffers(VertexInputInfo vertexInput, Span<BufferBinding> storage)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawVertexBufferAcquisition);
         var buffers = vertexInput.Buffers;
@@ -76,7 +77,7 @@ public sealed partial class RenderExecutor
             range.Binding = _host.ObtainBuffer(range.BaseAddress, size, isWritten: false);
         }
 
-        var prepared = new BufferBinding[buffers.Length];
+        var prepared = storage[..buffers.Length];
         BufferBinding? nullBuffer = null;
         for (var slot = 0; slot < buffers.Length; slot++)
         {
@@ -253,7 +254,8 @@ public sealed partial class RenderExecutor
         }
 
         var buffersScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepBuffers); // [local]
-        var vertexBuffers = AcquireVertexBuffers(vertexInput);
+        Span<BufferBinding> vertexStorage = stackalloc BufferBinding[VertexInputInfo.MaxBuffers]; // [local]
+        var vertexBuffers = AcquireVertexBuffers(vertexInput, vertexStorage);
         var indexBuffer = AcquireIndexBuffer(in indexSource);
         var indirectArguments = emission.IndirectArgumentsAddress != 0
             ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, IndexedIndirectArgumentsSize, isWritten: false)

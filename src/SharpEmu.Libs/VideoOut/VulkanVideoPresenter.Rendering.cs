@@ -45,8 +45,11 @@ internal static unsafe partial class VulkanVideoPresenter
     private sealed partial class Presenter : IRenderHost
     {
         // Keep each new stream allocation intact until the draw is recorded.
+        // [local] SHARPEMU_RENDER_POOLS (on by default): the closed preparation is reused by the next one, with its lists.
         private sealed class RenderPreparation(Presenter owner, IDisposable streamRetention) : IResourcePreparation
         {
+            private IDisposable _streamRetention = streamRetention;
+
             public List<PreparedStageBindings> Stages { get; } = new();
 
             // Host buffers that took an upload the ring could not hold; the committed draw owns them.
@@ -62,6 +65,18 @@ internal static unsafe partial class VulkanVideoPresenter
 
             public bool CommandsRecorded { get; set; }
 
+            // [local] Reopens a closed preparation as a new one.
+            public void Reopen(IDisposable retention)
+            {
+                _streamRetention = retention;
+                OverflowBuffers.Clear();
+                StencilStorageImages = null;
+                StencilStorageWriteBackImages = null;
+                FeedbackSnapshots = null;
+                Committed = false;
+                CommandsRecorded = false;
+            }
+
             public void Dispose()
             {
                 if (!ReferenceEquals(owner._preparation, this))
@@ -73,7 +88,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 owner._preparedTextures.Clear();
                 try
                 {
-                    streamRetention.Dispose();
+                    _streamRetention.Dispose();
                     if (StencilStorageImages is { } stencilImages)
                     {
                         foreach (var (attachment, storage) in stencilImages)
@@ -91,45 +106,9 @@ internal static unsafe partial class VulkanVideoPresenter
                         }
                     }
 
-                    if (Committed)
+                    if (!Committed)
                     {
-                        return;
-                    }
-
-                    // [local] An abandoned preparation may already have recorded the feedback snapshot copies and the
-                    // host movie uploads into the current tick (and with the record ring they may not be replayed
-                    // yet), so their images and staging buffers are released once that tick completes.
-                    var snapshots = FeedbackSnapshots?.ToArray() ?? [];
-                    var staging = new List<(VkBuffer Buffer, DeviceMemory Memory)>();
-                    foreach (var stage in Stages)
-                    {
-                        owner.CollectStageStaging(stage, staging);
-                    }
-
-                    staging.AddRange(OverflowBuffers);
-                    if (snapshots.Length != 0 || staging.Count != 0)
-                    {
-                        void Release()
-                        {
-                            foreach (var snapshot in snapshots)
-                            {
-                                snapshot.Dispose();
-                            }
-
-                            foreach (var (buffer, memory) in staging)
-                            {
-                                owner.RecycleHostBuffer(buffer, memory);
-                            }
-                        }
-
-                        if (owner._scheduler.Active)
-                        {
-                            owner._scheduler.QueueCompletionAction(Release);
-                        }
-                        else
-                        {
-                            Release();
-                        }
+                        ReleaseAbandoned();
                     }
                 }
                 finally
@@ -137,8 +116,53 @@ internal static unsafe partial class VulkanVideoPresenter
                     foreach (var stage in Stages) owner.ReturnStageScratch(stage);
                     Stages.Clear();
                 }
+
+                // [local] Kept for the next BeginPreparation; a failed close above is not reused.
+                if (RenderPools) owner._closedPreparation = this;
+            }
+
+            // [local] Its own method: the release closure no longer allocates its captures on every close.
+            private void ReleaseAbandoned()
+            {
+                // [local] An abandoned preparation may already have recorded the feedback snapshot copies and the
+                // host movie uploads into the current tick (and with the record ring they may not be replayed
+                // yet), so their images and staging buffers are released once that tick completes.
+                var snapshots = FeedbackSnapshots?.ToArray() ?? [];
+                var staging = new List<(VkBuffer Buffer, DeviceMemory Memory)>();
+                foreach (var stage in Stages)
+                {
+                    owner.CollectStageStaging(stage, staging);
+                }
+
+                staging.AddRange(OverflowBuffers);
+                if (snapshots.Length != 0 || staging.Count != 0)
+                {
+                    void Release()
+                    {
+                        foreach (var snapshot in snapshots)
+                        {
+                            snapshot.Dispose();
+                        }
+
+                        foreach (var (buffer, memory) in staging)
+                        {
+                            owner.RecycleHostBuffer(buffer, memory);
+                        }
+                    }
+
+                    if (owner._scheduler.Active)
+                    {
+                        owner._scheduler.QueueCompletionAction(Release);
+                    }
+                    else
+                    {
+                        Release();
+                    }
+                }
             }
         }
+
+        private RenderPreparation? _closedPreparation; // [local]
 
         private ExtColorWriteEnable? _colorWriteEnableApi;
         private bool _supportsDepthClipControl;
@@ -490,7 +514,18 @@ internal static unsafe partial class VulkanVideoPresenter
 
             EnsureGuestSubmissionCapacity();
             _ = BeginBatchedGuestCommands();
-            _preparation = new RenderPreparation(this, _bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream).RetainUpcomingAllocations());
+            var retention = _bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream).RetainUpcomingAllocations();
+            if (_closedPreparation is { } reused) // [local] SHARPEMU_RENDER_POOLS
+            {
+                _closedPreparation = null;
+                reused.Reopen(retention);
+                _preparation = reused;
+            }
+            else
+            {
+                _preparation = new RenderPreparation(this, retention);
+            }
+
             return _preparation;
         }
 

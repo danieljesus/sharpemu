@@ -130,6 +130,37 @@ internal static unsafe partial class VulkanVideoPresenter
         // A draw-local copy used when the guest samples a depth aspect while the
         // same image is attached for writes. It retires with the submission.
         public bool IsFeedbackSnapshot;
+        // [local] SHARPEMU_RENDER_POOLS: the binding waits in the presenter's pool.
+        public bool Pooled;
+
+        // [local] Every field back to the state of a new instance (the tests compare the two field by field).
+        public void Reset()
+        {
+            Address = 0;
+            ImageIdentifier = default;
+            Request = default;
+            CachedImage = null;
+            MipLevel = 0;
+            Image = default;
+            View = default;
+            Layout = ImageLayout.ShaderReadOnlyOptimal;
+            Sampler = default;
+            SamplerState = default;
+            IsStorage = false;
+            IsHostMovie = false;
+            HostMoviePlane = -1;
+            HostMovieFrameSerial = 0;
+            NeedsUpload = false;
+            StagingBuffer = default;
+            StagingMemory = default;
+            Width = 0;
+            Height = 0;
+            RowLength = 0;
+            DestinationSelect = 0;
+            MipViews = [];
+            IsFeedbackSnapshot = false;
+            Pooled = false;
+        }
     }
 
     private sealed partial class Presenter

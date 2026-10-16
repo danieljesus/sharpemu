@@ -269,12 +269,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private void RecycleSubmissionUploads(SubmissionUploadResources resources)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ResourceDestroy);
-            foreach (var texture in resources.Textures)
+            foreach (var (buffer, memory) in resources.StagingBuffers)
             {
-                if (texture is { StagingBuffer.Handle: not 0 })
-                {
-                    RecycleHostBuffer(texture.StagingBuffer, texture.StagingMemory);
-                }
+                RecycleHostBuffer(buffer, memory);
             }
 
             foreach (var snapshot in resources.FeedbackSnapshots)

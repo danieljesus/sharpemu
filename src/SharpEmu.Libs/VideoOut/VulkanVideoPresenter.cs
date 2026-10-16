@@ -263,7 +263,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private sealed class SubmissionUploadResources
         {
             public string DebugName = "SharpEmu translated";
-            public TextureResource[] Textures = [];
+            // [local] The host movie staging buffers of the draw's image bindings (the bindings themselves go back to
+            // the pool when the preparation closes).
+            public (VkBuffer Buffer, DeviceMemory Memory)[] StagingBuffers = [];
             // Draw-local feedback copies stay alive until the GPU has consumed
             // the descriptors that reference them.
             public CachedImage[] FeedbackSnapshots = [];

@@ -364,7 +364,20 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     public static uint NativeBindingIndex(ShaderStage stage, DescriptorBindingKind kind) =>
         (uint)kind + (stage == ShaderStage.Pixel ? (uint)DescriptorBindingKind.Count : 0);
 
-    public DescriptorBinding? Find(DescriptorBindingKind kind) => Descriptors.FirstOrDefault(binding => binding.Kind == kind);
+    // [local] A plain loop: the lambda allocated a closure and a delegate on every call (three per prepared stage).
+    public DescriptorBinding? Find(DescriptorBindingKind kind)
+    {
+        var descriptors = Descriptors;
+        for (var index = 0; index < descriptors.Count; index++)
+        {
+            if (descriptors[index].Kind == kind)
+            {
+                return descriptors[index];
+            }
+        }
+
+        return null;
+    }
 
     // The user-data registers live at program entry: those some path reads before it
     // writes them, found by liveness over the control-flow graph, in ascending order.

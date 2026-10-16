@@ -42,6 +42,11 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _batchOpen;
         private int _batchDrawCount;
         private readonly List<SubmissionUploadResources> _batchResources = new();
+        // [local] The debug name of the batch's first committed draw or dispatch; a draw with nothing to retire
+        // adds no resource entry, so the name is kept apart.
+        private string? _batchFirstDebugName;
+        private const string DrawDebugName = "SharpEmu draw";
+        private const string DispatchDebugName = "SharpEmu dispatch";
 
 
         private CommandBuffer BeginBatchedGuestCommands()
@@ -82,9 +87,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            _lastSubmitDebugName = _batchResources.Count > 0
-                ? $"batch={_batchResources[0].DebugName}"
-                : string.Empty;
+            _lastSubmitDebugName = _batchFirstDebugName switch
+            {
+                null => string.Empty,
+                DrawDebugName => "batch=" + DrawDebugName,
+                DispatchDebugName => "batch=" + DispatchDebugName,
+                var name => $"batch={name}",
+            };
         }
 
         private void CompleteGuestSubmission(ulong tick)
@@ -99,6 +108,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var resources = _batchResources.ToArray();
             var retireBuffers = _batchRetireBuffers.Count > 0 ? _batchRetireBuffers.ToArray() : [];
             _batchResources.Clear();
+            _batchFirstDebugName = null;
             _batchRetireBuffers.Clear();
 
             _pendingGuestSubmissions.Enqueue(

@@ -85,6 +85,17 @@ internal sealed class PresenterUnderTest : IDisposable
             field.SetValue(Instance, Activator.CreateInstance(field.FieldType, nonPublic: true));
         }
 
+        // [local] The uninitialized object skips field initializers: give every other readonly collection its empty
+        // instance, as the constructor would (the probe lists and sets of the [local] partials among them).
+        foreach (var field in PresenterType.GetFields(InstanceMembers))
+        {
+            if (field.IsInitOnly && field.GetValue(Instance) is null && field.FieldType.IsGenericType &&
+                field.FieldType.Namespace == "System.Collections.Generic" && field.FieldType.GetConstructor(Type.EmptyTypes) is not null)
+            {
+                field.SetValue(Instance, Activator.CreateInstance(field.FieldType));
+            }
+        }
+
         SetField("_shaderModuleCacheIdentities", new Dictionary<ulong, string>());
         var cacheShards = PresenterType.GetField("_pipelineCacheShards", InstanceMembers)!;
         cacheShards.SetValue(Instance, Activator.CreateInstance(cacheShards.FieldType, nonPublic: true));
