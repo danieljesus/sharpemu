@@ -66,7 +66,8 @@ public static class DeviceStoreTablePlanner
     // the entries they read, and the cache entries dropped by each kind of write (InvalidationSource), with the
     // tables scanned most often. Camera moves rescan store tables of tens of thousands of entries on the front.
     internal static readonly bool Profile = System.Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_STORE_TABLES") == "1";
-    private static long _evaluated, _hits, _scans, _scanEntries, _scanTicks, _bulkChunks, _bulkFallbacks, _bulkMismatches;
+    private static long _evaluated, _hits, _scans, _scanEntries, _scanTicks, _bulkChunks, _bulkFallbacks, _bulkMismatches, _bulkRaces;
+    private static int _bulkMismatchLogs;
     private static readonly string[] SourceNames = ["other", "cpu_fault", "cp_front", "dma_front", "cp_render", "fill_render", "copy_render"];
     private static readonly long[] _dropCalls = new long[SourceNames.Length];
     private static readonly long[] _drops = new long[SourceNames.Length];
@@ -89,13 +90,15 @@ public static class DeviceStoreTablePlanner
             $"{SourceNames[index]}={Interlocked.Exchange(ref _drops[index], 0)}/{Interlocked.Exchange(ref _dropCalls[index], 0)}/{Interlocked.Exchange(ref _dropBytes[index], 0)}b"));
         var top = string.Join(",", keys.OrderByDescending(pair => pair.Value).Take(4).Select(pair => $"0x{pair.Key.Base:X}+0x{pair.Key.Bytes:X}:{pair.Value}"));
         return System.FormattableString.Invariant(
-            $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]");
+            $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} bulk_races={Interlocked.Exchange(ref _bulkRaces, 0)} keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]");
     }
 
     // [local] SHARPEMU_STORE_TABLE_BULK=1 (off by default): a scan reads the table in 64 KB chunks through the
     // resident reader, which applies the same ownership rules once per chunk, instead of four reader calls per
     // entry; a chunk the resident reader refuses is read word by word as before. The recorder keeps the same
-    // words either way. =2 also reads every word through the word reader and counts the differences.
+    // words either way. =2 also reads every word through the word reader and counts the differences: a word whose
+    // second resident read agrees with the word reader changed in between (a guest write racing the scan, bulk_races);
+    // one that still differs is a difference between the two readers (bulk_mismatches, logged).
     private static readonly int BulkMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_BULK"), out var bulkMode) ? bulkMode : 0;
     private const int BulkChunkEntries = 4096;
 
@@ -195,6 +198,7 @@ public static class DeviceStoreTablePlanner
         using var scratch = RuntimeEvaluationScratch.Rent();
         var evaluator = new RuntimeValueEvaluator(scratch, plan, inputs);
         Span<uint> words = stackalloc uint[4];
+        Span<byte> again = stackalloc byte[4]; // [local] SHARPEMU_STORE_TABLE_BULK=2
         foreach (var table in plan.DeviceStoreTables)
         {
             var known = true;
@@ -251,8 +255,18 @@ public static class DeviceStoreTablePlanner
                             {
                                 for (var dword = 0; dword < 4; dword++)
                                 {
-                                    if (!read(address + (ulong)dword * 4, out var checkWord) || checkWord != words[dword])
-                                        Interlocked.Increment(ref _bulkMismatches);
+                                    if (read(address + (ulong)dword * 4, out var checkWord) && checkWord == words[dword])
+                                        continue;
+                                    if (bulk!(address + (ulong)dword * 4, again, false) &&
+                                        System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(again) == checkWord)
+                                    {
+                                        Interlocked.Increment(ref _bulkRaces);
+                                        continue;
+                                    }
+
+                                    Interlocked.Increment(ref _bulkMismatches);
+                                    if (Interlocked.Increment(ref _bulkMismatchLogs) <= 20)
+                                        System.Console.Error.WriteLine($"[STORE_TABLE_BULK_MISMATCH] thread={System.Environment.CurrentManagedThreadId} address=0x{address + (ulong)dword * 4:X} bulk=0x{words[dword]:X8} word=0x{checkWord:X8}");
                                 }
                             }
                         }
