@@ -191,6 +191,7 @@ internal sealed class ShaderProgramCache
             ReadMemory = _readGuestWord,
             ReadCleanMemory = _readCleanGuestWord,
             ReadResidentMemory = _prefetchResidentGuestBytes,
+            SynchronizeRanges = ResourceMaterializationCache.SyncValidateMode != 0 ? host.TrySynchronizeGuestRanges : null, // [local]
         };
     }
 

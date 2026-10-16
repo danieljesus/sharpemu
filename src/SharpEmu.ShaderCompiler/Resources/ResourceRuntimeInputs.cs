@@ -8,6 +8,10 @@ namespace SharpEmu.ShaderCompiler.Resources;
 // Reads one dword of guest memory; false when the address cannot be read.
 public delegate bool GuestWordReader(ulong address, out uint word);
 
+// [local] Brings GPU-owned guest ranges back to the CPU in one readback, as the word reader would one at a time:
+// true when the first range is synchronized. The other ranges are best effort.
+public delegate bool GuestRangeSynchronizer(ReadOnlySpan<(ulong Address, int Length)> ranges);
+
 // What one draw supplies to materialise a plan: its user data, the shader base and
 // the two memory readers. The clean reader refuses memory the GPU may still own.
 // Nothing keeps the instance past the materialisation, so a caller may refill one per draw.
@@ -27,6 +31,8 @@ public sealed class ResourceRuntimeInputs
 
     public bool ReadsClean { get; init; }
 
+    public GuestRangeSynchronizer? SynchronizeRanges { get; init; } // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE
+
     public ResourceRuntimeInputs WithReader(GuestWordReader? reader) => new()
     {
         UserData = UserData,
@@ -37,6 +43,7 @@ public sealed class ResourceRuntimeInputs
         TablePhase = TablePhase,
         ReadResidentMemory = ReadResidentMemory,
         ReadsClean = ReadsClean || ReferenceEquals(reader, ReadCleanMemory),
+        SynchronizeRanges = SynchronizeRanges,
     };
 }
 

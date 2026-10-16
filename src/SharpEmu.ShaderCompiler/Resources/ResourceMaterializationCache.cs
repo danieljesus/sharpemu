@@ -70,7 +70,7 @@ public sealed class ResourceMaterializationCache
         var refreshes = Interlocked.Exchange(ref _totalRefreshes, 0);
         var total = hits + misses;
         return FormattableString.Invariant(
-            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)} block_builds={Interlocked.Exchange(ref ReadRecorder.BlockBuilds, 0)} block_fallbacks={Interlocked.Exchange(ref ReadRecorder.BlockFallbacks, 0)} block_checked={Interlocked.Exchange(ref ReadRecorder.BlockChecked, 0)} block_mismatches={Interlocked.Exchange(ref ReadRecorder.BlockMismatches, 0)}{TakeRebaseReport()}");
+            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)} block_builds={Interlocked.Exchange(ref ReadRecorder.BlockBuilds, 0)} block_fallbacks={Interlocked.Exchange(ref ReadRecorder.BlockFallbacks, 0)} block_checked={Interlocked.Exchange(ref ReadRecorder.BlockChecked, 0)} block_mismatches={Interlocked.Exchange(ref ReadRecorder.BlockMismatches, 0)}{TakeRebaseReport()}{TakeSyncValidateReport()}");
     }
 
     public bool Materialize(
@@ -85,6 +85,7 @@ public sealed class ResourceMaterializationCache
         var key = KeyOf(plan, inputs);
         var found = TryFind(key, plan, inputs, out var cached);
         Entry? shifted = null; // [local] SHARPEMU_MATERIALIZE_REBASE
+        (ResourceSnapshot Snapshot, ResourceSpecialization Specialization)? syncCheck = null; // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE=2
         if (found)
         {
             if (StaleLog) _lastStaleReason = "nomatch";
@@ -98,8 +99,19 @@ public sealed class ResourceMaterializationCache
                 var validated = Validate(variant, inputs, residentReader, out var variantUnreadable);
                 MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Validate, validateStarted);
                 if (validated && StaleLog) _lastStaleReason = "snapshot";
+                var syncValidated = _syncValidated;
                 if (validated && variant.SnapshotFor(inputs, _patches) is { } hit)
                 {
+                    if (syncValidated)
+                    {
+                        NoteSyncValidate(plan.Hash, hit: true);
+                        if (SyncValidateMode == 2)
+                        {
+                            syncCheck = (hit, variant.Specialization);
+                            break;
+                        }
+                    }
+
                     if (previous is not null)
                     {
                         previous.Next = variant.Next;
@@ -115,8 +127,13 @@ public sealed class ResourceMaterializationCache
                     return true;
                 }
 
+                if (syncValidated)
+                    NoteSyncValidate(plan.Hash, hit: false);
                 unreadable |= variantUnreadable;
             }
+
+            if (syncCheck is not null)
+                goto Walk;
 
             var refreshStarted = MaterializeSplitProfile.Start(); // [local]
             Entry refreshed = null!;
@@ -174,6 +191,7 @@ public sealed class ResourceMaterializationCache
                 NoteStale(plan.Hash, cached);
         }
 
+    Walk:
         Misses++;
         Interlocked.Increment(ref _totalMisses);
         var recorder = TakeRecorder();
@@ -203,6 +221,8 @@ public sealed class ResourceMaterializationCache
                 return false;
             }
 
+            if (syncCheck is { } check)
+                NoteSyncCheck(plan.Hash, check.Snapshot, check.Specialization, snapshot, specialization);
             if (recorder.Failed)
             {
                 if (shifted is not null)
@@ -901,9 +921,98 @@ public sealed class ResourceMaterializationCache
         }
     }
 
+    // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE (0 off by default): a non-clean range the resident reader refuses
+    // because the GPU may still own it is synchronized (the readback the full walk would do for those same words)
+    // and compared like any other range. An entry whose every recorded word is unchanged is a hit: the walk it
+    // replaces would have read the same words, taken the same branches and produced the cached result. Clean ranges
+    // keep refusing (the walk would fail them too). In the same readback the other ranges this plan found GPU-owned
+    // before are brought back when their last writer is already submitted, so the plan's next draws validate from
+    // resident memory; the dirty tracking still decides every later read, so a range written again stays refused.
+    // =1 on; =2 also runs the full walk on each hit validated that way, uses its result and counts differences;
+    // =3 synchronizes only the range being validated (no other ranges of the plan).
+    public static readonly int SyncValidateMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_SYNC_VALIDATE"), out var syncValidate) ? syncValidate : 0;
+    private const int MaxHotRanges = 16;
+    private bool _syncValidated;
+    private readonly Dictionary<ulong, List<(ulong Address, int Length)>> _hotRanges = new();
+    private (ulong Address, int Length)[] _syncRanges = new (ulong, int)[MaxHotRanges + 1];
+    private static long _syncValidateReads, _syncValidateFailed, _syncValidateHits, _syncValidateChecked, _syncValidateMismatches, _syncValidateMismatchTotal;
+    private static readonly Dictionary<ulong, (long Hits, long Stale)> _syncValidateByPlan = new();
+
+    private bool TrySyncRead(ResourceRuntimeInputs inputs, ulong planHash, ulong address, Span<byte> destination, ResidentGuestBytesReader residentReader)
+    {
+        if (inputs.SynchronizeRanges is not { } synchronize)
+            return false;
+        if (!_hotRanges.TryGetValue(planHash, out var hot))
+            _hotRanges[planHash] = hot = new List<(ulong, int)>(MaxHotRanges);
+        var count = 0;
+        _syncRanges[count++] = (address, destination.Length);
+        if (SyncValidateMode != 3)
+            foreach (var range in hot)
+                if (range.Address != address)
+                    _syncRanges[count++] = range;
+        Interlocked.Increment(ref _syncValidateReads);
+        if (!synchronize(_syncRanges.AsSpan(0, count)) || !residentReader(address, destination, false))
+        {
+            Interlocked.Increment(ref _syncValidateFailed);
+            return false;
+        }
+
+        if (!hot.Exists(range => range.Address == address))
+        {
+            if (hot.Count == MaxHotRanges)
+                hot.RemoveAt(0);
+            hot.Add((address, destination.Length));
+        }
+
+        _syncValidated = true;
+        return true;
+    }
+
+    private static void NoteSyncValidate(ulong planHash, bool hit)
+    {
+        if (hit)
+            Interlocked.Increment(ref _syncValidateHits);
+        lock (_syncValidateByPlan)
+        {
+            var entry = _syncValidateByPlan.GetValueOrDefault(planHash);
+            _syncValidateByPlan[planHash] = hit ? (entry.Hits + 1, entry.Stale) : (entry.Hits, entry.Stale + 1);
+        }
+    }
+
+    private static string TakeSyncValidateReport()
+    {
+        if (SyncValidateMode == 0)
+            return string.Empty;
+        string plans;
+        lock (_syncValidateByPlan)
+        {
+            plans = string.Join(",", _syncValidateByPlan.OrderByDescending(pair => pair.Value.Hits + pair.Value.Stale).Take(6)
+                .Select(pair => $"{pair.Key:X16}:{pair.Value.Hits}/{pair.Value.Stale}"));
+            _syncValidateByPlan.Clear();
+        }
+
+        return FormattableString.Invariant(
+            $" sync_validate_reads={Interlocked.Exchange(ref _syncValidateReads, 0)} sync_validate_failed={Interlocked.Exchange(ref _syncValidateFailed, 0)} sync_validate_hits={Interlocked.Exchange(ref _syncValidateHits, 0)} sync_validate_checked={Interlocked.Exchange(ref _syncValidateChecked, 0)} sync_validate_mismatches={Interlocked.Exchange(ref _syncValidateMismatches, 0)} sync_validate_mismatches_total={Interlocked.Read(ref _syncValidateMismatchTotal)} sync_validate_plans=[{plans}]");
+    }
+
+    private static void NoteSyncCheck(ulong planHash, ResourceSnapshot validated, ResourceSpecialization validatedSpecialization,
+        ResourceSnapshot walked, ResourceSpecialization walkedSpecialization)
+    {
+        Interlocked.Increment(ref _syncValidateChecked);
+        var difference = SnapshotDifference(validated, walked) ?? (Equals(validatedSpecialization, walkedSpecialization) ? null : "specialization");
+        if (difference is null)
+            return;
+        Interlocked.Increment(ref _syncValidateMismatches);
+        // Always printed (the first 64, then every 1024th): grep for it.
+        var total = Interlocked.Increment(ref _syncValidateMismatchTotal);
+        if (total <= 64 || (total & 1023) == 0)
+            Console.Error.WriteLine($"[MATERIALIZE_SYNC_VALIDATE_MISMATCH] plan=0x{planHash:X16} total={total} {difference}");
+    }
+
     private bool Validate(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader, out bool unreadable)
     {
         unreadable = false;
+        _syncValidated = false;
         _patches.Clear();
         for (var index = 0; index < entry.RangeAddresses.Length; index++)
         {
@@ -916,7 +1025,8 @@ public sealed class ResourceMaterializationCache
             if (_scratch.Length < length)
                 _scratch = new byte[Math.Max(length, _scratch.Length * 2)];
             var current = _scratch.AsSpan(0, length);
-            if (!residentReader(address, current, entry.RangeClean[index]))
+            if (!residentReader(address, current, entry.RangeClean[index]) &&
+                !(SyncValidateMode != 0 && !entry.RangeClean[index] && TrySyncRead(inputs, entry.Plan.Hash, address, current, residentReader)))
             {
                 unreadable = true;
                 if (StaleLog) _lastStaleReason = $"unreadable:r{index}:clean{entry.RangeClean[index]}";
