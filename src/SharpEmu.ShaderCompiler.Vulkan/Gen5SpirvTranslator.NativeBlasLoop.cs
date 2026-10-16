@@ -475,12 +475,16 @@ public static partial class Gen5SpirvTranslator
         }
 
         // Entry e of the deep tier for this lane: entry-major within the slot, so a warp's push is one line.
-        private uint RtStackDeepPointer(uint entry)
+        private uint RtStackDeepPointer(uint entry) => RtStackDeepPointerAt(entry, null);
+
+        // Column `column` of the slot's row `entry`; null is the lane's own column (loaded after the row, so the
+        // module stays as it was before the spill rows existed).
+        private uint RtStackDeepPointerAt(uint entry, uint? column)
         {
             var slot = BitwiseAnd(Load(_uintType, _rtStackSlot), UInt(DeviceAddressPaging.RtStackWarpSlots - 1));
-            var row = IAdd(_module.AddInstruction(SpirvOp.IMul, _uintType, slot, UInt(DeviceAddressPaging.RtStackSlotEntries)), entry);
+            var row = IAdd(_module.AddInstruction(SpirvOp.IMul, _uintType, slot, UInt(DeviceAddressPaging.RtStackSlotStride)), entry);
             return BlockWordPointer(_faultBuffer, IAdd(UInt(RtStackEntriesDword),
-                IAdd(ShiftLeftLogical(row, UInt(5)), Load(_uintType, _subgroupInvocationIdInput))));
+                IAdd(ShiftLeftLogical(row, UInt(5)), column ?? Load(_uintType, _subgroupInvocationIdInput))));
         }
 
         private uint ULess(uint left, uint right) => _module.AddInstruction(SpirvOp.ULessThan, _boolType, left, right);

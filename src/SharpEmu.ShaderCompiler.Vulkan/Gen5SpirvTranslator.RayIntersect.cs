@@ -500,11 +500,11 @@ public static partial class Gen5SpirvTranslator
                         // [local] SHARPEMU_BVH_LEAN_SLABS=1 (off by default): as written, the max3/min3 below
                         // propagate NaN, so a NaN plane distance makes the child miss; otherwise they equal
                         // plain max/min up to the sign of a zero, which only reaches ordered compares. This
-                        // tests the six distances once and uses plain FMax/FMin. Not bit-exact with the
-                        // reference as NVIDIA compiles it: without SignedZeroInfNanPreserve the driver folds
-                        // the NaN select of NanMax/NanMin into a NaN-dropping max, so there a 0 * inf plane
-                        // (origin on the slab, zero direction component) or a NaN bound can still hit
-                        // (RayIntersectDeviceTests); here it always misses, as the code intends.
+                        // tests the six distances once and uses plain FMax/FMin. With SignedZeroInfNanPreserve
+                        // (what the game compiles with on the RTX 5080) it matches the reference on every
+                        // lane (RayIntersectDeviceTests). Without it the driver folds the NaN select of
+                        // NanMax/NanMin into a NaN-dropping max, so in the reference a 0 * inf plane (origin
+                        // on the slab, zero direction component) or a NaN bound can still hit; here it misses.
                         var planeNan = LogicalOr(
                             _module.AddInstruction(SpirvOp.IsNan, _boolType, planeMin),
                             _module.AddInstruction(SpirvOp.IsNan, _boolType, planeMax));

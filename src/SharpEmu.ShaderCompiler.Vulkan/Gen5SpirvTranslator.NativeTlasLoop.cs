@@ -362,7 +362,15 @@ public static partial class Gen5SpirvTranslator
                     }
                 }
 
+                var spilled = !verify && RtSpillEnabled ? RtSpillSet(plan.Instructions) : [];
+                if (spilled.Length != 0)
+                {
+                    Console.Error.WriteLine($"[RT_SPILL] hash=0x{_request.Hash:X16} scalars={spilled.Length}: {string.Join(' ', spilled.Select(register => $"s{register}"))}");
+                }
+
+                EmitRtSpill(spilled);
                 EmitNativeTlasLoop(plan);
+                EmitRtRestore(spilled);
                 if (verify)
                 {
                     _tlasResults ??= NativeTlasLiveOuts.Select(register => NativeVariable($"nativeTlasResult_v{register}")).ToArray();

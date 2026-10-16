@@ -46,9 +46,14 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
     ];
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void SwitchedLowerings_MatchTheReference(bool bvh64)
+    // preserveNan: SignedZeroInfNanPreserve, as the game compiles with it on the RTX 5080. Without it the driver
+    // folds the reference's NaN-propagating max3/min3 into a NaN-dropping max, so the lean slab test is compared
+    // only on lanes without a NaN plane distance.
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    public void SwitchedLowerings_MatchTheReference(bool bvh64, bool preserveNan)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true))
@@ -61,7 +66,12 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
         foreach (var (name, unified, lean, pageCache) in Variants)
         {
             var (plan, resources, layout) = Prepare(program);
-            var request = new ShaderCompileRequest(plan, resources, layout) { LocalSizeX = Lanes, ThreadCountX = Lanes };
+            var request = new ShaderCompileRequest(plan, resources, layout)
+            {
+                LocalSizeX = Lanes,
+                ThreadCountX = Lanes,
+                ShaderSignedZeroInfNanPreserveFloat32Supported = preserveNan,
+            };
             var spirv = Compile(request, unified, lean, pageCache);
             compiled.Add((name, request, spirv));
             if (Environment.GetEnvironmentVariable("LOCAL_SPV_OUT") is { Length: > 0 } directory)
@@ -128,7 +138,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                         var lean = Variants[variant].Lean == "1";
                         for (var lane = 0; lane < Lanes; lane++)
                         {
-                            if (lean && scene.NanPlanes[lane])
+                            if (lean && !preserveNan && scene.NanPlanes[lane])
                             {
                                 stats.LeanSkipped++;
                                 continue;
@@ -163,7 +173,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                 }
             }
 
-            output.WriteLine($"bvh64={bvh64} rounds={Rounds} lanes={Lanes}: {stats} on {vulkan.DeviceName}");
+            output.WriteLine($"bvh64={bvh64} preserveNan={preserveNan} rounds={Rounds} lanes={Lanes}: {stats} on {vulkan.DeviceName}");
             // The random scenes reach every path the switches change.
             Assert.True(stats.TriangleHits > 0 && stats.TriangleMisses > 0, stats.ToString());
             Assert.True(stats.BoxChildHits > 0 && stats.BoxChildMisses > 0, stats.ToString());
