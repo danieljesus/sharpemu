@@ -2944,68 +2944,140 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     // Kept apart from SynchronizeBuffer so that its closure is only allocated for buffers with
     // dirty ranges; most calls return before needing it.
-    private GpuBuffer? CollectUploadRanges(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten,
-        bool preserveCpuWriteHotPages, out List<BufferCopy> copies, out ulong totalSize)
+    // [local] The state of one CollectUploadRanges call, with the tracker callbacks bound once: the lambdas allocated a
+    // closure, two delegates and up to three lists on every synchronization (most of BufferDirtySync's allocation).
+    // One per thread; a nested synchronization on the same thread takes a new one.
+    private sealed class UploadCollection
     {
-        var collected = new List<BufferCopy>();
-        var collectedSize = 0UL;
-        GpuBuffer? source = null;
-        if (_deferredUploads is { } deferred && !isWritten) // [local]
+        public readonly List<BufferCopy> Collected = new();
+        // Handed to a deferred upload job, then replaced.
+        public List<TrackedRegion> Pending = new();
+        public List<(ulong Address, ulong Offset, int Size)> Reads = new();
+        public ulong CollectedSize;
+        public GpuBuffer? Source;
+        public GpuRingBuffer? Reserved;
+        public bool InUse;
+        private GuestBufferCache _cache = null!;
+        private GpuBuffer _buffer = null!;
+        private ulong _guestAddress;
+        private ulong _size;
+        public readonly Action<ulong, ulong> Range;
+        public readonly Action<ulong, ulong> RangeDeferred;
+        public readonly Action Upload;
+        public readonly Action UploadDeferred;
+
+        public UploadCollection()
         {
-            var pending = new List<TrackedRegion>();
-            var reads = new List<(ulong Address, ulong Offset, int Size)>();
-            GpuRingBuffer? reserved = null;
+            Range = AddRange;
+            RangeDeferred = AddRangeDeferred;
+            Upload = PrepareUpload;
+            UploadDeferred = ReserveUpload;
+        }
+
+        public void Begin(GuestBufferCache cache, GpuBuffer buffer, ulong guestAddress, ulong size)
+        {
+            InUse = true;
+            _cache = cache;
+            _buffer = buffer;
+            _guestAddress = guestAddress;
+            _size = size;
+            Collected.Clear();
+            Pending.Clear();
+            Reads.Clear();
+            CollectedSize = 0;
+            Source = null;
+            Reserved = null;
+        }
+
+        public void End()
+        {
+            InUse = false;
+            _cache = null!;
+            _buffer = null!;
+            Source = null;
+            Reserved = null;
+        }
+
+        private void AddRangeDeferred(ulong address, ulong bytes)
+        {
+            Collected.Add(new BufferCopy(CollectedSize, _buffer.Offset(address), bytes));
+            CollectedSize += bytes;
+        }
+
+        private void AddRange(ulong address, ulong bytes)
+        {
+            Collected.Add(new BufferCopy(CollectedSize, _buffer.Offset(address), bytes));
+            CollectedSize += bytes;
+            if (UploadDupCheck) _cache.NoteUploadContent(address, bytes); // [local]
+        }
+
+        private void ReserveUpload()
+        {
+            Source = Reserved = _cache._uploader.ReserveSource(_buffer.CpuAddress, CollectionsMarshal.AsSpan(Collected), CollectedSize, Reads);
+            if (Reserved == null)
+            {
+                // No staging for a later copy: protect now, then copy as before.
+                GuestPageTracker.ApplyDeferredProtection(Pending);
+                Pending.Clear();
+                Source = _cache._uploader.PrepareSource(_buffer.CpuAddress, CollectionsMarshal.AsSpan(Collected), CollectedSize, _guestAddress, _size);
+            }
+        }
+
+        private void PrepareUpload() =>
+            Source = _cache._uploader.PrepareSource(_buffer.CpuAddress, CollectionsMarshal.AsSpan(Collected), CollectedSize, _guestAddress, _size);
+    }
+
+    [ThreadStatic]
+    private static UploadCollection? _uploadCollection;
+
+    // The copies stay in the returned collection until ReleaseUploadCollection.
+    private UploadCollection CollectUploadRanges(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten,
+        bool preserveCpuWriteHotPages)
+    {
+        var collection = _uploadCollection is { InUse: false } free ? free : new UploadCollection();
+        _uploadCollection ??= collection;
+        collection.Begin(this, buffer, guestAddress, size);
+        try
+        {
+            if (_deferredUploads is { } deferred && !isWritten) // [local]
+            {
+                var pending = collection.Pending;
+                _tracker.ForEachUploadRange(
+                    guestAddress,
+                    size,
+                    isWritten,
+                    collection.RangeDeferred,
+                    collection.UploadDeferred,
+                    preserveCpuWriteHotPages,
+                    pending);
+                if (collection.Reserved is { } reserved)
+                {
+                    deferred.Enqueue(new DeferredUploadWorker.Job(pending, _uploader, reserved, collection.Reads));
+                    collection.Pending = new List<TrackedRegion>();
+                    collection.Reads = new List<(ulong Address, ulong Offset, int Size)>();
+                }
+                else if (pending.Count != 0)
+                {
+                    GuestPageTracker.ApplyDeferredProtection(pending);
+                }
+
+                return collection;
+            }
+
             _tracker.ForEachUploadRange(
                 guestAddress,
                 size,
                 isWritten,
-                (address, bytes) =>
-                {
-                    collected.Add(new BufferCopy(collectedSize, buffer.Offset(address), bytes));
-                    collectedSize += bytes;
-                },
-                () =>
-                {
-                    source = reserved = _uploader.ReserveSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(collected), collectedSize, reads);
-                    if (reserved == null)
-                    {
-                        // No staging for a later copy: protect now, then copy as before.
-                        GuestPageTracker.ApplyDeferredProtection(pending);
-                        pending.Clear();
-                        source = _uploader.PrepareSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(collected), collectedSize, guestAddress, size);
-                    }
-                },
-                preserveCpuWriteHotPages,
-                pending);
-            if (reserved != null)
-            {
-                deferred.Enqueue(new DeferredUploadWorker.Job(pending, _uploader, reserved, reads));
-            }
-            else if (pending.Count != 0)
-            {
-                GuestPageTracker.ApplyDeferredProtection(pending);
-            }
-
-            copies = collected;
-            totalSize = collectedSize;
-            return source;
+                collection.Range,
+                collection.Upload,
+                preserveCpuWriteHotPages);
+            return collection;
         }
-
-        _tracker.ForEachUploadRange(
-            guestAddress,
-            size,
-            isWritten,
-            (address, bytes) =>
-            {
-                collected.Add(new BufferCopy(collectedSize, buffer.Offset(address), bytes));
-                collectedSize += bytes;
-                if (UploadDupCheck) NoteUploadContent(address, bytes); // [local]
-            },
-            () => source = _uploader.PrepareSource(buffer.CpuAddress, CollectionsMarshal.AsSpan(collected), collectedSize, guestAddress, size),
-            preserveCpuWriteHotPages);
-        copies = collected;
-        totalSize = collectedSize;
-        return source;
+        catch
+        {
+            collection.End();
+            throw;
+        }
     }
 
     // [local experiment] SHARPEMU_UPLOAD_DUP_CHECK=1: per 4 KB page, how many uploaded bytes equal what
@@ -3061,57 +3133,67 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         profileScope.SwitchPhase(isWritten
             ? RenderPhaseProfile.Phase.BufferDirtySyncWritten
             : isTexelBuffer ? RenderPhaseProfile.Phase.BufferDirtySyncTexel : RenderPhaseProfile.Phase.BufferDirtySyncUpload);
-        var source = CollectUploadRanges(buffer, guestAddress, size, isWritten, preserveCpuWriteHotPages, out var copies, out var totalSize);
-        if (source != null)
+        var collection = CollectUploadRanges(buffer, guestAddress, size, isWritten, preserveCpuWriteHotPages);
+        try
         {
-            _syncUploads++; // [local] written-obtain memo verification
-            if (Rendering.BatchSimulation.Enabled) Rendering.BatchSimulation.NoteUpload(); // [local]
-            foreach (var copy in copies)
-                buffer.NoteGpuWrite(copy.DstOffset, copy.Size);
-            var command = _scheduler.Current;
-            command.EndRendering();
-            var native = new CommandBuffer(command.Handle);
-            var vk = _device.Vk;
-            var before = new BufferMemoryBarrier2
+            var copies = collection.Collected;
+            var totalSize = collection.CollectedSize;
+            var source = collection.Source;
+            if (source != null)
             {
-                SType = StructureType.BufferMemoryBarrier2,
-                SrcAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit | AccessFlags2.TransferReadBit | AccessFlags2.TransferWriteBit,
-                DstAccessMask = AccessFlags2.TransferWriteBit,
-                SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                Buffer = buffer.Handle,
-                Offset = 0,
-                Size = buffer.Size,
-            };
-            VulkanSynchronization.PipelineBarrier(vk,
-                native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
-                0, null, 1, &before, 0, null);
-            var regions = CollectionsMarshal.AsSpan(copies);
-            if (GuestGpuMemoryHook.TraceEnabled) // [local]
-                foreach (var copy in regions)
-                    GuestGpuMemoryHook.Trace(buffer.CpuAddress + copy.DstOffset, copy.Size, $"host-upload-sync written={isWritten} preserve={preserveCpuWriteHotPages} binding=0x{guestAddress:X}+0x{size:X} submission_tick={_scheduler.CurrentTick}");
-            fixed (BufferCopy* pointer = regions)
-            {
-                var vkProbe2631 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBuffer(vk, native, source.Handle, buffer.Handle, (uint)regions.Length, pointer); // [local]
-                SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.CopyBuffer, vkProbe2631); // [local]
+                _syncUploads++; // [local] written-obtain memo verification
+                if (Rendering.BatchSimulation.Enabled) Rendering.BatchSimulation.NoteUpload(); // [local]
+                foreach (var copy in copies)
+                    buffer.NoteGpuWrite(copy.DstOffset, copy.Size);
+                var command = _scheduler.Current;
+                command.EndRendering();
+                var native = new CommandBuffer(command.Handle);
+                var vk = _device.Vk;
+                var before = new BufferMemoryBarrier2
+                {
+                    SType = StructureType.BufferMemoryBarrier2,
+                    SrcAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit | AccessFlags2.TransferReadBit | AccessFlags2.TransferWriteBit,
+                    DstAccessMask = AccessFlags2.TransferWriteBit,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Buffer = buffer.Handle,
+                    Offset = 0,
+                    Size = buffer.Size,
+                };
+                VulkanSynchronization.PipelineBarrier(vk,
+                    native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
+                    0, null, 1, &before, 0, null);
+                var regions = CollectionsMarshal.AsSpan(copies);
+                if (GuestGpuMemoryHook.TraceEnabled) // [local]
+                    foreach (var copy in regions)
+                        GuestGpuMemoryHook.Trace(buffer.CpuAddress + copy.DstOffset, copy.Size, $"host-upload-sync written={isWritten} preserve={preserveCpuWriteHotPages} binding=0x{guestAddress:X}+0x{size:X} submission_tick={_scheduler.CurrentTick}");
+                fixed (BufferCopy* pointer = regions)
+                {
+                    var vkProbe2631 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+                    SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBuffer(vk, native, source.Handle, buffer.Handle, (uint)regions.Length, pointer); // [local]
+                    SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.CopyBuffer, vkProbe2631); // [local]
+                }
+
+                var after = before;
+                after.SrcAccessMask = AccessFlags2.TransferWriteBit;
+                after.DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit;
+                VulkanSynchronization.PipelineBarrier(vk,
+                    native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
+                    0, null, 1, &after, 0, null);
             }
 
-            var after = before;
-            after.SrcAccessMask = AccessFlags2.TransferWriteBit;
-            after.DstAccessMask = AccessFlags2.MemoryReadBit | AccessFlags2.MemoryWriteBit;
-            VulkanSynchronization.PipelineBarrier(vk,
-                native, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
-                0, null, 1, &after, 0, null);
+            if (BufferUploadProfile.Enabled)
+            {
+                var elapsedTicks = System.Diagnostics.Stopwatch.GetTimestamp() - startedAt;
+                ulong hotBytes = 0;
+                foreach (var copy in copies)
+                    hotBytes += _tracker.CountCpuWriteHotBytes(buffer.CpuAddress + copy.DstOffset, copy.Size);
+                BufferUploadProfile.Record(guestAddress, size, copies.Count, totalSize, hotBytes, elapsedTicks);
+            }
         }
-
-        if (BufferUploadProfile.Enabled)
+        finally
         {
-            var elapsedTicks = System.Diagnostics.Stopwatch.GetTimestamp() - startedAt;
-            ulong hotBytes = 0;
-            foreach (var copy in copies)
-                hotBytes += _tracker.CountCpuWriteHotBytes(buffer.CpuAddress + copy.DstOffset, copy.Size);
-            BufferUploadProfile.Record(guestAddress, size, copies.Count, totalSize, hotBytes, elapsedTicks);
+            collection.End();
         }
 
         if (isTexelBuffer)

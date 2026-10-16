@@ -283,47 +283,22 @@ public sealed class GuestPageTracker
         VisitRegions(vaddr, size, create: true, static (_, _, _) => false);
         var previousOwner = _uploadOwner;
         _uploadOwner = this;
-        var held = new List<TrackedRegion>();
-        var cleared = new List<(TrackedRegion Region, ulong Address, ulong Size)>();
+        // [local] The thread's visit state (a nested upload was rejected above); its lists and callbacks are reused.
+        var visit = _uploadVisit ??= new UploadVisit();
+        visit.Begin(isWritten, preserveCpuWriteHotPages, defer, rangeFunc, deferredProtection);
+        var held = visit.Held;
+        var cleared = visit.Cleared;
         try
         {
             using (GpuMemoryAccessProfile.Measure(GpuMemoryAccessProfile.Operation.UploadTracking, size))
             {
-                VisitRegions(vaddr, size, create: false, (region, offset, bytes) =>
-                {
-                    region.Lock.Enter();
-                    held.Add(region);
-                    var address = region.BaseAddress + offset;
-                    if (region.ForEachCpuUploadRange(
-                        preserveHotPages: !isWritten && preserveCpuWriteHotPages,
-                        address,
-                        bytes,
-                        (runAddress, runSize) => cleared.Add((region, runAddress, runSize)),
-                        rangeFunc,
-                        defer))
-                    {
-                        deferredProtection!.Add(region);
-                    }
-                    if (!isWritten)
-                    {
-                        region.Lock.Exit();
-                        held.Remove(region);
-                    }
-
-                    return false;
-                });
+                VisitRegions(vaddr, size, create: false, visit.Collect);
             }
             uploadFunc();
             if (isWritten)
             {
                 GuestGpuMemoryHook.Trace(vaddr, size, "gpu-own written-binding"); // [local]
-                VisitRegions(vaddr, size, create: false, (region, offset, bytes) =>
-                {
-                    region.ChangeState(WriteOrigin.Gpu, enable: true, region.BaseAddress + offset, bytes);
-                    region.Lock.Exit();
-                    held.Remove(region);
-                    return false;
-                });
+                VisitRegions(vaddr, size, create: false, visit.Own);
             }
         }
         catch
@@ -371,7 +346,92 @@ public sealed class GuestPageTracker
                 region.Lock.Exit();
             }
 
+            visit.End();
             _uploadOwner = previousOwner;
+        }
+    }
+
+    [ThreadStatic]
+    private static UploadVisit? _uploadVisit;
+
+    // [local] The per-call state of ForEachUploadRange with its region callbacks bound once: the lambdas allocated
+    // their closures, two lists and one closure and delegate per region on every call.
+    private sealed class UploadVisit
+    {
+        public readonly List<TrackedRegion> Held = new();
+        public readonly List<(TrackedRegion Region, ulong Address, ulong Size)> Cleared = new();
+        public readonly Func<TrackedRegion, ulong, ulong, bool> Collect;
+        public readonly Func<TrackedRegion, ulong, ulong, bool> Own;
+        private readonly Action<ulong, ulong> _noteCleared;
+        private bool _isWritten;
+        private bool _preserveCpuWriteHotPages;
+        private bool _defer;
+        private Action<ulong, ulong>? _rangeFunc;
+        private List<TrackedRegion>? _deferredProtection;
+        private TrackedRegion? _region;
+
+        public UploadVisit()
+        {
+            Collect = VisitCollect;
+            Own = VisitOwn;
+            _noteCleared = NoteCleared;
+        }
+
+        public void Begin(bool isWritten, bool preserveCpuWriteHotPages, bool defer, Action<ulong, ulong> rangeFunc,
+            List<TrackedRegion>? deferredProtection)
+        {
+            Held.Clear();
+            Cleared.Clear();
+            _isWritten = isWritten;
+            _preserveCpuWriteHotPages = preserveCpuWriteHotPages;
+            _defer = defer;
+            _rangeFunc = rangeFunc;
+            _deferredProtection = deferredProtection;
+        }
+
+        public void End()
+        {
+            Held.Clear();
+            Cleared.Clear();
+            _rangeFunc = null;
+            _deferredProtection = null;
+            _region = null;
+        }
+
+        // The cleared runs belong to the region ForEachCpuUploadRange is visiting.
+        private void NoteCleared(ulong runAddress, ulong runSize) => Cleared.Add((_region!, runAddress, runSize));
+
+        private bool VisitCollect(TrackedRegion region, ulong offset, ulong bytes)
+        {
+            region.Lock.Enter();
+            Held.Add(region);
+            var address = region.BaseAddress + offset;
+            _region = region;
+            if (region.ForEachCpuUploadRange(
+                preserveHotPages: !_isWritten && _preserveCpuWriteHotPages,
+                address,
+                bytes,
+                _noteCleared,
+                _rangeFunc!,
+                _defer))
+            {
+                _deferredProtection!.Add(region);
+            }
+            if (!_isWritten)
+            {
+                region.Lock.Exit();
+                Held.Remove(region);
+            }
+
+            return false;
+        }
+
+        private bool VisitOwn(TrackedRegion region, ulong offset, ulong bytes)
+        {
+            region.ChangeState(WriteOrigin.Gpu, enable: true, region.BaseAddress + offset, bytes);
+            region.Lock.Exit();
+            Held.Remove(region);
+            return false;
         }
     }
 
