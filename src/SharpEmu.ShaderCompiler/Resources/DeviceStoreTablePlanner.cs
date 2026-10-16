@@ -62,7 +62,44 @@ public static class DeviceStoreTablePlanner
 
     private static ulong _tableBegin = ulong.MaxValue, _tableEnd; // [local] bounds of every table ever cached
 
-    public static void InvalidateTables(ulong address, ulong size) // [local]
+    // [local] SHARPEMU_PROFILE_STORE_TABLES=1: per report window, the tables evaluated, the cache hits, the scans and
+    // the entries they read, and the cache entries dropped by each kind of write (InvalidationSource), with the
+    // tables scanned most often. Camera moves rescan store tables of tens of thousands of entries on the front.
+    internal static readonly bool Profile = System.Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_STORE_TABLES") == "1";
+    private static long _evaluated, _hits, _scans, _scanEntries, _scanTicks, _bulkChunks, _bulkFallbacks, _bulkMismatches;
+    private static readonly string[] SourceNames = ["other", "cpu_fault", "cp_front", "dma_front", "cp_render", "fill_render", "copy_render"];
+    private static readonly long[] _dropCalls = new long[SourceNames.Length];
+    private static readonly long[] _drops = new long[SourceNames.Length];
+    private static readonly long[] _dropBytes = new long[SourceNames.Length];
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Base, ulong Bytes), long> _scannedKeys = new();
+
+    public static class InvalidationSource
+    {
+        public const int CpuFault = 1, CommandFront = 2, DmaFront = 3, CommandRender = 4, FillRender = 5, CopyRender = 6;
+    }
+
+    public static string? TakeReport()
+    {
+        if (!Profile)
+            return null;
+        var keys = _scannedKeys.ToArray();
+        foreach (var (key, _) in keys)
+            _scannedKeys.TryRemove(key, out _);
+        var drops = string.Join(" ", Enumerable.Range(1, SourceNames.Length - 1).Select(index =>
+            $"{SourceNames[index]}={Interlocked.Exchange(ref _drops[index], 0)}/{Interlocked.Exchange(ref _dropCalls[index], 0)}/{Interlocked.Exchange(ref _dropBytes[index], 0)}b"));
+        var top = string.Join(",", keys.OrderByDescending(pair => pair.Value).Take(4).Select(pair => $"0x{pair.Key.Base:X}+0x{pair.Key.Bytes:X}:{pair.Value}"));
+        return System.FormattableString.Invariant(
+            $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]");
+    }
+
+    // [local] SHARPEMU_STORE_TABLE_BULK=1 (off by default): a scan reads the table in 64 KB chunks through the
+    // resident reader, which applies the same ownership rules once per chunk, instead of four reader calls per
+    // entry; a chunk the resident reader refuses is read word by word as before. The recorder keeps the same
+    // words either way. =2 also reads every word through the word reader and counts the differences.
+    private static readonly int BulkMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_BULK"), out var bulkMode) ? bulkMode : 0;
+    private const int BulkChunkEntries = 4096;
+
+    public static void InvalidateTables(ulong address, ulong size, int source = 0) // [local]
     {
         // Cheap reject first: this runs on every command-processor write, and IsEmpty/Keys on a
         // ConcurrentDictionary take all its locks (rt429: ~2 ms per frame of lock waits).
@@ -70,6 +107,7 @@ public static class DeviceStoreTablePlanner
             return;
         TableCache[] caches;
         lock (AllCaches) caches = AllCaches.ToArray();
+        var dropped = 0;
         foreach (var cache in caches)
         {
             foreach (var (key, _) in cache.Entries) // the enumerator takes no locks, unlike Keys
@@ -77,9 +115,18 @@ public static class DeviceStoreTablePlanner
                 if (address < key.Base + key.Bytes && key.Base < address + size)
                 {
                     Interlocked.Increment(ref cache.Generation);
-                    cache.Entries.TryRemove(key, out _);
+                    if (cache.Entries.TryRemove(key, out _))
+                        dropped++;
                 }
             }
+        }
+
+        if (Profile && dropped != 0)
+        {
+            var kind = (uint)source < (uint)SourceNames.Length ? source : 0;
+            Interlocked.Add(ref _drops[kind], dropped);
+            Interlocked.Increment(ref _dropCalls[kind]);
+            Interlocked.Add(ref _dropBytes[kind], (long)size);
         }
     }
 
@@ -161,6 +208,8 @@ public static class DeviceStoreTablePlanner
                 continue;
             }
 
+            if (Profile)
+                Interlocked.Increment(ref _evaluated);
             // [local experiment] the whole table, scanned once per table address and cached.
             var tableCache = Cache;
             var generation = Interlocked.Read(ref tableCache.Generation);
@@ -168,6 +217,8 @@ public static class DeviceStoreTablePlanner
                 (RescanEvery == 0 || ++_uses % RescanEvery != 0)) // [local] periodic rescan
             {
                 ranges.AddRange(cached);
+                if (Profile)
+                    Interlocked.Increment(ref _hits);
                 if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
                     System.Console.Error.WriteLine($"[STORE_TABLE_USE] hash=0x{plan.Hash:X16} thread={System.Environment.CurrentManagedThreadId} table=0x{tableBase:X} bytes=0x{tableBytes:X} hit ranges={Describe(cached)}");
                 continue;
@@ -175,19 +226,63 @@ public static class DeviceStoreTablePlanner
 
             var entries = (int)System.Math.Min(tableBytes / 16, MaxEntries);
             var before = ranges.Count; // [local]
-            for (var entry = 0; entry < entries; entry++)
+            var scanStarted = Profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            var bulk = BulkMode != 0 ? inputs.ReadResidentMemory : null;
+            var chunk = bulk is null ? null : System.Buffers.ArrayPool<byte>.Shared.Rent(BulkChunkEntries * 16);
+            try
             {
-                var address = tableBase + (ulong)entry * 16;
-                var readable = true;
-                for (var dword = 0; dword < 4 && readable; dword++)
+                for (var first = 0; first < entries; first += BulkChunkEntries)
                 {
-                    readable = read(address + (ulong)dword * 4, out words[dword]);
-                }
+                    var count = System.Math.Min(BulkChunkEntries, entries - first);
+                    var chunkBytes = chunk is null ? default : chunk.AsSpan(0, count * 16);
+                    var bulkRead = bulk is not null && bulk(tableBase + (ulong)first * 16, chunkBytes, false);
+                    if (Profile && bulk is not null)
+                        Interlocked.Increment(ref bulkRead ? ref _bulkChunks : ref _bulkFallbacks);
+                    for (var entry = first; entry < first + count; entry++)
+                    {
+                        var address = tableBase + (ulong)entry * 16;
+                        var readable = true;
+                        if (bulkRead)
+                        {
+                            var offset = (entry - first) * 16;
+                            for (var dword = 0; dword < 4; dword++)
+                                words[dword] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes[(offset + dword * 4)..]);
+                            if (BulkMode == 2)
+                            {
+                                for (var dword = 0; dword < 4; dword++)
+                                {
+                                    if (!read(address + (ulong)dword * 4, out var checkWord) || checkWord != words[dword])
+                                        Interlocked.Increment(ref _bulkMismatches);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            for (var dword = 0; dword < 4 && readable; dword++)
+                            {
+                                readable = read(address + (ulong)dword * 4, out words[dword]);
+                            }
+                        }
 
-                if (readable && TryDecode(words, out var entryBase, out var entryBytes) && entryBytes <= MaxEntryBytes && (FilterGpuWritable ? SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.IsGpuWritable(entryBase, entryBytes) : entryBase + entryBytes <= TableMaxAddress))
-                {
-                    ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, entryBase, entryBytes, Planned: true, Written: MarksWritten(entryBytes))); // [local]
+                        if (readable && TryDecode(words, out var entryBase, out var entryBytes) && entryBytes <= MaxEntryBytes && (FilterGpuWritable ? SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.IsGpuWritable(entryBase, entryBytes) : entryBase + entryBytes <= TableMaxAddress))
+                        {
+                            ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, entryBase, entryBytes, Planned: true, Written: MarksWritten(entryBytes))); // [local]
+                        }
+                    }
                 }
+            }
+            finally
+            {
+                if (chunk is not null)
+                    System.Buffers.ArrayPool<byte>.Shared.Return(chunk);
+            }
+
+            if (Profile)
+            {
+                Interlocked.Increment(ref _scans);
+                Interlocked.Add(ref _scanEntries, entries);
+                Interlocked.Add(ref _scanTicks, System.Diagnostics.Stopwatch.GetTimestamp() - scanStarted);
+                _scannedKeys.AddOrUpdate((tableBase, tableBytes), 1, static (_, value) => value + 1);
             }
             if (MergeGap != ulong.MaxValue && ranges.Count - before > 1) // [local] coalesce neighbouring V# ranges
             {
