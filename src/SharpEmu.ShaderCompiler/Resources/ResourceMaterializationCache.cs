@@ -70,7 +70,7 @@ public sealed class ResourceMaterializationCache
         var refreshes = Interlocked.Exchange(ref _totalRefreshes, 0);
         var total = hits + misses;
         return FormattableString.Invariant(
-            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)}{TakeRebaseReport()}");
+            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)}{TakeRebaseReport()}");
     }
 
     public bool Materialize(
@@ -94,7 +94,9 @@ public sealed class ResourceMaterializationCache
             {
                 if (!variant.Matches(plan, inputs))
                     continue;
+                var validateStarted = MaterializeSplitProfile.Start(); // [local]
                 var validated = Validate(variant, inputs, residentReader, out var variantUnreadable);
+                MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Validate, validateStarted);
                 if (validated && StaleLog) _lastStaleReason = "snapshot";
                 if (validated && variant.SnapshotFor(inputs, _patches) is { } hit)
                 {
@@ -116,7 +118,11 @@ public sealed class ResourceMaterializationCache
                 unreadable |= variantUnreadable;
             }
 
-            if (cached.UserDataEquals(inputs) && TryRefreshTable(key, cached, plan, inputs, residentReader, out var refreshed))
+            var refreshStarted = MaterializeSplitProfile.Start(); // [local]
+            Entry refreshed = null!;
+            var refreshedTable =cached.UserDataEquals(inputs) && TryRefreshTable(key, cached, plan, inputs, residentReader, out refreshed);
+            MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Refresh, refreshStarted);
+            if (refreshedTable)
             {
                 TableRefreshes++;
                 Interlocked.Increment(ref _totalRefreshes);
@@ -131,7 +137,11 @@ public sealed class ResourceMaterializationCache
                 for (var variant = cached; variant is not null && shifted is null; variant = variant.Next)
                 {
                     if (variant.Matches(plan, inputs))
+                    {
+                        var shiftStarted = MaterializeSplitProfile.Start(); // [local]
                         shifted = TryShift(variant, inputs, residentReader);
+                        MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Shift, shiftStarted);
+                    }
                 }
 
                 if (shifted is not null)
@@ -181,7 +191,11 @@ public sealed class ResourceMaterializationCache
                 ComputeState = inputs.ComputeState,
                 TablePhase = recorder.TablePhase,
             };
-            if (!ResourceMaterializer.Materialize(plan, recording, ref snapshot, ref specialization, out failure))
+            var walkStarted = MaterializeSplitProfile.Start(); // [local]
+            var walked = ResourceMaterializer.Materialize(plan, recording, ref snapshot, ref specialization, out failure);
+            MaterializeSplitProfile.Note(recorder.Reads.Count > MaterializeSplitProfile.BigReads ? MaterializeSplitProfile.Kind.BigWalk : MaterializeSplitProfile.Kind.Walk, walkStarted);
+            MaterializeSplitProfile.NoteReads(recorder.Reads.Count);
+            if (!walked)
             {
                 if (shifted is not null)
                     NoteRebaseVerdict(plan.Hash, shifted, null, null, null, "walk_failed");
@@ -197,7 +211,10 @@ public sealed class ResourceMaterializationCache
                 return true;
             }
 
+            var buildStarted = MaterializeSplitProfile.Start(); // [local]
+            var bigBuild = recorder.Reads.Count > MaterializeSplitProfile.BigReads;
             var built = recorder.Build(plan, inputs, snapshot, specialization);
+            MaterializeSplitProfile.Note(bigBuild ? MaterializeSplitProfile.Kind.BigBuild : MaterializeSplitProfile.Kind.Build, buildStarted);
             if (shifted is not null)
                 NoteRebaseVerdict(plan.Hash, shifted, snapshot, specialization, built, null);
             if (found)
@@ -906,6 +923,7 @@ public sealed class ResourceMaterializationCache
             }
 
             var cached = entry.Bytes.AsSpan(entry.RangeOffsets[index], length);
+            MaterializeSplitProfile.NoteValidatedBytes(length); // [local]
             if (current.SequenceEqual(cached))
                 continue;
             if (StaleLog)
@@ -1208,7 +1226,23 @@ public sealed class ResourceMaterializationCache
                 _sortOrder[index] = index;
             }
 
-            Array.Sort(_sortKeys, _sortOrder, 0, count);
+            if (RunSort != 0 && count >= RunSortMinReads && RunMergeSort(count))
+            {
+                if (RunSort == 2)
+                {
+                    Array.Sort(_sortKeys, _sortOrder, 0, count);
+                    CompareRunOrder(reads, count);
+                }
+                else
+                {
+                    _runIdxA.AsSpan(0, count).CopyTo(_sortOrder);
+                }
+            }
+            else
+            {
+                Array.Sort(_sortKeys, _sortOrder, 0, count);
+            }
+
             for (var index = 0; index < count; index++)
                 _sortScratch[index] = reads[_sortOrder[index]];
             _sortScratch.AsSpan(0, count).CopyTo(reads);
@@ -1218,6 +1252,182 @@ public sealed class ResourceMaterializationCache
                 _sortOrder = [];
                 _sortScratch = [];
             }
+
+            if (_runKeysA.Length > KeptReads)
+            {
+                _runKeysA = [];
+                _runIdxA = [];
+                _runKeysB = [];
+                _runIdxB = [];
+            }
+        }
+
+        // [local] SHARPEMU_RECORDER_RUNSORT (1 by default, =0 turns it off): a walk that recorded at least RunSortMinReads words, with
+        // at most MaxLongRuns runs of LongRun or more ascending addresses (a store table read in one pass in camera moves:
+        // ~520 k words; the introsort of those was 3.5 ms per frame of the front), is ordered by merging: the words outside
+        // the long runs are sorted, the long runs are taken as they are, and the parts are merged. Words of one address
+        // keep the order they were read in (the introsort leaves them in any order), so the entry Build makes can differ
+        // only where one walk read an address twice and the first read differs in value, clean, table, base or node.
+        // =2 orders both ways, keeps the introsort's order and counts such addresses (runsort_mismatches).
+        private static readonly int RunSort = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RECORDER_RUNSORT"), out var runSort) ? runSort : 1;
+        private const int RunSortMinReads = 65536;
+        private const int LongRun = 4096;
+        private const int MaxLongRuns = 8;
+        internal static long RunSortMismatches, RunSortChecked;
+        private ulong[] _runKeysA = [], _runKeysB = [];
+        private int[] _runIdxA = [], _runIdxB = [];
+        private readonly List<(int Start, int Length)> _segments = new();
+        private readonly List<(int Start, int Length)> _mergedSegments = new();
+
+        // The record order sorted by (address, record index) into _runIdxA; false when the reads have no long run, or
+        // too many, and the introsort should run instead. _sortKeys holds the addresses in record order.
+        private bool RunMergeSort(int count)
+        {
+            var keys = _sortKeys;
+            if (_runKeysA.Length < count)
+            {
+                var size = Math.Max(count, _runKeysA.Length * 2);
+                _runKeysA = new ulong[size];
+                _runIdxA = new int[size];
+                _runKeysB = new ulong[size];
+                _runIdxB = new int[size];
+            }
+
+            _segments.Clear();
+            var rest = 0;
+            var start = 0;
+            for (var index = 1; index <= count; index++)
+            {
+                if (index != count && keys[index] >= keys[index - 1])
+                    continue;
+                var length = index - start;
+                if (length >= LongRun)
+                {
+                    if (_segments.Count == MaxLongRuns)
+                        return false;
+                    _segments.Add((start, length));
+                }
+                else
+                {
+                    for (var position = start; position < index; position++)
+                    {
+                        _runKeysA[rest] = keys[position];
+                        _runIdxA[rest++] = position;
+                    }
+                }
+
+                start = index;
+            }
+
+            if (_segments.Count == 0)
+                return false;
+            Array.Sort(_runKeysA, _runIdxA, 0, rest);
+            for (var group = 0; group < rest;)
+            {
+                var end = group + 1;
+                while (end < rest && _runKeysA[end] == _runKeysA[group])
+                    end++;
+                if (end - group > 1)
+                    Array.Sort(_runIdxA, group, end - group);
+                group = end;
+            }
+
+            // The long runs follow the sorted rest in buffer A; record positions are already ascending inside each.
+            var offset = rest;
+            for (var run = 0; run < _segments.Count; run++)
+            {
+                var (runStart, runLength) = _segments[run];
+                Array.Copy(keys, runStart, _runKeysA, offset, runLength);
+                for (var position = 0; position < runLength; position++)
+                    _runIdxA[offset + position] = runStart + position;
+                _segments[run] = (offset, runLength);
+                offset += runLength;
+            }
+
+            if (rest != 0)
+                _segments.Insert(0, (0, rest));
+            while (_segments.Count > 1)
+            {
+                _mergedSegments.Clear();
+                for (var pair = 0; pair < _segments.Count; pair += 2)
+                {
+                    var (leftStart, leftLength) = _segments[pair];
+                    if (pair + 1 == _segments.Count)
+                    {
+                        Array.Copy(_runKeysA, leftStart, _runKeysB, leftStart, leftLength);
+                        Array.Copy(_runIdxA, leftStart, _runIdxB, leftStart, leftLength);
+                        _mergedSegments.Add((leftStart, leftLength));
+                        continue;
+                    }
+
+                    var (rightStart, rightLength) = _segments[pair + 1];
+                    MergeRuns(leftStart, leftLength, rightStart, rightLength);
+                    _mergedSegments.Add((leftStart, leftLength + rightLength));
+                }
+
+                (_runKeysA, _runKeysB) = (_runKeysB, _runKeysA);
+                (_runIdxA, _runIdxB) = (_runIdxB, _runIdxA);
+                _segments.Clear();
+                _segments.AddRange(_mergedSegments);
+            }
+
+            return true;
+        }
+
+        // Two adjacent ordered parts of buffer A into buffer B at the left part's start, by (address, record index).
+        private void MergeRuns(int leftStart, int leftLength, int rightStart, int rightLength)
+        {
+            var left = leftStart;
+            var right = rightStart;
+            var leftEnd = leftStart + leftLength;
+            var rightEnd = rightStart + rightLength;
+            var target = leftStart;
+            while (left < leftEnd && right < rightEnd)
+            {
+                var takeLeft = _runKeysA[left] < _runKeysA[right] ||
+                    (_runKeysA[left] == _runKeysA[right] && _runIdxA[left] < _runIdxA[right]);
+                var from = takeLeft ? left++ : right++;
+                _runKeysB[target] = _runKeysA[from];
+                _runIdxB[target++] = _runIdxA[from];
+            }
+
+            for (; left < leftEnd; left++, target++)
+            {
+                _runKeysB[target] = _runKeysA[left];
+                _runIdxB[target] = _runIdxA[left];
+            }
+
+            for (; right < rightEnd; right++, target++)
+            {
+                _runKeysB[target] = _runKeysA[right];
+                _runIdxB[target] = _runIdxA[right];
+            }
+        }
+
+        // SHARPEMU_RECORDER_RUNSORT=2: the first record of each address, which is what Build keeps, under both orders.
+        private void CompareRunOrder(Span<(ulong Address, uint Word, bool Clean, bool Table, int Base, int Node, ulong BaseAddress)> reads, int count)
+        {
+            var mismatches = 0L;
+            var groups = 0L;
+            for (var index = 0; index < count; index++)
+            {
+                var introsort = reads[_sortOrder[index]];
+                var merged = reads[_runIdxA[index]];
+                if (introsort.Address != merged.Address)
+                {
+                    mismatches++;
+                    continue;
+                }
+
+                if (index != 0 && reads[_sortOrder[index - 1]].Address == introsort.Address)
+                    continue;
+                groups++;
+                if (introsort != merged)
+                    mismatches++;
+            }
+
+            Interlocked.Add(ref RunSortMismatches, mismatches);
+            Interlocked.Add(ref RunSortChecked, groups);
         }
 
         public bool Failed { get; private set; }
@@ -1294,7 +1504,10 @@ public sealed class ResourceMaterializationCache
         public Entry Build(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, ResourceSnapshot snapshot,
             ResourceSpecialization specialization)
         {
+            var sortStarted = MaterializeSplitProfile.Start(); // [local]
+            var bigSort = _reads.Count > MaterializeSplitProfile.BigReads;
             SortReadsByAddress();
+            MaterializeSplitProfile.Note(bigSort ? MaterializeSplitProfile.Kind.BigSort : MaterializeSplitProfile.Kind.Sort, sortStarted);
             // Count unique words and contiguous ranges first, then fill the
             // retained arrays directly. Temporary lists previously duplicated
             // every recorded byte and range on each cache miss.
