@@ -113,6 +113,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     public ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat = false)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageLookup);
+        if (ResolveProfile.Enabled) ResolveProfile.CountFindImage(request.Role); // [local] SHARPEMU_PROFILE_RESOLVE
         var command = _scheduler.Current;
         if (command.IsInvalid)
         {

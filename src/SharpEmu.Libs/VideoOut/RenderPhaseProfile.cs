@@ -171,6 +171,9 @@ internal static class RenderPhaseProfile
         DrawPrepIndexBind,
         DrawPrepMemoryWrites,
         DrawPrepTail,
+        // [local] SHARPEMU_PROFILE_RESOLVE: the scope-cost calibration at each report (excluded from its lines).
+        ProfilerCalibration,
+        ProfilerCalibrationInner,
         Count,
     }
 
@@ -364,11 +367,26 @@ internal static class RenderPhaseProfile
     {
         private readonly Phase _previous;
         private readonly bool _active;
+        // [local] SHARPEMU_PROFILE_RESOLVE: what the scope's inclusive accounting needs.
+        private readonly Phase _phase;
+        private readonly long _started;
+        private readonly long _charges;
+        private readonly long _allocated;
 
         internal Scope(Phase previous)
         {
             _previous = previous;
             _active = true;
+        }
+
+        internal Scope(Phase previous, Phase phase)
+        {
+            _previous = previous;
+            _active = true;
+            _phase = phase;
+            _started = _lastTimestamp;
+            _charges = _chargeCount;
+            _allocated = _lastAllocated;
         }
 
         public void Dispose()
@@ -380,6 +398,11 @@ internal static class RenderPhaseProfile
 
             Charge(_previous);
             _scopeDepth--;
+            if (ResolveProfile.Enabled)
+            {
+                ResolveProfile.CloseScope(_previous, _phase, _lastTimestamp - _started, _chargeCount - _charges - 1,
+                    _lastAllocated - _allocated);
+            }
         }
 
         // Switch sequential work in this scope. Nested scopes must finish first.
@@ -405,7 +428,38 @@ internal static class RenderPhaseProfile
         var previous = Charge(phase);
         _scopeDepth++;
         _entries[(int)phase]++;
+        if (ResolveProfile.Enabled)
+        {
+            ResolveProfile.OpenScope(phase);
+            return new Scope(previous, phase);
+        }
+
         return new Scope(previous);
+    }
+
+    // [local] SHARPEMU_PROFILE_RESOLVE: Charge calls on this thread, and the cost of one measured scope (its two
+    // Charge calls and the bookkeeping) timed on real nested scopes, hot in cache: a lower bound of the in-situ cost.
+    [ThreadStatic] private static long _chargeCount;
+
+    internal static long ChargeCount => _chargeCount;
+
+    internal static double CalibrateScopeNanoseconds(int iterations)
+    {
+        if (!Enabled)
+        {
+            return double.NaN;
+        }
+
+        var started = Stopwatch.GetTimestamp();
+        using (Measure(Phase.ProfilerCalibration))
+        {
+            for (var index = 0; index < iterations; index++)
+            {
+                using var inner = Measure(Phase.ProfilerCalibrationInner);
+            }
+        }
+
+        return (Stopwatch.GetTimestamp() - started) * 1e9 / Stopwatch.Frequency / (iterations + 1);
     }
 
     // Cache calls on other threads must not enter the render-thread counters.
@@ -432,6 +486,11 @@ internal static class RenderPhaseProfile
     {
         var now = Stopwatch.GetTimestamp();
         var allocated = GC.GetAllocatedBytesForCurrentThread();
+        if (ResolveProfile.Enabled)
+        {
+            _chargeCount++;
+        }
+
         var previous = _current;
         if (_lastTimestamp != 0)
         {
@@ -459,6 +518,7 @@ internal static class RenderPhaseProfile
 
         _frames++;
         Charge(_current);
+        if (ResolveProfile.Enabled) ResolveProfile.OnFrame(); // [local]
         var now = Stopwatch.GetTimestamp();
         if (FrameTraceEnabled)
         {
@@ -534,6 +594,7 @@ internal static class RenderPhaseProfile
             string.Join(" ", allocations.Select(part => $"{part.Phase}={part.Bytes / 1024}kb")));
 
         if (FrontReport?.Invoke() is { Length: > 0 } frontReport) Console.Error.WriteLine(frontReport);
+        foreach (var resolveLine in ResolveProfile.TakeReport(seconds, frames)) Console.Error.WriteLine(resolveLine); // [local] SHARPEMU_PROFILE_RESOLVE
         if (Gpu.Scheduling.SubmitThreadStats.TakeReport(seconds, frames) is { } submitReport) Console.Error.WriteLine(submitReport); // [local]
         foreach (var vkCallLine in Gpu.Vulkan.VkCallProbe.TakeReport(seconds, frames)) Console.Error.WriteLine(vkCallLine); // [local]
         foreach (var ringLine in Gpu.Vulkan.CommandRing.TakeReport(seconds, frames)) Console.Error.WriteLine(ringLine); // [local]

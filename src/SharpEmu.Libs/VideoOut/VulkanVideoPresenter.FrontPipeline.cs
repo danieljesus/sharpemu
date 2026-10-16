@@ -1097,11 +1097,26 @@ internal static unsafe partial class VulkanVideoPresenter
             _guestBacking!.ExitBackingAliasAccess();
         }
 
+        // [local] SHARPEMU_PROFILE_RESOLVE: the draw or dispatch just executed, keyed by the pipeline it bound last.
+        private void EndResolveDraw(in ResolveProfile.DrawToken token, bool dispatch)
+        {
+            if (dispatch)
+            {
+                _pipelineEntries.TryGetValue(_profileComputePipeline, out var compute);
+                ResolveProfile.EndDraw(in token, dispatch: true, _profileComputePipeline, 0, 0, compute?.ProfileComputeHash ?? 0);
+                return;
+            }
+
+            var entry = _boundGraphicsPipeline;
+            ResolveProfile.EndDraw(in token, dispatch: false, entry?.Id ?? 0, entry?.ProfileVertexHash ?? 0, entry?.ProfilePixelHash ?? 0, 0);
+        }
+
         internal void ExecuteQueuedDraw(ulong submitId, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments,
             GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs, KeyValuePair<uint, uint>[]? drawRegisters = null)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             try
             {
                 _translation.ExecuteDraw(submitId, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs, drawRegisters);
@@ -1109,6 +1124,7 @@ internal static unsafe partial class VulkanVideoPresenter
             finally
             {
                 Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                if (ResolveProfile.Enabled) EndResolveDraw(in resolveToken, dispatch: false); // [local]
             }
         }
 
@@ -1117,6 +1133,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDispatchTranslation);
             var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             try
             {
                 _translation.ExecuteDispatch(submitId, banks, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, prepared);
@@ -1124,6 +1141,7 @@ internal static unsafe partial class VulkanVideoPresenter
             finally
             {
                 Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                if (ResolveProfile.Enabled) EndResolveDraw(in resolveToken, dispatch: true); // [local]
             }
         }
 

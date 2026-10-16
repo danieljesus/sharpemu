@@ -421,6 +421,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             if (BindingRepeatProbe.Enabled) BindingRepeatProbe.Record(program.Hash, stage); // [local]
+            if (ResolveProfile.Enabled) CountResolveBindings(info, snapshot); // [local] SHARPEMU_PROFILE_RESOLVE
             using var setupScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingSetup); // [local]
             var prepared = new PreparedStageBindings(stage, program);
             // Register ownership before preparation can fail halfway through.
@@ -491,6 +492,19 @@ internal static unsafe partial class VulkanVideoPresenter
             return prepared;
         }
 
+        // [local] SHARPEMU_PROFILE_RESOLVE: the bindings one PrepareBindings call resolves.
+        private static void CountResolveBindings(ShaderResourceInfo info, ResourceSnapshot snapshot)
+        {
+            var storage = 0;
+            foreach (var image in info.Images)
+            {
+                if (image.ResourceClass == ShaderCompiler.Resources.ImageResourceClass.Storage)
+                    storage++;
+            }
+
+            ResolveProfile.CountBindings(info.Images.Count, storage, info.Samplers.Count, info.Buffers.Count, snapshot.DeviceAddressRanges.Length);
+        }
+
         // Reject incompatible draw views before buffer writes or image transitions are recorded.
         private void ValidateDrawImageTypes(PreparedStageBindings prepared)
         {
@@ -555,6 +569,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"A storage buffer descriptor footprint overflows: buffer={index} stride={descriptor.Stride} records={descriptor.RecordCount} hash=0x{program.Hash:X16}.");
                 if (descriptor.Address == 0 || requested == 0)
                 {
+                    if (ResolveProfile.Enabled) ResolveProfile.CountNullBuffer(); // [local]
                     sources[index] = (descriptor, default);
                     continue;
                 }

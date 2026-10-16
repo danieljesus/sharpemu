@@ -22,6 +22,32 @@ public sealed class RegionLock
 
     public RegionLock(Category category = Category.MemoryTracker) => _category = category;
 
+    // [local] SHARPEMU_PROFILE_RESOLVE=1: contended waits per category, the probe thread's (the render thread) apart
+    // from the others. Only the contended path pays for it.
+    public static readonly bool WaitProbe = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_RESOLVE") == "1";
+    [ThreadStatic] private static bool t_probeThread;
+    private static readonly long[] ProbeWaits = new long[4];
+    private static readonly long[] ProbeWaitTicks = new long[4];
+
+    public static void MarkProbeThread() => t_probeThread = true;
+
+    private static void RecordProbeWait(Category category, long ticks)
+    {
+        var slot = (int)category * 2 + (t_probeThread ? 0 : 1);
+        Interlocked.Increment(ref ProbeWaits[slot]);
+        Interlocked.Add(ref ProbeWaitTicks[slot], ticks);
+    }
+
+    // (waits, ticks) per category: [category * 2] = probe thread, [category * 2 + 1] = every other thread; resets them.
+    public static void TakeProbeWaits(Span<long> waits, Span<long> ticks)
+    {
+        for (var index = 0; index < ProbeWaits.Length; index++)
+        {
+            waits[index] = Interlocked.Exchange(ref ProbeWaits[index], 0);
+            ticks[index] = Interlocked.Exchange(ref ProbeWaitTicks[index], 0);
+        }
+    }
+
     public readonly ref struct Held
     {
         private readonly RegionLock _lock;
@@ -48,7 +74,7 @@ public sealed class RegionLock
 
         if (Interlocked.CompareExchange(ref _held, 1, 0) != 0)
         {
-            var waitStarted = GpuMemoryAccessProfile.Enabled ? Stopwatch.GetTimestamp() : 0;
+            var waitStarted = GpuMemoryAccessProfile.Enabled || WaitProbe ? Stopwatch.GetTimestamp() : 0;
             do
             {
                 Thread.SpinWait(1);
@@ -56,6 +82,8 @@ public sealed class RegionLock
             while (Interlocked.CompareExchange(ref _held, 1, 0) != 0);
             if (GpuMemoryAccessProfile.Enabled)
                 GpuMemoryAccessProfile.RecordLockWait(_category, Stopwatch.GetTimestamp() - waitStarted);
+            if (WaitProbe)
+                RecordProbeWait(_category, Stopwatch.GetTimestamp() - waitStarted);
         }
 
         Volatile.Write(ref _owner, thread);
