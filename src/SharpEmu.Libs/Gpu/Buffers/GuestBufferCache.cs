@@ -339,8 +339,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         ReadMemoryOrAwaitShutdown(address, size, isWrite: false, source);
 
     // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: the synchronizing read of ranges[0] (as TrySynchronizeCpuRead) with
-    // the other ranges brought back in the same readback when their last writer is already submitted, so no batch is
-    // flushed for them. Each download is the ordinary one (window, write ticks, stale pieces left GPU-owned); the
+    // the other ranges brought back in the same readback when their last writer has already completed, so nothing is
+    // flushed or waited for them (a writer still in flight would move its wait here). Each download is the ordinary one (window, write ticks, stale pieces left GPU-owned); the
     // others are only started earlier than a later read would start them. On the GPU queue thread the relays run
     // inline and the waits block it, as the synchronous download does.
     public bool TrySynchronizeCpuReads(IReadOnlyList<(ulong Address, ulong Size)> ranges, GuestMemoryProfile.ReadbackSource source)
@@ -366,7 +366,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     var (address, size) = ranges[index];
                     if (!_tracker.MayHaveGpuDirtyPages(address, size) || !_tracker.HasGpuDirtyPages(address, size) ||
                         pendings.Exists(pending => pending.WindowBegin <= address && address + size <= pending.WindowEnd) ||
-                        (index != 0 && !WriterSubmitted(address, size)))
+                        (index != 0 && !WriterCompleted(address, size)))
                     {
                         continue;
                     }
@@ -406,13 +406,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public static long TakeBatchedSyncReads() => Interlocked.Exchange(ref _batchedSyncReads, 0);
 
-    private bool WriterSubmitted(ulong address, ulong size)
+    private bool WriterCompleted(ulong address, ulong size)
     {
-        var current = _scheduler.CurrentTick;
+        var completed = _scheduler.Timeline.CompletedTick;
         foreach (var copy in CollectReadbackWindow(address, size, out _, out _))
         {
             var written = copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size);
-            if (written == 0 || written >= current)
+            if (written == 0 || written > completed)
             {
                 return false;
             }

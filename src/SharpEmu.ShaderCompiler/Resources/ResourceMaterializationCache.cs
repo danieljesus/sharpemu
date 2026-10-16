@@ -926,7 +926,7 @@ public sealed class ResourceMaterializationCache
     // and compared like any other range. An entry whose every recorded word is unchanged is a hit: the walk it
     // replaces would have read the same words, taken the same branches and produced the cached result. Clean ranges
     // keep refusing (the walk would fail them too). In the same readback the other ranges this plan found GPU-owned
-    // before are brought back when their last writer is already submitted, so the plan's next draws validate from
+    // before are brought back when their last writer has already completed, so the plan's next draws validate from
     // resident memory; the dirty tracking still decides every later read, so a range written again stays refused.
     // =1 on; =2 also runs the full walk on each hit validated that way, uses its result and counts differences;
     // =3 synchronizes only the range being validated (no other ranges of the plan).
