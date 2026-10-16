@@ -1262,14 +1262,14 @@ public sealed class ResourceMaterializationCache
             }
         }
 
-        // [local] SHARPEMU_RECORDER_RUNSORT=1 (off by default): a walk that recorded at least RunSortMinReads words, with
+        // [local] SHARPEMU_RECORDER_RUNSORT (1 by default, =0 turns it off): a walk that recorded at least RunSortMinReads words, with
         // at most MaxLongRuns runs of LongRun or more ascending addresses (a store table read in one pass in camera moves:
         // ~520 k words; the introsort of those was 3.5 ms per frame of the front), is ordered by merging: the words outside
         // the long runs are sorted, the long runs are taken as they are, and the parts are merged. Words of one address
         // keep the order they were read in (the introsort leaves them in any order), so the entry Build makes can differ
         // only where one walk read an address twice and the first read differs in value, clean, table, base or node.
         // =2 orders both ways, keeps the introsort's order and counts such addresses (runsort_mismatches).
-        private static readonly int RunSort = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RECORDER_RUNSORT"), out var runSort) ? runSort : 0;
+        private static readonly int RunSort = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RECORDER_RUNSORT"), out var runSort) ? runSort : 1;
         private const int RunSortMinReads = 65536;
         private const int LongRun = 4096;
         private const int MaxLongRuns = 8;
