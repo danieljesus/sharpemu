@@ -64,6 +64,37 @@ internal static class ResolveProfile
     private static readonly Dictionary<ulong, KeyStat> Keys = new();
     private static readonly KeyStat OtherKeys = new();
 
+    // [local] The render thread's resource materializations by program: time, cache hits and the GPU completion
+    // waits inside them (the synchronous table reads).
+    private sealed class MaterializeStat
+    {
+        public long Calls, Ticks, Hits, Waits, WaitTicks;
+    }
+
+    private static readonly Dictionary<ulong, MaterializeStat> Materializations = new();
+
+    internal static long CompletionWaitTicks => InclusiveTicks[(int)RenderPhaseProfile.Phase.GpuCompletionWait];
+
+    internal static long CompletionWaits => InclusiveCalls[(int)RenderPhaseProfile.Phase.GpuCompletionWait];
+
+    internal static void NoteMaterialize(ulong hash, long ticks, bool hit, long waits, long waitTicks)
+    {
+        if (!t_render)
+            return;
+        if (!Materializations.TryGetValue(hash, out var stat))
+        {
+            if (Materializations.Count >= MaxKeys)
+                return;
+            Materializations[hash] = stat = new MaterializeStat();
+        }
+
+        stat.Calls++;
+        stat.Ticks += ticks;
+        stat.Hits += hit ? 1 : 0;
+        stat.Waits += waits;
+        stat.WaitTicks += waitTicks;
+    }
+
     private static double _tscHz;
     private static ulong _windowCycles;
     private static long _windowAllocated;
@@ -326,6 +357,15 @@ internal static class ResolveProfile
             yield return Inv($"[PERF][RESOLVE_TOP] frames={frames} rank={rank} kind={(stat == OtherKeys ? "other" : stat.Dispatch ? "dispatch" : "draw")} pipeline={stat.Pipeline} vertex=0x{stat.Vertex:X16} pixel=0x{stat.Pixel:X16} compute=0x{stat.Compute:X16} n={stat.Calls / f:F1} ms={Ms(stat.Ticks) / f:F3} us_per_call={Ms(stat.Ticks) * 1000.0 / calls:F2} max_us={Ms(stat.MaxTicks) * 1000.0:F1} images_per_call={stat.Images / calls:F1} buffers_per_call={stat.Buffers / calls:F1} samplers_per_call={stat.Samplers / calls:F1} prepares_per_call={stat.Prepares / calls:F2}");
         }
 
+        var materializations = Materializations.Where(static pair => pair.Value.Calls > 0).OrderByDescending(static pair => pair.Value.Ticks).Take(12).ToArray();
+        if (materializations.Length != 0)
+        {
+            line.Clear().Append(Inv($"[PERF][RESOLVE_MATERIALIZE] frames={frames}"));
+            foreach (var (hash, stat) in materializations)
+                line.Append(Inv($" 0x{hash:X16}={Ms(stat.Ticks) / f:F3}ms/n{stat.Calls / f:F1}/hit{100.0 * stat.Hits / stat.Calls:F0}%/wait{Ms(stat.WaitTicks) / f:F3}ms/nw{stat.Waits / f:F2}"));
+            yield return line.ToString();
+        }
+
         Reset();
         _windowChargeStart = RenderPhaseProfile.ChargeCount;
         StartWindow();
@@ -348,6 +388,10 @@ internal static class ResolveProfile
         }
 
         OtherKeys.Calls = OtherKeys.Ticks = OtherKeys.MaxTicks = OtherKeys.Images = OtherKeys.Buffers = OtherKeys.Samplers = OtherKeys.Prepares = 0;
+        foreach (var stat in Materializations.Values)
+        {
+            stat.Calls = stat.Ticks = stat.Hits = stat.Waits = stat.WaitTicks = 0;
+        }
         _frames = 0;
         _draws = _dispatches = _drawTicks = _dispatchTicks = 0;
         _sampled = _sampledTicks = _sampledCycles = 0;

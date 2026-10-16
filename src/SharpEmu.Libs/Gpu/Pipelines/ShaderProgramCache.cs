@@ -371,11 +371,20 @@ internal sealed class ShaderProgramCache
             var frontStarted = SharpEmu.Libs.VideoOut.FrontProfile.Active ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
             var hitsBefore = _materializations?.Hits ?? 0;
             var refreshesBefore = _materializations?.TableRefreshes ?? 0;
+            // [local] SHARPEMU_PROFILE_RESOLVE: this materialization's time and completion waits, by program.
+            var resolveStarted = SharpEmu.Libs.VideoOut.ResolveProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            var waitsBefore = resolveStarted != 0 ? SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaits : 0;
+            var waitTicksBefore = resolveStarted != 0 ? SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaitTicks : 0;
             var materialized = _materializations is not null && captureIndirectImageFailure is null
                 ? _materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
                     out var materializationFailure)
                 : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
                     captureIndirectImageFailure);
+            if (resolveStarted != 0)
+                SharpEmu.Libs.VideoOut.ResolveProfile.NoteMaterialize(source.Hash, System.Diagnostics.Stopwatch.GetTimestamp() - resolveStarted,
+                    _materializations is { } hitCache && hitCache.Hits != hitsBefore,
+                    SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaits - waitsBefore,
+                    SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaitTicks - waitTicksBefore);
             if (frontStarted != 0)
                 SharpEmu.Libs.VideoOut.FrontProfile.NoteMaterialize(
                     _materializations is { } cache && cache.Hits != hitsBefore ? 0 : _materializations is { } refreshed && refreshed.TableRefreshes != refreshesBefore ? 1 : 2,
