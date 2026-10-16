@@ -70,7 +70,7 @@ public sealed class ResourceMaterializationCache
         var refreshes = Interlocked.Exchange(ref _totalRefreshes, 0);
         var total = hits + misses;
         return FormattableString.Invariant(
-            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)}{TakeRebaseReport()}");
+            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)} block_builds={Interlocked.Exchange(ref ReadRecorder.BlockBuilds, 0)} block_fallbacks={Interlocked.Exchange(ref ReadRecorder.BlockFallbacks, 0)} block_checked={Interlocked.Exchange(ref ReadRecorder.BlockChecked, 0)} block_mismatches={Interlocked.Exchange(ref ReadRecorder.BlockMismatches, 0)}{TakeRebaseReport()}");
     }
 
     public bool Materialize(
@@ -177,6 +177,7 @@ public sealed class ResourceMaterializationCache
         Misses++;
         Interlocked.Increment(ref _totalMisses);
         var recorder = TakeRecorder();
+        recorder.AllowBlocks(); // [local] SHARPEMU_RECORDER_BLOCKS
         var missStarted = MissLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         try
         {
@@ -193,8 +194,8 @@ public sealed class ResourceMaterializationCache
             };
             var walkStarted = MaterializeSplitProfile.Start(); // [local]
             var walked = ResourceMaterializer.Materialize(plan, recording, ref snapshot, ref specialization, out failure);
-            MaterializeSplitProfile.Note(recorder.Reads.Count > MaterializeSplitProfile.BigReads ? MaterializeSplitProfile.Kind.BigWalk : MaterializeSplitProfile.Kind.Walk, walkStarted);
-            MaterializeSplitProfile.NoteReads(recorder.Reads.Count);
+            MaterializeSplitProfile.Note(recorder.RecordedWords > MaterializeSplitProfile.BigReads ? MaterializeSplitProfile.Kind.BigWalk : MaterializeSplitProfile.Kind.Walk, walkStarted);
+            MaterializeSplitProfile.NoteReads(recorder.RecordedWords);
             if (!walked)
             {
                 if (shifted is not null)
@@ -212,7 +213,7 @@ public sealed class ResourceMaterializationCache
             }
 
             var buildStarted = MaterializeSplitProfile.Start(); // [local]
-            var bigBuild = recorder.Reads.Count > MaterializeSplitProfile.BigReads;
+            var bigBuild = recorder.RecordedWords > MaterializeSplitProfile.BigReads;
             var built = recorder.Build(plan, inputs, snapshot, specialization);
             MaterializeSplitProfile.Note(bigBuild ? MaterializeSplitProfile.Kind.BigBuild : MaterializeSplitProfile.Kind.Build, buildStarted);
             if (shifted is not null)
@@ -237,7 +238,7 @@ public sealed class ResourceMaterializationCache
         finally
         {
             if (MissLog)
-                NoteMiss(plan.Hash, found, recorder.Reads.Count, System.Diagnostics.Stopwatch.GetTimestamp() - missStarted);
+                NoteMiss(plan.Hash, found, recorder.RecordedWords, System.Diagnostics.Stopwatch.GetTimestamp() - missStarted);
             ReturnRecorder(recorder);
         }
     }
@@ -1172,6 +1173,12 @@ public sealed class ResourceMaterializationCache
         public void Reset()
         {
             _reads.Clear();
+            _blocks.Clear();
+            _blockWords = 0;
+            _blockBytesUsed = 0;
+            _blocksAllowed = false;
+            if (_blockBytes.Length > KeptReads * sizeof(uint))
+                _blockBytes = [];
             if (_memo.Count != 0)
                 _memo.Clear();
             // Retain ordinary descriptor walks without keeping unusually large
@@ -1494,6 +1501,19 @@ public sealed class ResourceMaterializationCache
             if (!_residentReader!(address, destination, clean))
                 return false;
 
+            if (BlockMode != 0 && _blocksAllowed && destination.Length >= BlockMinBytes)
+            {
+                var words = destination.Length / sizeof(uint);
+                var length = words * sizeof(uint);
+                if (_blockBytes.Length < _blockBytesUsed + length)
+                    Array.Resize(ref _blockBytes, Math.Max(_blockBytesUsed + length, _blockBytes.Length * 2));
+                destination[..length].CopyTo(_blockBytes.AsSpan(_blockBytesUsed));
+                _blocks.Add((address, _blockBytesUsed, words, clean, _inTable, RuntimeValueEvaluator.CurrentReadBase, RuntimeValueEvaluator.CurrentReadNode));
+                _blockBytesUsed += length;
+                _blockWords += words;
+                return true;
+            }
+
             for (var offset = 0; offset + sizeof(uint) <= destination.Length; offset += sizeof(uint))
                 _reads.Add((address + (ulong)offset,
                     System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(destination[offset..]), clean, _inTable,
@@ -1501,7 +1521,298 @@ public sealed class ResourceMaterializationCache
             return true;
         }
 
+        // [local] SHARPEMU_RECORDER_BLOCKS (1 by default, =0 turns it off): on a miss, a resident read of BlockMinBytes or more (a store
+        // table read in 64 KB chunks: ~520 k words per scan in camera moves) is kept as one block of bytes instead of a
+        // 40-byte record per word, and Build lays each block into the entry at once: the words of a block are one
+        // ascending run with the same clean, table, base and node, so the per-word steps of Build reduce to one range
+        // decision, a fill and a copy. Blocks that overlap each other or a word read are expanded into word records
+        // first and Build runs as before. =2 builds the entry both ways, keeps the per-word one and counts the entries
+        // whose fields differ (block_mismatches).
+        private static readonly int BlockMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RECORDER_BLOCKS"), out var blockMode) ? blockMode : 1;
+        private const int BlockMinBytes = 4096;
+        internal static long BlockBuilds, BlockFallbacks, BlockMismatches, BlockChecked;
+        private readonly List<(ulong Address, int Offset, int Words, bool Clean, bool Table, int Base, int Node)> _blocks = new();
+        private byte[] _blockBytes = [];
+        private int _blockBytesUsed;
+        private int _blockWords;
+        private bool _blocksAllowed;
+
+        public void AllowBlocks() => _blocksAllowed = true;
+
+        public int RecordedWords => _reads.Count + _blockWords;
+
         public Entry Build(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, ResourceSnapshot snapshot,
+            ResourceSpecialization specialization)
+        {
+            if (_blocks.Count == 0)
+                return BuildWords(plan, inputs, snapshot, specialization);
+            var blocked = BuildBlocks(plan, inputs, snapshot, specialization);
+            if (blocked is null)
+                Interlocked.Increment(ref BlockFallbacks);
+            else
+                Interlocked.Increment(ref BlockBuilds);
+            if (blocked is not null && BlockMode != 2)
+                return blocked;
+            ExpandBlocks();
+            var words = BuildWords(plan, inputs, snapshot, specialization);
+            if (blocked is not null)
+            {
+                Interlocked.Increment(ref BlockChecked);
+                if (!SameEntry(words, blocked))
+                    Interlocked.Increment(ref BlockMismatches);
+            }
+
+            return words;
+        }
+
+        private void ExpandBlocks()
+        {
+            foreach (var (address, offset, words, clean, table, readBase, node) in _blocks)
+            {
+                for (var word = 0; word < words; word++)
+                    _reads.Add((address + (ulong)word * sizeof(uint),
+                        System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(_blockBytes.AsSpan(offset + word * sizeof(uint))),
+                        clean, table, readBase, node, 0UL));
+            }
+
+            _blocks.Clear();
+            _blockWords = 0;
+        }
+
+        private static bool SameEntry(Entry left, Entry right)
+        {
+            if (!left.RangeAddresses.AsSpan().SequenceEqual(right.RangeAddresses) || !left.RangeOffsets.AsSpan().SequenceEqual(right.RangeOffsets) ||
+                !left.RangeLengths.AsSpan().SequenceEqual(right.RangeLengths) || !left.RangeClean.AsSpan().SequenceEqual(right.RangeClean) ||
+                !left.RangeBase.AsSpan().SequenceEqual(right.RangeBase) || left.ExactUserData != right.ExactUserData ||
+                !left.WordTableOnly.AsSpan().SequenceEqual(right.WordTableOnly) || left.TableRefreshable != right.TableRefreshable ||
+                !left.Bytes.AsSpan().SequenceEqual(right.Bytes) || !left.UserData.AsSpan().SequenceEqual(right.UserData) ||
+                left.ShaderBase != right.ShaderBase || !Nullable.Equals(left.ComputeState, right.ComputeState))
+                return false;
+            if ((left.RangeReadBase is null) != (right.RangeReadBase is null) ||
+                (left.RangeReadBase is not null && !left.RangeReadBase.AsSpan().SequenceEqual(right.RangeReadBase)))
+                return false;
+            if ((left.WordPatches is null) != (right.WordPatches is null))
+                return false;
+            if (left.WordPatches is not null)
+            {
+                if (left.WordPatches.Count != right.WordPatches!.Count)
+                    return false;
+                foreach (var (word, targets) in left.WordPatches)
+                {
+                    if (!right.WordPatches.TryGetValue(word, out var other) || !ReferenceEquals(targets, other))
+                        return false;
+                }
+            }
+
+            return true;
+        }
+
+        // The entry with the blocks laid in whole; null when a block overlaps another block or a word record.
+        private Entry? BuildBlocks(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, ResourceSnapshot snapshot,
+            ResourceSpecialization specialization)
+        {
+            var sortStarted = MaterializeSplitProfile.Start();
+            var bigSort = RecordedWords > MaterializeSplitProfile.BigReads;
+            SortReadsByAddress();
+            MaterializeSplitProfile.Note(bigSort ? MaterializeSplitProfile.Kind.BigSort : MaterializeSplitProfile.Kind.Sort, sortStarted);
+            _blocks.Sort(static (left, right) => left.Address.CompareTo(right.Address));
+            var reads = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_reads);
+            ulong previousEnd = 0;
+            foreach (var block in _blocks)
+            {
+                if (block.Words == 0)
+                    continue;
+                var start = block.Address;
+                var stop = block.Address + (ulong)block.Words * sizeof(uint);
+                if (start < previousEnd)
+                    return null;
+                previousEnd = stop;
+                // The first word record at or after the block's start must lie past its end.
+                int low = 0, high = reads.Length;
+                while (low < high)
+                {
+                    var middle = (low + high) >>> 1;
+                    if (reads[middle].Address < start)
+                        low = middle + 1;
+                    else
+                        high = middle;
+                }
+
+                if (low < reads.Length && reads[low].Address < stop)
+                    return null;
+            }
+
+            // Count unique words and contiguous ranges, as BuildWords does, a block at a time.
+            var rangeCount = 0;
+            var wordCount = 0;
+            ulong end = 0;
+            var previous = ulong.MaxValue;
+            var previousBase = UserDataUseAnalysis.UnknownBase;
+            var previousBaseAddress = 0UL;
+            var exactUserData = false;
+            var readIndex = 0;
+            var blockIndex = 0;
+            while (readIndex < reads.Length || blockIndex < _blocks.Count)
+            {
+                if (blockIndex < _blocks.Count && (readIndex == reads.Length || _blocks[blockIndex].Address < reads[readIndex].Address))
+                {
+                    var block = _blocks[blockIndex++];
+                    if (block.Words == 0)
+                        continue;
+                    exactUserData |= block.Base == UserDataUseAnalysis.UnknownBase;
+                    if (wordCount == 0 || block.Address != end || block.Base != previousBase ||
+                        (SplitByBaseAddress && previousBaseAddress != 0)) rangeCount++;
+                    wordCount += block.Words;
+                    previous = block.Address + (ulong)(block.Words - 1) * sizeof(uint);
+                    previousBase = block.Base;
+                    previousBaseAddress = 0;
+                    end = block.Address + (ulong)block.Words * sizeof(uint);
+                    continue;
+                }
+
+                var read = reads[readIndex++];
+                exactUserData |= read.Base == UserDataUseAnalysis.UnknownBase;
+                if (read.Address == previous) continue;
+                if (wordCount == 0 || read.Address != end || read.Base != previousBase ||
+                    (SplitByBaseAddress && read.BaseAddress != previousBaseAddress)) rangeCount++;
+                wordCount++;
+                previous = read.Address;
+                previousBase = read.Base;
+                previousBaseAddress = read.BaseAddress;
+                end = read.Address + sizeof(uint);
+            }
+
+            var addresses = new ulong[rangeCount];
+            var offsets = new int[rangeCount];
+            var lengths = new int[rangeCount];
+            var clean = new bool[rangeCount];
+            var bases = new int[rangeCount];
+            var readBases = SplitByBaseAddress ? new ulong[rangeCount] : null;
+            var bytes = new byte[wordCount * sizeof(uint)];
+            var tableOnly = new bool[wordCount];
+            var patchableReads = plan.UserDataUse.PatchableReads;
+            Dictionary<int, UserDataUseAnalysis.PatchTarget[]>? patches = null;
+            var rangeIndex = -1;
+            var wordIndex = -1;
+            end = 0;
+            previous = ulong.MaxValue;
+            previousBase = UserDataUseAnalysis.UnknownBase;
+            previousBaseAddress = 0;
+            readIndex = 0;
+            blockIndex = 0;
+            while (readIndex < reads.Length || blockIndex < _blocks.Count)
+            {
+                if (blockIndex < _blocks.Count && (readIndex == reads.Length || _blocks[blockIndex].Address < reads[readIndex].Address))
+                {
+                    var block = _blocks[blockIndex++];
+                    if (block.Words == 0)
+                        continue;
+                    var first = wordIndex + 1;
+                    if (block.Node != RuntimeValueEvaluator.NoReadNode && patchableReads.TryGetValue(block.Node, out var blockTargets))
+                    {
+                        patches ??= new Dictionary<int, UserDataUseAnalysis.PatchTarget[]>();
+                        for (var word = 0; word < block.Words; word++)
+                            patches[first + word] = blockTargets;
+                    }
+
+                    if (rangeIndex < 0 || block.Address != end || block.Base != previousBase ||
+                        (readBases is not null && previousBaseAddress != 0))
+                    {
+                        rangeIndex++;
+                        addresses[rangeIndex] = block.Address;
+                        offsets[rangeIndex] = first * sizeof(uint);
+                        bases[rangeIndex] = block.Base;
+                        if (readBases is not null)
+                            readBases[rangeIndex] = 0;
+                    }
+
+                    previousBase = block.Base;
+                    previousBaseAddress = 0;
+                    lengths[rangeIndex] += block.Words * sizeof(uint);
+                    clean[rangeIndex] |= block.Clean;
+                    tableOnly.AsSpan(first, block.Words).Fill(block.Table);
+                    _blockBytes.AsSpan(block.Offset, block.Words * sizeof(uint)).CopyTo(bytes.AsSpan(first * sizeof(uint)));
+                    wordIndex += block.Words;
+                    previous = block.Address + (ulong)(block.Words - 1) * sizeof(uint);
+                    end = block.Address + (ulong)block.Words * sizeof(uint);
+                    continue;
+                }
+
+                var (address, wordValue, wordClean, table, readBase, node, baseAddress) = reads[readIndex++];
+                if (address == previous)
+                {
+                    clean[rangeIndex] |= wordClean;
+                    if (readBases is not null && readBases[rangeIndex] != baseAddress)
+                        readBases[rangeIndex] = ConflictingBaseAddress;
+                    tableOnly[wordIndex] &= table;
+                    if (bases[rangeIndex] != readBase)
+                        bases[rangeIndex] = UserDataUseAnalysis.UnknownBase;
+                    if (patches is not null && patches.TryGetValue(wordIndex, out var existing) &&
+                        (node == RuntimeValueEvaluator.NoReadNode || !patchableReads.TryGetValue(node, out var again) || !ReferenceEquals(again, existing)))
+                        patches.Remove(wordIndex);
+                    continue;
+                }
+
+                wordIndex++;
+                if (node != RuntimeValueEvaluator.NoReadNode && patchableReads.TryGetValue(node, out var targets))
+                    (patches ??= new Dictionary<int, UserDataUseAnalysis.PatchTarget[]>())[wordIndex] = targets;
+                if (rangeIndex < 0 || address != end || readBase != previousBase ||
+                    (readBases is not null && baseAddress != previousBaseAddress))
+                {
+                    rangeIndex++;
+                    addresses[rangeIndex] = address;
+                    offsets[rangeIndex] = wordIndex * sizeof(uint);
+                    bases[rangeIndex] = readBase;
+                    if (readBases is not null)
+                        readBases[rangeIndex] = baseAddress;
+                }
+
+                previousBase = readBase;
+                previousBaseAddress = baseAddress;
+                lengths[rangeIndex] += sizeof(uint);
+                clean[rangeIndex] |= wordClean;
+                tableOnly[wordIndex] = table;
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(wordIndex * sizeof(uint)), wordValue);
+                previous = address;
+                end = address + sizeof(uint);
+            }
+
+            return NewEntry(plan, inputs, snapshot, specialization, addresses, offsets, lengths, clean, bases, readBases, exactUserData,
+                tableOnly, patches, bytes);
+        }
+
+        private static Entry NewEntry(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, ResourceSnapshot snapshot,
+            ResourceSpecialization specialization, ulong[] addresses, int[] offsets, int[] lengths, bool[] clean, int[] bases,
+            ulong[]? readBases, bool exactUserData, bool[] tableOnly, Dictionary<int, UserDataUseAnalysis.PatchTarget[]>? patches,
+            byte[] bytes)
+        {
+            var userData = new uint[inputs.UserData.Count];
+            for (var index = 0; index < userData.Length; index++)
+                userData[index] = inputs.UserData[index];
+            return new Entry
+            {
+                Plan = plan,
+                UserData = userData,
+                ShaderBase = inputs.ShaderBase,
+                ComputeState = inputs.ComputeState,
+                RangeAddresses = addresses,
+                RangeOffsets = offsets,
+                RangeLengths = lengths,
+                RangeClean = clean,
+                RangeBase = bases,
+                RangeReadBase = readBases,
+                ExactUserData = exactUserData,
+                WordTableOnly = tableOnly,
+                WordPatches = patches is { Count: > 0 } ? patches : null,
+                TableRefreshable = snapshot.FlattenedResourceTable.Length ==
+                    plan.TableReads.Count + plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount,
+                Bytes = bytes,
+                Snapshot = snapshot,
+                Specialization = specialization,
+            };
+        }
+
+        private Entry BuildWords(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, ResourceSnapshot snapshot,
             ResourceSpecialization specialization)
         {
             var sortStarted = MaterializeSplitProfile.Start(); // [local]
@@ -1590,30 +1901,8 @@ public sealed class ResourceMaterializationCache
                 end = address + sizeof(uint);
             }
 
-            var userData = new uint[inputs.UserData.Count];
-            for (var index = 0; index < userData.Length; index++)
-                userData[index] = inputs.UserData[index];
-            return new Entry
-            {
-                Plan = plan,
-                UserData = userData,
-                ShaderBase = inputs.ShaderBase,
-                ComputeState = inputs.ComputeState,
-                RangeAddresses = addresses,
-                RangeOffsets = offsets,
-                RangeLengths = lengths,
-                RangeClean = clean,
-                RangeBase = bases,
-                RangeReadBase = readBases,
-                ExactUserData = exactUserData,
-                WordTableOnly = tableOnly,
-                WordPatches = patches is { Count: > 0 } ? patches : null,
-                TableRefreshable = snapshot.FlattenedResourceTable.Length ==
-                    plan.TableReads.Count + plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount,
-                Bytes = bytes,
-                Snapshot = snapshot,
-                Specialization = specialization,
-            };
+            return NewEntry(plan, inputs, snapshot, specialization, addresses, offsets, lengths, clean, bases, readBases, exactUserData,
+                tableOnly, patches, bytes);
         }
     }
 }
