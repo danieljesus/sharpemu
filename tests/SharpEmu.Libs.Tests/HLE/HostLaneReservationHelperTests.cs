@@ -53,6 +53,12 @@ public sealed class HostLaneReservationHelperTests
     [Fact]
     public void HelperLanesStayOffTheRenderAndGuestLanes()
     {
+        if (OperatingSystem.IsWindows() && HostLaneReservation.HelperLanesRequested && HostLaneReservation.Active &&
+            Environment.ProcessorCount >= 12)
+        {
+            Assert.True(HostLaneReservation.HelperLanesActive);
+        }
+
         if (!HostLaneReservation.HelperLanesActive)
         {
             Assert.Equal(0UL, HostLaneReservation.FrontMask);
