@@ -23,11 +23,11 @@ internal sealed class DeferredUploadWorker : IDisposable
     private static readonly int WorkerCount = Math.Clamp(
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_PROTECT_WORKERS"), out var count) ? count : 1, 1, 8);
 
-    // [local] SHARPEMU_DEFERRED_UPLOAD_WAIT_BLOCK=1 (off by default): WaitIdle spins BlockSpins rounds of
+    // [local] SHARPEMU_DEFERRED_UPLOAD_WAIT_BLOCK (on by default, =0 turns it off): WaitIdle spins BlockSpins rounds of
     // Thread.SpinWait (16, 32, ... 512 iterations, some tens of microseconds in all) without yielding, then blocks on
-    // a monitor the workers pulse after every job while a waiter is blocked (1 ms timeout as a backstop). The default
+    // a monitor the workers pulse after every job while a waiter is blocked (1 ms timeout as a backstop). =0
     // yield-spins until the target job is done (the submit thread's join, ~2 ms/frame in GTA V).
-    internal static readonly bool BlockWait = Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_UPLOAD_WAIT_BLOCK") == "1";
+    internal static readonly bool BlockWait = Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_UPLOAD_WAIT_BLOCK") != "0";
     private const int BlockSpins = 6;
 
     private readonly BlockingCollection<Job> _queue = new();

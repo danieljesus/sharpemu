@@ -10,12 +10,12 @@ namespace SharpEmu.Libs.Kernel;
 // under 1 ms. A short usleep and a yield map to Thread.Yield, which returns at once when no other thread is ready on
 // the lane, so a guest loop around them burns the lane.
 //
-// SHARPEMU_GUEST_POLL_BACKOFF=N (off by default): per guest thread, a short usleep or a yield that starts less than
+// SHARPEMU_GUEST_POLL_BACKOFF=N (16 by default, -1 turns it off): per guest thread, a short usleep or a yield that starts less than
 // SHARPEMU_GUEST_POLL_GAP_US (default 50) after the previous one returned extends a streak; any other call starts a
 // new streak of 1. From call N+1 of a streak on, the call sleeps 1 ms (Thread.Sleep(1), 1 ms timer resolution)
 // instead of yielding. N=0 sleeps on every short usleep and yield.
 //
-// SHARPEMU_USLEEP_SHORT_PUMP=0 (off by default): usleep(1..999) skips the cooperative scheduler's Pump (a scan of
+// SHARPEMU_USLEEP_SHORT_PUMP (skipped by default, =1 keeps the Pump): usleep(1..999) skips the cooperative scheduler's Pump (a scan of
 // every guest thread under the scheduler gate). The dispatcher thread still wakes expired waits every 1 ms and the
 // ready dispatcher still runs ready threads.
 //
@@ -23,11 +23,11 @@ namespace SharpEmu.Libs.Kernel;
 // [PERF][YIELDS] line per active thread every 5 s.
 internal static class GuestPolling
 {
-    internal static readonly int BackoffAfter = ReadBackoff(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_POLL_BACKOFF"));
+    internal static readonly int BackoffAfter = ReadBackoff(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_POLL_BACKOFF") ?? "16");
     internal static readonly long GapTicks =
         (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_POLL_GAP_US"), out var gap) && gap >= 0 ? gap : 50) *
         Stopwatch.Frequency / 1_000_000;
-    internal static readonly bool SkipShortUsleepPump = Environment.GetEnvironmentVariable("SHARPEMU_USLEEP_SHORT_PUMP") == "0";
+    internal static readonly bool SkipShortUsleepPump = Environment.GetEnvironmentVariable("SHARPEMU_USLEEP_SHORT_PUMP") != "1";
     internal static readonly bool Profile = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_YIELDS") == "1";
 
     internal enum Kind

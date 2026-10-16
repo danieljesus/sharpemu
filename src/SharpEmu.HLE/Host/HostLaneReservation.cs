@@ -14,12 +14,12 @@ public static unsafe class HostLaneReservation
     public static readonly ulong ReservedMask;
     public static readonly ulong GuestMask;
 
-    // [local] SHARPEMU_HOST_HELPER_LANES=1 (off by default; needs the render core above and at least 6 physical
+    // [local] SHARPEMU_HOST_HELPER_LANES (on by default, =0 turns it off; needs the render core above and at least 6 physical
     // cores): the replay thread of the record ring and the GPU front thread each get a physical core of their own
     // (both SMT lanes, AboveNormal), the two highest-class cores after the render core, last in processor order
     // first. Guest threads lose those lanes too, and the other GPU helpers (submit, priority, deferred uploads) run
     // on the guest lanes, so no host thread is left free to land on the render core's sibling lane.
-    public static readonly bool HelperLanesRequested = Environment.GetEnvironmentVariable("SHARPEMU_HOST_HELPER_LANES") == "1";
+    public static readonly bool HelperLanesRequested = Environment.GetEnvironmentVariable("SHARPEMU_HOST_HELPER_LANES") != "0";
     public static readonly ulong RingMask;
     public static readonly ulong FrontMask;
 
