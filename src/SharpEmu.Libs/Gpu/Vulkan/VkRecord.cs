@@ -53,6 +53,7 @@ internal static unsafe class VkRecord
 
     public static void CmdPipelineBarrier2(Vk vk, CommandBuffer command, DependencyInfo* info)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Barrier); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             var memoryBytes = (int)info->MemoryBarrierCount * sizeof(MemoryBarrier2);
@@ -170,6 +171,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDraw(Vk vk, CommandBuffer command, uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Four*)ring.Reserve(RingOp.Draw, sizeof(RingArgs.Four));
@@ -186,6 +188,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDrawIndexed(Vk vk, CommandBuffer command, uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Four*)ring.Reserve(RingOp.DrawIndexed, sizeof(RingArgs.Four));
@@ -203,6 +206,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDrawIndexedIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset, uint drawCount, uint stride)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Indirect*)ring.Reserve(RingOp.DrawIndexedIndirect, sizeof(RingArgs.Indirect));
@@ -219,6 +223,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDispatch(Vk vk, CommandBuffer command, uint x, uint y, uint z)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Dispatch); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Four*)ring.Reserve(RingOp.Dispatch, sizeof(RingArgs.Four));
@@ -234,6 +239,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDispatchIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Dispatch); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Indirect*)ring.Reserve(RingOp.DispatchIndirect, sizeof(RingArgs.Indirect));
@@ -452,6 +458,7 @@ internal static unsafe class VkRecord
 
     public static void CmdBeginRendering(Vk vk, CommandBuffer command, RenderingInfo* info)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteRendering(command, info); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             var colorCount = (int)info->ColorAttachmentCount;
@@ -505,6 +512,7 @@ internal static unsafe class VkRecord
 
     public static void CmdEndRendering(Vk vk, CommandBuffer command)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteEndRendering(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             ring.Reserve(RingOp.EndRendering, 0);
@@ -666,6 +674,13 @@ internal static unsafe class VkRecord
 
     public static void CmdCopyBuffer(Vk vk, CommandBuffer command, VkBuffer source, VkBuffer destination, uint count, BufferCopy* regions)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdCopyBufferCore(vk, command, source, destination, count, regions);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.CopyBuffer);
+    }
+
+    private static void CmdCopyBufferCore(Vk vk, CommandBuffer command, VkBuffer source, VkBuffer destination, uint count, BufferCopy* regions)
+    {
         var payloadSize = sizeof(RingArgs.CopyBuffer) + (int)count * sizeof(BufferCopy);
         if (Ring(command) is { } ring && Fits(payloadSize))
         {
@@ -685,6 +700,13 @@ internal static unsafe class VkRecord
 
     public static void CmdFillBuffer(Vk vk, CommandBuffer command, VkBuffer destination, ulong offset, ulong size, uint data)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdFillBufferCore(vk, command, destination, offset, size, data);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.FillBuffer);
+    }
+
+    private static void CmdFillBufferCore(Vk vk, CommandBuffer command, VkBuffer destination, ulong offset, ulong size, uint data)
+    {
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.FillBuffer*)ring.Reserve(RingOp.FillBuffer, sizeof(RingArgs.FillBuffer));
@@ -700,6 +722,13 @@ internal static unsafe class VkRecord
     }
 
     public static void CmdUpdateBuffer(Vk vk, CommandBuffer command, VkBuffer destination, ulong offset, ulong size, void* data)
+    {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdUpdateBufferCore(vk, command, destination, offset, size, data);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.FillBuffer);
+    }
+
+    private static void CmdUpdateBufferCore(Vk vk, CommandBuffer command, VkBuffer destination, ulong offset, ulong size, void* data)
     {
         if (Ring(command) is { } ring && size <= (ulong)CommandRing.MaxPayload - (ulong)sizeof(RingArgs.FillBuffer))
         {
@@ -748,6 +777,14 @@ internal static unsafe class VkRecord
     public static void CmdCopyImage(Vk vk, CommandBuffer command, Image source, ImageLayout sourceLayout, Image destination,
         ImageLayout destinationLayout, uint count, ImageCopy* regions)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdCopyImageCore(vk, command, source, sourceLayout, destination, destinationLayout, count, regions);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.CopyImage);
+    }
+
+    private static void CmdCopyImageCore(Vk vk, CommandBuffer command, Image source, ImageLayout sourceLayout, Image destination,
+        ImageLayout destinationLayout, uint count, ImageCopy* regions)
+    {
         if (!PutImageToImage(command, RingOp.CopyImage, source, sourceLayout, destination, destinationLayout, count, regions, default))
         {
             vk.CmdCopyImage(command, source, sourceLayout, destination, destinationLayout, count, regions);
@@ -757,6 +794,14 @@ internal static unsafe class VkRecord
     public static void CmdBlitImage(Vk vk, CommandBuffer command, Image source, ImageLayout sourceLayout, Image destination,
         ImageLayout destinationLayout, uint count, ImageBlit* regions, Filter filter)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdBlitImageCore(vk, command, source, sourceLayout, destination, destinationLayout, count, regions, filter);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Blit);
+    }
+
+    private static void CmdBlitImageCore(Vk vk, CommandBuffer command, Image source, ImageLayout sourceLayout, Image destination,
+        ImageLayout destinationLayout, uint count, ImageBlit* regions, Filter filter)
+    {
         if (!PutImageToImage(command, RingOp.BlitImage, source, sourceLayout, destination, destinationLayout, count, regions, filter))
         {
             vk.CmdBlitImage(command, source, sourceLayout, destination, destinationLayout, count, regions, filter);
@@ -764,6 +809,14 @@ internal static unsafe class VkRecord
     }
 
     public static void CmdResolveImage(Vk vk, CommandBuffer command, Image source, ImageLayout sourceLayout, Image destination,
+        ImageLayout destinationLayout, uint count, ImageResolve* regions)
+    {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdResolveImageCore(vk, command, source, sourceLayout, destination, destinationLayout, count, regions);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Resolve);
+    }
+
+    private static void CmdResolveImageCore(Vk vk, CommandBuffer command, Image source, ImageLayout sourceLayout, Image destination,
         ImageLayout destinationLayout, uint count, ImageResolve* regions)
     {
         if (!PutImageToImage(command, RingOp.ResolveImage, source, sourceLayout, destination, destinationLayout, count, regions, default))
@@ -801,6 +854,14 @@ internal static unsafe class VkRecord
     public static void CmdCopyBufferToImage(Vk vk, CommandBuffer command, VkBuffer buffer, Image image, ImageLayout layout, uint count,
         BufferImageCopy* regions)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdCopyBufferToImageCore(vk, command, buffer, image, layout, count, regions);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Upload);
+    }
+
+    private static void CmdCopyBufferToImageCore(Vk vk, CommandBuffer command, VkBuffer buffer, Image image, ImageLayout layout, uint count,
+        BufferImageCopy* regions)
+    {
         if (!PutBufferImage(command, RingOp.CopyBufferToImage, buffer, image, layout, count, regions))
         {
             vk.CmdCopyBufferToImage(command, buffer, image, layout, count, regions);
@@ -810,6 +871,14 @@ internal static unsafe class VkRecord
     public static void CmdCopyImageToBuffer(Vk vk, CommandBuffer command, Image image, ImageLayout layout, VkBuffer buffer, uint count,
         BufferImageCopy* regions)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdCopyImageToBufferCore(vk, command, image, layout, buffer, count, regions);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Readback);
+    }
+
+    private static void CmdCopyImageToBufferCore(Vk vk, CommandBuffer command, Image image, ImageLayout layout, VkBuffer buffer, uint count,
+        BufferImageCopy* regions)
+    {
         if (!PutBufferImage(command, RingOp.CopyImageToBuffer, buffer, image, layout, count, regions))
         {
             vk.CmdCopyImageToBuffer(command, image, layout, buffer, count, regions);
@@ -817,6 +886,14 @@ internal static unsafe class VkRecord
     }
 
     public static void CmdClearColorImage(Vk vk, CommandBuffer command, Image image, ImageLayout layout, ClearColorValue* color, uint count,
+        ImageSubresourceRange* ranges)
+    {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdClearColorImageCore(vk, command, image, layout, color, count, ranges);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Clear);
+    }
+
+    private static void CmdClearColorImageCore(Vk vk, CommandBuffer command, Image image, ImageLayout layout, ClearColorValue* color, uint count,
         ImageSubresourceRange* ranges)
     {
         var payloadSize = sizeof(RingArgs.ClearColor) + (int)count * sizeof(ImageSubresourceRange);
@@ -840,6 +917,14 @@ internal static unsafe class VkRecord
     public static void CmdClearDepthStencilImage(Vk vk, CommandBuffer command, Image image, ImageLayout layout, ClearDepthStencilValue* value,
         uint count, ImageSubresourceRange* ranges)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        CmdClearDepthStencilImageCore(vk, command, image, layout, value, count, ranges);
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Clear);
+    }
+
+    private static void CmdClearDepthStencilImageCore(Vk vk, CommandBuffer command, Image image, ImageLayout layout, ClearDepthStencilValue* value,
+        uint count, ImageSubresourceRange* ranges)
+    {
         var payloadSize = sizeof(RingArgs.ClearDepth) + (int)count * sizeof(ImageSubresourceRange);
         if (Ring(command) is { } ring && Fits(payloadSize))
         {
@@ -860,6 +945,7 @@ internal static unsafe class VkRecord
 
     public static void CmdBeginRenderPass(Vk vk, CommandBuffer command, RenderPassBeginInfo* info, SubpassContents contents)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.RenderPass); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             var payloadSize = sizeof(RingArgs.RenderPass) + (int)info->ClearValueCount * sizeof(ClearValue);
@@ -886,6 +972,7 @@ internal static unsafe class VkRecord
 
     public static void CmdEndRenderPass(Vk vk, CommandBuffer command)
     {
+        if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.RenderPass); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
             ring.Reserve(RingOp.EndRenderPass, 0);

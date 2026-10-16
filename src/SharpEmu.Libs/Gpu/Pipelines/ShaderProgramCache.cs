@@ -251,6 +251,8 @@ internal sealed class ShaderProgramCache
             return _decoded[key];
         }
 
+        if (Vulkan.VulkanCommandProfile.PassesEnabled && program.Instructions.Any(static i => i.Opcode is "ImageBvhIntersectRay" or "ImageBvh64IntersectRay")) // [local] SHARPEMU_PROFILE_GPU_PASSES: ray-tracing programs
+            Console.Error.WriteLine($"[PERF][GPU_SHADER_RT] hash=0x{source.Hash:X16} stage={source.Label} instructions={program.Instructions.Count}");
         if (Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local] programs that store through global/flat addresses
         {
             var stores = program.Instructions.Where(static i => i.Opcode.StartsWith("GlobalStore", StringComparison.Ordinal) || i.Opcode.StartsWith("FlatStore", StringComparison.Ordinal) || i.Opcode.StartsWith("GlobalAtomic", StringComparison.Ordinal) || i.Opcode.StartsWith("FlatAtomic", StringComparison.Ordinal)).Select(static i => i.Opcode).Distinct().ToArray();

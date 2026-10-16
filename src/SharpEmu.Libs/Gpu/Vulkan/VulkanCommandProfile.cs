@@ -6,9 +6,12 @@ using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Vulkan;
 
-internal sealed unsafe class VulkanCommandProfile : IDisposable
+internal sealed unsafe partial class VulkanCommandProfile : IDisposable
 {
-    internal const int QueryCapacity = 512;
+    // [local] SHARPEMU_PROFILE_GPU_PASSES=1 (VulkanCommandProfile.Passes.cs): per-command markers, transfer markers and the
+    // pass breakdown; 4096 queries per buffer so that long buffers do not fold their last draws into the tail.
+    internal static readonly bool PassesEnabled = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_PASSES") == "1";
+    internal static readonly int QueryCapacity = PassesEnabled ? 4096 : 512;
     private const int BufferCapacity = 64;
     private readonly Vk _vulkan;
     private readonly Device _device;
@@ -20,12 +23,13 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
     private long _reportStart = Stopwatch.GetTimestamp();
     private ulong _skippedMarkers;
     private ulong _unavailableBuffers;
-    internal bool PerCommandMarkers { get; set; } = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_DRAWS") == "1";
+    internal bool PerCommandMarkers { get; set; } = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_DRAWS") == "1" || PassesEnabled;
     private readonly List<(ulong Start, ulong End)> _spans = new();
+    private ulong[]? _values;
 
-    internal enum IntervalKind { Preparation, Draw, DrawIndexed, Dispatch, Tail, Overflow }
+    internal enum IntervalKind { Preparation, Draw, DrawIndexed, Dispatch, Tail, Overflow, Gap, CopyBuffer, FillBuffer, CopyImage, Blit, Resolve, Upload, Readback, Clear }
     private readonly record struct IntervalKey(IntervalKind Kind, ulong Pipeline);
-    private readonly record struct Marker(IntervalKey Key, uint First, uint Second, uint Third);
+    private readonly record struct Marker(IntervalKey Key, uint First, uint Second, uint Third, ushort Mask = 0, ulong Pass = 0);
     private sealed class IntervalTotal
     {
         public ulong Count;
@@ -74,7 +78,7 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
             {
                 SType = StructureType.QueryPoolCreateInfo,
                 QueryType = QueryType.Timestamp,
-                QueryCount = QueryCapacity,
+                QueryCount = (uint)QueryCapacity,
             };
             var result = _vulkan.CreateQueryPool(_device, &createInfo, null, out var pool);
             if (result != Result.Success)
@@ -90,7 +94,9 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
         Collect(queries);
         queries.Count = 1;
         queries.Submitted = false;
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdResetQueryPool(_vulkan, command, queries.Pool, 0, QueryCapacity); // [local]
+        if (PassesEnabled)
+            StartPassBuffer(command);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdResetQueryPool(_vulkan, command, queries.Pool, 0, (uint)QueryCapacity); // [local]
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdWriteTimestamp2(_vulkan, command, PipelineStageFlags2.TopOfPipeBit, queries.Pool, 0); // [local]
     }
 
@@ -113,7 +119,9 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
         }
 
         var index = queries.Count++;
-        queries.Markers[index] = new Marker(new IntervalKey(kind, pipeline), first, second, third);
+        queries.Markers[index] = PassesEnabled
+            ? TakePassMarker(command, new IntervalKey(kind, pipeline), first, second, third)
+            : new Marker(new IntervalKey(kind, pipeline), first, second, third);
         // Completion intervals do not isolate shader stages or eliminate overlap with later work.
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdWriteTimestamp2(_vulkan, command, PipelineStageFlags2.BottomOfPipeBit, queries.Pool, (uint)index); // [local]
     }
@@ -132,7 +140,7 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
         if (!queries.Submitted)
             return;
         queries.Submitted = false;
-        Span<ulong> values = stackalloc ulong[QueryCapacity * 2];
+        var values = _values ??= new ulong[QueryCapacity * 2];
         fixed (ulong* pointer = values)
         {
             var result = _vulkan.GetQueryPoolResults(_device, queries.Pool, 0, (uint)queries.Count,
@@ -164,6 +172,8 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
             var milliseconds = ElapsedTicks(values[(index - 1) * 2], values[index * 2], _timestampBits) * (double)_timestampPeriod / 1_000_000;
             total.Count++;
             total.Milliseconds += milliseconds;
+            if (PassesEnabled)
+                AccumulatePass(in marker, milliseconds);
             if (milliseconds >= total.MaximumMilliseconds)
             {
                 total.MaximumMilliseconds = milliseconds;
@@ -224,6 +234,8 @@ internal sealed unsafe class VulkanCommandProfile : IDisposable
             var busyMilliseconds = busy * (double)_timestampPeriod / 1_000_000;
             _write(FormattableString.Invariant(
                 $"[PERF][GPU_BUSY] window_s={windowSeconds:F1} submissions={_spans.Count} busy_ms={busyMilliseconds:F1} busy_pct={busyMilliseconds / (windowSeconds * 10):F1} longest_submission_ms={longest * (double)_timestampPeriod / 1_000_000:F2} per_draw_markers={PerCommandMarkers}"));
+            if (PassesEnabled)
+                ReportPasses(windowSeconds, busyMilliseconds, _spans.Count);
         }
 
         _spans.Clear();

@@ -511,6 +511,7 @@ internal static class RenderPhaseProfile
     /// <summary>Called once per presented frame; also drives the report.</summary>
     public static void RecordFrame()
     {
+        if (Gpu.Vulkan.VulkanCommandProfile.PassesEnabled) Gpu.Vulkan.VulkanCommandProfile.CountFrame(); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (!Enabled)
         {
             return;
