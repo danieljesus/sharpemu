@@ -29,7 +29,7 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
 
     internal enum IntervalKind { Preparation, Draw, DrawIndexed, Dispatch, Tail, Overflow, Gap, CopyBuffer, FillBuffer, CopyImage, Blit, Resolve, Upload, Readback, Clear }
     private readonly record struct IntervalKey(IntervalKind Kind, ulong Pipeline);
-    private readonly record struct Marker(IntervalKey Key, uint First, uint Second, uint Third, ushort Mask = 0, ulong Pass = 0);
+    private readonly record struct Marker(IntervalKey Key, uint First, uint Second, uint Third, ushort Mask = 0, ulong Pass = 0, int Site = 0);
     private sealed class IntervalTotal
     {
         public ulong Count;

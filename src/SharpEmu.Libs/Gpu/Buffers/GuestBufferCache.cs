@@ -498,7 +498,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         return FormattableString.Invariant(
             $"[PERF][BUFFER_OBTAIN] stream={counts[0]} stream_prefound={counts[1]} stream_failed={counts[2]} cached_prefound={counts[3]} cached_lookup={counts[4]} cached_stream_candidate={counts[5]} ") +
-            FormattableString.Invariant($"written={counts[6]} written_memo_hits={counts[7]} written_memo_verified={counts[8]} written_memo_mismatches={counts[9]} written_memo_mismatches_total={Interlocked.Read(ref _writtenMemoMismatchTotal)}");
+            FormattableString.Invariant($"written={counts[6]} written_memo_hits={counts[7]} written_memo_verified={counts[8]} written_memo_mismatches={counts[9]} written_memo_mismatches_total={Interlocked.Read(ref _writtenMemoMismatchTotal)}") +
+            FormattableString.Invariant($" cp_writes={Interlocked.Exchange(ref _cpWrites, 0)} cp_bytes={Interlocked.Exchange(ref _cpBytes, 0)} cp_consecutive={Interlocked.Exchange(ref _cpConsecutive, 0)} cp_adjacent={Interlocked.Exchange(ref _cpAdjacent, 0)} cp_same_range={Interlocked.Exchange(ref _cpSameRange, 0)} cp_same_range_any={Interlocked.Exchange(ref _cpSameRangeAny, 0)}");
     }
 
     // [local] SHARPEMU_WRITTEN_OBTAIN_MEMO (idea from a Kyty fork, todojuegos67-bot c128d6b9): a written, unformatted
@@ -2660,8 +2661,41 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _registry.CompleteRetirement(bufferIdentifier);
     }
 
+    // [local] With SHARPEMU_PROFILE_GPU_PASSES: command-processor writes into device buffers, and how many follow the
+    // previous one with nothing recorded in between (mergeable under one barrier pair), of those how many continue its
+    // range in the same buffer (one copy), and how many rewrite exactly its range (the previous copy is dead).
+    private static long _cpWrites, _cpBytes, _cpConsecutive, _cpAdjacent, _cpSameRange, _cpSameRangeAny;
+    private long _cpLastSequence = -1;
+    private GpuBuffer? _cpLastBuffer;
+    private ulong _cpLastAddress, _cpLastEnd;
+
+    private void NoteCommandWrite(GpuBuffer buffer, ulong address, ulong size, long sequenceBefore)
+    {
+        Interlocked.Increment(ref _cpWrites);
+        Interlocked.Add(ref _cpBytes, (long)size);
+        var consecutive = sequenceBefore == _cpLastSequence;
+        var sameBuffer = ReferenceEquals(buffer, _cpLastBuffer);
+        if (consecutive)
+        {
+            Interlocked.Increment(ref _cpConsecutive);
+            if (sameBuffer && address == _cpLastEnd)
+                Interlocked.Increment(ref _cpAdjacent);
+            if (sameBuffer && address == _cpLastAddress && address + size == _cpLastEnd)
+                Interlocked.Increment(ref _cpSameRange);
+        }
+
+        if (sameBuffer && address == _cpLastAddress && address + size == _cpLastEnd)
+            Interlocked.Increment(ref _cpSameRangeAny);
+        _cpLastBuffer = buffer;
+        _cpLastAddress = address;
+        _cpLastEnd = address + size;
+    }
+
     private void WriteDataBuffer(GpuBuffer buffer, ulong address, ReadOnlySpan<byte> source)
     {
+        var sequenceBefore = SharpEmu.Libs.Gpu.Vulkan.VulkanCommandProfile.t_opSequence; // [local]
+        if (SharpEmu.Libs.Gpu.Vulkan.VulkanCommandProfile.PassesEnabled)
+            NoteCommandWrite(buffer, address, (ulong)source.Length, sequenceBefore);
         GuestGpuMemoryHook.Trace(address, (ulong)source.Length, $"host-write-data submission_tick={_scheduler.CurrentTick}"); // [local]
         while (!source.IsEmpty)
         {
@@ -2671,6 +2705,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             source = source[chunk..];
             address += (ulong)chunk;
         }
+
+        _cpLastSequence = SharpEmu.Libs.Gpu.Vulkan.VulkanCommandProfile.t_opSequence; // [local]
     }
 
     private void Register(ResourceSlotIdentifier bufferIdentifier) => UpdateRegistration(bufferIdentifier, insert: true);
