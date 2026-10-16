@@ -98,17 +98,26 @@ public static class KernelRuntimeCompatExports
         TraceUsleepSpin(ctx, micros);
         if (micros == 0)
         {
+            GuestPolling.Note(GuestPolling.Kind.Usleep0); // [local]
             ctx[CpuRegister.Rax] = 0;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelUsleep");
+        if (micros >= 1000 || !GuestPolling.SkipShortUsleepPump) // [local] SHARPEMU_USLEEP_SHORT_PUMP=0
+        {
+            GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelUsleep");
+        }
 
         if (micros < 1000)
         {
+            GuestPolling.Note(GuestPolling.Kind.UsleepShort); // [local]
             // Guest worker pools use usleep(1) as a polling backoff. Do not turn
             // PS microsecond waits into Windows millisecond sleeps on hot paths.
-            if ((++_shortUsleepCount & 255) == 0)
+            if (GuestPolling.BeginPoll()) // [local] SHARPEMU_GUEST_POLL_BACKOFF
+            {
+                Thread.Sleep(1);
+            }
+            else if ((++_shortUsleepCount & 255) == 0)
             {
                 Thread.Sleep(0);
             }
@@ -116,9 +125,12 @@ public static class KernelRuntimeCompatExports
             {
                 Thread.Yield();
             }
+
+            GuestPolling.EndPoll();
         }
         else
         {
+            GuestPolling.Note(GuestPolling.Kind.UsleepLong); // [local]
             _shortUsleepCount = 0;
             // Precise sleep: rounding microseconds up to Thread.Sleep
             // milliseconds (which itself overshoots by a scheduler quantum)
@@ -2085,6 +2097,11 @@ public static class KernelRuntimeCompatExports
             WriteRemainingTime(ctx, remainAddress, 0, 0);
             ctx[CpuRegister.Rax] = 0;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        if (tvSec == 0 && tvNsec < 1_000_000)
+        {
+            GuestPolling.Note(GuestPolling.Kind.NanosleepShort); // [local]
         }
 
         GuestThreadExecution.Scheduler?.Pump(ctx, posix ? "nanosleep" : "sceKernelNanosleep");

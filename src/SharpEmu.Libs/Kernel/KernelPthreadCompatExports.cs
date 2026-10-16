@@ -288,11 +288,17 @@ public static class KernelPthreadCompatExports
     public static int PthreadYield(CpuContext ctx)
     {
         _ = ctx;
-        if (!Thread.Yield())
+        GuestPolling.Note(GuestPolling.Kind.Yield); // [local]
+        if (GuestPolling.BeginPoll()) // [local] SHARPEMU_GUEST_POLL_BACKOFF
+        {
+            Thread.Sleep(1);
+        }
+        else if (!Thread.Yield())
         {
             Thread.Sleep(0);
         }
 
+        GuestPolling.EndPoll();
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

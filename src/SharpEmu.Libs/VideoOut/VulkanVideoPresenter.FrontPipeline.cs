@@ -948,6 +948,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // The front: the slices the render thread ran before, on their own thread.
         private void FrontLoop()
         {
+            SharpEmu.HLE.Host.HostLaneReservation.ApplyToFrontThread();
             FrontProfile.BindFrontThread();
             var pendingBlockedTicks = 0L; // [local] SHARPEMU_PROFILE_FRONT: idle with every head blocked, since the last progress
             try
