@@ -45,6 +45,51 @@ internal sealed unsafe partial class VulkanCommandProfile
     [ThreadStatic] private static ushort t_mask;
     [ThreadStatic] private static ulong t_pass;
 
+    // [local] SHARPEMU_PROFILE_GPU_SITES=1 (with GPU_PASSES): which emulator code recorded the barriers, transfers and
+    // emulator shaders of an interval. One interval in SiteSampleEvery is sampled: its first such command takes a
+    // managed stack (the callers above VkRecord), and the interval's GPU time is charged to that site. Lines
+    // [PERF][GPU_SITES] per category and site, ms per frame of the sampled intervals times SiteSampleEvery.
+    internal static readonly bool SitesEnabled = PassesEnabled && Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_SITES") == "1";
+    internal const int SiteSampleEvery = 8;
+    [ThreadStatic] private static int t_site;
+    [ThreadStatic] private static bool t_siteSampled;
+    [ThreadStatic] private static int t_siteCounter;
+    private static readonly Dictionary<string, int> _siteIds = new();
+    private static readonly List<string> _siteNames = ["unsampled"];
+    private readonly Dictionary<(string Category, int Site), Sum> _sites = new();
+
+    private static void NoteSite()
+    {
+        if (!SitesEnabled || !t_siteSampled || t_site != 0)
+            return;
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var names = new List<string>(7);
+        foreach (var frame in frames)
+        {
+            if (frame.GetMethod() is not { } method)
+                continue;
+            var type = method.DeclaringType?.Name ?? "?";
+            if (names.Count == 0 && type is nameof(VkRecord) or nameof(VulkanCommandProfile))
+                continue;
+            names.Add($"{type}.{method.Name}");
+            if (names.Count == 7)
+                break;
+        }
+
+        var site = string.Join(" < ", names);
+        lock (_siteIds)
+        {
+            if (!_siteIds.TryGetValue(site, out var id))
+            {
+                id = _siteNames.Count;
+                _siteNames.Add(site);
+                _siteIds.Add(site, id);
+            }
+
+            t_site = id;
+        }
+    }
+
     private static long _passFrames;
 
     internal static void CountFrame() => Interlocked.Increment(ref _passFrames);
@@ -86,7 +131,13 @@ internal sealed unsafe partial class VulkanCommandProfile
         var mask = t_current == command.Handle ? t_mask : (ushort)0;
         if (t_current == command.Handle)
             t_mask = 0;
-        var marker = new Marker(key, first, second, third, mask, t_current == command.Handle ? t_pass : 0);
+        var marker = new Marker(key, first, second, third, mask, t_current == command.Handle ? t_pass : 0, t_site);
+        if (SitesEnabled)
+        {
+            t_site = 0;
+            t_siteSampled = ++t_siteCounter % SiteSampleEvery == 0;
+        }
+
         if (key.Kind == IntervalKind.Tail && t_current == command.Handle)
         {
             t_current = 0;
@@ -96,18 +147,31 @@ internal sealed unsafe partial class VulkanCommandProfile
         return marker;
     }
 
+    // [local] Commands recorded so far on this thread (barriers, draws, dispatches, transfers, rendering begin/end), with
+    // GPU_PASSES: two command-processor writes with the same count in between have nothing recorded between them.
+    [ThreadStatic] internal static long t_opSequence;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void NoteOp(CommandBuffer command, OpBit bit)
     {
+        t_opSequence++;
         if (t_current == command.Handle && command.Handle != 0)
+        {
             t_mask |= (ushort)bit;
+            if (SitesEnabled && (bit & (OpBit.Barrier | OpBit.Dispatch | OpBit.Draw)) != 0)
+                NoteSite();
+        }
     }
 
     // Before a transfer command: closes what the buffer recorded since the last marker.
     internal static void BeforeTransfer(CommandBuffer command)
     {
+        t_opSequence++;
         if (t_current == command.Handle && command.Handle != 0 && t_profile is { } profile)
+        {
             profile.WriteMarker(command, IntervalKind.Gap);
+            NoteSite();
+        }
     }
 
     // After a transfer command: its own interval.
@@ -122,6 +186,7 @@ internal sealed unsafe partial class VulkanCommandProfile
 
     internal static void NoteRendering(CommandBuffer command, RenderingInfo* info)
     {
+        t_opSequence++;
         if (t_current != command.Handle || command.Handle == 0 || t_profile is not { } profile)
             return;
         var bits = OpBit.BeginRendering;
@@ -158,6 +223,7 @@ internal sealed unsafe partial class VulkanCommandProfile
 
     internal static void NoteEndRendering(CommandBuffer command)
     {
+        t_opSequence++;
         if (t_current == command.Handle && command.Handle != 0)
         {
             t_mask |= (ushort)OpBit.EndRendering;
@@ -195,6 +261,18 @@ internal sealed unsafe partial class VulkanCommandProfile
     private void AccumulatePass(in Marker marker, double milliseconds)
     {
         var kind = marker.Key.Kind;
+        if (SitesEnabled && marker.Site != 0 && kind is not (IntervalKind.Draw or IntervalKind.DrawIndexed or IntervalKind.Dispatch))
+        {
+            var category = kind switch
+            {
+                IntervalKind.Preparation => "prep_" + MaskClass(marker.Mask),
+                IntervalKind.Gap => "gap_" + MaskClass(marker.Mask),
+                IntervalKind.Tail => "tail_" + MaskClass(marker.Mask),
+                _ => "op_" + kind.ToString().ToLowerInvariant(),
+            };
+            Add(_sites, (category, marker.Site), milliseconds);
+        }
+
         switch (kind)
         {
             case IntervalKind.Draw:
@@ -276,6 +354,16 @@ internal sealed unsafe partial class VulkanCommandProfile
         foreach (var (shape, sum) in _shapes.OrderByDescending(static pair => pair.Value.Milliseconds).Take(20))
             line.Append(Inv($" {shape.Width}x{shape.Height}c{shape.Colors}d{(shape.Depth ? 1 : 0)}={sum.Milliseconds / f:F3}/n{sum.Count / f:F0}"));
         _write(line.ToString());
+
+        if (SitesEnabled)
+        {
+            string[] names;
+            lock (_siteIds) names = _siteNames.ToArray();
+            var siteRank = 0;
+            foreach (var ((category, site), sum) in _sites.OrderByDescending(static pair => pair.Value.Milliseconds).Take(40))
+                _write(Inv($"[PERF][GPU_SITES] frames={frames} rank={siteRank++} category={category} est_ms={sum.Milliseconds * SiteSampleEvery / f:F3} est_n={sum.Count * SiteSampleEvery / f:F1} site={names[site]}"));
+            _sites.Clear();
+        }
 
         _categories.Clear();
         _masks.Clear();
