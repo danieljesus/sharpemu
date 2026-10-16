@@ -1521,14 +1521,14 @@ public sealed class ResourceMaterializationCache
             return true;
         }
 
-        // [local] SHARPEMU_RECORDER_BLOCKS=1 (off by default): on a miss, a resident read of BlockMinBytes or more (a store
+        // [local] SHARPEMU_RECORDER_BLOCKS (1 by default, =0 turns it off): on a miss, a resident read of BlockMinBytes or more (a store
         // table read in 64 KB chunks: ~520 k words per scan in camera moves) is kept as one block of bytes instead of a
         // 40-byte record per word, and Build lays each block into the entry at once: the words of a block are one
         // ascending run with the same clean, table, base and node, so the per-word steps of Build reduce to one range
         // decision, a fill and a copy. Blocks that overlap each other or a word read are expanded into word records
         // first and Build runs as before. =2 builds the entry both ways, keeps the per-word one and counts the entries
         // whose fields differ (block_mismatches).
-        private static readonly int BlockMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RECORDER_BLOCKS"), out var blockMode) ? blockMode : 0;
+        private static readonly int BlockMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RECORDER_BLOCKS"), out var blockMode) ? blockMode : 1;
         private const int BlockMinBytes = 4096;
         internal static long BlockBuilds, BlockFallbacks, BlockMismatches, BlockChecked;
         private readonly List<(ulong Address, int Offset, int Words, bool Clean, bool Table, int Base, int Node)> _blocks = new();
