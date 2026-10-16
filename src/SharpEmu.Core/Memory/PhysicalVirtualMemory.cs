@@ -1178,10 +1178,29 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 return true;
             }
 
-            cursor = AlignUp(cursor + effectiveAlignment, effectiveAlignment);
+            cursor = NextSearchCursorPastHostRegion(cursor, effectiveAlignment);
         }
 
         return false;
+    }
+
+    // [local] Step over a whole host allocation instead of one alignment unit: a large host reservation at the
+    // search base (the GC range when bottom-up ASLR is off) otherwise exhausts the attempt budget.
+    private ulong NextSearchCursorPastHostRegion(ulong cursor, ulong alignment)
+    {
+        var next = AlignUp(cursor + alignment, alignment);
+        if (_hostMemory.Query(cursor, out var info) && info.State != HostRegionState.Free &&
+            info.RegionSize <= ulong.MaxValue - info.BaseAddress &&
+            (_backedSpace is null || _backedSpace.OwnedBytesIn(cursor, alignment) == 0))
+        {
+            var regionEnd = AlignUp(info.BaseAddress + info.RegionSize, alignment);
+            if (regionEnd > next)
+            {
+                return regionEnd;
+            }
+        }
+
+        return next;
     }
 
     private void ReleaseUntrackedAllocation(ulong address)

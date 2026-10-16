@@ -352,6 +352,29 @@ public sealed class HostWindowSurveyTests
         Assert.False(plain.HoldsEbootGuard);
     }
 
+    // Regression: with bottom-up ASLR off the 16 GiB GC range sits at the guest search base, and stepping one
+    // alignment unit per attempt ran out of attempts inside it (sceAgcGetRegisterDefaults2 returned null).
+    [Fact]
+    public void AllocationSearchStepsOverAForeignHostReservationLargerThanItsAttemptBudget()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var views = HostViewMemory.Create();
+        var memoryHost = PlatformMemory;
+        const ulong blocked = 0x2000_0000;
+        var address = ProbeGuestAddress(views, 2 * blocked);
+        Assert.Equal(address, memoryHost.Reserve(address, blocked, HostPageProtection.NoAccess));
+        try
+        {
+            using var memory = new PhysicalVirtualMemory(memoryHost, views, BackingSize);
+            Assert.True(memory.TryAllocateAtOrAbove(address, 0x1000, executable: false, 0x1000, out var placed));
+            Assert.InRange(placed, address + blocked, address + 2 * blocked - 0x1000);
+        }
+        finally
+        {
+            Assert.True(memoryHost.Free(address));
+        }
+    }
+
     private static Func<string, string?> Env(params (string Name, string? Value)[] values) =>
         name => values.FirstOrDefault(value => value.Name == name).Value;
 }
