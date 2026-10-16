@@ -180,15 +180,15 @@ public static partial class Gen5SpirvTranslator
         // [local] Read on every compile, so the translator tests can compare both lowerings in one process.
         private readonly int _bvhUnifiedFetch = Environment.GetEnvironmentVariable("SHARPEMU_BVH_UNIFIED_FETCH") switch
         {
+            "0" => 0,
             "1" => 1,
             "2" => 2,
-            "3" => 3,
-            _ => 0,
+            _ => 3,
         };
         private readonly bool _bvhLeanSlabs = Environment.GetEnvironmentVariable("SHARPEMU_BVH_LEAN_SLABS") == "1";
         private uint _bvhSecondPointer, _bvhSecondMapped;
 
-        // [local] SHARPEMU_BVH_UNIFIED_FETCH (adapted from the local hito4 experiment unified-fetch.diff):
+        // [local] SHARPEMU_BVH_UNIFIED_FETCH (3 by default, =0 off; adapted from the local hito4 experiment unified-fetch.diff):
         // every node type resolves its first 64-byte unit through one page-table lookup and only then
         // branches on the type, so lanes of a warp on different node types no longer run one dependent
         // lookup chain per type in turn. A float32 box's second unit is the next 64 bytes of the same page

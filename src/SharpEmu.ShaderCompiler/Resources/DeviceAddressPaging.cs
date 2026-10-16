@@ -32,12 +32,12 @@ public static class DeviceAddressPaging
     public const ulong RtStackSlotBitmapBytes = RtStackWarpSlots / 8;
     public static ulong RtStackAreaBytes => RtStackAreaEnabled ? RtStackSlotBitmapBytes + (ulong)RtStackWarpSlots * RtStackSlotStride * 32 * 4 : 0;
 
-    // [local] SHARPEMU_RT_SPILL_SCALARS=1 (off by default): 0x8395 keeps up to RtSpillMaxScalars scalar registers that
+    // [local] SHARPEMU_RT_SPILL_SCALARS (on by default; =0 turns it off): 0x8395 keeps up to RtSpillMaxScalars scalar registers that
     // the BVH walk neither reads nor writes in the warp slot while it runs. Each slot then has RtSpillRows more
     // 32-dword rows after the deep stack entries: two rows for values equal in the whole subgroup (one dword each),
     // then one row per value for subgroups where they differ.
     // =2 (verify) keeps the values in registers as well and counts restores that differ ([GPU][RT_STACK]).
-    public static readonly bool RtSpillScalars = Environment.GetEnvironmentVariable("SHARPEMU_RT_SPILL_SCALARS") is "1" or "2";
+    public static readonly bool RtSpillScalars = Environment.GetEnvironmentVariable("SHARPEMU_RT_SPILL_SCALARS") != "0";
     public static readonly bool RtSpillVerify = Environment.GetEnvironmentVariable("SHARPEMU_RT_SPILL_SCALARS") == "2";
     public const uint RtSpillMaxScalars = 40;
     public const uint RtSpillUniformRows = (RtSpillMaxScalars + 31) / 32;
