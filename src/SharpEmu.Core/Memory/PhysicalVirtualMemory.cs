@@ -150,6 +150,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             _preReserveGuestAddressSpace = preReserveGuestAddressSpace;
             if (preReserveGuestAddressSpace)
             {
+                _ebootGuard = Interlocked.Exchange(ref s_pendingEbootGuard, null);
                 LogGuestWindowPreReserve("Guest window pre-reserved");
                 StartGuestWindowAudit();
             }
@@ -173,6 +174,27 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         Console.Error.WriteLine($"[LOADER][INFO] Host layout: {HostWindowSurvey.DescribeHostLayout(host)}");
         _ = HostWindowSurvey.ApplyTestHostBlockers(host,
             Environment.GetEnvironmentVariable(HostWindowSurvey.TestHostBlockerVariable), Console.Error.WriteLine);
+        if (HostWindowSurvey.ShouldGuardEbootBand(Environment.GetEnvironmentVariable))
+        {
+            s_pendingEbootGuard = HostWindowSurvey.ReserveEbootGuard(host, Console.Error.WriteLine);
+        }
+    }
+
+    private static HostAddressRange? s_pendingEbootGuard;
+    private HostAddressRange? _ebootGuard;
+
+    // Gives the eboot band back just before the main image claims it. Until then it keeps first-fit host
+    // allocations (the backing alias above all) from landing on the eboot base.
+    private void ReleaseEbootGuard()
+    {
+        if (_ebootGuard is not { } guard)
+        {
+            return;
+        }
+
+        _ebootGuard = null;
+        var freed = _hostMemory.Free(guard.Address);
+        Console.Error.WriteLine($"[LOADER][INFO] Eboot guard released: 0x{guard.Address:X}+0x{guard.Size:X} ok={freed}.");
     }
 
     private void LogGuestWindowPreReserve(string label)
@@ -288,6 +310,11 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     private bool IsSharpEmuAllocationBase(ulong allocationBase)
     {
+        if (_ebootGuard is { } guard && guard.Address == allocationBase)
+        {
+            return true;
+        }
+
         lock (_fixedAllocationGate)
         {
             if (_fixedGranuleReservationBases.Contains(allocationBase))
@@ -1799,6 +1826,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     }
 
                     _fixedGranuleReservationBases.Clear();
+                    ReleaseEbootGuard();
                     _backedSpace?.ReleaseAddressRanges();
                     if (_preReserveGuestAddressSpace && !_disposing)
                     {

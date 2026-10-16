@@ -291,6 +291,38 @@ public sealed class HostWindowSurveyTests
         }
     }
 
+    [Theory]
+    [InlineData(null, null, false)]
+    [InlineData(null, "low", true)]
+    [InlineData("0", "low", false)]
+    [InlineData("1", null, true)]
+    [InlineData("yes", "low", false)]
+    public void EbootGuardFollowsTheLowAslrToggleUnlessSetExplicitly(string? guard, string? aslr, bool expected)
+    {
+        Assert.Equal(expected, HostWindowSurvey.ShouldGuardEbootBand(Env(("SHARPEMU_EBOOT_GUARD", guard), ("SHARPEMU_CHILD_ASLR", aslr))));
+    }
+
+    [Fact]
+    public void EbootGuardCoversTheBandBetweenTheEbootBaseAndTheWindow()
+    {
+        var host = new ScriptedHostMemory();
+        var log = new List<string>();
+        Assert.Equal(new HostAddressRange(0x8_0000_0000, 0x8_0000_0000), HostWindowSurvey.ReserveEbootGuard(host, log.Add));
+        Assert.Equal((0x8_0000_0000UL, 0x8_0000_0000UL), Assert.Single(host.Reserves));
+        Assert.StartsWith("[LOADER][INFO] Eboot guard reserved", Assert.Single(log));
+    }
+
+    [Fact]
+    public void EbootGuardThatCannotTakeTheBandNamesTheOccupant()
+    {
+        var host = new ScriptedHostMemory { ReserveResult = _ => 0x9_0000_0000 }
+            .Add(0x4_7FFF_0000, 0x4_7FFF_0000, 0x4_1C00_0000, HostRegionState.Committed);
+        var log = new List<string>();
+        Assert.Null(HostWindowSurvey.ReserveEbootGuard(host, log.Add));
+        Assert.Equal(0x9_0000_0000UL, Assert.Single(host.Frees));
+        Assert.Contains("alloc=0x47FFF0000", Assert.Single(log));
+    }
+
     private static Func<string, string?> Env(params (string Name, string? Value)[] values) =>
         name => values.FirstOrDefault(value => value.Name == name).Value;
 }

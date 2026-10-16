@@ -192,6 +192,46 @@ internal static unsafe class HostWindowSurvey
         return placed;
     }
 
+    // With bottom-up ASLR off every host-chosen reservation is first-fit, so the 16.4 GiB backing alias lands
+    // right after the GC range and over the eboot base (mapeo2 m2saA). SHARPEMU_EBOOT_GUARD=1 (implied by
+    // SHARPEMU_CHILD_ASLR=low, =0 turns it off) holds [eboot base, guest window) until the main image is loaded.
+    internal const string EbootGuardVariable = "SHARPEMU_EBOOT_GUARD";
+    internal const ulong EbootBandStart = 0x8_0000_0000;
+
+    internal static bool ShouldGuardEbootBand(Func<string, string?> environment)
+    {
+        var configured = environment(EbootGuardVariable)?.Trim();
+        if (!string.IsNullOrEmpty(configured))
+        {
+            return configured == "1";
+        }
+
+        return string.Equals(environment("SHARPEMU_CHILD_ASLR")?.Trim(), "low", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static HostAddressRange? ReserveEbootGuard(IHostMemory host, Action<string> log)
+    {
+        const ulong size = GuestSpaceOwner.GuestWindowStart - EbootBandStart;
+        var got = host.Reserve(EbootBandStart, size, HostPageProtection.NoAccess);
+        if (got == EbootBandStart)
+        {
+            log($"[LOADER][INFO] Eboot guard reserved: 0x{EbootBandStart:X}+0x{size:X}.");
+            return new HostAddressRange(EbootBandStart, size);
+        }
+
+        if (got != 0)
+        {
+            host.Free(got);
+        }
+
+        var occupant = host.Query(EbootBandStart, out var info)
+            ? $"state={info.State} alloc=0x{info.AllocationBase:X} region=0x{info.BaseAddress:X}+0x{info.RegionSize:X}"
+            : "unknown";
+        log($"[LOADER][ERROR] Eboot guard: cannot reserve 0x{EbootBandStart:X}+0x{size:X} (got 0x{got:X}); " +
+            $"at the eboot base: {occupant}.");
+        return null;
+    }
+
     // Child-side view of where the host runtime put itself: the ASLR policy the process actually runs with and
     // the GC reservation that holds a managed object. Large reservations below the window end are listed because
     // first-fit placement (bottom-up ASLR off) can put them over the eboot base or the guest window.
