@@ -9,9 +9,19 @@ public static unsafe class HostLaneReservation
 {
     private const int RelationProcessorCore = 0;
     private const int ThreadPriorityHighest = 2;
+    private const int ThreadPriorityAboveNormal = 1;
 
     public static readonly ulong ReservedMask;
     public static readonly ulong GuestMask;
+
+    // [local] SHARPEMU_HOST_HELPER_LANES=1 (off by default; needs the render core above and at least 6 physical
+    // cores): the replay thread of the record ring and the GPU front thread each get a physical core of their own
+    // (both SMT lanes, AboveNormal), the two highest-class cores after the render core, last in processor order
+    // first. Guest threads lose those lanes too, and the other GPU helpers (submit, priority, deferred uploads) run
+    // on the guest lanes, so no host thread is left free to land on the render core's sibling lane.
+    public static readonly bool HelperLanesRequested = Environment.GetEnvironmentVariable("SHARPEMU_HOST_HELPER_LANES") == "1";
+    public static readonly ulong RingMask;
+    public static readonly ulong FrontMask;
 
     static HostLaneReservation()
     {
@@ -26,7 +36,8 @@ public static unsafe class HostLaneReservation
             return;
         }
 
-        var core = SelectCore();
+        var cores = ReadCores();
+        var core = SelectCore(cores);
         var all = lanes == 64 ? ulong.MaxValue : (1UL << lanes) - 1;
         if (core == 0 || (core & ~all) != 0 || (all & ~core) == 0)
         {
@@ -35,9 +46,21 @@ public static unsafe class HostLaneReservation
 
         ReservedMask = core;
         GuestMask = all & ~core;
+        if (HelperLanesRequested)
+        {
+            var (ring, front) = SelectHelperCores(cores, core);
+            if (ring != 0 && front != 0 && ((ring | front) & ~all) == 0 && (GuestMask & ~(ring | front)) != 0)
+            {
+                RingMask = ring;
+                FrontMask = front;
+                GuestMask &= ~(ring | front);
+            }
+        }
     }
 
     public static bool Active => ReservedMask != 0;
+
+    public static bool HelperLanesActive => RingMask != 0;
 
     public static void ApplyToRenderThread()
     {
@@ -60,13 +83,81 @@ public static unsafe class HostLaneReservation
         }
     }
 
-    private static ulong SelectCore()
+    // [local] SHARPEMU_HOST_HELPER_LANES=1: on the record ring's replay thread.
+    public static void ApplyToRingThread() => ApplyToHelperCore(RingMask, "Record ring replay thread");
+
+    // [local] SHARPEMU_HOST_HELPER_LANES=1: on the GPU front thread.
+    public static void ApplyToFrontThread() => ApplyToHelperCore(FrontMask, "GPU front thread");
+
+    // [local] SHARPEMU_HOST_HELPER_LANES=1: the GPU submit, priority and deferred upload threads share the guest lanes.
+    public static void ApplyToHelperThread()
     {
+        if (HelperLanesActive)
+        {
+            _ = SetThreadAffinityMask(GetCurrentThread(), (nuint)GuestMask);
+        }
+    }
+
+    private static void ApplyToHelperCore(ulong mask, string what)
+    {
+        if (mask == 0)
+        {
+            return;
+        }
+
+        var thread = GetCurrentThread();
+        _ = SetThreadAffinityMask(thread, (nuint)mask);
+        _ = SetThreadPriority(thread, ThreadPriorityAboveNormal);
+        Console.Error.WriteLine($"[LOADER][INFO] {what} reserved host lanes 0x{mask:X}; guest threads use 0x{GuestMask:X}.");
+    }
+
+    // The render core: the last core of the highest efficiency class.
+    internal static ulong SelectCore(IReadOnlyList<(ulong Mask, int EfficiencyClass)> cores)
+    {
+        ulong selected = 0;
+        var selectedClass = -1;
+        foreach (var (mask, efficiencyClass) in cores)
+        {
+            if (mask != 0 && efficiencyClass >= selectedClass)
+            {
+                selected = mask;
+                selectedClass = efficiencyClass;
+            }
+        }
+
+        return selected;
+    }
+
+    // [local] The ring and front cores: the two highest-class cores other than the render core, the later one in
+    // processor order first. None below 6 physical cores, which would leave the guest too few.
+    internal static (ulong Ring, ulong Front) SelectHelperCores(IReadOnlyList<(ulong Mask, int EfficiencyClass)> cores, ulong render)
+    {
+        var candidates = new List<(ulong Mask, int EfficiencyClass, int Order)>();
+        for (var index = 0; index < cores.Count; index++)
+        {
+            if (cores[index].Mask != 0 && cores[index].Mask != render)
+            {
+                candidates.Add((cores[index].Mask, cores[index].EfficiencyClass, index));
+            }
+        }
+
+        if (candidates.Count + 1 < 6)
+        {
+            return (0, 0);
+        }
+
+        candidates.Sort((a, b) => a.EfficiencyClass != b.EfficiencyClass ? b.EfficiencyClass.CompareTo(a.EfficiencyClass) : b.Order.CompareTo(a.Order));
+        return (candidates[0].Mask, candidates[1].Mask);
+    }
+
+    private static List<(ulong Mask, int EfficiencyClass)> ReadCores()
+    {
+        var cores = new List<(ulong Mask, int EfficiencyClass)>();
         uint length = 0;
         _ = GetLogicalProcessorInformationEx(RelationProcessorCore, null, &length);
         if (length == 0)
         {
-            return 0;
+            return cores;
         }
 
         var buffer = new byte[length];
@@ -74,11 +165,9 @@ public static unsafe class HostLaneReservation
         {
             if (!GetLogicalProcessorInformationEx(RelationProcessorCore, start, &length))
             {
-                return 0;
+                return cores;
             }
 
-            ulong selected = 0;
-            var selectedClass = -1;
             for (uint offset = 0; offset + 48 <= length;)
             {
                 var entry = start + offset;
@@ -92,17 +181,16 @@ public static unsafe class HostLaneReservation
                 var groupCount = *(ushort*)(entry + 30);
                 var mask = *(ulong*)(entry + 32);
                 var group = *(ushort*)(entry + 40);
-                if (*(int*)entry == RelationProcessorCore && groupCount == 1 && group == 0 && mask != 0 && efficiencyClass >= selectedClass)
+                if (*(int*)entry == RelationProcessorCore && groupCount == 1 && group == 0 && mask != 0)
                 {
-                    selected = mask;
-                    selectedClass = efficiencyClass;
+                    cores.Add((mask, efficiencyClass));
                 }
 
                 offset += size;
             }
-
-            return selected;
         }
+
+        return cores;
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]

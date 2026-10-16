@@ -350,6 +350,7 @@ internal sealed unsafe partial class CommandRing : IDisposable
 
     private void Run()
     {
+        SharpEmu.HLE.Host.HostLaneReservation.ApplyToRingThread();
         long consumed = 0;
         try
         {

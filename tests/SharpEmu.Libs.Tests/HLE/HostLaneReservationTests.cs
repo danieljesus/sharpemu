@@ -21,7 +21,8 @@ public sealed class HostLaneReservationTests
         var lanes = Environment.ProcessorCount;
         var all = lanes == 64 ? ulong.MaxValue : (1UL << lanes) - 1;
         Assert.Equal(0ul, HostLaneReservation.ReservedMask & HostLaneReservation.GuestMask);
-        Assert.Equal(all, HostLaneReservation.ReservedMask | HostLaneReservation.GuestMask);
+        Assert.Equal(all, HostLaneReservation.ReservedMask | HostLaneReservation.GuestMask |
+            HostLaneReservation.RingMask | HostLaneReservation.FrontMask);
         Assert.InRange(BitOperations.PopCount(HostLaneReservation.ReservedMask), 1, 2);
     }
 }
