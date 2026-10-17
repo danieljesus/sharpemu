@@ -158,10 +158,15 @@ internal sealed unsafe class LayoutComputeRunner : IDisposable
         return sampler;
     }
 
-    // The page table entries for guest pages that map onto a buffer's device address.
+    // The page table entries for guest pages that map onto a buffer's device address. With SHARPEMU_DA_ZERO_PAGE on (the
+    // default) the translated shaders read an unmapped page through a page of zeros named by one more entry after the
+    // table, as GuestBufferCache lays it out; without that entry they would read device address 0 and lose the device.
     public GpuBuffer CreatePageTable(ulong entryCount, IEnumerable<(ulong GuestAddress, GpuBuffer Buffer, ulong BufferOffset)> pages)
     {
-        var table = new ulong[entryCount];
+        var zeroPage = DeviceAddressPaging.ZeroPageMode != 0;
+        var table = new ulong[entryCount + (zeroPage ? 1UL : 0UL)];
+        if (zeroPage)
+            table[entryCount] = CreateBuffer(DeviceAddressPaging.PageSize).DeviceAddress;
         foreach (var (guestAddress, buffer, bufferOffset) in pages)
         {
             table[guestAddress >> Gen5SpirvTranslator.DeviceAddressPageBits] = buffer.DeviceAddress + bufferOffset;
