@@ -238,6 +238,12 @@ public static partial class Gen5SpirvTranslator
                 _module.AddName(_deviceWordScratch, "deviceAddressWord");
                 _interfaces.Add(_deviceEntryScratch);
                 _interfaces.Add(_deviceWordScratch);
+                if (DeviceAddressFaultMode is 2 or 3)
+                {
+                    _pendingFaultPage = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(NoPendingFault));
+                    _module.AddName(_pendingFaultPage, "pendingFaultPage");
+                    _interfaces.Add(_pendingFaultPage);
+                }
                 if (request.Memory.Entries.Any(static memory => memory.DeviceDescriptor))
                 {
                     _deviceBufferWordScratch = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
@@ -689,46 +695,136 @@ public static partial class Gen5SpirvTranslator
             });
         }
 
+        // [local measurement, not exact] SHARPEMU_DA_UNCHECKED=1: the page-table lookup of a device address without its
+        // checks: the index is clamped into the table, the entry is loaded unconditionally and an unmapped page records
+        // no fault. Only for bounding what the checked lookup costs on the GPU (an unmapped page reads zero either way
+        // while the walk is fault-free); never a default.
+        private static readonly bool DeviceAddressUnchecked = System.Environment.GetEnvironmentVariable("SHARPEMU_DA_UNCHECKED") == "1";
+
+        // [local] SHARPEMU_DA_BRANCHLESS=1 (off by default): the page-table entry of a device address is selected instead
+        // of loaded under a branch into a scratch variable. Same entry, same fault records; only the shape changes.
+        private static readonly bool DeviceAddressBranchless = System.Environment.GetEnvironmentVariable("SHARPEMU_DA_BRANCHLESS") == "1";
+
+        // [local] SHARPEMU_DA_FAULT_MODE: how a lookup of an unmapped page records it in the fault bitmap.
+        //   0 (default) an atomic OR of the page's bit right there;
+        //   1 not at all (measurement only, not exact);
+        //   2 the page index is kept in a private variable and its bit is set once, when the invocation ends; a second,
+        //     different unmapped page sets the kept page's bit then and takes its place. The host reads the bitmap only
+        //     after the command buffer completes, so it finds the same bits, and no atomic is left on the load path;
+        //   3 as 2 without the second-page step (measurement only: a second unmapped page of one invocation is lost);
+        //   4 as 0, inside a branch on GroupNonUniformAny of the fault, which the whole subgroup takes or skips together.
+        private static readonly int DeviceAddressFaultMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_DA_FAULT_MODE"), out var faultMode) ? faultMode : 0;
+        private const uint NoPendingFault = uint.MaxValue;
+        private uint _pendingFaultPage;
+
+        private void RecordFaultPage(uint pageIndex)
+        {
+            var word = ShiftRightLogical(pageIndex, UInt(5));
+            var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
+            EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
+                _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bit));
+        }
+
+        // Before the program ends: the unmapped page an invocation kept (SHARPEMU_DA_FAULT_MODE=2/3).
+        private void FlushPendingFault()
+        {
+            if (_pendingFaultPage == 0)
+                return;
+            var pending = Load(_uintType, _pendingFaultPage);
+            EmitConditional(_module.AddInstruction(SpirvOp.INotEqual, _boolType, pending, UInt(NoPendingFault)), () => RecordFaultPage(pending));
+        }
+
         private (uint Pointer, uint Valid) ResolveDeviceAddress(uint address64)
         {
+            if (DeviceAddressUnchecked)
+            {
+                var uncheckedMasked = And64(address64, ULong(DeviceAddressMask));
+                var uncheckedIndex = Narrow(_module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, uncheckedMasked, ULong(DeviceAddressPageBits)));
+                var lastIndex = _module.AddInstruction(SpirvOp.ISub, _uintType, _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _pageTable, 0), UInt(1));
+                var clamped = _module.AddInstruction(SpirvOp.ExtInst, _uintType, _glsl, 38, uncheckedIndex, lastIndex);
+                var uncheckedEntry = Load(_ulongType, _module.AddInstruction(SpirvOp.AccessChain, _storageUlongPointer, _pageTable, UInt(0), clamped));
+                return (IAdd64(uncheckedEntry, And64(uncheckedMasked, ULong(DeviceAddressPageSize - 1))),
+                    _module.AddInstruction(SpirvOp.INotEqual, _boolType, uncheckedEntry, ULong(0)));
+            }
+
             var masked = And64(address64, ULong(DeviceAddressMask));
             var pageIndex64 = _module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, masked, ULong(DeviceAddressPageBits));
             var tableLength = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _pageTable, 0);
             var inTable = ULessThan64(pageIndex64, Widen(tableLength));
             var pageIndex = Narrow(pageIndex64);
-            Store(_deviceEntryScratch, ULong(0));
-            EmitConditional(inTable, () =>
+            uint entry;
+            if (DeviceAddressBranchless)
             {
-                var entryPointer = _module.AddInstruction(SpirvOp.AccessChain, _storageUlongPointer, _pageTable, UInt(0), pageIndex);
-                Store(_deviceEntryScratch, Load(_ulongType, entryPointer));
-            });
-            var entry = Load(_ulongType, _deviceEntryScratch);
-            var mapped = _module.AddInstruction(SpirvOp.INotEqual, _boolType, entry, ULong(0));
-            EmitConditional(LogicalAnd(inTable, LogicalNot(mapped)), () =>
+                // The entry of an index outside the table is zero, as below; the load reads entry 0 instead (the
+                // table always has one) and the select drops it, so no branch or scratch round trip is emitted.
+                var tableIndex = _module.AddInstruction(SpirvOp.Select, _uintType, inTable, pageIndex, UInt(0));
+                var tableEntry = Load(_ulongType, _module.AddInstruction(SpirvOp.AccessChain, _storageUlongPointer, _pageTable, UInt(0), tableIndex));
+                entry = _module.AddInstruction(SpirvOp.Select, _ulongType, inTable, tableEntry, ULong(0));
+            }
+            else
             {
-                if (_request.TraceDeviceAddressFaults)
+                Store(_deviceEntryScratch, ULong(0));
+                EmitConditional(inTable, () =>
                 {
-                    var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);
-                    var recordStart = _module.AddInstruction(SpirvOp.ISub, _uintType, length, UInt(8));
-                    var claim = _module.AddInstruction(SpirvOp.AtomicCompareExchange, _uintType,
-                        BlockWordPointer(_faultBuffer, recordStart), UInt(1), UInt(0), UInt(0), UInt(1), UInt(0));
-                    EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, claim, UInt(0)), () =>
-                    {
-                        uint[] values = [UInt((uint)_request.Hash), UInt((uint)(_request.Hash >> 32)),
-                            UInt(_deviceAddressInstructionPc), Narrow(address64),
-                            Narrow(_module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, address64, ULong(32))),
-                            UInt((uint)_request.Stage), UInt(0)];
-                        for (var index = 0; index < values.Length; index++)
-                            Store(BlockWordPointer(_faultBuffer, IAdd(recordStart, UInt((uint)index + 1))), values[index]);
-                    });
+                    var entryPointer = _module.AddInstruction(SpirvOp.AccessChain, _storageUlongPointer, _pageTable, UInt(0), pageIndex);
+                    Store(_deviceEntryScratch, Load(_ulongType, entryPointer));
+                });
+                entry = Load(_ulongType, _deviceEntryScratch);
+            }
+
+            var mapped = _module.AddInstruction(SpirvOp.INotEqual, _boolType, entry, ULong(0));
+            if (DeviceAddressFaultMode == 1)
+                return (IAdd64(entry, And64(masked, ULong(DeviceAddressPageSize - 1))), mapped);
+            var faulted = LogicalAnd(inTable, LogicalNot(mapped));
+            if (DeviceAddressFaultMode == 4 && !_nativeLaneEmit) // a lane-local region keeps the plain branch: no subgroup operations there
+            {
+                // The lanes that hit an unmapped page record it inside a branch the whole subgroup takes or skips.
+                _module.AddCapability(SpirvCapability.GroupNonUniformVote);
+                var anyFaulted = _module.AddInstruction(SpirvOp.GroupNonUniformAny, _boolType, UInt(3), faulted);
+                EmitConditional(anyFaulted, () => EmitConditional(faulted, () => RecordFault(address64, pageIndex)));
+                return (IAdd64(entry, And64(masked, ULong(DeviceAddressPageSize - 1))), mapped);
+            }
+
+            EmitConditional(faulted, () => RecordFault(address64, pageIndex));
+            var pointerValue = IAdd64(entry, And64(masked, ULong(DeviceAddressPageSize - 1)));
+            return (pointerValue, mapped);
+        }
+
+        // The fault record of an unmapped page the lookup of address64 hit: the trace record and the page's bit.
+        private void RecordFault(uint address64, uint pageIndex)
+        {
+            if (_request.TraceDeviceAddressFaults)
+            {
+                var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);
+                var recordStart = _module.AddInstruction(SpirvOp.ISub, _uintType, length, UInt(8));
+                var claim = _module.AddInstruction(SpirvOp.AtomicCompareExchange, _uintType,
+                    BlockWordPointer(_faultBuffer, recordStart), UInt(1), UInt(0), UInt(0), UInt(1), UInt(0));
+                EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, claim, UInt(0)), () =>
+                {
+                    uint[] values = [UInt((uint)_request.Hash), UInt((uint)(_request.Hash >> 32)),
+                        UInt(_deviceAddressInstructionPc), Narrow(address64),
+                        Narrow(_module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, address64, ULong(32))),
+                        UInt((uint)_request.Stage), UInt(0)];
+                    for (var index = 0; index < values.Length; index++)
+                        Store(BlockWordPointer(_faultBuffer, IAdd(recordStart, UInt((uint)index + 1))), values[index]);
+                });
+            }
+            if (_pendingFaultPage != 0)
+            {
+                if (DeviceAddressFaultMode == 2)
+                {
+                    var pending = Load(_uintType, _pendingFaultPage);
+                    EmitConditional(LogicalAnd(
+                        _module.AddInstruction(SpirvOp.INotEqual, _boolType, pending, UInt(NoPendingFault)),
+                        _module.AddInstruction(SpirvOp.INotEqual, _boolType, pending, pageIndex)), () => RecordFaultPage(pending));
                 }
-                var word = ShiftRightLogical(pageIndex, UInt(5));
-                var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
-                EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
-                    _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bit));
-            });
-            var pointer = IAdd64(entry, And64(masked, ULong(DeviceAddressPageSize - 1)));
-            return (pointer, mapped);
+
+                Store(_pendingFaultPage, pageIndex);
+            }
+            else
+            {
+                RecordFaultPage(pageIndex);
+            }
         }
 
         private uint DeviceWordPointer(uint pointerValue) =>
