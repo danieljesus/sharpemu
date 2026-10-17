@@ -9,6 +9,7 @@ using SharpEmu.Libs.Gpu.Scheduling;
 using SharpEmu.Libs.Kernel;
 using SharpEmu.Libs.VideoOut;
 using SharpEmu.Libs.Gpu.Vulkan;
+using SharpEmu.ShaderCompiler.Resources;
 using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Buffers;
@@ -51,6 +52,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly BdaFaultProcessor _faults;
     private readonly GpuBuffer _gds;
     private readonly GpuBuffer _bdaPageTable;
+    // [local] SHARPEMU_DA_ZERO_PAGE: one page of zeros, its address in the page table's extra last entry.
+    private readonly GpuBuffer? _zeroPage;
+    private bool _zeroPageReady;
     private readonly GuestBufferRegistry<GpuBuffer> _registry = new(CachingPageSize, PageOwnerTable.AddressSpaceSize);
     private readonly SpanSet _gpuModifiedRanges = new();
     private static readonly ulong DirtyWatch = Convert.ToUInt64(Environment.GetEnvironmentVariable("SHARPEMU_DIRTY_WATCH") ?? "0", 16); // [local]
@@ -156,7 +160,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _backing = backing;
         _faults = new BdaFaultProcessor(device, scheduler, this, CachingPageBits, CachingPageCount);
         _gds = new GpuBuffer(device, scheduler, GpuBufferUsage.Stream, 0, GpuBuffer.AllFlags, GdsBufferSize);
-        _bdaPageTable = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags, BdaPageTableSize);
+        _bdaPageTable = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags,
+            BdaPageTableSize + (DeviceAddressPaging.ZeroPageMode != 0 ? sizeof(ulong) : 0UL)); // [local] SHARPEMU_DA_ZERO_PAGE
+        if (DeviceAddressPaging.ZeroPageMode != 0)
+            _zeroPage = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, CachingPageSize);
         _tracker = new GuestPageTracker(pages);
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
         _uploader = new GuestBufferUploader(device, scheduler, guest, _staging);
@@ -192,7 +199,25 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public GpuBuffer GdsBuffer => _gds;
 
-    public GpuBuffer BdaPageTableBuffer => _bdaPageTable;
+    public GpuBuffer BdaPageTableBuffer
+    {
+        get
+        {
+            // [local] SHARPEMU_DA_ZERO_PAGE: before the table's first binding, zero the page and publish its address.
+            if (_zeroPage is { } zeroPage && !_zeroPageReady)
+            {
+                _zeroPageReady = true;
+                zeroPage.Fill(0, zeroPage.Size, 0);
+                Span<ulong> address = [zeroPage.DeviceAddress];
+                WriteDataBuffer(_bdaPageTable, BdaPageTableSize, MemoryMarshal.AsBytes(address));
+            }
+
+            return _bdaPageTable;
+        }
+    }
+
+    // [local] Whether the CPU interface can read the range (counted for SHARPEMU_DA_ZERO_PAGE fault pages).
+    internal bool CanReadGuest(ulong guestAddress, ulong size) => _guestMemory.CanRead(guestAddress, size);
 
     public GpuBuffer FaultBuffer => _faults.FaultBuffer;
 
@@ -1407,6 +1432,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _stream.Dispose();
         _staging.Dispose();
         _bdaPageTable.Dispose();
+        _zeroPage?.Dispose(); // [local]
         _gds.Dispose();
         _faults.Dispose();
     }
