@@ -206,7 +206,7 @@ internal static unsafe class HostWindowSurvey
             return configured == "1";
         }
 
-        return string.Equals(environment("SHARPEMU_CHILD_ASLR")?.Trim(), "low", StringComparison.OrdinalIgnoreCase);
+        return SharpEmu.Core.Runtime.MitigatedChildAddressSpace.IsLow(environment);
     }
 
     internal static HostAddressRange? ReserveEbootGuard(IHostMemory host, Action<string> log)

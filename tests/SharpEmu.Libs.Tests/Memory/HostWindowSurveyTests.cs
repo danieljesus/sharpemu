@@ -234,11 +234,12 @@ public sealed class HostWindowSurveyTests
     }
 
     [Fact]
-    public void ChildAddressSpaceIsUnchangedWithoutTheToggle()
+    public void ChildAddressSpaceIsLowByDefaultAndUnchangedWhenHigh()
     {
-        Assert.False(MitigatedChildAddressSpace.Resolve(_ => null).IsActive);
+        Assert.True(MitigatedChildAddressSpace.Resolve(_ => null).IsActive);
+        Assert.Equal("0x1000", MitigatedChildAddressSpace.Resolve(Env(("SHARPEMU_CHILD_GC_REGION_RANGE", "0x1000"))).GcRegionRange);
         Assert.False(MitigatedChildAddressSpace.Resolve(Env(("SHARPEMU_CHILD_ASLR", "high"))).IsActive);
-        Assert.Equal(default, MitigatedChildAddressSpace.Resolve(Env(("SHARPEMU_CHILD_GC_REGION_RANGE", "0x1000"))));
+        Assert.Equal(default, MitigatedChildAddressSpace.Resolve(Env(("SHARPEMU_CHILD_ASLR", "high"), ("SHARPEMU_CHILD_GC_REGION_RANGE", "0x1000"))));
     }
 
     [Fact]
@@ -292,8 +293,9 @@ public sealed class HostWindowSurveyTests
     }
 
     [Theory]
-    [InlineData(null, null, false)]
+    [InlineData(null, null, true)]
     [InlineData(null, "low", true)]
+    [InlineData(null, "high", false)]
     [InlineData("0", "low", false)]
     [InlineData("1", null, true)]
     [InlineData("yes", "low", false)]
