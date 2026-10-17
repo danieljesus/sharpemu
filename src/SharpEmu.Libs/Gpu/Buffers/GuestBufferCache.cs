@@ -363,6 +363,89 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         !_tracker.HasGpuDirtyPages(address, size) ||
         ReadMemoryOrAwaitShutdown(address, size, isWrite: false, source);
 
+    // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: the synchronizing read of ranges[0] (as TrySynchronizeCpuRead) with
+    // the other ranges brought back in the same readback when their last writer has already completed, so nothing is
+    // flushed or waited for them (a writer still in flight would move its wait here). Each download is the ordinary one (window, write ticks, stale pieces left GPU-owned); the
+    // others are only started earlier than a later read would start them. On the GPU queue thread the relays run
+    // inline and the waits block it, as the synchronous download does.
+    public bool TrySynchronizeCpuReads(IReadOnlyList<(ulong Address, ulong Size)> ranges, GuestMemoryProfile.ReadbackSource source)
+    {
+        var (primary, primarySize) = ranges[0];
+        if (ranges.Count == 1 || (!_relay.IsGpuQueueThread && SubmissionScheduler.InDeferredOperation) || AsyncReadback is not { } readback ||
+            !GuestReadsAwaitOffQueue)
+        {
+            return TrySynchronizeCpuRead(primary, primarySize, source);
+        }
+
+        var pendings = new List<PendingDownload>(ranges.Count);
+        if (!_relay.TryRunOnGpuQueue(() =>
+            {
+                for (var index = 0; index < ranges.Count; index++)
+                {
+                    // The readback queue has 7 slots; one is left for the ordinary reads.
+                    if (pendings.Count >= 6)
+                    {
+                        break;
+                    }
+
+                    var (address, size) = ranges[index];
+                    if (!_tracker.MayHaveGpuDirtyPages(address, size) || !_tracker.HasGpuDirtyPages(address, size) ||
+                        pendings.Exists(pending => pending.WindowBegin <= address && address + size <= pending.WindowEnd) ||
+                        (index != 0 && !WriterCompleted(address, size)))
+                    {
+                        continue;
+                    }
+
+                    if (BeginReadMemoryOnGpu(address, size, isWrite: false, source, allowPending: true) is { } started)
+                    {
+                        pendings.Add(started);
+                    }
+                }
+            }))
+        {
+            return AwaitShutdown();
+        }
+
+        Interlocked.Add(ref _batchedSyncReads, pendings.Count);
+        foreach (var pending in pendings)
+        {
+            readback.Wait(pending.Ticket);
+        }
+
+        if (pendings.Count != 0 && !_relay.TryRunOnGpuQueue(() =>
+            {
+                foreach (var pending in pendings)
+                {
+                    _ = CompleteReadMemoryOnGpu(pending, retrySynchronously: false);
+                }
+            }))
+        {
+            return AwaitShutdown();
+        }
+
+        // A piece the GPU wrote again meanwhile is still GPU-owned: the ordinary path takes the primary from here.
+        return TrySynchronizeCpuRead(primary, primarySize, source);
+    }
+
+    private static long _batchedSyncReads;
+
+    public static long TakeBatchedSyncReads() => Interlocked.Exchange(ref _batchedSyncReads, 0);
+
+    private bool WriterCompleted(ulong address, ulong size)
+    {
+        var completed = _scheduler.Timeline.CompletedTick;
+        foreach (var copy in CollectReadbackWindow(address, size, out _, out _))
+        {
+            var written = copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size);
+            if (written == 0 || written > completed)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // Lock-free on the GPU queue thread; see GuestPageTracker.MayHaveGpuDirtyPages.
     public bool MayHaveGpuDirtyPages(ulong address, ulong size) => _tracker.MayHaveGpuDirtyPages(address, size);
 

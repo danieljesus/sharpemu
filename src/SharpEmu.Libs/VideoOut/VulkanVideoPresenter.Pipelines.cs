@@ -741,6 +741,24 @@ internal static unsafe partial class VulkanVideoPresenter
             return _guestMemory.TryRead(address, destination);
         }
 
+        // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: on the render thread, the GPU-owned ranges among these are
+        // synchronized as TryReadGuestWord would one word at a time, in one readback; the front never synchronizes.
+        private readonly List<(ulong Address, ulong Size)> _syncRanges = new();
+
+        public bool TrySynchronizeGuestRanges(ReadOnlySpan<(ulong Address, int Length)> ranges)
+        {
+            if (OnFrontThread || ranges.Length == 0 || !_guestMemory.CanRead(ranges[0].Address, (ulong)ranges[0].Length))
+                return false;
+            _syncRanges.Clear();
+            foreach (var (address, length) in ranges)
+            {
+                if (_syncRanges.Count == 0 || (_guestMemory.CanRead(address, (ulong)length) && _bufferCache.HasGpuDirtyBytes(address, (ulong)length)))
+                    _syncRanges.Add((address, (ulong)length));
+            }
+
+            return _bufferCache.TrySynchronizeCpuReads(_syncRanges, SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead);
+        }
+
         private const ulong CleanReadPageBytes = 0x1000;
         private const int CleanReadPageSlots = 64;
         private CleanReadPages? _cleanReadPages;

@@ -73,6 +73,9 @@ internal interface IShaderPipelineHost
     // the resource cache then re-materializes instead of trusting a stale copy.
     bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean) => false;
 
+    // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: GPU-owned ranges brought back in one readback; true when the first is.
+    bool TrySynchronizeGuestRanges(ReadOnlySpan<(ulong Address, int Length)> ranges) => false;
+
     // Creates the host module of one compiled permutation and returns its handle.
     ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId);
 

@@ -17,6 +17,7 @@ internal static class FpsLog
 
     public static void FramePresented()
     {
+        IdleProbe.NoteFrame(); // [local]
         if (!Enabled)
         {
             return;
@@ -36,6 +37,8 @@ internal static class FpsLog
         }
 
         Console.Error.WriteLine(FormattableString.Invariant($"[PERF][RENDER_MS] window_s={seconds:F1} frames={_frames}"));
+        // [local] SHARPEMU_PROFILE_FRONT=1 without the render profiler: the front loop split (cheap) per window.
+        foreach (var line in FrontProfile.TakeReport((int)_frames)) Console.Error.WriteLine(line);
         _windowStart = now;
         _frames = 0;
     }

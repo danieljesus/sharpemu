@@ -602,6 +602,8 @@ internal static class RenderPhaseProfile
         ReportImageUploads();
         BufferUploadProfile.Report();
         Console.Error.WriteLine(SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.TakeReport());
+        if (SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.SyncValidateMode != 0) // [local]
+            Console.Error.WriteLine($"[PERF][SYNC_VALIDATE] batched_downloads={Gpu.Buffers.GuestBufferCache.TakeBatchedSyncReads()}");
         if (SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TakeReport() is { } storeTables) // [local] SHARPEMU_PROFILE_STORE_TABLES
             Console.Error.WriteLine(storeTables);
         foreach (var split in SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.TakeReport()) // [local] SHARPEMU_PROFILE_MATERIALIZE_SPLIT
