@@ -601,7 +601,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     internal static readonly int WrittenObtainMemoMode =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_WRITTEN_OBTAIN_MEMO"), out var writtenMemo) ? writtenMemo : 0;
 
-    private static bool WrittenObtainMemoAllowed => !WrittenSyncCpuDirty && !EagerReadbacks && !ReadbackTickLog && DirtyWatch == 0 &&
+    private bool WrittenObtainMemoAllowed => !WrittenSyncCpuDirty && !EagerReadbacksOn && !ReadbackTickLog && DirtyWatch == 0 &&
         !EarlyWriterSubmit && !Diagnostics.TableReadCensus.Enabled && !Diagnostics.DccWriterTrace.Enabled && ReadbackMirror.Mode == 0 &&
         !GpuWriteHistory.Enabled;
 
@@ -1716,9 +1716,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private static readonly bool EagerReadbacks = Environment.GetEnvironmentVariable("SHARPEMU_EAGER_READBACK") == "1"; // [local] off by default: rt251noeager 6,26 -> 6,64 FPS
 
+    // Lets the read-ahead tests turn the feature on for one cache without the environment switch.
+    internal bool ForceEagerReadbacks { get; set; }
+
+    private bool EagerReadbacksOn => EagerReadbacks || ForceEagerReadbacks;
+
     private void NoteHotWindowWrite(ulong guestAddress, ulong size)
     {
-        if (!EagerReadbacks || _hotWindows.Count == 0 || size == 0)
+        if (!EagerReadbacksOn || _hotWindows.Count == 0 || size == 0)
         {
             return;
         }

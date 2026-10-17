@@ -162,6 +162,9 @@ public sealed class ShaderCompileRequest
     public IReadOnlyDictionary<int, uint> WrittenRangeSlotByMemoryIndex { get; }
 
     public uint WaveSize { get; init; } = 32;
+
+    // Emulates a wave64 workgroup of several waves with bridged halves; null follows SHARPEMU_WAVE64_MULTIWAVE.
+    public bool? EmulateMultiWaveWave64 { get; init; }
     public bool EnableExecGuardElision { get; init; } = true;
     public uint ScratchDwords { get; init; }
     public bool EnableGraphicsSubgroupOperations { get; init; } = true;

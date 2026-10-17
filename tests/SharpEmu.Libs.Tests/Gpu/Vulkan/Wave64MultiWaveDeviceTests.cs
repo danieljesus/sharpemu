@@ -48,6 +48,7 @@ public sealed class Wave64MultiWaveDeviceTests(HeadlessVulkanFixture fixture) : 
         var request = new ShaderCompileRequest(plan, resources, layout)
         {
             LocalSizeX = threads, ThreadCountX = dispatchedThreads ?? threads, WaveSize = 64,
+            EmulateMultiWaveWave64 = true,
         };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         Assert.NotNull(fixture.Vulkan);

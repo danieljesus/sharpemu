@@ -70,6 +70,7 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         using var harness = new CacheHarness(_vulkan);
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
+        harness.Cache.ForceEagerReadbacks = true;
         var address = harness.MapBacked(0x10000, ReadWrite);
         GpuWrite(harness, address, 0x01010101);
         QueueRead(harness, address);
@@ -93,6 +94,7 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         using var harness = new CacheHarness(_vulkan);
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
+        harness.Cache.ForceEagerReadbacks = true;
         var address = harness.MapBacked(0x10000, ReadWrite);
         GpuWrite(harness, address, 0x01010101);
         QueueRead(harness, address);

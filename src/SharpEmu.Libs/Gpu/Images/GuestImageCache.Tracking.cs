@@ -523,7 +523,7 @@ public sealed partial class GuestImageCache
         var inOnePage = (address + size - 1 & ~(TrackerLayout.PageBytes - 1)) == page;
         var ok = HeadPageWrites && inOnePage && !owner.IsCpuDirty && owner.IsWatched &&
             page >= owner.WatchBegin && page + TrackerLayout.PageBytes <= owner.WatchEnd &&
-            owner.WatchHoles.Count < CachedImage.MaxWatchHoles && !owner.WatchHoles.Exists(hole => hole.Page == page);
+            owner.WatchHoles.Count < CachedImage.MaxWatchHoles && !HasWatchHole(owner, page);
         if (HeadPageLog && _headPageLogs++ < 200)
             Console.Error.WriteLine($"[WATCH_HOLE] image=0x{owner.Description.Data.Address:X} write=0x{address:X}+{size} opened={ok} holes={owner.WatchHoles.Count} cpuDirty={owner.IsCpuDirty} watch=0x{owner.WatchBegin:X}-0x{owner.WatchEnd:X}");
         if (!ok)
@@ -534,6 +534,20 @@ public sealed partial class GuestImageCache
         owner.WatchHoles.Add((page, owner.HashGuestPage(page)));
         _pages.RemoveWatch(page, TrackerLayout.PageBytes, blockReads: false);
         return true;
+    }
+
+    // A loop, not a lambda: a closure over the page would allocate on every CPU write to an image.
+    private static bool HasWatchHole(CachedImage owner, ulong page)
+    {
+        foreach (var hole in owner.WatchHoles)
+        {
+            if (hole.Page == page)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // Watches the holes again; a hole whose content changed makes the image dirty.

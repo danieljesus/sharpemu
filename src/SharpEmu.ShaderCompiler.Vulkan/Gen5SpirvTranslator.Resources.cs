@@ -124,7 +124,7 @@ public static partial class Gen5SpirvTranslator
             var workgroupSize = (ulong)_localSizeX * _localSizeY * _localSizeZ;
             _emulateWave64 = _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 &&
                 (workgroupSize == 64 ||
-                 (Wave64MultiWave && workgroupSize % 64 == 0 && workgroupSize <= 1024 && ReadsAFixedLane(request.Program)));
+                 ((request.EmulateMultiWaveWave64 ?? Wave64MultiWave) && workgroupSize % 64 == 0 && workgroupSize <= 1024 && ReadsAFixedLane(request.Program)));
             if (_emulateWave64 && workgroupSize > 64) Console.Error.WriteLine($"[WAVE64_MULTIWAVE] hash=0x{request.Hash:X16} local={_localSizeX}x{_localSizeY}x{_localSizeZ}"); // [local]
             else if (_stage == Gen5SpirvStage.Compute && _waveLaneCount == 64 && workgroupSize > 64) Console.Error.WriteLine($"[WAVE64_SPLIT] hash=0x{request.Hash:X16} local={_localSizeX}x{_localSizeY}x{_localSizeZ}"); // [local]
             _requiredVertexOutputCount = request.RequiredVertexOutputCount;
