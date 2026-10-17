@@ -766,8 +766,10 @@ public static partial class Gen5SpirvTranslator
             var present = _module.AddInstruction(SpirvOp.INotEqual, _boolType, raw, ULong(0));
             var mapped = LogicalAnd(inTable, present);
             var faulted = LogicalAnd(inTable, LogicalNot(present));
-            if (DeviceAddressPaging.ZeroPageMode == 2)
-                EmitConditional(faulted, () => RecordFault(address64, pageIndex)); // the exact bitmap, for the comparison
+            // =2 keeps the exact bitmap for the comparison; a traced build (SHARPEMU_TRACE_GPU_MEMORY_ADDRESS) also needs the
+            // fault record with the access's pc and address, which only the lookup itself knows.
+            if (DeviceAddressPaging.ZeroPageMode == 2 || _request.TraceDeviceAddressFaults)
+                EmitConditional(faulted, () => RecordFault(address64, pageIndex));
             var min = Load(_uintType, _faultMin);
             var max = Load(_uintType, _faultMax);
             var seen = _module.AddInstruction(SpirvOp.INotEqual, _boolType, min, UInt(NoPendingFault));
