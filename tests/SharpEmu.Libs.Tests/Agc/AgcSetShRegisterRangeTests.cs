@@ -73,10 +73,27 @@ public sealed class AgcSetShRegisterRangeTests
     }
 
     [Theory]
-    [InlineData(1u)]
-    [InlineData(64u)]
-    [InlineData(0x3FFFu)]
-    public void Emit_UsesOneBulkCopyAndPreservesPacket(uint valueCount)
+    [InlineData(1u, false)]
+    [InlineData(64u, false)]
+    [InlineData(0x3FFFu, false)]
+    [InlineData(1u, true)]
+    [InlineData(64u, true)]
+    [InlineData(0x3FFFu, true)]
+    public void Emit_UsesOneBulkCopyAndPreservesPacket(uint valueCount, bool spanWrites)
+    {
+        // [local] Both write paths: one read and one write per field and dword, or per allocation and packet.
+        AgcExports.OverrideSpanWritesOnThisThread(spanWrites);
+        try
+        {
+            Emit_UsesOneBulkCopyAndPreservesPacketCore(valueCount, spanWrites);
+        }
+        finally
+        {
+            AgcExports.OverrideSpanWritesOnThisThread(null);
+        }
+    }
+
+    private static void Emit_UsesOneBulkCopyAndPreservesPacketCore(uint valueCount, bool spanWrites)
     {
         var memory = new CopyRecordingMemory();
         var sourceAddress = BaseAddress + 0x18000;
@@ -91,8 +108,8 @@ public sealed class AgcSetShRegisterRangeTests
         Assert.Equal(PacketAddress + 8, context[CpuRegister.Rax]);
         Assert.Equal(1, memory.CopyCalls);
         Assert.Equal((PacketAddress + 16, sourceAddress, (ulong)valueCount * 4), memory.LastCopy);
-        Assert.Equal(10, memory.ReadCalls);
-        Assert.Equal(6, memory.WriteCalls);
+        Assert.Equal(spanWrites ? 2 : 10, memory.ReadCalls);
+        Assert.Equal(spanWrites ? 4 : 6, memory.WriteCalls);
         Assert.Equal(0xC0001000u, ReadUInt32(memory, PacketAddress));
         Assert.Equal(0x6875000Du, ReadUInt32(memory, PacketAddress + 4));
         Assert.Equal(0xC0007600u | (valueCount << 16), ReadUInt32(memory, PacketAddress + 8));
@@ -119,10 +136,27 @@ public sealed class AgcSetShRegisterRangeTests
     }
 
     [Theory]
-    [InlineData(1u)]
-    [InlineData(64u)]
-    [InlineData(0x3FFFu)]
-    public void Emit_NullValuesReservePayloadWithoutAccessingIt(uint valueCount)
+    [InlineData(1u, false)]
+    [InlineData(64u, false)]
+    [InlineData(0x3FFFu, false)]
+    [InlineData(1u, true)]
+    [InlineData(64u, true)]
+    [InlineData(0x3FFFu, true)]
+    public void Emit_NullValuesReservePayloadWithoutAccessingIt(uint valueCount, bool spanWrites)
+    {
+        // [local] Both write paths: one read and one write per field and dword, or per allocation and packet.
+        AgcExports.OverrideSpanWritesOnThisThread(spanWrites);
+        try
+        {
+            Emit_NullValuesReservePayloadWithoutAccessingItCore(valueCount, spanWrites);
+        }
+        finally
+        {
+            AgcExports.OverrideSpanWritesOnThisThread(null);
+        }
+    }
+
+    private static void Emit_NullValuesReservePayloadWithoutAccessingItCore(uint valueCount, bool spanWrites)
     {
         var memory = new CopyRecordingMemory();
         var context = CreateEmitterContext(memory, 0, valueCount);
@@ -136,8 +170,8 @@ public sealed class AgcSetShRegisterRangeTests
 
         Assert.Equal(PacketAddress + 8, context[CpuRegister.Rax]);
         Assert.Equal(0, memory.CopyCalls);
-        Assert.Equal(10, memory.ReadCalls);
-        Assert.Equal(6, memory.WriteCalls);
+        Assert.Equal(spanWrites ? 2 : 10, memory.ReadCalls);
+        Assert.Equal(spanWrites ? 4 : 6, memory.WriteCalls);
         Assert.Equal(0xC0001000u, ReadUInt32(memory, PacketAddress));
         Assert.Equal(0x6875000Du, ReadUInt32(memory, PacketAddress + 4));
         Assert.Equal(0xC0007600u | (valueCount << 16), ReadUInt32(memory, PacketAddress + 8));

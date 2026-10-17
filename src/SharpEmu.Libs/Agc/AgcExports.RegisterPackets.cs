@@ -109,20 +109,9 @@ public static partial class AgcExports
         ulong commandAddress;
         using (AgcRegisterPacketProfile.Measure(AgcRegisterPacketProfile.Phase.PacketSetup))
         {
-            // [local] With span writes the marker and the packet header take one allocation and one write.
-            if (SpanWrites)
-            {
-                if (!TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords + 2, out var markerAddress) ||
-                    !TryWriteCommandDwords(ctx, markerAddress, Pm4(2, ItNop, RZero), CbSetShRegisterRangeMarker,
-                        Pm4(packetDwords, ItSetShReg, 0), offset))
-                {
-                    AgcRegisterPacketProfile.RecordResult(false);
-                    return ReturnPointer(ctx, 0);
-                }
-
-                commandAddress = markerAddress + 8;
-            }
-            else if (!TryEmitCommandDwords(ctx, commandBufferAddress, out _, Pm4(2, ItNop, RZero), CbSetShRegisterRangeMarker) ||
+            // [local] Marker and packet keep separate allocations with span writes too, as upstream 2838b258 does:
+            // a full buffer then fails, or moves to the callback's buffer, exactly where the per-dword path does.
+            if (!TryEmitCommandDwords(ctx, commandBufferAddress, out _, Pm4(2, ItNop, RZero), CbSetShRegisterRangeMarker) ||
                 !TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out commandAddress) ||
                 !TryWriteCommandDwords(ctx, commandAddress, Pm4(packetDwords, ItSetShReg, 0), offset))
             {
