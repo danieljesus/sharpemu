@@ -171,6 +171,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDraw(Vk vk, CommandBuffer command, uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -188,6 +189,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDrawIndexed(Vk vk, CommandBuffer command, uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -206,6 +208,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDrawIndexedIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset, uint drawCount, uint stride)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -223,6 +226,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDispatch(Vk vk, CommandBuffer command, uint x, uint y, uint z)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Dispatch); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -239,6 +243,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDispatchIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Dispatch); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {

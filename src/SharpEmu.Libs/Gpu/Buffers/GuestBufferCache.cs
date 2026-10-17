@@ -2783,12 +2783,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _cpLastEnd = address + size;
     }
 
+    private static readonly bool SyncvalSelfTest = Environment.GetEnvironmentVariable("SHARPEMU_SYNCVAL_SELFTEST") == "1"; // [local]
+    private int _syncvalSelfTests;
+
     private void WriteDataBuffer(GpuBuffer buffer, ulong address, ReadOnlySpan<byte> source)
     {
         var sequenceBefore = SharpEmu.Libs.Gpu.Vulkan.VulkanCommandProfile.t_opSequence; // [local]
         if (SharpEmu.Libs.Gpu.Vulkan.VulkanCommandProfile.PassesEnabled)
             NoteCommandWrite(buffer, address, (ulong)source.Length, sequenceBefore);
         GuestGpuMemoryHook.Trace(address, (ulong)source.Length, $"host-write-data submission_tick={_scheduler.CurrentTick}"); // [local]
+        if (SyncvalSelfTest && _syncvalSelfTests++ < 3) // [local] SHARPEMU_SYNCVAL_SELFTEST
+            buffer.RecordSyncvalSelfTest(_scheduler.Current);
         while (!source.IsEmpty)
         {
             var chunk = (int)Math.Min((ulong)source.Length, _staging.Size);

@@ -18,6 +18,9 @@ internal static class ScopeBarrierTracker
 
     private static volatile bool _unorderedWrites = true;
     [ThreadStatic] private static int t_selfOrdered;
+    // [local] Set around the guest's own draws and dispatches, whose writes the stage path already notes.
+    [ThreadStatic] internal static bool t_guestStage;
+    private static long _emulatorCommands;
     private static long _scopes, _kept, _prunable, _forcedEnds, _writeNotes, _transferNotes, _fullBarriers;
     private static long _report = System.Diagnostics.Stopwatch.GetTimestamp();
 
@@ -35,6 +38,16 @@ internal static class ScopeBarrierTracker
             return;
         _unorderedWrites = true;
         _transferNotes++;
+    }
+
+    // Every draw and dispatch VkRecord records: one the emulator records for itself (detiling, blits to
+    // depth, fault processing, presentation) counts as an unordered write unless it records its own barrier.
+    internal static void NoteCommand()
+    {
+        if (t_guestStage || t_selfOrdered != 0)
+            return;
+        _unorderedWrites = true;
+        _emulatorCommands++;
     }
 
     internal static void BeginSelfOrdered() => t_selfOrdered++;
@@ -67,7 +80,7 @@ internal static class ScopeBarrierTracker
         if (System.Diagnostics.Stopwatch.GetElapsedTime(_report).TotalSeconds < 5)
             return;
         _report = System.Diagnostics.Stopwatch.GetTimestamp();
-        Console.Error.WriteLine($"[PERF][SCOPE_BARRIER] mode={Mode} scopes={_scopes} kept={_kept} prunable={_prunable} forced_ends={_forcedEnds} write_notes={_writeNotes} transfer_notes={_transferNotes} full_barriers={_fullBarriers}");
-        _scopes = _kept = _prunable = _forcedEnds = _writeNotes = _transferNotes = _fullBarriers = 0;
+        Console.Error.WriteLine($"[PERF][SCOPE_BARRIER] mode={Mode} scopes={_scopes} kept={_kept} prunable={_prunable} forced_ends={_forcedEnds} write_notes={_writeNotes} transfer_notes={_transferNotes} full_barriers={_fullBarriers} emulator_commands={_emulatorCommands}");
+        _scopes = _kept = _prunable = _forcedEnds = _writeNotes = _transferNotes = _fullBarriers = _emulatorCommands = 0;
     }
 }

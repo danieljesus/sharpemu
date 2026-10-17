@@ -389,6 +389,16 @@ public unsafe class GpuBuffer : IDisposable
             0, null, 1, &after, 0, null);
     }
 
+    // [local] SHARPEMU_SYNCVAL_SELFTEST=1: two fills of the same dword with no barrier between them, a write-after-write
+    // hazard the synchronization validation layer must report; proves the layer is checking.
+    internal void RecordSyncvalSelfTest(RecordingBuffer command)
+    {
+        command.EndRendering();
+        var native = new CommandBuffer(command.Handle);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdFillBuffer(_device.Vk, native, Handle, 0, 4, 0x5A5A5A5A);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdFillBuffer(_device.Vk, native, Handle, 0, 4, 0xA5A5A5A5);
+    }
+
     private int _foreignReads;
     private int _disposeDeferred;
 
