@@ -16,4 +16,6 @@ public sealed class ResourceSnapshot
 }
 
 // One device-address handle's evaluated base and bounded extent for this draw.
-public readonly record struct DeviceAddressRange(uint Handle, ulong Base, ulong Size, bool Planned, bool Written);
+// [local] Conservative: written only by the whole-table over-approximation, which the exact store-handle
+// evaluation excluded (SHARPEMU_STORE_TABLE_EXACT=2 keeps it written and checks the exclusion).
+public readonly record struct DeviceAddressRange(uint Handle, ulong Base, ulong Size, bool Planned, bool Written, bool Conservative = false);

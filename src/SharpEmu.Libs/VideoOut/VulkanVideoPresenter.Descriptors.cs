@@ -1289,7 +1289,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (range.Written)
                 {
                     if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TracesExtra(range.Base, size)) SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(range.Base, size, $"bda-written-range hash=0x{program.Hash:X16} submission_tick={_scheduler.CurrentTick}"); // [local]
-                    _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true);
+                    _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true, conservativeWrite: range.Conservative);
                 }
                 else
                 {

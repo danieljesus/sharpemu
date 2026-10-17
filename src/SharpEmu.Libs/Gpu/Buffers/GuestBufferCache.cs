@@ -78,6 +78,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         _gpuModifiedRanges.Remove(address, size);
         _preciseGpuModifiedRanges.Remove(address, size); // [local]
+        if (StoreTableVerify) _exactGpuModifiedRanges.Remove(address, size); // [local]
         Interlocked.Increment(ref _gpuModifiedRemovals); // [local] invalidates the written-obtain memo
     }
 
@@ -86,6 +87,68 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // [local] experiment: writes through bindings of 16 MB or more are tracked as "broad";
     // a word dirty only through broad bindings may be read speculatively by table reads.
     private readonly SpanSet _preciseGpuModifiedRanges = new();
+
+    // [local] SHARPEMU_STORE_TABLE_EXACT=2: the GPU-modified ranges without the store-table ranges the exact store-handle
+    // evaluation excluded. A readback byte outside them was, by that analysis, not written by the GPU since it was last
+    // synchronized, so the downloaded byte must equal the backing; a difference is a discrepancy (pages the CPU dirtied
+    // since are skipped and counted apart).
+    private static readonly bool StoreTableVerify = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.ExactMode == 2;
+    private readonly SpanSet _exactGpuModifiedRanges = new();
+    private static long _verifyPieces, _verifyCheckedBytes, _verifyDiscrepancies, _verifyDiffBytes, _verifyCpuDirtySkipped;
+    private static int _verifyLogs;
+
+    public static string? TakeStoreTableVerifyReport() =>
+        StoreTableVerify
+            ? $"[PERF][STORE_TABLE_VERIFY] pieces={Interlocked.Exchange(ref _verifyPieces, 0)} checked_bytes={Interlocked.Exchange(ref _verifyCheckedBytes, 0)} discrepancies={Interlocked.Exchange(ref _verifyDiscrepancies, 0)} diff_bytes={Interlocked.Exchange(ref _verifyDiffBytes, 0)} cpu_dirty_skipped={Interlocked.Exchange(ref _verifyCpuDirtySkipped, 0)}"
+            : null;
+
+    private void VerifyExcludedBytes(ulong address, ReadOnlySpan<byte> bytes)
+    {
+        Interlocked.Increment(ref _verifyPieces);
+        var end = address + (ulong)bytes.Length;
+        var covered = _exactGpuModifiedRanges.GetOverlappingRanges(address, (ulong)bytes.Length);
+        var cursor = address;
+        for (var index = 0; index <= covered.Count && cursor < end; index++)
+        {
+            var gapEnd = index < covered.Count ? Math.Min(Math.Max(covered[index].Address, cursor), end) : end;
+            if (gapEnd > cursor)
+                VerifyGap(cursor, bytes.Slice((int)(cursor - address), (int)(gapEnd - cursor)));
+            if (index < covered.Count)
+                cursor = Math.Max(cursor, covered[index].Address + covered[index].Size);
+        }
+    }
+
+    private void VerifyGap(ulong address, ReadOnlySpan<byte> downloaded)
+    {
+        if (_tracker.HasCpuDirtyPages(address, (ulong)downloaded.Length))
+        {
+            Interlocked.Increment(ref _verifyCpuDirtySkipped);
+            return;
+        }
+
+        var backing = System.Buffers.ArrayPool<byte>.Shared.Rent(downloaded.Length);
+        try
+        {
+            var current = backing.AsSpan(0, downloaded.Length);
+            if (!_backing.TryReadBacking(address, current))
+                return;
+            Interlocked.Add(ref _verifyCheckedBytes, downloaded.Length);
+            var first = current.CommonPrefixLength(downloaded);
+            if (first == downloaded.Length)
+                return;
+            var differing = 0;
+            for (var offset = first; offset < downloaded.Length; offset++)
+                if (current[offset] != downloaded[offset]) differing++;
+            Interlocked.Increment(ref _verifyDiscrepancies);
+            Interlocked.Add(ref _verifyDiffBytes, differing);
+            if (Interlocked.Increment(ref _verifyLogs) <= 40)
+                Console.Error.WriteLine($"[STORE_TABLE_VERIFY_MISMATCH] gap=0x{address:X}+0x{downloaded.Length:X} first=0x{address + (ulong)first:X} differing={differing} tick={_scheduler.CurrentTick}");
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(backing);
+        }
+    }
     public const ulong BroadWriteBytes = 16UL * 1024 * 1024;
     public bool HasPreciseGpuDirtyBytes(ulong guestAddress, ulong size) => _preciseGpuModifiedRanges.Overlaps(guestAddress, size);
 
@@ -566,7 +629,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private static readonly bool ObtainFastChecks =Environment.GetEnvironmentVariable("SHARPEMU_OBTAIN_FAST_CHECKS") != "0";
 
-    public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false, ResourceSlotIdentifier bufferIdentifier = default)
+    public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false, ResourceSlotIdentifier bufferIdentifier = default, bool conservativeWrite = false)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferAcquisitionChecks);
         var command = _scheduler.Current;
@@ -664,6 +727,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (DirtyWatch != 0 && guestAddress <= DirtyWatch && DirtyWatch < guestAddress + size && _dirtyWatchLogs++ < 400) // [local]
                 Console.Error.WriteLine($"[DIRTY_WATCH] range=0x{guestAddress:X}+0x{size:X} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16} stage={Diagnostics.GpuReadTrace.CurrentStage} tick={_scheduler.CurrentTick} caller={(_dirtyWatchLogs < 6 ? new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
             if (size < BroadWriteBytes) _preciseGpuModifiedRanges.Add(guestAddress, size); // [local]
+            if (StoreTableVerify && !conservativeWrite) _exactGpuModifiedRanges.Add(guestAddress, size); // [local]
             NoteEverGpuWritten(guestAddress, size); // [local]
             if (Diagnostics.TableReadCensus.Enabled) Diagnostics.TableReadCensus.NoteWrite(guestAddress, size, _scheduler.CurrentTick); // [local]
             if (EarlyWriterSubmit && !EarlySubmitPending) NoteHotWordWrite(guestAddress, size); // [local]
@@ -2978,6 +3042,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         readback.Read(pieces, waitTick, (index, bytes) =>
         {
+            if (StoreTableVerify) VerifyExcludedBytes(copies[index].Address, bytes); // [local]
             if (!_backing.TryWriteBacking(copies[index].Address, bytes))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");

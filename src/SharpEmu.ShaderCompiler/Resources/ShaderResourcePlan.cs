@@ -203,6 +203,7 @@ public sealed class ShaderResourcePlan
         plan.ResourceBranches = ResourceBranchBlock.Build(plan, Rewrite);
         plan.DeviceAddressRanges = DeviceAddressRangePlanner.Plan(plan);
         plan.DeviceStoreTables = DeviceStoreTablePlanner.Plan(plan);
+        plan.DeviceStoreHandles = DeviceStoreTablePlanner.PlanHandles(plan); // [local]
 
         // Each written handle owns three flattened slots after the table reads: base
         // low, base high and size, which the shader checks every store against.
@@ -229,6 +230,9 @@ public sealed class ShaderResourcePlan
     // Tables of V#s that page-table buffer stores pick their descriptor from (a V# loaded with
     // S_BUFFER_LOAD from one of these tables); every V# listed is a range the program may write.
     public IReadOnlyList<ScalarValue> DeviceStoreTables { get; private set; } = [];
+
+    // [local] The V# handles of those stores (SHARPEMU_STORE_TABLE_EXACT evaluates them per dispatch).
+    public IReadOnlyList<ScalarValue> DeviceStoreHandles { get; private set; } = [];
 
     public IReadOnlyDictionary<uint, uint> WrittenRangeSlotByHandle { get; private set; } = new Dictionary<uint, uint>();
 
