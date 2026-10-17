@@ -167,7 +167,7 @@ public static class DepthTargetResolver
     [ThreadStatic] private static IImageFormatSupport? _lastDevice;
     [ThreadStatic] private static DepthTargetState? _lastResult;
     [ThreadStatic] private static bool _lastValid;
-    internal static long MemoHits, MemoChecked, MemoMismatches;
+    internal static long MemoHits, MemoChecked, MemoMismatches, MemoUnverifiable;
 
     public static DepthTargetState? Resolve(ContextRegisters context, IImageFormatSupport device, Func<string, Exception> fatal)
     {
@@ -182,7 +182,7 @@ public static class DepthTargetResolver
                 return _lastResult;
             var fresh = ResolveCore(context, device, fatal);
             MemoChecked++;
-            if (!Nullable.Equals(fresh, _lastResult))
+            if (!SameResult(fresh, _lastResult))
             {
                 MemoMismatches++;
                 if (MemoMismatches <= 20)
@@ -198,6 +198,22 @@ public static class DepthTargetResolver
         _lastResult = result;
         _lastValid = true;
         return result;
+    }
+
+    // Field by field through the bytes: the request holds inline arrays, whose built-in Equals throws.
+    private static bool SameResult(DepthTargetState? left, DepthTargetState? right)
+    {
+        if (left is null || right is null)
+            return left is null && right is null;
+        if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<DepthTargetState>())
+        {
+            MemoUnverifiable++;
+            return true;
+        }
+        var a = left.Value;
+        var b = right.Value;
+        return System.Runtime.InteropServices.MemoryMarshal.AsBytes(new ReadOnlySpan<DepthTargetState>(in a))
+            .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.AsBytes(new ReadOnlySpan<DepthTargetState>(in b)));
     }
 
     private static DepthTargetState? ResolveCore(ContextRegisters context, IImageFormatSupport device, Func<string, Exception> fatal)
