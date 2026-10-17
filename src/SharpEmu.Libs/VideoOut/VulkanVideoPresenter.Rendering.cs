@@ -181,6 +181,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool _renderingActive;
         private RenderingState _renderingState;
+        private RenderingState _probeBrokenState; // [local] SHARPEMU_CP_WRITE_DEFER_PROBE
+        private bool _probeBrokenWritesMemory;
         private long _renderingScopesBegun;
         // SHARPEMU_DEFER_GLOBAL_BARRIERS=0 ends the rendering scope at every guest cache flush again.
         private static readonly bool DeferGlobalBarriers =
@@ -1035,6 +1037,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled && Gpu.Buffers.CpWriteDeferProbe.AfterBreak) // [local]
+                Gpu.Buffers.CpWriteDeferProbe.OnBeginRendering(state == _probeBrokenState);
             EndRendering();
             var command = BeginBatchedGuestCommands();
             _commandBuffer = command;
@@ -1042,7 +1046,9 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 // A guest cache flush inside this scope may be deferred to its end; this keeps
                 // everything recorded before the scope ordered before its draws either way.
+                Gpu.Buffers.CpWriteDeferProbe.Suppress = true; // [local] the scope's own barrier
                 RecordGlobalBarrier(command);
+                Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
             }
 
             _renderingWritesMemory = _nextDrawWritesMemory;
@@ -1127,6 +1133,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _renderingActive = false;
             _renderingState = default;
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled) Gpu.Buffers.CpWriteDeferProbe.OnEndRendering(); // [local]
             var command = new CommandBuffer(_scheduler.Current.Handle);
             var vkProbe1008 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRendering(_vk, command); // [local]

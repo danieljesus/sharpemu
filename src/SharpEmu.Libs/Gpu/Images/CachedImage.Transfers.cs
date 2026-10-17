@@ -165,7 +165,14 @@ public sealed unsafe partial class CachedImage
             }
 
             _scheduler.EndRendering();
+            // [local] SHARPEMU_CP_WRITE_DEFER_PROBE: a repeated attachment access after a write broke the scope would have
+            // waited for the scope's end, so it does not end the probe's scope.
+            var probeSuppress = Gpu.Buffers.CpWriteDeferProbe.Enabled && Gpu.Buffers.CpWriteDeferProbe.AfterBreak && OnlyRepeatsAttachmentAccess(barriers);
+            if (probeSuppress) Gpu.Buffers.CpWriteDeferProbe.Suppress = true;
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled && Gpu.Buffers.CpWriteDeferProbe.AfterBreak)
+                Gpu.Buffers.CpWriteDeferProbe.NoteBarrier((probeSuppress ? "repeat " : "change ") + string.Join(";", barriers.Select(b => $"{b.OldLayout}->{b.NewLayout} {b.SrcAccessMask}->{b.DstAccessMask}")));
             RecordBarriers(command, sourceStages, stage, null, barriers);
+            if (probeSuppress) Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
         }
         finally
         {
@@ -176,6 +183,8 @@ public sealed unsafe partial class CachedImage
     private const AccessFlags2 AttachmentAccess =
         AccessFlags2.ColorAttachmentReadBit | AccessFlags2.ColorAttachmentWriteBit |
         AccessFlags2.DepthStencilAttachmentReadBit | AccessFlags2.DepthStencilAttachmentWriteBit;
+
+    private static int _probeLogs; // [local]
 
     private static bool OnlyRepeatsAttachmentAccess(List<ImageMemoryBarrier2> barriers)
     {

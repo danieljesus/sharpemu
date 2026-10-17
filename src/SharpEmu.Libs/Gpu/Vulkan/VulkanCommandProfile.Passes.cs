@@ -155,6 +155,9 @@ internal sealed unsafe partial class VulkanCommandProfile
     internal static void NoteOp(CommandBuffer command, OpBit bit)
     {
         t_opSequence++;
+        if (Buffers.CpWriteDeferProbe.Enabled && (bit & (OpBit.Barrier | OpBit.Dispatch | OpBit.Transfer)) != 0) Buffers.CpWriteDeferProbe.OnOtherOp(); // [local]
+        if (Buffers.CpWriteDeferProbe.Enabled && bit == OpBit.Barrier) Buffers.CpWriteDeferProbe.OnBarrier(); // [local]
+        if (Buffers.CpWriteDeferProbe.Enabled && (bit & (OpBit.Draw | OpBit.Dispatch)) != 0) Buffers.CpWriteDeferProbe.OnCommand(); // [local]
         if (t_current == command.Handle && command.Handle != 0)
         {
             t_mask |= (ushort)bit;
@@ -167,6 +170,7 @@ internal sealed unsafe partial class VulkanCommandProfile
     internal static void BeforeTransfer(CommandBuffer command)
     {
         t_opSequence++;
+        if (Buffers.CpWriteDeferProbe.Enabled) Buffers.CpWriteDeferProbe.OnOtherOp(); // [local]
         if (t_current == command.Handle && command.Handle != 0 && t_profile is { } profile)
         {
             profile.WriteMarker(command, IntervalKind.Gap);

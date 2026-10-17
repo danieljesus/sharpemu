@@ -370,11 +370,15 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             EndRendering();
+            var probeSuppress = Gpu.Buffers.CpWriteDeferProbe.Enabled && Gpu.Buffers.CpWriteDeferProbe.AfterBreak && DeferGlobalBarriers && !_probeBrokenWritesMemory; // [local] deferred in the open scope
+            if (probeSuppress) Gpu.Buffers.CpWriteDeferProbe.Suppress = true;
             RecordGlobalBarrier(BeginBatchedGuestCommands());
+            if (probeSuppress) Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
         }
 
         private void RecordGlobalBarrier(CommandBuffer commandBuffer)
         {
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled) Gpu.Buffers.CpWriteDeferProbe.OnFullBarrier(); // [local]
             var barrier = new MemoryBarrier2
             {
                 SType = StructureType.MemoryBarrier2,
@@ -435,9 +439,15 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 using var transferScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemoryTransfer);
                 using var stat = CommandMemoryStats.Measure(0, (ulong)data.Length); // [local]
+                if (Gpu.Buffers.CpWriteDeferProbe.Enabled) // [local]
+                {
+                    if (_renderingActive) { _probeBrokenState = _renderingState; _probeBrokenWritesMemory = _renderingWritesMemory; }
+                    Gpu.Buffers.CpWriteDeferProbe.BeginWrite(address, (ulong)data.Length, _renderingActive);
+                }
                 _ = BeginBatchedGuestCommands();
                 if (Gpu.Buffers.GuestBufferCache.BvhWatch(address, (ulong)data.Length)) Console.Error.WriteLine($"[BVH_CPWRITE] seq={_bvhSeq++} device-order address=0x{address:X} size={data.Length} tick={_scheduler.CurrentTick} payload+8C=0x{(data.Length >= 0x94 ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(0x8C)) : 0):X} payload+90=0x{(data.Length >= 0x94 ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(0x90)) : 0):X}");
                 _bufferCache.WriteHostMemory(address, data);
+                if (Gpu.Buffers.CpWriteDeferProbe.Enabled) Gpu.Buffers.CpWriteDeferProbe.EndWrite(); // [local]
                 if (Gpu.Buffers.GuestBufferCache.BvhWatch(address, (ulong)data.Length)) DumpBvhBuffer($"wr{_bvhSeq - 1:D4}_afterwrite_hdr", default(Gpu.Rendering.BufferDescriptorWords).WithAddress(address + 0x80), 32);
                 return;
             }

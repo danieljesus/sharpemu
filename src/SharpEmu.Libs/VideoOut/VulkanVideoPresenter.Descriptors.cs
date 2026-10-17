@@ -1105,6 +1105,12 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
             var stage = (PreparedStageBindings)prepared;
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled) // [local]
+            {
+                if (stage.Program.UsesDeviceAddresses) Gpu.Buffers.CpWriteDeferProbe.OnUnknownReads();
+                foreach (var range in stage.Stage.Resources.DeviceAddressRanges)
+                    if (range.Planned && range.Size != 0) Gpu.Buffers.CpWriteDeferProbe.OnRead(range.Base, range.Size);
+            }
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingBuffers)) BindBuffers(stage); // [local]
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingDeviceRanges)) ObtainDeviceAddressRanges(stage); // [local]
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingImages)) BindImages(stage); // [local]

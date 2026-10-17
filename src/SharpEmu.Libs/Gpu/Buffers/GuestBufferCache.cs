@@ -632,6 +632,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false, ResourceSlotIdentifier bufferIdentifier = default, bool conservativeWrite = false)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferAcquisitionChecks);
+        if (CpWriteDeferProbe.Enabled) CpWriteDeferProbe.OnRead(guestAddress, size); // [local]
         var command = _scheduler.Current;
         if (command.IsInvalid || !IsValidRange(guestAddress, size))
         {
