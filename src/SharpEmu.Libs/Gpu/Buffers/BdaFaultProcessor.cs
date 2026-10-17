@@ -70,6 +70,13 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private readonly ulong _faultBufferSize;
     private readonly ulong _traceTailOffset;
     private bool _rtStackAreaInitialized;
+    // [local] SHARPEMU_DA_ZERO_PAGE: the counters per area, the shadow bitmap's page lists (=2), and totals.
+    private bool _zeroPageAreaInitialized;
+    private readonly GpuBuffer? _counterDownload;
+    private readonly GpuBuffer? _shadowDownload;
+    private readonly DescriptorSet[] _shadowSets = new DescriptorSet[MaxPendingFaults];
+    private readonly HashSet<ulong> _exactPages = new();
+    private long _zpScans, _zpInvocations, _zpMany, _zpCut, _zpExtraMarks, _zpExactPages, _zpShadowPages, _zpLost, _zpOver, _zpUnreadable;
     private readonly GpuBuffer _faultBuffer;
     private readonly GpuBuffer _downloadBuffer;
     private readonly GpuBuffer? _traceDownloadBuffer;
@@ -92,12 +99,19 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         _faultBufferSize = pageCount / 8;
         if (DeviceAddressPaging.RtStackAreaEnabled && _faultBufferSize != DeviceAddressPaging.FaultBitmapBytes)
             throw new InvalidOperationException("The fault bitmap size does not match DeviceAddressPaging.FaultBitmapBytes.");
-        _traceTailOffset = _faultBufferSize + DeviceAddressPaging.RtStackAreaBytes; // [local] RT stack area before the tail
+        if (DeviceAddressPaging.ZeroPageMode != 0 && _faultBufferSize != DeviceAddressPaging.FaultBitmapBytes)
+            throw new InvalidOperationException("The fault bitmap size does not match DeviceAddressPaging.FaultBitmapBytes.");
+        // [local] RT stack area and SHARPEMU_DA_ZERO_PAGE area before the tail
+        _traceTailOffset = _faultBufferSize + DeviceAddressPaging.RtStackAreaBytes + DeviceAddressPaging.ZeroPageAreaBytes;
         _faultBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags,
             _traceTailOffset + (GuestGpuMemoryHook.TraceEnabled ? TraceTailBytes : 0UL));
         if (GuestGpuMemoryHook.TraceEnabled)
             _traceDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * TraceTailBytes);
         _downloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
+        if (DeviceAddressPaging.ZeroPageMode != 0)
+            _counterDownload = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * DeviceAddressPaging.ZeroPageCounterBytes);
+        if (DeviceAddressPaging.ZeroPageMode == 2)
+            _shadowDownload = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
 
         var vk = device.Vk;
         var bindings = stackalloc DescriptorSetLayoutBinding[2];
@@ -165,11 +179,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         RequireSuccess(created, "Fault-buffer pipeline creation");
 
         // One pre-written set per area replaces push descriptors; the bindings never change.
-        var poolSize = new DescriptorPoolSize { Type = DescriptorType.StorageBuffer, DescriptorCount = 2 * MaxPendingFaults };
+        var poolSize = new DescriptorPoolSize { Type = DescriptorType.StorageBuffer, DescriptorCount = 4 * MaxPendingFaults };
         var poolInfo = new DescriptorPoolCreateInfo
         {
             SType = StructureType.DescriptorPoolCreateInfo,
-            MaxSets = MaxPendingFaults,
+            MaxSets = 2 * MaxPendingFaults, // [local] the second half for the SHARPEMU_DA_ZERO_PAGE=2 shadow bitmap
             PoolSizeCount = 1,
             PPoolSizes = &poolSize,
         };
@@ -213,6 +227,24 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         }
 
         vk.UpdateDescriptorSets(device.Device, 2 * MaxPendingFaults, writes, 0, null);
+
+        if (_shadowDownload is not null) // [local] the same scan over the shadow bitmap, into its own lists
+        {
+            fixed (DescriptorSet* shadowSets = _shadowSets)
+            {
+                RequireSuccess(vk.AllocateDescriptorSets(device.Device, &allocateInfo, shadowSets), "Shadow fault-buffer descriptor set allocation");
+            }
+
+            for (var area = 0; area < MaxPendingFaults; area++)
+            {
+                infos[2 * area] = new DescriptorBufferInfo(_faultBuffer.Handle, DeviceAddressPaging.ZeroPageShadowOffset, _faultBufferSize);
+                infos[2 * area + 1] = new DescriptorBufferInfo(_shadowDownload.Handle, (ulong)area * PageFaultAreaSize, PageFaultAreaSize);
+                for (uint binding = 0; binding < 2; binding++)
+                    writes[2 * area + binding].DstSet = _shadowSets[area];
+            }
+
+            vk.UpdateDescriptorSets(device.Device, 2 * MaxPendingFaults, writes, 0, null);
+        }
     }
 
     public GpuBuffer FaultBuffer
@@ -223,6 +255,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             {
                 _faultBuffer.Fill(_traceTailOffset, TraceTailBytes, 0);
                 _traceInitialized = true;
+            }
+            if (DeviceAddressPaging.ZeroPageMode != 0 && !_zeroPageAreaInitialized) // [local] counters and shadow bitmap
+            {
+                _faultBuffer.Fill(DeviceAddressPaging.ZeroPageCounterOffset, DeviceAddressPaging.ZeroPageAreaBytes, 0);
+                _zeroPageAreaInitialized = true;
             }
             if (DeviceAddressPaging.RtStackAreaEnabled && !_rtStackAreaInitialized) // [local] every warp slot free
             {
@@ -245,6 +282,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         var offset = _currentArea * PageFaultAreaSize;
         _downloadBuffer.Mapped.Slice((int)offset, (int)PageFaultAreaSize).Clear();
         _downloadBuffer.Flush(offset, PageFaultAreaSize);
+        if (_shadowDownload is not null) // [local]
+        {
+            _shadowDownload.Mapped.Slice((int)offset, (int)PageFaultAreaSize).Clear();
+            _shadowDownload.Flush(offset, PageFaultAreaSize);
+        }
 
         var preBarrier = new BufferMemoryBarrier2
         {
@@ -255,7 +297,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
             Buffer = _faultBuffer.Handle,
             Offset = 0,
-            Size = _faultBufferSize,
+            Size = _shadowDownload is not null ? Vk.WholeSize : _faultBufferSize, // [local] the shadow bitmap too
         };
         var postBarrier = preBarrier;
         postBarrier.DstAccessMask = AccessFlags2.ShaderWriteBit;
@@ -271,6 +313,12 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null); // [local]
         var threads = _pageCount / 32;
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, (uint)((threads + 63) / 64), 1, 1); // [local]
+        if (_shadowDownload is not null) // [local] SHARPEMU_DA_ZERO_PAGE=2
+        {
+            var shadowSet = _shadowSets[_currentArea];
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &shadowSet, 0, null);
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, (uint)((threads + 63) / 64), 1, 1);
+        }
         VulkanSynchronization.PipelineBarrier(vk,
             command, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
             0, null, 1, &postBarrier, 0, null);
@@ -287,6 +335,12 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                 try { _cache.DumpDeviceRange(hdrAddress, 256, $"C:/Users/danyy/AppData/Local/Temp/gta/hdr_{hdrAddress:X}_{stage}_{scanTick}.gpu.bin"); _cache.DumpGuestRange(hdrAddress, 256, $"C:/Users/danyy/AppData/Local/Temp/gta/hdr_{hdrAddress:X}_{stage}_{scanTick}.guest.bin"); }
                 catch (Exception e) { Console.Error.WriteLine($"[GPU][HDRSNAP] dump failed: {e.Message}"); }
             }
+        }
+        if (_counterDownload is not null) // [local] SHARPEMU_DA_ZERO_PAGE counters
+        {
+            _counterDownload.CopyFrom(_scheduler.Current, _faultBuffer, DeviceAddressPaging.ZeroPageCounterOffset,
+                area * DeviceAddressPaging.ZeroPageCounterBytes, DeviceAddressPaging.ZeroPageCounterBytes, destinationAfter: AccessFlags.HostReadBit);
+            _faultBuffer.Fill(DeviceAddressPaging.ZeroPageCounterOffset, DeviceAddressPaging.ZeroPageCounterBytes, 0);
         }
         if (_traceDownloadBuffer is not null)
         {
@@ -434,8 +488,15 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             _faultRanges.Clear();
             var faults = MemoryMarshal.Cast<byte, ulong>(_downloadBuffer.Mapped.Slice((int)offset, (int)PageFaultAreaSize));
             var count = Math.Min((uint)faults[0], MaxPageFaults - 1);
+            if (_counterDownload is not null)
+                NoteZeroPageScan(area, faults, count, scanTick);
             for (var index = 1; index <= count; index++)
             {
+                // [local] SHARPEMU_DA_ZERO_PAGE: counted only. Pages the CPU interface cannot read are mapped as before (the
+                // default path maps every reported page; skipping them left real faults unserved and every frame faulting).
+                if (DeviceAddressPaging.ZeroPageMode != 0 && !_cache.CanReadGuest(faults[index], _pageSize))
+                    _zpUnreadable++;
+
                 _faultRanges.Add(faults[index], _pageSize);
                 GuestGpuMemoryHook.SelectDeviceFaultTracePage(faults[index]);
                 if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Traces(faults[index], _pageSize))
@@ -467,6 +528,48 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         _currentArea %= MaxPendingFaults;
     }
 
+    // [local] SHARPEMU_DA_ZERO_PAGE: this scan's counters and, with =2, the shadow bitmap's pages against the exact ones.
+    private void NoteZeroPageScan(uint area, Span<ulong> faults, uint count, ulong scanTick)
+    {
+        var counterOffset = area * DeviceAddressPaging.ZeroPageCounterBytes;
+        _counterDownload!.Invalidate(counterOffset, DeviceAddressPaging.ZeroPageCounterBytes);
+        var counters = MemoryMarshal.Cast<byte, uint>(_counterDownload.Mapped.Slice((int)counterOffset, (int)DeviceAddressPaging.ZeroPageCounterBytes));
+        _zpScans++;
+        _zpMany += counters[0];
+        _zpCut += counters[1];
+        _zpExtraMarks += counters[2];
+        _zpInvocations += counters[3];
+        long lost = 0, over = 0, shadowCount = 0;
+        if (_shadowDownload is not null)
+        {
+            var offset = area * PageFaultAreaSize;
+            _shadowDownload.Invalidate(offset, PageFaultAreaSize);
+            var shadow = MemoryMarshal.Cast<byte, ulong>(_shadowDownload.Mapped.Slice((int)offset, (int)PageFaultAreaSize));
+            var shadowPages = Math.Min((uint)shadow[0], MaxPageFaults - 1);
+            shadowCount = shadowPages;
+            _exactPages.Clear();
+            for (var index = 1; index <= count; index++)
+                _exactPages.Add(faults[index]);
+            var matched = 0;
+            for (var index = 1; index <= shadowPages; index++)
+            {
+                if (_exactPages.Contains(shadow[index]))
+                    matched++;
+                else
+                    over++;
+            }
+
+            lost = count - matched;
+            _zpExactPages += count;
+            _zpShadowPages += shadowPages;
+            _zpLost += lost;
+            _zpOver += over;
+        }
+
+        if (lost != 0 || counters[0] != 0 || counters[1] != 0 || (_zpScans & 1023) == 0)
+            Console.Error.WriteLine($"[GPU][DA_ZERO_PAGE] scan_tick={scanTick} mode={DeviceAddressPaging.ZeroPageMode} scans={_zpScans} faulted_invocations={_zpInvocations} many={_zpMany} cut={_zpCut} extra_marks={_zpExtraMarks} exact_pages={_zpExactPages} shadow_pages={_zpShadowPages} lost={_zpLost} over={_zpOver} not_cpu_readable={_zpUnreadable} this_scan=[exact={count} shadow={shadowCount} lost={lost} over={over} many={counters[0]} cut={counters[1]}]");
+    }
+
     public void Dispose()
     {
         var vk = _device.Vk;
@@ -475,6 +578,8 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         vk.DestroyDescriptorPool(_device.Device, _pool, null);
         vk.DestroyDescriptorSetLayout(_device.Device, _layout, null);
         _downloadBuffer.Dispose();
+        _counterDownload?.Dispose(); // [local]
+        _shadowDownload?.Dispose();
         _traceDownloadBuffer?.Dispose();
         _faultBuffer.Dispose();
     }

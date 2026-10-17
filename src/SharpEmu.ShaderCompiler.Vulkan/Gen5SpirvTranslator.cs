@@ -582,6 +582,7 @@ public static partial class Gen5SpirvTranslator
                         126,
                         _module.Constant64(_ulongType, 1));
                 }
+                FlushPendingFault(); // [local] SHARPEMU_DA_FAULT_MODE=2: before the pixel kill and the return
                 if (_stage == Gen5SpirvStage.Pixel)
                 {
                     // EXP.VM publishes EXEC as the pixel-valid mask. EXEC may
