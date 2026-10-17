@@ -353,6 +353,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
     public ImageView AcquireColorTargetView(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
+        var probeStarted = SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        using var probe = new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.ColorView, probeStarted);
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageAcquire);
         if (request.Role != ImageRole.ColorTarget)
         {
@@ -369,7 +371,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         TouchImage(image);
         image.MarkGpuModified();
         image.Uses.RenderTarget = true;
-        RefreshFromGuest(imageIdentifier, request);
+        using (new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.Refresh,
+            SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0)) // [local]
+            RefreshFromGuest(imageIdentifier, request);
         if (request.Description.Metadata.Kind == MetadataKind.Dcc && request.Description.Metadata.Range.Size == 0)
         {
             image.Description.Metadata = request.Description.Metadata;
@@ -398,6 +402,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
     public ImageView AcquireDepthTargetView(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
+        var probeStarted = SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        using var probe = new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.DepthView, probeStarted);
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageAcquire);
         if (request.Role != ImageRole.DepthTarget)
         {
@@ -414,7 +420,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         TouchImage(image);
         image.MarkGpuModified();
         image.Uses.DepthTarget = true;
-        RefreshFromGuest(imageIdentifier, request);
+        using (new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.Refresh,
+            SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0)) // [local]
+            RefreshFromGuest(imageIdentifier, request);
         if (request.Description.HasMetadata)
         {
             image.Description.Metadata = request.Description.Metadata;

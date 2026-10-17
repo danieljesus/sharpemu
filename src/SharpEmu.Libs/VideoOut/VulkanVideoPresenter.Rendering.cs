@@ -421,6 +421,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // The image transition ends the scope only when it records a barrier.
         public void TransitionDepthAttachment(in DepthAttachmentState depth, ImageLayout layout, ImageAspectFlags writeAspects)
         {
+            using var transitionProbe = new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.Transition,
+                SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0); // [local]
             var command = BeginBatchedGuestCommands();
             var image = _imageCache.GetImage(depth.Image);
             var view = depth.Target.Target.Request.View;
