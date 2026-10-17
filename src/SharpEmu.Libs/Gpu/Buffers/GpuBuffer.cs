@@ -348,7 +348,10 @@ public unsafe class GpuBuffer : IDisposable
             0, null, 2, before, 0, null);
         var copy = new BufferCopy(sourceOffset, destinationOffset, size);
         var vkProbe320 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+        var selfOrdered = (destinationAfter & MemoryAccess) == MemoryAccess && (sourceAfter & MemoryAccess) == MemoryAccess; // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
+        if (selfOrdered) SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.BeginSelfOrdered();
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBuffer(vk, native, source.Handle, Handle, 1, &copy); // [local]
+        if (selfOrdered) SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.EndSelfOrdered();
         SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.CopyBuffer, vkProbe320); // [local]
         var after = stackalloc BufferMemoryBarrier2[2];
         after[0] = source.CreateBarrier(sourceOffset, size, AccessFlags.TransferReadBit, sourceAfter);
@@ -376,7 +379,9 @@ public unsafe class GpuBuffer : IDisposable
             native, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, DependencyFlags.ByRegionBit,
             0, null, 1, &before, 0, null);
         var vkProbe346 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+        SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.BeginSelfOrdered(); // [local] the barrier below orders the fill
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdFillBuffer(vk, native, Handle, offset, size, value); // [local]
+        SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.EndSelfOrdered();
         SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.FillBuffer, vkProbe346); // [local]
         var after = CreateBarrier(offset, size, AccessFlags.TransferWriteBit, MemoryAccess);
         VulkanSynchronization.PipelineBarrier(vk,

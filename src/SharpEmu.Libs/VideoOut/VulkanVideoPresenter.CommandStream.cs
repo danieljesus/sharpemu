@@ -378,6 +378,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void RecordGlobalBarrier(CommandBuffer commandBuffer)
         {
+            if (Gpu.Vulkan.ScopeBarrierTracker.Enabled) Gpu.Vulkan.ScopeBarrierTracker.NoteFullBarrier(); // [local]
             if (Gpu.Buffers.CpWriteDeferProbe.Enabled) Gpu.Buffers.CpWriteDeferProbe.OnFullBarrier(); // [local]
             var barrier = new MemoryBarrier2
             {

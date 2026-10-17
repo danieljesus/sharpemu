@@ -633,6 +633,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferAcquisitionChecks);
         if (CpWriteDeferProbe.Enabled) CpWriteDeferProbe.OnRead(guestAddress, size); // [local]
+        if (isWritten && SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.Enabled) SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.NoteWrite(); // [local]
         var command = _scheduler.Current;
         if (command.IsInvalid || !IsValidRange(guestAddress, size))
         {
@@ -3386,7 +3387,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 fixed (BufferCopy* pointer = regions)
                 {
                     var vkProbe2631 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+                    SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.BeginSelfOrdered(); // [local] the upload's barrier below orders it
                     SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBuffer(vk, native, source.Handle, buffer.Handle, (uint)regions.Length, pointer); // [local]
+                    SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.EndSelfOrdered();
                     SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.CopyBuffer, vkProbe2631); // [local]
                 }
 

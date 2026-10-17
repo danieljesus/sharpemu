@@ -183,6 +183,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private RenderingState _renderingState;
         private RenderingState _probeBrokenState; // [local] SHARPEMU_CP_WRITE_DEFER_PROBE
         private bool _probeBrokenWritesMemory;
+        private bool _scopeBarrierPruned; // [local] SHARPEMU_SCOPE_BARRIER_PRUNE: this scope skipped its barrier
+        private bool _scopeBarrierWouldPrune; // [local] =1: the scope could have skipped it
         private long _renderingScopesBegun;
         // SHARPEMU_DEFER_GLOBAL_BARRIERS=0 ends the rendering scope at every guest cache flush again.
         private static readonly bool DeferGlobalBarriers =
@@ -1042,7 +1044,12 @@ internal static unsafe partial class VulkanVideoPresenter
             EndRendering();
             var command = BeginBatchedGuestCommands();
             _commandBuffer = command;
-            if (DeferGlobalBarriers)
+            var scopeBarrierPrunable = Gpu.Vulkan.ScopeBarrierTracker.Enabled && DeferGlobalBarriers && // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
+                Gpu.Vulkan.ScopeBarrierTracker.ScopeBegins(_nextDrawWritesMemory);
+            var pruneScopeBarrier = scopeBarrierPrunable && Gpu.Vulkan.ScopeBarrierTracker.Mode == 2;
+            _scopeBarrierPruned = pruneScopeBarrier;
+            _scopeBarrierWouldPrune = scopeBarrierPrunable && !pruneScopeBarrier;
+            if (DeferGlobalBarriers && !pruneScopeBarrier)
             {
                 // A guest cache flush inside this scope may be deferred to its end; this keeps
                 // everything recorded before the scope ordered before its draws either way.
@@ -1164,6 +1171,13 @@ internal static unsafe partial class VulkanVideoPresenter
             if (_globalBarrierAfterRendering)
             {
                 EndRendering();
+            }
+            // [local] A scope that skipped its barrier ends before a store, so the next one records it.
+            if (_renderingActive && (_scopeBarrierPruned || _scopeBarrierWouldPrune))
+            {
+                Gpu.Vulkan.ScopeBarrierTracker.NoteForcedEnd();
+                if (_scopeBarrierPruned) EndRendering();
+                _scopeBarrierWouldPrune = false;
             }
 
             _nextDrawWritesMemory = true;

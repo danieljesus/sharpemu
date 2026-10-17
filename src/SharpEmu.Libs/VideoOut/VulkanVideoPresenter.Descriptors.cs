@@ -1111,6 +1111,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 foreach (var range in stage.Stage.Resources.DeviceAddressRanges)
                     if (range.Planned && range.Size != 0) Gpu.Buffers.CpWriteDeferProbe.OnRead(range.Base, range.Size);
             }
+            if (Gpu.Vulkan.ScopeBarrierTracker.Enabled && stage.Program.UsesDeviceAddresses) Gpu.Vulkan.ScopeBarrierTracker.NoteWrite(); // [local] counted as stores
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingBuffers)) BindBuffers(stage); // [local]
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingDeviceRanges)) ObtainDeviceAddressRanges(stage); // [local]
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingImages)) BindImages(stage); // [local]
@@ -1380,6 +1381,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 image.Uses.Storage |= binding.IsStorage;
+                if (binding.IsStorage && Gpu.Vulkan.ScopeBarrierTracker.Enabled) Gpu.Vulkan.ScopeBarrierTracker.NoteWrite(); // [local]
                 image.Uses.Texture |= !binding.IsStorage;
                 binding.CachedImage = image;
                 binding.Image = image.Backing.Handle;
