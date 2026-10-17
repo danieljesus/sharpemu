@@ -12,7 +12,7 @@ internal static class AttachProbe
 {
     // Pieces of one draw's target work: resolution (TryResolveDrawTargets), the color and depth view acquisitions
     // (each including its refresh), the refreshes from guest memory alone, and the attachment transitions.
-    public enum Part { Resolve, ColorView, DepthView, Refresh, Transition, Count }
+    public enum Part { Resolve, DepthResolve, ColorView, DepthView, Refresh, Transition, Count }
 
     private static readonly long[] Current = new long[(int)Part.Count];
     private static readonly long[] SameParts = new long[(int)Part.Count];
@@ -95,7 +95,7 @@ internal static class AttachProbe
             $"[ATTACH_PROBE] window_s={seconds:F1} draws_per_s={_draws / seconds:F0} same={100.0 * _same / Math.Max(1, _draws):F1}% acquire_ms_per_s={Ms(_ticks):F2} same_ms_per_s={Ms(_sameTicks):F2} us_per_draw={(_ticks * 1e6 / Stopwatch.Frequency) / Math.Max(1, _draws):F2} us_per_same={(_sameTicks * 1e6 / Stopwatch.Frequency) / Math.Max(1, _same):F2}"));
         var parts = string.Join(" ", Enumerable.Range(0, (int)Part.Count).Select(part =>
             FormattableString.Invariant($"{(Part)part}={Ms(AllParts[part]):F2}/{Ms(SameParts[part]):F2}")));
-        Console.Error.WriteLine("[ATTACH_PROBE] parts_ms_per_s(all/same) " + parts);
+        Console.Error.WriteLine("[ATTACH_PROBE] parts_ms_per_s(all/same) " + parts + FormattableString.Invariant($" depth_memo_hits={Interlocked.Exchange(ref DepthTargetResolver.MemoHits, 0)} depth_memo_checked={Interlocked.Exchange(ref DepthTargetResolver.MemoChecked, 0)} depth_memo_mismatches={DepthTargetResolver.MemoMismatches}"));
         Array.Clear(AllParts);
         Array.Clear(SameParts);
         _draws = _same = _ticks = _sameTicks = 0;

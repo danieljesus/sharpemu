@@ -56,7 +56,11 @@ public sealed partial class RenderExecutor
             state.Colors[(int)state.ColorCount++] = new ColorTargetState(in resolution, resolvedSlot, image);
         }
 
-        if (DepthTargetResolver.Resolve(context, _host.FormatSupport, _fatal) is { } depthTarget)
+        var depthStarted = AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        var resolvedDepth = DepthTargetResolver.Resolve(context, _host.FormatSupport, _fatal);
+        if (depthStarted != 0)
+            AttachProbe.Add(AttachProbe.Part.DepthResolve, System.Diagnostics.Stopwatch.GetTimestamp() - depthStarted);
+        if (resolvedDepth is { } depthTarget)
         {
             var image = FindDepthTargetImage(context, in depthTarget); // [local] SHARPEMU_TARGET_MEMO
             _host.BindRenderTarget(image);
