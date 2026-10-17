@@ -3,7 +3,7 @@
 
 namespace SharpEmu.Libs.Gpu.Vulkan;
 
-// [local] SHARPEMU_SCOPE_BARRIER_PRUNE (0 by default): the global memory barrier every rendering scope records when it
+// [local] SHARPEMU_SCOPE_BARRIER_PRUNE (2 by default; =0 turns it off): the global memory barrier every rendering scope records when it
 // begins (DeferGlobalBarriers) orders what came before the scope ahead of its draws, because a guest cache flush inside
 // the scope waits for the scope's end. It only matters when a memory write recorded since the last global barrier is
 // not ordered yet. Writes: written buffer bindings and device-address ranges, programs that access memory through the
@@ -13,7 +13,7 @@ namespace SharpEmu.Libs.Gpu.Vulkan;
 // scope records the barrier.
 internal static class ScopeBarrierTracker
 {
-    internal static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SCOPE_BARRIER_PRUNE"), out var mode) ? mode : 0;
+    internal static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SCOPE_BARRIER_PRUNE"), out var mode) ? mode : 2;
     internal static bool Enabled => Mode != 0;
 
     private static volatile bool _unorderedWrites = true;
