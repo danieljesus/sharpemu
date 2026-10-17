@@ -223,6 +223,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
                 PValues = &signalValue,
             };
             var probeStart = System.Diagnostics.Stopwatch.GetTimestamp(); // [local]
+            var probeCompleted = _scheduler.Timeline.CompletedTick; // [local] SHARPEMU_RENDER_WAIT_PROBE
             using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.GpuCompletionWait))
             {
                 var reports = 0;
@@ -237,7 +238,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
 
                 Require(result, "vkWaitSemaphores(readback)");
             }
-            VideoOut.RenderWaitProbe.Record("readback", probeStart);
+            VideoOut.RenderWaitProbe.Record("readback", probeStart, (long)ticket.WaitTick - (long)probeCompleted);
         }
         finally
         {
