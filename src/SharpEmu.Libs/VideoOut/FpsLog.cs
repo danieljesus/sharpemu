@@ -17,6 +17,7 @@ internal static class FpsLog
 
     public static void FramePresented()
     {
+        IdleProbe.NoteFrame(); // [local]
         if (!Enabled)
         {
             return;

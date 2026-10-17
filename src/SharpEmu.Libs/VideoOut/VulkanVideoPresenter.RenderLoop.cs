@@ -75,7 +75,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.WaitStarted,
                     detail: waitMilliseconds);
                 if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.RenderIdle, -1, 0, (ulong)waitPhase); // [local]
+                var idleStarted = IdleProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
                 var signaled = System.Threading.Monitor.Wait(_gate, waitMilliseconds);
+                if (idleStarted != 0)
+                    IdleProbe.Note(waitPhase, gpuWorkInFlight, signaled, System.Diagnostics.Stopwatch.GetTimestamp() - idleStarted);
                 if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.RenderIdleEnd, -1, 0, (ulong)waitPhase); // [local]
                 // The result describes the monitor wait, not the arrival of runnable guest work.
                 SubmissionFlowProfile.Record(signaled ? SubmissionFlowProfile.EventKind.WaitSignaled
