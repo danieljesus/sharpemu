@@ -18,7 +18,7 @@ public static class DeviceAddressPaging
     public const int AddressSpaceBits = 40;
     public const ulong FaultBitmapBytes = (1UL << (AddressSpaceBits - PageBits)) / 8;
 
-    // [local] SHARPEMU_DA_ZERO_PAGE (off by default): a device-address load reads unconditionally, through the page's
+    // [local] SHARPEMU_DA_ZERO_PAGE (1 by default, =0 turns it off): a device-address load reads unconditionally, through the page's
     // entry or, for a page the table does not map, through a page of zeros whose address is the table's last entry (an
     // unmapped page reads zero, as before). The unmapped pages an invocation hits are kept as their lowest and highest
     // index and set in the fault bitmap when the invocation ends: both pages when it hit at most two, every page of the
@@ -28,7 +28,7 @@ public static class DeviceAddressPaging
     // The counter words follow the RT stack area: 0 invocations with three or more distinct pages, 1 of those whose
     // interval was cut, 2 pages set beyond the two ends, 3 invocations that hit any unmapped page. The shadow bitmap
     // (=2) follows the counters.
-    public static readonly int ZeroPageMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DA_ZERO_PAGE"), out var zeroPage) && zeroPage is 1 or 2 ? zeroPage : 0;
+    public static readonly int ZeroPageMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DA_ZERO_PAGE"), out var zeroPage) ? (zeroPage is 1 or 2 ? zeroPage : 0) : 1;
     public const uint ZeroPageMaxSpan = 64;
     public const ulong ZeroPageCounterBytes = 64;
     public static ulong ZeroPageCounterOffset => FaultBitmapBytes + RtStackAreaBytes;
