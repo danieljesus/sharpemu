@@ -54,6 +54,77 @@ public static class DeviceStoreTablePlanner
 
     private static bool MarksWritten(ulong bytes) => TableRangesWritten && bytes >= WrittenMin;
 
+    // [local] SHARPEMU_STORE_TABLE_EXACT (0 by default): the whole-table scan marks every V# of the table written for
+    // every program that picks a store V# from it (one 40 MB merged range for seven GTA programs, which made each frame's
+    // readbacks wait for them). When every store handle of the program evaluates at dispatch (its table offsets are
+    // uniform), the stores can only reach those V#s: =1 marks only them written and keeps the table's ranges registered
+    // read-only; a handle that does not evaluate, or a V# whose bounds checks leave its extent open, keeps the scan as
+    // it is. =2 keeps the scan written (Conservative) and the cache checks every readback byte the exact set leaves out.
+    public static readonly int ExactMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_EXACT"), out var exactMode) ? exactMode : 0;
+    private static long _exactPlans, _exactFallbacks, _exactRanges;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Hash, int Reason), long> _exactByHash = new();
+
+    public static IReadOnlyList<ScalarValue> PlanHandles(ShaderResourcePlan plan)
+    {
+        var handles = new List<ScalarValue>();
+        for (var index = 0; index < plan.Memory.Count; index++)
+        {
+            var memory = plan.Memory[index];
+            if (memory.Kind != MemoryResourceKind.Buffer || !memory.DeviceDescriptor ||
+                memory.Access is not (MemoryAccess.Write or MemoryAccess.Atomic) ||
+                plan.Accesses[index]?.Handle is not { Kind: ScalarValueKind.BufferHandle } handle)
+            {
+                continue;
+            }
+
+            if (!handles.Exists(existing => plan.Graph.Equivalent(existing, handle)))
+                handles.Add(handle);
+        }
+
+        return handles;
+    }
+
+    // [local] The exact written ranges of the plan's store handles, or the reason they are not exact (1 a handle
+    // does not evaluate, 2 a V# without a base or records, 3 a V# whose bounds checks leave the extent open).
+    private static int TryExactRanges(ShaderResourcePlan plan, RuntimeValueEvaluator evaluator, List<DeviceAddressRange> exact)
+    {
+        Span<uint> words = stackalloc uint[4];
+        foreach (var handle in plan.DeviceStoreHandles)
+        {
+            if (handle.Operands.Length != 4)
+                return 1;
+            for (var dword = 0; dword < 4; dword++)
+            {
+                if (!evaluator.Evaluate(handle.Operands[dword], out words[dword]))
+                    return 1;
+            }
+
+            if (!TryDecode(words, out var baseAddress, out var bytes) || bytes > MaxEntryBytes)
+                return 2;
+            // The V# bounds every byte only when its checks cover the offset: OOB_SELECT 0 checks the index and the
+            // offset against the stride, 3 checks a raw offset against the records. ADD_TID moves the address per lane.
+            var stride = (words[1] >> 16) & 0x3FFF;
+            var outOfBounds = (words[3] >> 28) & 3;
+            var addTid = (words[3] >> 23) & 1;
+            if (addTid != 0 || !(outOfBounds == 0 || (outOfBounds == 3 && stride == 0)))
+                return 3;
+            exact.Add(new DeviceAddressRange(uint.MaxValue - 0x8000u - (uint)exact.Count, baseAddress, bytes, Planned: true, Written: true));
+        }
+
+        return 0;
+    }
+
+    public static string? TakeExactReport()
+    {
+        if (ExactMode == 0)
+            return null;
+        var pairs = _exactByHash.ToArray();
+        foreach (var (key, _) in pairs)
+            _exactByHash.TryRemove(key, out _);
+        var top = string.Join(",", pairs.OrderByDescending(pair => pair.Value).Take(12).Select(pair => $"{pair.Key.Hash:X16}/{pair.Key.Reason}:{pair.Value}"));
+        return $"[PERF][STORE_TABLE_EXACT] mode={ExactMode} exact={Interlocked.Exchange(ref _exactPlans, 0)} fallback={Interlocked.Exchange(ref _exactFallbacks, 0)} ranges={Interlocked.Exchange(ref _exactRanges, 0)} by_hash(hash/reason)=[{top}]";
+    }
+
     private static readonly bool TableLog = System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_LOG") == "1"; // [local]
     private static int _tableLogs;
 
@@ -197,6 +268,25 @@ public static class DeviceStoreTablePlanner
 
         using var scratch = RuntimeEvaluationScratch.Rent();
         var evaluator = new RuntimeValueEvaluator(scratch, plan, inputs);
+        List<DeviceAddressRange>? exact = null; // [local] SHARPEMU_STORE_TABLE_EXACT
+        var tableStart = ranges.Count;
+        if (ExactMode != 0 && plan.DeviceStoreHandles.Count != 0)
+        {
+            exact = new List<DeviceAddressRange>(plan.DeviceStoreHandles.Count);
+            var reason = TryExactRanges(plan, evaluator, exact);
+            _exactByHash.AddOrUpdate((plan.Hash, reason), 1, static (_, value) => value + 1);
+            if (reason != 0)
+            {
+                exact = null;
+                Interlocked.Increment(ref _exactFallbacks);
+            }
+            else
+            {
+                Interlocked.Increment(ref _exactPlans);
+                Interlocked.Add(ref _exactRanges, exact.Count);
+            }
+        }
+
         Span<uint> words = stackalloc uint[4];
         Span<byte> again = stackalloc byte[4]; // [local] SHARPEMU_STORE_TABLE_BULK=2
         foreach (var table in plan.DeviceStoreTables)
@@ -335,6 +425,17 @@ public static class DeviceStoreTablePlanner
             }
             if (_logs++ < 40 && System.Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local]
                 System.Console.Error.WriteLine($"[STORE_TABLE] hash=0x{plan.Hash:X16} table=0x{tableBase:X} bytes=0x{tableBytes:X} ranges={ranges.Count - before} first={(ranges.Count > before ? $"0x{ranges[before].Base:X}+0x{ranges[before].Size:X}" : "-")}");
+        }
+
+        if (exact is not null) // [local] the table's ranges stay registered; only the exact V#s are written
+        {
+            for (var index = tableStart; index < ranges.Count; index++)
+            {
+                if (ranges[index].Written)
+                    ranges[index] = ExactMode == 2 ? ranges[index] with { Conservative = true } : ranges[index] with { Written = false };
+            }
+
+            ranges.AddRange(exact);
         }
     }
 

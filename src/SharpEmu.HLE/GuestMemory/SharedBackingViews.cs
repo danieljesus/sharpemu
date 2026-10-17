@@ -30,10 +30,64 @@ public sealed unsafe class SharedBackingViews : IDisposable
     // Single-view accesses in flight; Dispose waits for them before releasing the alias.
     private int _activeAccesses;
 
+    // [local] SHARPEMU_STRIPED_ACCESS_COUNT=1 (off by default): the in-flight count is kept in per-thread stripes on
+    // their own cache lines, so the render threads' lock-free accesses (every HLE guest read and write, several per Agc
+    // builder call) stop bouncing one shared line between cores. Only Dispose reads it, as the sum of the stripes: an
+    // access enters and leaves on the same thread, and an alias access left on another thread moves the count between
+    // stripes without changing the sum. Read once per instance at construction; settable for tests.
+    internal static bool StripedAccessCountDefault { get; set; } =
+        Environment.GetEnvironmentVariable("SHARPEMU_STRIPED_ACCESS_COUNT") == "1";
+
+    private const int AccessStripes = 64;
+    private const int AccessStripeStride = 16; // 16 longs: 128 bytes, a pair of cache lines per stripe
+    private readonly long[]? _accessStripes;
+
     public SharedBackingViews(IHostViewMemory host, ulong size)
     {
         _host = host;
         _ = host.TryCreateBacking(size, out _backing, out _);
+        if (StripedAccessCountDefault)
+        {
+            _accessStripes = new long[AccessStripes * AccessStripeStride];
+        }
+    }
+
+    private void EnterAccess()
+    {
+        if (_accessStripes is { } stripes)
+        {
+            Interlocked.Increment(ref stripes[(Environment.CurrentManagedThreadId & (AccessStripes - 1)) * AccessStripeStride]);
+            return;
+        }
+
+        Interlocked.Increment(ref _activeAccesses);
+    }
+
+    private void ExitAccess()
+    {
+        if (_accessStripes is { } stripes)
+        {
+            Interlocked.Decrement(ref stripes[(Environment.CurrentManagedThreadId & (AccessStripes - 1)) * AccessStripeStride]);
+            return;
+        }
+
+        Interlocked.Decrement(ref _activeAccesses);
+    }
+
+    private long ActiveAccesses()
+    {
+        if (_accessStripes is not { } stripes)
+        {
+            return Volatile.Read(ref _activeAccesses);
+        }
+
+        long sum = 0;
+        for (var stripe = 0; stripe < AccessStripes; stripe++)
+        {
+            sum += Volatile.Read(ref stripes[stripe * AccessStripeStride]);
+        }
+
+        return sum;
     }
 
     public bool IsAvailable => _backing != null && !_disposed;
@@ -67,7 +121,7 @@ public sealed unsafe class SharedBackingViews : IDisposable
             }
             finally
             {
-                Interlocked.Decrement(ref _activeAccesses);
+                ExitAccess();
             }
         }
 
@@ -114,7 +168,59 @@ public sealed unsafe class SharedBackingViews : IDisposable
         }
         finally
         {
-            Interlocked.Decrement(ref _activeAccesses);
+            ExitAccess();
+        }
+    }
+
+    // [local] The lock-free single-view write only; false (with nothing written) for anything else.
+    // Adapted from 2838b258 by Berk (par274), co-authored by Astellou.
+    public bool TryWriteSingleView(ulong address, ReadOnlySpan<byte> data)
+    {
+        if (!TryAccessSingleView(address, (ulong)data.Length, out var target))
+        {
+            return false;
+        }
+
+        try
+        {
+            data.CopyTo(new Span<byte>((void*)target, data.Length));
+            return true;
+        }
+        finally
+        {
+            ExitAccess();
+        }
+    }
+
+    // [local] A copy whose source and destination each lie in one view, without the lock; false (with nothing
+    // copied) otherwise. Both go through the backing alias, so an overlap is copied as memmove does.
+    public bool TryCopySingleView(ulong destination, ulong source, ulong size)
+    {
+        if (size > int.MaxValue || !TryAccessSingleView(source, size, out var from))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!TryAccessSingleView(destination, size, out var to))
+            {
+                return false;
+            }
+
+            try
+            {
+                Buffer.MemoryCopy((void*)from, (void*)to, size, size);
+                return true;
+            }
+            finally
+            {
+                ExitAccess();
+            }
+        }
+        finally
+        {
+            ExitAccess();
         }
     }
 
@@ -129,7 +235,7 @@ public sealed unsafe class SharedBackingViews : IDisposable
             }
             finally
             {
-                Interlocked.Decrement(ref _activeAccesses);
+                ExitAccess();
             }
         }
 
@@ -489,8 +595,9 @@ public sealed unsafe class SharedBackingViews : IDisposable
 
         // A lock-free access that found a view before the snapshot emptied still copies
         // through the alias; let it finish before the alias is released.
+        Interlocked.MemoryBarrier();
         var spin = new SpinWait();
-        while (Volatile.Read(ref _activeAccesses) != 0)
+        while (ActiveAccesses() != 0)
         {
             spin.SpinOnce();
         }
@@ -622,13 +729,13 @@ public sealed unsafe class SharedBackingViews : IDisposable
             return false;
         }
 
-        Interlocked.Increment(ref _activeAccesses);
+        EnterAccess();
         if (TryFindAlias(Volatile.Read(ref _snapshot), address, size, out target))
         {
             return true;
         }
 
-        Interlocked.Decrement(ref _activeAccesses);
+        ExitAccess();
         return false;
     }
 
@@ -636,17 +743,17 @@ public sealed unsafe class SharedBackingViews : IDisposable
 
     public bool TryEnterAliasAccess()
     {
-        Interlocked.Increment(ref _activeAccesses);
+        EnterAccess();
         if (!Volatile.Read(ref _disposed) && _backing != null)
         {
             return true;
         }
 
-        Interlocked.Decrement(ref _activeAccesses);
+        ExitAccess();
         return false;
     }
 
-    public void ExitAliasAccess() => Interlocked.Decrement(ref _activeAccesses);
+    public void ExitAliasAccess() => ExitAccess();
 
     public bool TryResolveAlias(ulong address, ulong size, out ulong target)
     {

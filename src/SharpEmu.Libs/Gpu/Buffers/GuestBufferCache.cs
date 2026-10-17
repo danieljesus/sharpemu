@@ -78,6 +78,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         _gpuModifiedRanges.Remove(address, size);
         _preciseGpuModifiedRanges.Remove(address, size); // [local]
+        if (StoreTableVerify) _exactGpuModifiedRanges.Remove(address, size); // [local]
         Interlocked.Increment(ref _gpuModifiedRemovals); // [local] invalidates the written-obtain memo
     }
 
@@ -86,6 +87,68 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // [local] experiment: writes through bindings of 16 MB or more are tracked as "broad";
     // a word dirty only through broad bindings may be read speculatively by table reads.
     private readonly SpanSet _preciseGpuModifiedRanges = new();
+
+    // [local] SHARPEMU_STORE_TABLE_EXACT=2: the GPU-modified ranges without the store-table ranges the exact store-handle
+    // evaluation excluded. A readback byte outside them was, by that analysis, not written by the GPU since it was last
+    // synchronized, so the downloaded byte must equal the backing; a difference is a discrepancy (pages the CPU dirtied
+    // since are skipped and counted apart).
+    private static readonly bool StoreTableVerify = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.ExactMode == 2;
+    private readonly SpanSet _exactGpuModifiedRanges = new();
+    private static long _verifyPieces, _verifyCheckedBytes, _verifyDiscrepancies, _verifyDiffBytes, _verifyCpuDirtySkipped;
+    private static int _verifyLogs;
+
+    public static string? TakeStoreTableVerifyReport() =>
+        StoreTableVerify
+            ? $"[PERF][STORE_TABLE_VERIFY] pieces={Interlocked.Exchange(ref _verifyPieces, 0)} checked_bytes={Interlocked.Exchange(ref _verifyCheckedBytes, 0)} discrepancies={Interlocked.Exchange(ref _verifyDiscrepancies, 0)} diff_bytes={Interlocked.Exchange(ref _verifyDiffBytes, 0)} cpu_dirty_skipped={Interlocked.Exchange(ref _verifyCpuDirtySkipped, 0)}"
+            : null;
+
+    private void VerifyExcludedBytes(ulong address, ReadOnlySpan<byte> bytes)
+    {
+        Interlocked.Increment(ref _verifyPieces);
+        var end = address + (ulong)bytes.Length;
+        var covered = _exactGpuModifiedRanges.GetOverlappingRanges(address, (ulong)bytes.Length);
+        var cursor = address;
+        for (var index = 0; index <= covered.Count && cursor < end; index++)
+        {
+            var gapEnd = index < covered.Count ? Math.Min(Math.Max(covered[index].Address, cursor), end) : end;
+            if (gapEnd > cursor)
+                VerifyGap(cursor, bytes.Slice((int)(cursor - address), (int)(gapEnd - cursor)));
+            if (index < covered.Count)
+                cursor = Math.Max(cursor, covered[index].Address + covered[index].Size);
+        }
+    }
+
+    private void VerifyGap(ulong address, ReadOnlySpan<byte> downloaded)
+    {
+        if (_tracker.HasCpuDirtyPages(address, (ulong)downloaded.Length))
+        {
+            Interlocked.Increment(ref _verifyCpuDirtySkipped);
+            return;
+        }
+
+        var backing = System.Buffers.ArrayPool<byte>.Shared.Rent(downloaded.Length);
+        try
+        {
+            var current = backing.AsSpan(0, downloaded.Length);
+            if (!_backing.TryReadBacking(address, current))
+                return;
+            Interlocked.Add(ref _verifyCheckedBytes, downloaded.Length);
+            var first = current.CommonPrefixLength(downloaded);
+            if (first == downloaded.Length)
+                return;
+            var differing = 0;
+            for (var offset = first; offset < downloaded.Length; offset++)
+                if (current[offset] != downloaded[offset]) differing++;
+            Interlocked.Increment(ref _verifyDiscrepancies);
+            Interlocked.Add(ref _verifyDiffBytes, differing);
+            if (Interlocked.Increment(ref _verifyLogs) <= 40)
+                Console.Error.WriteLine($"[STORE_TABLE_VERIFY_MISMATCH] gap=0x{address:X}+0x{downloaded.Length:X} first=0x{address + (ulong)first:X} differing={differing} tick={_scheduler.CurrentTick}");
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(backing);
+        }
+    }
     public const ulong BroadWriteBytes = 16UL * 1024 * 1024;
     public bool HasPreciseGpuDirtyBytes(ulong guestAddress, ulong size) => _preciseGpuModifiedRanges.Overlaps(guestAddress, size);
 
@@ -363,6 +426,89 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         !_tracker.HasGpuDirtyPages(address, size) ||
         ReadMemoryOrAwaitShutdown(address, size, isWrite: false, source);
 
+    // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: the synchronizing read of ranges[0] (as TrySynchronizeCpuRead) with
+    // the other ranges brought back in the same readback when their last writer has already completed, so nothing is
+    // flushed or waited for them (a writer still in flight would move its wait here). Each download is the ordinary one (window, write ticks, stale pieces left GPU-owned); the
+    // others are only started earlier than a later read would start them. On the GPU queue thread the relays run
+    // inline and the waits block it, as the synchronous download does.
+    public bool TrySynchronizeCpuReads(IReadOnlyList<(ulong Address, ulong Size)> ranges, GuestMemoryProfile.ReadbackSource source)
+    {
+        var (primary, primarySize) = ranges[0];
+        if (ranges.Count == 1 || (!_relay.IsGpuQueueThread && SubmissionScheduler.InDeferredOperation) || AsyncReadback is not { } readback ||
+            !GuestReadsAwaitOffQueue)
+        {
+            return TrySynchronizeCpuRead(primary, primarySize, source);
+        }
+
+        var pendings = new List<PendingDownload>(ranges.Count);
+        if (!_relay.TryRunOnGpuQueue(() =>
+            {
+                for (var index = 0; index < ranges.Count; index++)
+                {
+                    // The readback queue has 7 slots; one is left for the ordinary reads.
+                    if (pendings.Count >= 6)
+                    {
+                        break;
+                    }
+
+                    var (address, size) = ranges[index];
+                    if (!_tracker.MayHaveGpuDirtyPages(address, size) || !_tracker.HasGpuDirtyPages(address, size) ||
+                        pendings.Exists(pending => pending.WindowBegin <= address && address + size <= pending.WindowEnd) ||
+                        (index != 0 && !WriterCompleted(address, size)))
+                    {
+                        continue;
+                    }
+
+                    if (BeginReadMemoryOnGpu(address, size, isWrite: false, source, allowPending: true) is { } started)
+                    {
+                        pendings.Add(started);
+                    }
+                }
+            }))
+        {
+            return AwaitShutdown();
+        }
+
+        Interlocked.Add(ref _batchedSyncReads, pendings.Count);
+        foreach (var pending in pendings)
+        {
+            readback.Wait(pending.Ticket);
+        }
+
+        if (pendings.Count != 0 && !_relay.TryRunOnGpuQueue(() =>
+            {
+                foreach (var pending in pendings)
+                {
+                    _ = CompleteReadMemoryOnGpu(pending, retrySynchronously: false);
+                }
+            }))
+        {
+            return AwaitShutdown();
+        }
+
+        // A piece the GPU wrote again meanwhile is still GPU-owned: the ordinary path takes the primary from here.
+        return TrySynchronizeCpuRead(primary, primarySize, source);
+    }
+
+    private static long _batchedSyncReads;
+
+    public static long TakeBatchedSyncReads() => Interlocked.Exchange(ref _batchedSyncReads, 0);
+
+    private bool WriterCompleted(ulong address, ulong size)
+    {
+        var completed = _scheduler.Timeline.CompletedTick;
+        foreach (var copy in CollectReadbackWindow(address, size, out _, out _))
+        {
+            var written = copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size);
+            if (written == 0 || written > completed)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // Lock-free on the GPU queue thread; see GuestPageTracker.MayHaveGpuDirtyPages.
     public bool MayHaveGpuDirtyPages(ulong address, ulong size) => _tracker.MayHaveGpuDirtyPages(address, size);
 
@@ -483,9 +629,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private static readonly bool ObtainFastChecks =Environment.GetEnvironmentVariable("SHARPEMU_OBTAIN_FAST_CHECKS") != "0";
 
-    public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false, ResourceSlotIdentifier bufferIdentifier = default)
+    public (GpuBuffer Buffer, ulong Offset) ObtainBuffer(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false, ResourceSlotIdentifier bufferIdentifier = default, bool conservativeWrite = false)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferAcquisitionChecks);
+        if (CpWriteDeferProbe.Enabled) CpWriteDeferProbe.OnRead(guestAddress, size); // [local]
+        if (isWritten && SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.Enabled) SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.NoteWrite(); // [local]
         var command = _scheduler.Current;
         if (command.IsInvalid || !IsValidRange(guestAddress, size))
         {
@@ -581,6 +729,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (DirtyWatch != 0 && guestAddress <= DirtyWatch && DirtyWatch < guestAddress + size && _dirtyWatchLogs++ < 400) // [local]
                 Console.Error.WriteLine($"[DIRTY_WATCH] range=0x{guestAddress:X}+0x{size:X} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16} stage={Diagnostics.GpuReadTrace.CurrentStage} tick={_scheduler.CurrentTick} caller={(_dirtyWatchLogs < 6 ? new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
             if (size < BroadWriteBytes) _preciseGpuModifiedRanges.Add(guestAddress, size); // [local]
+            if (StoreTableVerify && !conservativeWrite) _exactGpuModifiedRanges.Add(guestAddress, size); // [local]
             NoteEverGpuWritten(guestAddress, size); // [local]
             if (Diagnostics.TableReadCensus.Enabled) Diagnostics.TableReadCensus.NoteWrite(guestAddress, size, _scheduler.CurrentTick); // [local]
             if (EarlyWriterSubmit && !EarlySubmitPending) NoteHotWordWrite(guestAddress, size); // [local]
@@ -2634,12 +2783,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _cpLastEnd = address + size;
     }
 
+    private static readonly bool SyncvalSelfTest = Environment.GetEnvironmentVariable("SHARPEMU_SYNCVAL_SELFTEST") == "1"; // [local]
+    private int _syncvalSelfTests;
+
     private void WriteDataBuffer(GpuBuffer buffer, ulong address, ReadOnlySpan<byte> source)
     {
         var sequenceBefore = SharpEmu.Libs.Gpu.Vulkan.VulkanCommandProfile.t_opSequence; // [local]
         if (SharpEmu.Libs.Gpu.Vulkan.VulkanCommandProfile.PassesEnabled)
             NoteCommandWrite(buffer, address, (ulong)source.Length, sequenceBefore);
         GuestGpuMemoryHook.Trace(address, (ulong)source.Length, $"host-write-data submission_tick={_scheduler.CurrentTick}"); // [local]
+        if (SyncvalSelfTest && _syncvalSelfTests++ < 3) // [local] SHARPEMU_SYNCVAL_SELFTEST
+            buffer.RecordSyncvalSelfTest(_scheduler.Current);
         while (!source.IsEmpty)
         {
             var chunk = (int)Math.Min((ulong)source.Length, _staging.Size);
@@ -2893,13 +3047,19 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             pieces[index] = new ReadbackPiece(copies[index].Buffer, copies[index].SourceOffset, copies[index].Size);
         }
 
+        var runCompleted = Vulkan.VulkanCommandProfile.RunEnabled ? _scheduler.Timeline.CompletedTick : 0; // [local] SHARPEMU_PROFILE_GPU_RUN
+        var runStarted = Vulkan.VulkanCommandProfile.RunEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         readback.Read(pieces, waitTick, (index, bytes) =>
         {
+            if (StoreTableVerify) VerifyExcludedBytes(copies[index].Address, bytes); // [local]
             if (!_backing.TryWriteBacking(copies[index].Address, bytes))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
             }
         });
+        if (Vulkan.VulkanCommandProfile.RunEnabled &&
+            System.Diagnostics.Stopwatch.GetElapsedTime(runStarted).TotalMilliseconds >= Vulkan.VulkanCommandProfile.RunMinMilliseconds)
+            Vulkan.VulkanCommandProfile.NoteRun(runCompleted + 1, waitTick);
         return true;
     }
 
@@ -3232,7 +3392,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 fixed (BufferCopy* pointer = regions)
                 {
                     var vkProbe2631 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+                    SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.BeginSelfOrdered(); // [local] the upload's barrier below orders it
                     SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdCopyBuffer(vk, native, source.Handle, buffer.Handle, (uint)regions.Length, pointer); // [local]
+                    SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.EndSelfOrdered();
                     SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.CopyBuffer, vkProbe2631); // [local]
                 }
 

@@ -171,6 +171,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDraw(Vk vk, CommandBuffer command, uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -188,6 +189,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDrawIndexed(Vk vk, CommandBuffer command, uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -206,6 +208,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDrawIndexedIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset, uint drawCount, uint stride)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -223,6 +226,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDispatch(Vk vk, CommandBuffer command, uint x, uint y, uint z)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Dispatch); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -239,6 +243,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDispatchIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset)
     {
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Dispatch); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -675,6 +680,7 @@ internal static unsafe class VkRecord
     public static void CmdCopyBuffer(Vk vk, CommandBuffer command, VkBuffer source, VkBuffer destination, uint count, BufferCopy* regions)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdCopyBufferCore(vk, command, source, destination, count, regions);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.CopyBuffer);
     }
@@ -701,6 +707,7 @@ internal static unsafe class VkRecord
     public static void CmdFillBuffer(Vk vk, CommandBuffer command, VkBuffer destination, ulong offset, ulong size, uint data)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdFillBufferCore(vk, command, destination, offset, size, data);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.FillBuffer);
     }
@@ -724,6 +731,7 @@ internal static unsafe class VkRecord
     public static void CmdUpdateBuffer(Vk vk, CommandBuffer command, VkBuffer destination, ulong offset, ulong size, void* data)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdUpdateBufferCore(vk, command, destination, offset, size, data);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.FillBuffer);
     }
@@ -778,6 +786,7 @@ internal static unsafe class VkRecord
         ImageLayout destinationLayout, uint count, ImageCopy* regions)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdCopyImageCore(vk, command, source, sourceLayout, destination, destinationLayout, count, regions);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.CopyImage);
     }
@@ -795,6 +804,7 @@ internal static unsafe class VkRecord
         ImageLayout destinationLayout, uint count, ImageBlit* regions, Filter filter)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdBlitImageCore(vk, command, source, sourceLayout, destination, destinationLayout, count, regions, filter);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Blit);
     }
@@ -812,6 +822,7 @@ internal static unsafe class VkRecord
         ImageLayout destinationLayout, uint count, ImageResolve* regions)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdResolveImageCore(vk, command, source, sourceLayout, destination, destinationLayout, count, regions);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Resolve);
     }
@@ -855,6 +866,7 @@ internal static unsafe class VkRecord
         BufferImageCopy* regions)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdCopyBufferToImageCore(vk, command, buffer, image, layout, count, regions);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Upload);
     }
@@ -872,6 +884,7 @@ internal static unsafe class VkRecord
         BufferImageCopy* regions)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdCopyImageToBufferCore(vk, command, image, layout, buffer, count, regions);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Readback);
     }
@@ -889,6 +902,7 @@ internal static unsafe class VkRecord
         ImageSubresourceRange* ranges)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdClearColorImageCore(vk, command, image, layout, color, count, ranges);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Clear);
     }
@@ -918,6 +932,7 @@ internal static unsafe class VkRecord
         uint count, ImageSubresourceRange* ranges)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdClearDepthStencilImageCore(vk, command, image, layout, value, count, ranges);
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.AfterTransfer(command, VulkanCommandProfile.IntervalKind.Clear);
     }

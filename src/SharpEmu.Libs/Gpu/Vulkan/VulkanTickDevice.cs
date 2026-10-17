@@ -261,6 +261,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         };
         Result result;
         var probeStart = System.Diagnostics.Stopwatch.GetTimestamp(); // [local]
+        var probeCompleted = RenderWaitProbe.Enabled ? ReadTimeline() : 0; // [local] SHARPEMU_RENDER_WAIT_PROBE
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.GpuCompletionWait))
         {
             // [local] A wait over GpuStallReport.TimeoutNs reports where the queues stand, then keeps waiting.
@@ -273,7 +274,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
                 }
             }
         }
-        RenderWaitProbe.Record("timeline", probeStart);
+        RenderWaitProbe.Record("timeline", probeStart, (long)tick - (long)probeCompleted);
         failure = result.ToString();
         return result == Result.Success && WaitRetired(tick);
     }

@@ -181,6 +181,10 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool _renderingActive;
         private RenderingState _renderingState;
+        private RenderingState _probeBrokenState; // [local] SHARPEMU_CP_WRITE_DEFER_PROBE
+        private bool _probeBrokenWritesMemory;
+        private bool _scopeBarrierPruned; // [local] SHARPEMU_SCOPE_BARRIER_PRUNE: this scope skipped its barrier
+        private bool _scopeBarrierWouldPrune; // [local] =1: the scope could have skipped it
         private long _renderingScopesBegun;
         // SHARPEMU_DEFER_GLOBAL_BARRIERS=0 ends the rendering scope at every guest cache flush again.
         private static readonly bool DeferGlobalBarriers =
@@ -1035,14 +1039,23 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled && Gpu.Buffers.CpWriteDeferProbe.AfterBreak) // [local]
+                Gpu.Buffers.CpWriteDeferProbe.OnBeginRendering(state == _probeBrokenState);
             EndRendering();
             var command = BeginBatchedGuestCommands();
             _commandBuffer = command;
-            if (DeferGlobalBarriers)
+            var scopeBarrierPrunable = Gpu.Vulkan.ScopeBarrierTracker.Enabled && DeferGlobalBarriers && // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
+                Gpu.Vulkan.ScopeBarrierTracker.ScopeBegins(_nextDrawWritesMemory);
+            var pruneScopeBarrier = scopeBarrierPrunable && Gpu.Vulkan.ScopeBarrierTracker.Mode == 2;
+            _scopeBarrierPruned = pruneScopeBarrier;
+            _scopeBarrierWouldPrune = scopeBarrierPrunable && !pruneScopeBarrier;
+            if (DeferGlobalBarriers && !pruneScopeBarrier)
             {
                 // A guest cache flush inside this scope may be deferred to its end; this keeps
                 // everything recorded before the scope ordered before its draws either way.
+                Gpu.Buffers.CpWriteDeferProbe.Suppress = true; // [local] the scope's own barrier
                 RecordGlobalBarrier(command);
+                Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
             }
 
             _renderingWritesMemory = _nextDrawWritesMemory;
@@ -1127,6 +1140,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _renderingActive = false;
             _renderingState = default;
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled) Gpu.Buffers.CpWriteDeferProbe.OnEndRendering(); // [local]
             var command = new CommandBuffer(_scheduler.Current.Handle);
             var vkProbe1008 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRendering(_vk, command); // [local]
@@ -1157,6 +1171,13 @@ internal static unsafe partial class VulkanVideoPresenter
             if (_globalBarrierAfterRendering)
             {
                 EndRendering();
+            }
+            // [local] A scope that skipped its barrier ends before a store, so the next one records it.
+            if (_renderingActive && (_scopeBarrierPruned || _scopeBarrierWouldPrune))
+            {
+                Gpu.Vulkan.ScopeBarrierTracker.NoteForcedEnd();
+                if (_scopeBarrierPruned) EndRendering();
+                _scopeBarrierWouldPrune = false;
             }
 
             _nextDrawWritesMemory = true;
@@ -1252,7 +1273,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1121 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = true; // [local] the stage path noted this command's writes
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDraw(_vk, command, count, instanceCount, firstVertex, firstInstance); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = false;
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Draw, vkProbe1121); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Draw,
                 _boundGraphicsPipeline?.Id ?? 0, count, instanceCount);
@@ -1277,7 +1300,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1144 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = true; // [local] the stage path noted this command's writes
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDrawIndexed(_vk, command, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = false;
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DrawIndexed, vkProbe1144); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, indexCount, instanceCount);
@@ -1302,7 +1327,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1167 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = true; // [local] the stage path noted this command's writes
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDrawIndexedIndirect(_vk, command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 20); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = false;
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DrawIndirect, vkProbe1167); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, 0, 0);
@@ -1316,7 +1343,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1179 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = true; // [local] the stage path noted this command's writes
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(_vk, command, groupsX, groupsY, groupsZ); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = false;
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Dispatch, vkProbe1179); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch,
                 _profileComputePipeline, groupsX, groupsY, groupsZ);
@@ -1344,7 +1373,9 @@ internal static unsafe partial class VulkanVideoPresenter
             // of the gap before the next marker (it was counted as gap_emu_shader).
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1202 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = true; // [local] the stage path noted this command's writes
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatchIndirect(_vk, command, buffer.Handle, offset); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = false;
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DispatchIndirect, vkProbe1202); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch, _profileComputePipeline, 0, 0, 0); // [local]
             CountDraw();
@@ -1415,7 +1446,9 @@ internal static unsafe partial class VulkanVideoPresenter
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe1260); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation); // [local] as TryDispatchIndirect
             var vkProbe1261 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = true; // [local] the stage path noted this command's writes
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatchIndirect(_vk, command, buffer.Handle, offset); // [local]
+            Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = false;
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DispatchIndirect, vkProbe1261); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch, _profileComputePipeline, 0, 0, 0); // [local]
             CountDraw();
