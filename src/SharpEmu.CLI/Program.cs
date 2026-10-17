@@ -60,11 +60,42 @@ internal static partial class Program
         }
     }
 
+    // [local] SHARPEMU_GC_SERVER (on by default, =0 keeps the runtime's regions workstation GC): the child runs the
+    // segments GC (clrgc.dll, shipped next to coreclr.dll by the runtime pack) as a non-concurrent server GC with two
+    // heaps and no heap affinity, so its threads do not take the host lanes HostLaneReservation keeps for the render,
+    // ring and front threads. GTA V static (2026-10-17): the regions GC paused ~11 ms per gen0/gen1 (54 GCs and
+    // ~590 ms per 20 s, ~1.25 ms per frame) although each promoted only ~4 MB; segments alone halve the pause per GC,
+    // and the two server heaps cut the collections to 17 per 20 s (~120 ms, ~0.25 ms per frame). The segments GC does
+    // not reserve the region range that collides with the fixed PS5 image bases (see SharpEmu.CLI.csproj). Each
+    // variable the user already set is left alone.
+    private static void ApplyChildServerGc()
+    {
+        if (Environment.GetEnvironmentVariable("SHARPEMU_GC_SERVER") == "0")
+        {
+            return;
+        }
+
+        SetIfUnset("DOTNET_GCName", "clrgc.dll");
+        SetIfUnset("DOTNET_gcServer", "1");
+        SetIfUnset("DOTNET_GCHeapCount", "2");
+        SetIfUnset("DOTNET_GCNoAffinitize", "1");
+        SetIfUnset("DOTNET_gcConcurrent", "0");
+
+        static void SetIfUnset(string name, string value)
+        {
+            if (Environment.GetEnvironmentVariable(name) is null)
+            {
+                Environment.SetEnvironmentVariable(name, value);
+            }
+        }
+    }
+
     [STAThread]
     private static int Main(string[] args)
     {
         ConfigureManagedPluginResolution();
         ApplyChildGcBudget();
+        ApplyChildServerGc();
 
         if (args.Length > 0 && args[0] == SharpEmu.Core.Diagnostics.WindowsCrashCapture.HelperArgument)
             return SharpEmu.Core.Diagnostics.WindowsCrashCapture.RunHelper(args);
