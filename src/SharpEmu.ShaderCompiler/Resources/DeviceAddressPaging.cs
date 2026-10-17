@@ -18,6 +18,23 @@ public static class DeviceAddressPaging
     public const int AddressSpaceBits = 40;
     public const ulong FaultBitmapBytes = (1UL << (AddressSpaceBits - PageBits)) / 8;
 
+    // [local] SHARPEMU_DA_ZERO_PAGE (off by default): a device-address load reads unconditionally, through the page's
+    // entry or, for a page the table does not map, through a page of zeros whose address is the table's last entry (an
+    // unmapped page reads zero, as before). The unmapped pages an invocation hits are kept as their lowest and highest
+    // index and set in the fault bitmap when the invocation ends: both pages when it hit at most two, every page of the
+    // interval when it hit more (at most ZeroPageMaxSpan from the lowest, plus the highest), so no page goes unreported
+    // and only pages of the interval can be reported too. =2 keeps the exact bitmap as before and sets the pages above
+    // in a shadow bitmap instead, which the host compares with it ([GPU][DA_ZERO_PAGE]).
+    // The counter words follow the RT stack area: 0 invocations with three or more distinct pages, 1 of those whose
+    // interval was cut, 2 pages set beyond the two ends, 3 invocations that hit any unmapped page. The shadow bitmap
+    // (=2) follows the counters.
+    public static readonly int ZeroPageMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DA_ZERO_PAGE"), out var zeroPage) && zeroPage is 1 or 2 ? zeroPage : 0;
+    public const uint ZeroPageMaxSpan = 64;
+    public const ulong ZeroPageCounterBytes = 64;
+    public static ulong ZeroPageCounterOffset => FaultBitmapBytes + RtStackAreaBytes;
+    public static ulong ZeroPageShadowOffset => ZeroPageCounterOffset + ZeroPageCounterBytes;
+    public static ulong ZeroPageAreaBytes => ZeroPageMode == 0 ? 0 : ZeroPageCounterBytes + (ZeroPageMode == 2 ? FaultBitmapBytes : 0);
+
     // [local] SHARPEMU_RT_STACK_SPLIT=<rows> (8 by default, 0 = off): the workgroup rows of the 0x8395
     // BLAS stack. An area after the fault bitmap holds the deeper entries: a bitmap of warp slots (each
     // 32-lane subgroup claims one for the dispatch and frees it at the end), then per slot

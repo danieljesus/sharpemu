@@ -238,6 +238,21 @@ public static partial class Gen5SpirvTranslator
                 _module.AddName(_deviceWordScratch, "deviceAddressWord");
                 _interfaces.Add(_deviceEntryScratch);
                 _interfaces.Add(_deviceWordScratch);
+                if (DeviceAddressPaging.ZeroPageMode != 0)
+                {
+                    _faultMin = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(NoPendingFault));
+                    _faultMax = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                    _faultMany = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                    _faultMarkIndex = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                    _module.AddName(_faultMin, "faultMin");
+                    _module.AddName(_faultMax, "faultMax");
+                    _module.AddName(_faultMany, "faultMany");
+                    _interfaces.Add(_faultMin);
+                    _interfaces.Add(_faultMax);
+                    _interfaces.Add(_faultMany);
+                    _interfaces.Add(_faultMarkIndex);
+                }
+
                 if (DeviceAddressFaultMode is 2 or 3)
                 {
                     _pendingFaultPage = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(NoPendingFault));
@@ -728,14 +743,113 @@ public static partial class Gen5SpirvTranslator
         // Before the program ends: the unmapped page an invocation kept (SHARPEMU_DA_FAULT_MODE=2/3).
         private void FlushPendingFault()
         {
+            FlushZeroPageFaults();
             if (_pendingFaultPage == 0)
                 return;
             var pending = Load(_uintType, _pendingFaultPage);
             EmitConditional(_module.AddInstruction(SpirvOp.INotEqual, _boolType, pending, UInt(NoPendingFault)), () => RecordFaultPage(pending));
         }
 
+        private uint _faultMin, _faultMax, _faultMany, _faultMarkIndex;
+
+        // SHARPEMU_DA_ZERO_PAGE: the lookup without branches (DeviceAddressPaging.ZeroPageMode).
+        private (uint Pointer, uint Valid) ResolveDeviceAddressZeroPage(uint address64)
+        {
+            var masked = And64(address64, ULong(DeviceAddressMask));
+            var pageIndex64 = _module.AddInstruction(SpirvOp.ShiftRightLogical, _ulongType, masked, ULong(DeviceAddressPageBits));
+            var zeroSlot = _module.AddInstruction(SpirvOp.ISub, _uintType, _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _pageTable, 0), UInt(1));
+            var inTable = ULessThan64(pageIndex64, Widen(zeroSlot));
+            var pageIndex = Narrow(pageIndex64);
+            var raw = Load(_ulongType, _module.AddInstruction(SpirvOp.AccessChain, _storageUlongPointer, _pageTable, UInt(0),
+                _module.AddInstruction(SpirvOp.Select, _uintType, inTable, pageIndex, zeroSlot)));
+            var zeroPage = Load(_ulongType, _module.AddInstruction(SpirvOp.AccessChain, _storageUlongPointer, _pageTable, UInt(0), zeroSlot));
+            var present = _module.AddInstruction(SpirvOp.INotEqual, _boolType, raw, ULong(0));
+            var mapped = LogicalAnd(inTable, present);
+            var faulted = LogicalAnd(inTable, LogicalNot(present));
+            if (DeviceAddressPaging.ZeroPageMode == 2)
+                EmitConditional(faulted, () => RecordFault(address64, pageIndex)); // the exact bitmap, for the comparison
+            var min = Load(_uintType, _faultMin);
+            var max = Load(_uintType, _faultMax);
+            var seen = _module.AddInstruction(SpirvOp.INotEqual, _boolType, min, UInt(NoPendingFault));
+            var another = LogicalAnd(LogicalAnd(faulted, seen), LogicalAnd(
+                _module.AddInstruction(SpirvOp.INotEqual, _boolType, pageIndex, min),
+                _module.AddInstruction(SpirvOp.INotEqual, _boolType, pageIndex, max)));
+            // A third distinct page: when it first comes, the pages seen so far are exactly the two ends.
+            var third = LogicalAnd(another, _module.AddInstruction(SpirvOp.INotEqual, _boolType, min, max));
+            Store(_faultMany, _module.AddInstruction(SpirvOp.Select, _uintType, third, UInt(1), Load(_uintType, _faultMany)));
+            Store(_faultMin, _module.AddInstruction(SpirvOp.Select, _uintType, faulted, _module.AddInstruction(SpirvOp.ExtInst, _uintType, _glsl, 38, min, pageIndex), min));
+            Store(_faultMax, _module.AddInstruction(SpirvOp.Select, _uintType, faulted, _module.AddInstruction(SpirvOp.ExtInst, _uintType, _glsl, 41, max, pageIndex), max));
+            var pageBase = _module.AddInstruction(SpirvOp.Select, _ulongType, mapped, raw, zeroPage);
+            return (IAdd64(pageBase, And64(masked, ULong(DeviceAddressPageSize - 1))), mapped);
+        }
+
+        private uint ZeroPageCounterWord(uint index) => UInt((uint)(DeviceAddressPaging.ZeroPageCounterOffset / 4) + index);
+
+        private void AddZeroPageCounter(uint index, uint amount)
+        {
+            var word = ZeroPageCounterWord(index);
+            EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
+                _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), amount));
+        }
+
+        // The page's bit in the fault bitmap, or with =2 in the shadow bitmap.
+        private void MarkZeroPageFault(uint pageIndex)
+        {
+            var baseWord = DeviceAddressPaging.ZeroPageMode == 2 ? (uint)(DeviceAddressPaging.ZeroPageShadowOffset / 4) : 0u;
+            var word = IAdd(UInt(baseWord), ShiftRightLogical(pageIndex, UInt(5)));
+            var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
+            EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
+                _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bit));
+        }
+
+        // Before the program ends: the unmapped pages the invocation hit (SHARPEMU_DA_ZERO_PAGE).
+        private void FlushZeroPageFaults()
+        {
+            if (_faultMin == 0)
+                return;
+            var min = Load(_uintType, _faultMin);
+            EmitConditional(_module.AddInstruction(SpirvOp.INotEqual, _boolType, min, UInt(NoPendingFault)), () =>
+            {
+                var max = Load(_uintType, _faultMax);
+                AddZeroPageCounter(3, UInt(1));
+                EmitConditional(IsNotZero(Load(_uintType, _faultMany)), () =>
+                {
+                    AddZeroPageCounter(0, UInt(1));
+                    var span = IAdd(_module.AddInstruction(SpirvOp.ISub, _uintType, max, min), UInt(1));
+                    var cut = _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, span, UInt(DeviceAddressPaging.ZeroPageMaxSpan));
+                    var count = _module.AddInstruction(SpirvOp.Select, _uintType, cut, UInt(DeviceAddressPaging.ZeroPageMaxSpan), span);
+                    EmitConditional(cut, () => AddZeroPageCounter(1, UInt(1)));
+                    AddZeroPageCounter(2, _module.AddInstruction(SpirvOp.ISub, _uintType, count, UInt(2)));
+                    Store(_faultMarkIndex, UInt(0));
+                    var header = _module.AllocateId();
+                    var body = _module.AllocateId();
+                    var next = _module.AllocateId();
+                    var merge = _module.AllocateId();
+                    _module.AddStatement(SpirvOp.Branch, header);
+                    _module.AddLabel(header);
+                    _module.AddStatement(SpirvOp.LoopMerge, merge, next, 0);
+                    var index = Load(_uintType, _faultMarkIndex);
+                    _module.AddStatement(SpirvOp.BranchConditional, _module.AddInstruction(SpirvOp.ULessThan, _boolType, index, count), body, merge);
+                    _module.AddLabel(body);
+                    MarkZeroPageFault(IAdd(min, index));
+                    _module.AddStatement(SpirvOp.Branch, next);
+                    _module.AddLabel(next);
+                    Store(_faultMarkIndex, IAdd(index, UInt(1)));
+                    _module.AddStatement(SpirvOp.Branch, header);
+                    _module.AddLabel(merge);
+                    EmitConditional(cut, () => MarkZeroPageFault(max));
+                }, () =>
+                {
+                    MarkZeroPageFault(min);
+                    EmitConditional(_module.AddInstruction(SpirvOp.INotEqual, _boolType, max, min), () => MarkZeroPageFault(max));
+                });
+            });
+        }
+
         private (uint Pointer, uint Valid) ResolveDeviceAddress(uint address64)
         {
+            if (DeviceAddressPaging.ZeroPageMode != 0)
+                return ResolveDeviceAddressZeroPage(address64);
             if (DeviceAddressUnchecked)
             {
                 var uncheckedMasked = And64(address64, ULong(DeviceAddressMask));
@@ -833,6 +947,13 @@ public static partial class Gen5SpirvTranslator
         // Loads one aligned dword through a device address; an unmapped page reads zero.
         private uint LoadDeviceDword(uint address64)
         {
+            if (DeviceAddressPaging.ZeroPageMode != 0)
+            {
+                // The pointer always reaches readable memory: the page itself or the page of zeros.
+                var (anyPointer, _) = ResolveDeviceAddress(address64);
+                return _module.AddInstruction(SpirvOp.Load, _uintType, DeviceWordPointer(anyPointer), 2u, 4u);
+            }
+
             var (pointer, valid) = ResolveDeviceAddress(address64);
             Store(_deviceWordScratch, UInt(0));
             EmitConditional(valid, () =>
