@@ -30,13 +30,13 @@ public sealed unsafe class SharedBackingViews : IDisposable
     // Single-view accesses in flight; Dispose waits for them before releasing the alias.
     private int _activeAccesses;
 
-    // [local] SHARPEMU_STRIPED_ACCESS_COUNT=1 (off by default): the in-flight count is kept in per-thread stripes on
+    // [local] SHARPEMU_STRIPED_ACCESS_COUNT (on by default; =0 turns it off): the in-flight count is kept in per-thread stripes on
     // their own cache lines, so the render threads' lock-free accesses (every HLE guest read and write, several per Agc
     // builder call) stop bouncing one shared line between cores. Only Dispose reads it, as the sum of the stripes: an
     // access enters and leaves on the same thread, and an alias access left on another thread moves the count between
     // stripes without changing the sum. Read once per instance at construction; settable for tests.
     internal static bool StripedAccessCountDefault { get; set; } =
-        Environment.GetEnvironmentVariable("SHARPEMU_STRIPED_ACCESS_COUNT") == "1";
+        Environment.GetEnvironmentVariable("SHARPEMU_STRIPED_ACCESS_COUNT") != "0";
 
     private const int AccessStripes = 64;
     private const int AccessStripeStride = 16; // 16 longs: 128 bytes, a pair of cache lines per stripe

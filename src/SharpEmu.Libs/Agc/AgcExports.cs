@@ -491,12 +491,12 @@ public static partial class AgcExports
     private static bool TryAllocateCommandDwords(CpuContext ctx, ulong commandBufferAddress, uint sizeDwords, out ulong commandAddress)
         => TryPrepareCommandDwords(ctx, commandBufferAddress, sizeDwords, true, out commandAddress);
 
-    // [local] SHARPEMU_HLE_SPAN_WRITES=1 (off by default): a builder writes its packet to guest memory as one span and
+    // [local] SHARPEMU_HLE_SPAN_WRITES (on by default; =0 turns it off): a builder writes its packet to guest memory as one span and
     // reads the command buffer state in one read, so the write hooks and the memory lock run once per packet instead
     // of once per dword. Off keeps one write per dword and one read per state field.
     // Adapted from 2838b258 by Berk (par274), co-authored by Astellou.
     private static readonly bool SpanWritesFromEnvironment =
-        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_HLE_SPAN_WRITES"), "1", StringComparison.Ordinal);
+        !string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_HLE_SPAN_WRITES"), "0", StringComparison.Ordinal);
 
     // 0 follows the environment, 1 forces span writes on, 2 off; per thread, for tests and benchmarks.
     [ThreadStatic]

@@ -187,9 +187,9 @@ public sealed class GuestPageTracker
     private static long _invalidations;
     private static long _cpuDirtySkips;
 
-    // [local] SHARPEMU_STRIPED_ACCESS_COUNT=1 also stops these two counters: nothing reads them, and every guest thread's
+    // [local] SHARPEMU_STRIPED_ACCESS_COUNT (on by default) also stops these two counters: nothing reads them, and every guest thread's
     // CPU write into a tracked region stored into their shared cache line.
-    private static readonly bool CountInvalidations = Environment.GetEnvironmentVariable("SHARPEMU_STRIPED_ACCESS_COUNT") != "1";
+    private static readonly bool CountInvalidations = Environment.GetEnvironmentVariable("SHARPEMU_STRIPED_ACCESS_COUNT") == "0";
 
     public static (long Invalidations, long CpuDirtySkips) TakeInvalidationCounters() =>
         (Interlocked.Exchange(ref _invalidations, 0), Interlocked.Exchange(ref _cpuDirtySkips, 0));

@@ -2341,10 +2341,10 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
     }
 
-    // [local] SHARPEMU_SINGLE_VIEW_WRITES=1 (off by default): managed writes that one backing view covers skip the
+    // [local] SHARPEMU_SINGLE_VIEW_WRITES (on by default; =0 turns it off): managed writes that one backing view covers skip the
     // region lock, as reads already do. Settable for tests and benchmarks.
     internal static bool SingleViewWrites { get; set; } =
-        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_SINGLE_VIEW_WRITES"), "1", StringComparison.Ordinal);
+        !string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_SINGLE_VIEW_WRITES"), "0", StringComparison.Ordinal);
 
     public bool TryWrite(ulong virtualAddress, ReadOnlySpan<byte> source)
     {
