@@ -595,6 +595,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         {
             var tick = _timeline.ReserveTick();
             if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Seal, -1, 0, tick); // [local]
+            Vulkan.VulkanCommandProfile.NoteSealed(buffer, tick); // [local] SHARPEMU_PROFILE_GPU_RUN
             submit.AddSignal(_timeline.Handle, tick);
             item = new SealedSubmit(buffer, submit, tick, target, new SubmissionTraceEntry(tick, _command.DebugOp,
                 _command.DebugSubmitId, _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3,

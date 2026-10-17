@@ -323,6 +323,7 @@ internal sealed unsafe partial class VulkanCommandProfile
         var frames = Interlocked.Exchange(ref _passFrames, 0);
         var f = (double)Math.Max(frames, 1);
         var total = _categories.Values.Sum(static sum => sum.Milliseconds);
+        if (RunEnabled) { _write(TakeRunReport()); _write(TakeRunSpanReport()); } // [local]
         var line = new StringBuilder(Inv($"[PERF][GPU_PASSES] window_s={windowSeconds:F1} frames={frames} busy_ms={busyMilliseconds / f:F2} idle_ms={(windowSeconds * 1000.0 - busyMilliseconds) / f:F2} intervals_ms={total / f:F2} submissions={submissions / f:F1} skipped_markers={_skippedMarkers} unavailable_buffers={_unavailableBuffers}"));
         foreach (var (name, sum) in _categories.OrderByDescending(static pair => pair.Value.Milliseconds))
             line.Append(Inv($" {name}={sum.Milliseconds / f:F3}/n{sum.Count / f:F0}"));

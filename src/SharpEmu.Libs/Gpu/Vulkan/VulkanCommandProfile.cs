@@ -27,6 +27,78 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
     private readonly List<(ulong Start, ulong End)> _spans = new();
     private ulong[]? _values;
 
+    // [local] SHARPEMU_PROFILE_GPU_RUN=<ms> (with GPU_PASSES): only the command buffers of the ticks a render-thread
+    // readback of at least <ms> waited behind (completed tick + 1 .. waited tick) are accumulated, so the pass, pipeline
+    // and site lines break down the GPU queue ahead of the long waits. The tick of a buffer is the one it was sealed with.
+    internal static readonly double RunMinMilliseconds = double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_RUN"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var runMs) ? runMs : 0;
+    internal static bool RunEnabled => RunMinMilliseconds > 0;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<nint, ulong> _sealedTicks = new();
+    private static readonly object _runGate = new();
+    private static readonly List<(ulong First, ulong Last)> _runs = new();
+    private static long _runWaits, _runTicks, _runBuffers, _otherBuffers;
+
+    internal static void NoteSealed(nint buffer, ulong tick)
+    {
+        if (RunEnabled)
+            _sealedTicks[buffer] = tick;
+    }
+
+    internal static void NoteRun(ulong first, ulong last)
+    {
+        if (last < first)
+            return;
+        lock (_runGate)
+        {
+            if (_runs.Count >= 512)
+                _runs.RemoveRange(0, 256);
+            _runs.Add((first, last));
+        }
+
+        Interlocked.Increment(ref _runWaits);
+        Interlocked.Add(ref _runTicks, (long)(last - first + 1));
+    }
+
+    private static ulong RunOf(nint buffer)
+    {
+        if (!_sealedTicks.TryGetValue(buffer, out var tick))
+            return 0;
+        lock (_runGate)
+        {
+            for (var index = _runs.Count - 1; index >= 0; index--)
+                if (tick >= _runs[index].First && tick <= _runs[index].Last)
+                    return _runs[index].Last;
+        }
+
+        return 0;
+    }
+
+    // [local] GPU timestamps of each run's buffers: span (first start .. last end), busy (merged) and the gaps between.
+    private readonly Dictionary<ulong, List<(ulong Start, ulong End)>> _runSpans = new();
+
+    private string TakeRunSpanReport()
+    {
+        double span = 0, busy = 0; long runs = 0, buffers = 0;
+        foreach (var (_, list) in _runSpans)
+        {
+            if (list.Count == 0)
+                continue;
+            var first = list.Min(static item => item.Start);
+            var last = list.Max(static item => item.End);
+            span += (last - first) * (double)_timestampPeriod / 1_000_000;
+            busy += MergeSpans(list).Busy * (double)_timestampPeriod / 1_000_000;
+            runs++;
+            buffers += list.Count;
+        }
+
+        _runSpans.Clear();
+        return runs == 0 ? "[PERF][GPU_RUN_SPAN] runs=0" : System.FormattableString.Invariant($"[PERF][GPU_RUN_SPAN] runs={runs} buffers_per_run={(double)buffers / runs:F1} span_ms={span / runs:F2} busy_ms={busy / runs:F2} gaps_ms={(span - busy) / runs:F2}");
+    }
+
+    private ulong _currentRun;
+
+    private static string TakeRunReport() =>
+        $"[PERF][GPU_RUN] min_ms={RunMinMilliseconds} waits={Interlocked.Exchange(ref _runWaits, 0)} ticks={Interlocked.Exchange(ref _runTicks, 0)} buffers_in_run={Interlocked.Exchange(ref _runBuffers, 0)} buffers_skipped={Interlocked.Exchange(ref _otherBuffers, 0)}";
+
     internal enum IntervalKind { Preparation, Draw, DrawIndexed, Dispatch, Tail, Overflow, Gap, CopyBuffer, FillBuffer, CopyImage, Blit, Resolve, Upload, Readback, Clear }
     private readonly record struct IntervalKey(IntervalKind Kind, ulong Pipeline);
     private readonly record struct Marker(IntervalKey Key, uint First, uint Second, uint Third, ushort Mask = 0, ulong Pass = 0, int Site = 0);
@@ -140,6 +212,18 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
         if (!queries.Submitted)
             return;
         queries.Submitted = false;
+        if (RunEnabled) // [local] SHARPEMU_PROFILE_GPU_RUN
+        {
+            var handle = _buffers.FirstOrDefault(pair => ReferenceEquals(pair.Value, queries)).Key;
+            _currentRun = RunOf(handle);
+            if (_currentRun == 0)
+            {
+                Interlocked.Increment(ref _otherBuffers);
+                return;
+            }
+
+            Interlocked.Increment(ref _runBuffers);
+        }
         var values = _values ??= new ulong[QueryCapacity * 2];
         fixed (ulong* pointer = values)
         {
@@ -157,6 +241,12 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
         if (last > 0 && values[1] != 0 && values[last * 2 + 1] != 0)
         {
             _spans.Add((values[0], values[last * 2]));
+            if (RunEnabled && _currentRun != 0) // [local]
+            {
+                if (!_runSpans.TryGetValue(_currentRun, out var runList))
+                    _runSpans.Add(_currentRun, runList = new());
+                runList.Add((values[0], values[last * 2]));
+            }
         }
 
         for (var index = 1; index < queries.Count; index++)

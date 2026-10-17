@@ -3040,6 +3040,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             pieces[index] = new ReadbackPiece(copies[index].Buffer, copies[index].SourceOffset, copies[index].Size);
         }
 
+        var runCompleted = Vulkan.VulkanCommandProfile.RunEnabled ? _scheduler.Timeline.CompletedTick : 0; // [local] SHARPEMU_PROFILE_GPU_RUN
+        var runStarted = Vulkan.VulkanCommandProfile.RunEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         readback.Read(pieces, waitTick, (index, bytes) =>
         {
             if (StoreTableVerify) VerifyExcludedBytes(copies[index].Address, bytes); // [local]
@@ -3048,6 +3050,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
             }
         });
+        if (Vulkan.VulkanCommandProfile.RunEnabled &&
+            System.Diagnostics.Stopwatch.GetElapsedTime(runStarted).TotalMilliseconds >= Vulkan.VulkanCommandProfile.RunMinMilliseconds)
+            Vulkan.VulkanCommandProfile.NoteRun(runCompleted + 1, waitTick);
         return true;
     }
 
