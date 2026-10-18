@@ -967,6 +967,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return created;
     }
 
+    // [local] SkipLocalsInit: the stack chunk is filled whole before it is written out.
+    [System.Runtime.CompilerServices.SkipLocalsInit]
     public void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds)
     {
         if ((guestAddress & 3) != 0 || size == 0 || (size & 3) != 0 || size > ulong.MaxValue - guestAddress)

@@ -27,6 +27,8 @@ public sealed partial class RenderExecutor
 
     // Merges the vertex ranges, obtains one host buffer per merged range and offsets every slot into it.
     // [local] Fills the caller's span (VertexInputInfo.MaxBuffers long) and returns the bound slots, without an array.
+    // [local] SkipLocalsInit: ranges and merged are read only below rangeCount/mergedCount, each element written whole first.
+    [System.Runtime.CompilerServices.SkipLocalsInit]
     private Span<BufferBinding> AcquireVertexBuffers(VertexInputInfo vertexInput, Span<BufferBinding> storage)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawVertexBufferAcquisition);
@@ -197,6 +199,8 @@ public sealed partial class RenderExecutor
     }
 
     // Binds everything the draw needs inside one preparation scope, then records it.
+    // [local] SkipLocalsInit: vertexStorage is only read through the slots AcquireVertexBuffers writes (every vertex slot).
+    [System.Runtime.CompilerServices.SkipLocalsInit]
     private void RecordDraw(
         ulong submitId,
         RegisterBanks banks,
