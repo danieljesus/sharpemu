@@ -154,7 +154,69 @@ public static class DepthTargetResolver
     private const byte ExclusiveOr = 0x0C;
 
     // Null means no depth or stencil state is active for the draw.
+    // [local] SHARPEMU_DEPTH_RESOLVE_MEMO (0 off by default): the depth resolution is a pure function of the depth
+    // target words, the stencil control and mask registers, the clear and bounds values and the device's format
+    // support; like ColorTargetResolver, the last result is kept on the resolving thread while those inputs are the
+    // same (the result is a value with no mutable tables). =2 resolves again on every hit and counts differences.
+    private static readonly int MemoMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEPTH_RESOLVE_MEMO"), out var memoMode) ? memoMode : 0;
+
+    private readonly record struct ResolveKey(DepthTargetWords Depth, StencilControlRegisters Control, StencilMaskRegisters Masks,
+        float DepthClear, float BoundsMin, float BoundsMax, byte StencilClear);
+
+    [ThreadStatic] private static ResolveKey _lastKey;
+    [ThreadStatic] private static IImageFormatSupport? _lastDevice;
+    [ThreadStatic] private static DepthTargetState? _lastResult;
+    [ThreadStatic] private static bool _lastValid;
+    internal static long MemoHits, MemoChecked, MemoMismatches, MemoUnverifiable;
+
     public static DepthTargetState? Resolve(ContextRegisters context, IImageFormatSupport device, Func<string, Exception> fatal)
+    {
+        if (MemoMode == 0)
+            return ResolveCore(context, device, fatal);
+        var key = new ResolveKey(context.DepthTarget, context.StencilControl, context.StencilMask, context.DepthClearValue,
+            context.DepthBoundsMin, context.DepthBoundsMax, context.StencilClearValue);
+        if (_lastValid && ReferenceEquals(_lastDevice, device) && _lastKey == key)
+        {
+            MemoHits++;
+            if (MemoMode != 2)
+                return _lastResult;
+            var fresh = ResolveCore(context, device, fatal);
+            MemoChecked++;
+            if (!SameResult(fresh, _lastResult))
+            {
+                MemoMismatches++;
+                if (MemoMismatches <= 20)
+                    Console.Error.WriteLine($"[DEPTH_RESOLVE_MEMO_MISMATCH] total={MemoMismatches}");
+            }
+
+            return fresh;
+        }
+
+        var result = ResolveCore(context, device, fatal);
+        _lastKey = key;
+        _lastDevice = device;
+        _lastResult = result;
+        _lastValid = true;
+        return result;
+    }
+
+    // Field by field through the bytes: the request holds inline arrays, whose built-in Equals throws.
+    private static bool SameResult(DepthTargetState? left, DepthTargetState? right)
+    {
+        if (left is null || right is null)
+            return left is null && right is null;
+        if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<DepthTargetState>())
+        {
+            MemoUnverifiable++;
+            return true;
+        }
+        var a = left.Value;
+        var b = right.Value;
+        return System.Runtime.InteropServices.MemoryMarshal.AsBytes(new ReadOnlySpan<DepthTargetState>(in a))
+            .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.AsBytes(new ReadOnlySpan<DepthTargetState>(in b)));
+    }
+
+    private static DepthTargetState? ResolveCore(ContextRegisters context, IImageFormatSupport device, Func<string, Exception> fatal)
     {
         if (ImageRequestBuilders.DepthTarget(in context.DepthTarget, device) is not { } target)
         {

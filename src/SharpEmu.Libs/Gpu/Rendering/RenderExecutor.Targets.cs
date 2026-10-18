@@ -16,6 +16,21 @@ public sealed partial class RenderExecutor
     // Finds the color and depth targets; false when the draw has nothing to render into.
     private bool TryResolveDrawTargets(RegisterBanks banks, in DrawCall draw, ref DrawState state)
     {
+        if (!AttachProbe.Enabled)
+            return TryResolveDrawTargetsCore(banks, in draw, ref state);
+        var started = System.Diagnostics.Stopwatch.GetTimestamp(); // [local] SHARPEMU_ATTACH_PROBE
+        try
+        {
+            return TryResolveDrawTargetsCore(banks, in draw, ref state);
+        }
+        finally
+        {
+            AttachProbe.Add(AttachProbe.Part.Resolve, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+        }
+    }
+
+    private bool TryResolveDrawTargetsCore(RegisterBanks banks, in DrawCall draw, ref DrawState state)
+    {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawTargetResolution);
         var context = banks.Context;
         if (TryResolveMultisampleColor(context))
@@ -41,7 +56,11 @@ public sealed partial class RenderExecutor
             state.Colors[(int)state.ColorCount++] = new ColorTargetState(in resolution, resolvedSlot, image);
         }
 
-        if (DepthTargetResolver.Resolve(context, _host.FormatSupport, _fatal) is { } depthTarget)
+        var depthStarted = AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        var resolvedDepth = DepthTargetResolver.Resolve(context, _host.FormatSupport, _fatal);
+        if (depthStarted != 0)
+            AttachProbe.Add(AttachProbe.Part.DepthResolve, System.Diagnostics.Stopwatch.GetTimestamp() - depthStarted);
+        if (resolvedDepth is { } depthTarget)
         {
             var image = FindDepthTargetImage(context, in depthTarget); // [local] SHARPEMU_TARGET_MEMO
             _host.BindRenderTarget(image);

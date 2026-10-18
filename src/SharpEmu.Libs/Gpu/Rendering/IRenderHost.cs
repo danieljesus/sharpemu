@@ -159,6 +159,18 @@ public interface IRenderHost
     // Whether a texture bound for the draw being prepared reads the depth attachment's subresources.
     bool SamplesDepthAttachment(in DepthAttachmentState depth) => true;
 
+    // [local] SHARPEMU_ATTACH_REPEAT: the recording tick and the BeginRendering calls so far, captured after an
+    // acquisition; then whether the next draw may take that acquisition again (see the Vulkan host), and with
+    // apply its bookkeeping replayed. Hosts without it never repeat.
+    (ulong Tick, long BeginCalls) AttachmentRepeatToken => (0, 0);
+
+    bool TryRepeatAttachments(ReadOnlySpan<ColorTargetState> colors, ReadOnlySpan<ImageLayout> colorLayouts, in DepthAttachmentState depth,
+        ImageLayout depthLayout, in RenderingState rendering, (ulong Tick, long BeginCalls) token, ReadOnlySpan<(object? Backing, long Version)> versions,
+        bool apply) => false;
+
+    // The backing of a target image and its access-state version (TryRepeatAttachments compares them).
+    (object? Backing, long Version) AttachmentStateVersion(ResourceSlotIdentifier image) => (null, -1);
+
     // The next draw stores to buffers or storage images; called before its BeginRendering.
     void PrepareMemoryWritingDraw() { }
 

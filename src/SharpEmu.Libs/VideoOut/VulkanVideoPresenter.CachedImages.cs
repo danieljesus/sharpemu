@@ -295,6 +295,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var view = target.Request.View;
             target.Layout = image.Binding.IsBound ? ImageLayout.General : ImageLayout.ColorAttachmentOptimal;
+            using var transitionProbe = new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.Transition,
+                SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0); // [local]
             image.Transition(
                 target.Layout,
                 AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit,

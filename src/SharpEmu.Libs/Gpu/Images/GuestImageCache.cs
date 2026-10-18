@@ -21,6 +21,32 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly GpuDeviceInfo _device;
     private readonly SubmissionScheduler _scheduler;
     private readonly RegionLock _lock = new(RegionLock.Category.ImageCache);
+
+    // [local] A counter of the image-cache events that can change what acquiring an image as a target does: an image
+    // registered or removed, an image marked for rebinding, and a transition or transfer whose barriers change a
+    // subresource's layout or access (a repeated attachment access in the same layout does not). Readers compare it
+    // with Volatile.Read after their own checks. Counted only while a consumer asks for it (SHARPEMU_ATTACH_REPEAT or
+    // SHARPEMU_IMAGE_STATE_GENERATION=1).
+    public static readonly bool TrackStateGeneration =
+        (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ATTACH_REPEAT"), out var attachRepeat) && attachRepeat != 0) ||
+        Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_STATE_GENERATION") == "1";
+
+    private static long _stateGeneration;
+
+    public static long StateGeneration => Volatile.Read(ref _stateGeneration);
+
+    // [local] SHARPEMU_ATTACH_REPEAT: images registered or removed (which image a stencil range resolves to).
+    private static long _registrationGeneration;
+
+    public static long RegistrationGeneration => Volatile.Read(ref _registrationGeneration);
+
+    internal static void BumpRegistrationGeneration() => Interlocked.Increment(ref _registrationGeneration);
+
+    internal static void BumpStateGeneration()
+    {
+        if (TrackStateGeneration)
+            Interlocked.Increment(ref _stateGeneration);
+    }
     private readonly PageGuard _pages;
     private readonly ColorToMultisampleDepthBlit _blit;
     private readonly GpuTiler _tiler;
@@ -353,6 +379,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
     public ImageView AcquireColorTargetView(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
+        var probeStarted = SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        using var probe = new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.ColorView, probeStarted);
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageAcquire);
         if (request.Role != ImageRole.ColorTarget)
         {
@@ -369,7 +397,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         TouchImage(image);
         image.MarkGpuModified();
         image.Uses.RenderTarget = true;
-        RefreshFromGuest(imageIdentifier, request);
+        using (new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.Refresh,
+            SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0)) // [local]
+            RefreshFromGuest(imageIdentifier, request);
         if (request.Description.Metadata.Kind == MetadataKind.Dcc && request.Description.Metadata.Range.Size == 0)
         {
             image.Description.Metadata = request.Description.Metadata;
@@ -396,8 +426,86 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         return image.GetOrCreateView(request.View);
     }
 
+    // [local] SHARPEMU_ATTACH_REPEAT: whether acquiring this image again as the same target would do only the
+    // bookkeeping that ReplayTargetAcquire repeats: registered and not to be found again, no CPU write pending or
+    // possible (no dirty state, no buffer copy, no watch hole whose page could have changed unseen), and nothing that
+    // reads guest memory on acquisition (DCC color metadata; a stencil plane that would be refreshed). The caller
+    // compares StateGeneration after this.
+    public bool IsRepeatableTarget(ResourceSlotIdentifier imageIdentifier, bool depth, bool stencilCompressed)
+    {
+        using var held = _lock.Hold();
+        var image = _slots.TryGet(imageIdentifier);
+        var offset = depth ? 6 : 0;
+        if (image is null || !image.Registered || image.DepthOwner.IsValid || image.Binding.NeedsRebind)
+            return RepeatRefused(offset + 0);
+        if (image.IsCpuDirty || image.IsBufferModified)
+            return RepeatRefused(offset + 1);
+        if (image.WatchHoles.Count != 0)
+            return RepeatRefused(offset + 2);
+        if (!image.IsWatched || image.WatchBegin != image.Description.Data.Address || image.WatchEnd != image.Description.Data.End)
+            return RepeatRefused(offset + 3);
+        // A DCC color target with no metadata range of its own registers the range and reads its clear state on
+        // acquisition (ResolveDccAttachmentClear); one with a range does neither.
+        if (!depth)
+            return image.Description.Metadata.Kind != MetadataKind.Dcc || image.Description.Metadata.Range.Size != 0 || RepeatRefused(4);
+        if (!image.Description.HasStencil)
+            return true;
+        // The stencil association is found again on acquisition (one more touch) and refreshed only when the
+        // plane is uncompressed single-sample: then it must be as clean as the image.
+        var association = image.LastStencilAssociation.IsValid ? _slots.TryGet(image.LastStencilAssociation) : null;
+        if (association is null || !association.Registered || association.DepthOwner != imageIdentifier ||
+            association.Description.Data.Address != image.Description.Stencil.Address)
+            return RepeatRefused(offset + 4);
+        if (stencilCompressed || image.Description.Samples != 1)
+            return true;
+        if (association.Binding.NeedsRebind || association.IsCpuDirty || association.IsBufferModified || association.WatchHoles.Count != 0 ||
+            !association.IsWatched || association.WatchBegin != association.Description.Data.Address || association.WatchEnd != association.Description.Data.End)
+            return RepeatRefused(offset + 5);
+        return true;
+    }
+
+    internal static readonly long[] RepeatRefusals = new long[12];
+
+    private static bool RepeatRefused(int reason)
+    {
+        RepeatRefusals[reason]++;
+        return false;
+    }
+
+    // [local] SHARPEMU_ATTACH_REPEAT: the backing behind an image and its state version, for comparing later.
+    public (object? Backing, long Version) TargetStateVersion(ResourceSlotIdentifier imageIdentifier)
+    {
+        using var held = _lock.Hold();
+        var image = _slots.TryGet(imageIdentifier);
+        return image is null ? (null, -1) : (image.Backing, image.Backing.StateVersion);
+    }
+
+    // [local] SHARPEMU_ATTACH_REPEAT: the bookkeeping of AcquireColorTargetView / AcquireDepthTargetView for an image
+    // IsRepeatableTarget accepted, in the same order: recency, GPU write order, use, ownership and readback.
+    public void ReplayTargetAcquire(ResourceSlotIdentifier imageIdentifier, bool depth)
+    {
+        using var held = _lock.Hold();
+        var image = _slots[imageIdentifier];
+        TouchImage(image);
+        image.MarkGpuModified();
+        if (depth)
+        {
+            image.Uses.DepthTarget = true;
+            if (image.Description.HasStencil && _slots.TryGet(image.LastStencilAssociation) is { } association)
+                TouchImage(association);
+            TakeGpuOwnership(image);
+            return;
+        }
+
+        image.Uses.RenderTarget = true;
+        TakeGpuOwnership(image);
+        ScheduleReadback(imageIdentifier, image);
+    }
+
     public ImageView AcquireDepthTargetView(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
+        var probeStarted = SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        using var probe = new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.DepthView, probeStarted);
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageAcquire);
         if (request.Role != ImageRole.DepthTarget)
         {
@@ -414,7 +522,9 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         TouchImage(image);
         image.MarkGpuModified();
         image.Uses.DepthTarget = true;
-        RefreshFromGuest(imageIdentifier, request);
+        using (new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.Refresh,
+            SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0)) // [local]
+            RefreshFromGuest(imageIdentifier, request);
         if (request.Description.HasMetadata)
         {
             image.Description.Metadata = request.Description.Metadata;
@@ -513,6 +623,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private void RefreshStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth, bool stencilCompressed)
     {
         var association = AssociateStencilRange(depthIdentifier, depth.Description.Stencil);
+        depth.LastStencilAssociation = association; // [local] SHARPEMU_ATTACH_REPEAT
         if (stencilCompressed || depth.Description.Samples != 1)
         {
             return;

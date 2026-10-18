@@ -421,6 +421,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // The image transition ends the scope only when it records a barrier.
         public void TransitionDepthAttachment(in DepthAttachmentState depth, ImageLayout layout, ImageAspectFlags writeAspects)
         {
+            using var transitionProbe = new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.Transition,
+                SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0); // [local]
             var command = BeginBatchedGuestCommands();
             var image = _imageCache.GetImage(depth.Image);
             var view = depth.Target.Target.Request.View;
@@ -1032,8 +1034,10 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRenderingSetup);
             if (Gpu.Rendering.BatchSimulation.Enabled) Gpu.Rendering.BatchSimulation.NoteDraw(in state); // [local]
+            _beginRenderingCalls++; // [local] SHARPEMU_ATTACH_REPEAT
             if (_renderingActive && _renderingState == state)
             {
+                _scopeAtLastBegin = _renderingScopesBegun; // [local]
                 _renderingWritesMemory |= _nextDrawWritesMemory;
                 _nextDrawWritesMemory = false;
                 return;
@@ -1129,6 +1133,88 @@ internal static unsafe partial class VulkanVideoPresenter
             _renderingScopesBegun++;
             _renderingActive = true;
             _renderingState = state;
+            _scopeAtLastBegin = _renderingScopesBegun; // [local]
+        }
+
+        // [local] SHARPEMU_ATTACH_REPEAT: the BeginRendering calls and the scope the last one left open.
+        private long _beginRenderingCalls;
+        private long _scopeAtLastBegin = -1;
+
+        (ulong Tick, long BeginCalls) IRenderHost.AttachmentRepeatToken => (_scheduler.CurrentTick, _beginRenderingCalls);
+
+        (object? Backing, long Version) IRenderHost.AttachmentStateVersion(ResourceSlotIdentifier image) => _imageCache.TargetStateVersion(image);
+
+        // [local] Why repeats are refused, by reason (reported with [ATTACH_REPEAT]).
+        internal static readonly long[] AttachRepeatMisses = new long[12];
+
+        private static bool Miss(int reason)
+        {
+            AttachRepeatMisses[reason]++;
+            return false;
+        }
+
+        private bool SameStateVersion(ResourceSlotIdentifier image, (object? Backing, long Version) recorded)
+        {
+            var now = _imageCache.TargetStateVersion(image);
+            return recorded.Backing is not null && ReferenceEquals(now.Backing, recorded.Backing) && now.Version == recorded.Version;
+        }
+
+        // The previous draw acquired these attachments (token taken after it), and only its own BeginRendering ran
+        // since, leaving that scope open with the same rendering state, in the same recording tick. Each image must
+        // still be acquirable without work (IsRepeatableTarget), the layouts must be the ones this draw would pick
+        // (a color target bound as a texture takes General; a sampled depth target its sampling layout), a depth
+        // target must have no HTile clear to consume, and no barrier may have changed an attachment's backing
+        // since (the same backing and state version). The transitions the full path would make here only repeat the attachment
+        // accesses already deferred to the scope's end.
+        bool IRenderHost.TryRepeatAttachments(ReadOnlySpan<ColorTargetState> colors, ReadOnlySpan<ImageLayout> colorLayouts, in DepthAttachmentState depth,
+            ImageLayout depthLayout, in RenderingState rendering, (ulong Tick, long BeginCalls) token, ReadOnlySpan<(object? Backing, long Version)> versions,
+            bool apply)
+        {
+            if (_scheduler.CurrentTick != token.Tick) return Miss(0);
+            if (_beginRenderingCalls != token.BeginCalls + 1) return Miss(1);
+            if (!_renderingActive || _renderingScopesBegun != _scopeAtLastBegin) return Miss(2);
+            if (_renderingState != rendering) return Miss(3);
+            for (var index = 0; index < colors.Length; index++)
+            {
+                var image = colors[index].Image;
+                // A DCC request with no metadata range of its own registers it and reads its clear state on acquisition.
+                var metadata = colors[index].Resolution.Request.Description.Metadata;
+                if (metadata.Kind == MetadataKind.Dcc && metadata.Range.Size == 0) return Miss(11);
+                if (!_imageCache.IsRepeatableTarget(image, depth: false, stencilCompressed: false)) return Miss(4);
+                if (!SameStateVersion(image, versions[index])) return Miss(5);
+                var layout = _imageCache.GetImage(image).Binding.IsBound ? ImageLayout.General : ImageLayout.ColorAttachmentOptimal;
+                if (layout != colorLayouts[index]) return Miss(6);
+            }
+
+            if (depth.HasTarget)
+            {
+                var target = depth.Target.Target;
+                if (!_imageCache.IsRepeatableTarget(depth.Image, depth: true, target.Request.Description.Metadata.StencilCompressed)) return Miss(7);
+                if (!SameStateVersion(depth.Image, versions[colors.Length])) return Miss(8);
+                if (target.DepthClearEnabled || depth.LoadClear ||
+                    (target.HasHtile && _imageCache.IsMetadataCleared(target.HtileAddress, target.Request.View.BaseLayer)))
+                    return Miss(9);
+                var loadState = depth.LoadState;
+                var layout = ((IRenderHost)this).SamplesDepthAttachment(in depth)
+                    ? loadState.AttachmentLayout(target.Format)
+                    : DepthStencilState.WritableAttachmentLayout(target.Format);
+                if (layout != depthLayout) return Miss(10);
+            }
+
+            if (!apply)
+                return true;
+            for (var index = 0; index < colors.Length; index++)
+                _imageCache.ReplayTargetAcquire(colors[index].Image, depth: false);
+            if (depth.HasTarget)
+            {
+                _imageCache.ReplayTargetAcquire(depth.Image, depth: true);
+                _hasBoundDepth = true;
+                _boundDepth = depth;
+                _boundDepthLayout = depthLayout;
+                _boundDepthLoadState = depth.LoadState;
+            }
+
+            return true;
         }
 
         public void EndRendering()

@@ -128,7 +128,17 @@ public sealed unsafe partial class CachedImage
         }
 
         Backing.State = new ImageAccessState(stage, access, layout);
+        if (barriers.Count != 0 && !OnlyRepeatsAttachmentAccess(barriers)) Backing.StateVersion++; // [local] SHARPEMU_ATTACH_REPEAT
+        NoteStateBarriers(barriers); // [local]
         return sourceStages;
+    }
+
+    // [local] GuestImageCache.StateGeneration: barriers that change a layout or an access move it; a repeated
+    // attachment access in the same layout does not.
+    private static void NoteStateBarriers(List<ImageMemoryBarrier2> barriers)
+    {
+        if (GuestImageCache.TrackStateGeneration && barriers.Count != 0 && !OnlyRepeatsAttachmentAccess(barriers))
+            GuestImageCache.BumpStateGeneration();
     }
 
     public void Transition(ImageLayout layout, AccessFlags access, SubresourceRange? range, CommandBuffer command)

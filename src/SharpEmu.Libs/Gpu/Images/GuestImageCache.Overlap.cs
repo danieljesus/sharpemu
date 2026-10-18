@@ -424,6 +424,7 @@ public sealed partial class GuestImageCache
         if (cached.Binding.IsBound || cached.Binding.IsTarget)
         {
             cached.Binding.NeedsRebind = true;
+            BumpStateGeneration(); // [local]
         }
 
         if (cached.Backing.Samples == replacement.Backing.Samples)
@@ -550,6 +551,8 @@ public sealed partial class GuestImageCache
             }
 
             cached.Binding.NeedsRebind |= cached.Binding.IsBound || cached.Binding.IsTarget;
+
+            BumpStateGeneration(); // [local]
             _slots[mergedImageIdentifier].Binding.IsTarget |= cached.Binding.IsTarget;
             CopyIntoMip(mergedImageIdentifier, cachedImageIdentifier, (uint)containedMip, (uint)containedLayer);
             ReleaseImage(cachedImageIdentifier);
@@ -575,6 +578,7 @@ public sealed partial class GuestImageCache
         if (source.Binding.IsBound || source.Binding.IsTarget)
         {
             source.Binding.NeedsRebind = true;
+            BumpStateGeneration(); // [local]
         }
 
         PopulateFromGuest(expandedImageIdentifier, ImageRequest.Refresh(description, UploadRole(source)), "expand");
@@ -606,6 +610,7 @@ public sealed partial class GuestImageCache
         if (cached.Binding.IsBound || cached.Binding.IsTarget)
         {
             cached.Binding.NeedsRebind = true;
+            BumpStateGeneration(); // [local]
         }
 
         CopyWholeImage(replacementImageIdentifier, cachedImageIdentifier);
