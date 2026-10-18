@@ -1177,6 +1177,9 @@ internal static unsafe partial class VulkanVideoPresenter
             for (var index = 0; index < colors.Length; index++)
             {
                 var image = colors[index].Image;
+                // A DCC request with no metadata range of its own registers it and reads its clear state on acquisition.
+                var metadata = colors[index].Resolution.Request.Description.Metadata;
+                if (metadata.Kind == MetadataKind.Dcc && metadata.Range.Size == 0) return Miss(11);
                 if (!_imageCache.IsRepeatableTarget(image, depth: false, stencilCompressed: false)) return Miss(4);
                 if (!SameStateVersion(image, versions[index])) return Miss(5);
                 var layout = _imageCache.GetImage(image).Binding.IsBound ? ImageLayout.General : ImageLayout.ColorAttachmentOptimal;

@@ -96,6 +96,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 var misses = Presenter.AttachRepeatMisses;
                 var text = string.Join(",", misses.Select(static value => value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
                 Array.Clear(misses);
+                var refusals = GuestImageCache.RepeatRefusals;
+                text += " image=" + string.Join(",", refusals.Select(static value => value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                Array.Clear(refusals);
                 return text;
             };
             _bufferCache.StreamOffsetAlignment = Math.Max(_bufferCache.StreamOffsetAlignment, GuestStorageBufferOffsetAlignment);

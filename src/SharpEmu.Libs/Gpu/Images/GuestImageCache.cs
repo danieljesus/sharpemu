@@ -428,13 +428,28 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     {
         using var held = _lock.Hold();
         var image = _slots.TryGet(imageIdentifier);
-        if (image is null || !image.Registered || image.DepthOwner.IsValid || image.Binding.NeedsRebind ||
-            image.IsCpuDirty || image.IsBufferModified || image.WatchHoles.Count != 0 || !image.IsWatched ||
-            image.WatchBegin != image.Description.Data.Address || image.WatchEnd != image.Description.Data.End)
-            return false;
+        var offset = depth ? 6 : 0;
+        if (image is null || !image.Registered || image.DepthOwner.IsValid || image.Binding.NeedsRebind)
+            return RepeatRefused(offset + 0);
+        if (image.IsCpuDirty || image.IsBufferModified)
+            return RepeatRefused(offset + 1);
+        if (image.WatchHoles.Count != 0)
+            return RepeatRefused(offset + 2);
+        if (!image.IsWatched || image.WatchBegin != image.Description.Data.Address || image.WatchEnd != image.Description.Data.End)
+            return RepeatRefused(offset + 3);
+        // A DCC color target with no metadata range of its own registers the range and reads its clear state on
+        // acquisition (ResolveDccAttachmentClear); one with a range does neither.
         if (!depth)
-            return image.Description.Metadata.Kind != MetadataKind.Dcc;
-        return !image.Description.HasStencil || stencilCompressed || image.Description.Samples != 1;
+            return image.Description.Metadata.Kind != MetadataKind.Dcc || image.Description.Metadata.Range.Size != 0 || RepeatRefused(4);
+        return !image.Description.HasStencil || stencilCompressed || image.Description.Samples != 1 || RepeatRefused(offset + 4);
+    }
+
+    internal static readonly long[] RepeatRefusals = new long[12];
+
+    private static bool RepeatRefused(int reason)
+    {
+        RepeatRefusals[reason]++;
+        return false;
     }
 
     // [local] SHARPEMU_ATTACH_REPEAT: the backing behind an image and its state version, for comparing later.
