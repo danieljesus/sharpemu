@@ -1144,6 +1144,15 @@ internal static unsafe partial class VulkanVideoPresenter
 
         (object? Backing, long Version) IRenderHost.AttachmentStateVersion(ResourceSlotIdentifier image) => _imageCache.TargetStateVersion(image);
 
+        // [local] Why repeats are refused, by reason (reported with [ATTACH_REPEAT]).
+        internal static readonly long[] AttachRepeatMisses = new long[12];
+
+        private static bool Miss(int reason)
+        {
+            AttachRepeatMisses[reason]++;
+            return false;
+        }
+
         private bool SameStateVersion(ResourceSlotIdentifier image, (object? Backing, long Version) recorded)
         {
             var now = _imageCache.TargetStateVersion(image);
@@ -1161,33 +1170,32 @@ internal static unsafe partial class VulkanVideoPresenter
             ImageLayout depthLayout, in RenderingState rendering, (ulong Tick, long BeginCalls) token, ReadOnlySpan<(object? Backing, long Version)> versions,
             bool apply)
         {
-            if (_scheduler.CurrentTick != token.Tick || _beginRenderingCalls != token.BeginCalls + 1 || !_renderingActive ||
-                _renderingScopesBegun != _scopeAtLastBegin || _renderingState != rendering)
-                return false;
+            if (_scheduler.CurrentTick != token.Tick) return Miss(0);
+            if (_beginRenderingCalls != token.BeginCalls + 1) return Miss(1);
+            if (!_renderingActive || _renderingScopesBegun != _scopeAtLastBegin) return Miss(2);
+            if (_renderingState != rendering) return Miss(3);
             for (var index = 0; index < colors.Length; index++)
             {
                 var image = colors[index].Image;
-                if (!_imageCache.IsRepeatableTarget(image, depth: false, stencilCompressed: false) || !SameStateVersion(image, versions[index]))
-                    return false;
+                if (!_imageCache.IsRepeatableTarget(image, depth: false, stencilCompressed: false)) return Miss(4);
+                if (!SameStateVersion(image, versions[index])) return Miss(5);
                 var layout = _imageCache.GetImage(image).Binding.IsBound ? ImageLayout.General : ImageLayout.ColorAttachmentOptimal;
-                if (layout != colorLayouts[index])
-                    return false;
+                if (layout != colorLayouts[index]) return Miss(6);
             }
 
             if (depth.HasTarget)
             {
                 var target = depth.Target.Target;
-                if (!_imageCache.IsRepeatableTarget(depth.Image, depth: true, target.Request.Description.Metadata.StencilCompressed) ||
-                    !SameStateVersion(depth.Image, versions[colors.Length]) ||
-                    target.DepthClearEnabled || depth.LoadClear ||
+                if (!_imageCache.IsRepeatableTarget(depth.Image, depth: true, target.Request.Description.Metadata.StencilCompressed)) return Miss(7);
+                if (!SameStateVersion(depth.Image, versions[colors.Length])) return Miss(8);
+                if (target.DepthClearEnabled || depth.LoadClear ||
                     (target.HasHtile && _imageCache.IsMetadataCleared(target.HtileAddress, target.Request.View.BaseLayer)))
-                    return false;
+                    return Miss(9);
                 var loadState = depth.LoadState;
                 var layout = ((IRenderHost)this).SamplesDepthAttachment(in depth)
                     ? loadState.AttachmentLayout(target.Format)
                     : DepthStencilState.WritableAttachmentLayout(target.Format);
-                if (layout != depthLayout)
-                    return false;
+                if (layout != depthLayout) return Miss(10);
             }
 
             if (!apply)

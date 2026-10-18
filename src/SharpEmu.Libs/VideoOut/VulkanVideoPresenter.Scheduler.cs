@@ -91,6 +91,13 @@ internal static unsafe partial class VulkanVideoPresenter
             var (memory, guest, backing) = RequireGuestMemory("buffer store");
             _guestBacking = backing;
             _bufferCache = new GuestBufferCache(_deviceInfo, _scheduler, _relay, memory.Pages, guest, backing);
+            Gpu.Rendering.RenderExecutor.HostMissReport = static () => // [local] SHARPEMU_ATTACH_REPEAT
+            {
+                var misses = Presenter.AttachRepeatMisses;
+                var text = string.Join(",", misses.Select(static value => value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                Array.Clear(misses);
+                return text;
+            };
             _bufferCache.StreamOffsetAlignment = Math.Max(_bufferCache.StreamOffsetAlignment, GuestStorageBufferOffsetAlignment);
             if (_readbackQueueFamilyIndex is { } readbackFamily)
             {

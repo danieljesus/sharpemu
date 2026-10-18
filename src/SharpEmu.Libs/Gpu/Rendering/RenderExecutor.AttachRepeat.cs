@@ -36,6 +36,9 @@ public sealed partial class RenderExecutor
     }
 
     private readonly AttachRecord _attachRecord = new();
+    // [local] No record to repeat (the last acquisition had clears), and targets that differ from the record.
+    internal static readonly long[] InputMisses = new long[2];
+    public static Func<string>? HostMissReport { get; set; }
     private static long _attachDraws, _attachWindow = System.Diagnostics.Stopwatch.GetTimestamp();
 
     private static void ReportAttachRepeat()
@@ -46,7 +49,8 @@ public sealed partial class RenderExecutor
         if (seconds < 5)
             return;
         Console.Error.WriteLine(FormattableString.Invariant(
-            $"[ATTACH_REPEAT] window_s={seconds:F1} draws={_attachDraws} repeats={AttachRepeatHits} ({100.0 * AttachRepeatHits / Math.Max(1, _attachDraws):F1}%) checked={AttachRepeatChecked} mismatches={AttachRepeatMismatches} mismatches_total={AttachRepeatMismatchTotal} generation={GuestImageCache.StateGeneration}"));
+            $"[ATTACH_REPEAT] window_s={seconds:F1} draws={_attachDraws} repeats={AttachRepeatHits} ({100.0 * AttachRepeatHits / Math.Max(1, _attachDraws):F1}%) checked={AttachRepeatChecked} mismatches={AttachRepeatMismatches} mismatches_total={AttachRepeatMismatchTotal} generation={GuestImageCache.StateGeneration} no_record={InputMisses[0]} other_targets={InputMisses[1]} host=[{HostMissReport?.Invoke()}]"));
+        Array.Clear(InputMisses);
         _attachDraws = AttachRepeatHits = AttachRepeatChecked = AttachRepeatMismatches = 0;
         _attachWindow = now;
     }
@@ -81,6 +85,8 @@ public sealed partial class RenderExecutor
             return AcquireAttachments(ref state);
         ReportAttachRepeat();
         var record = _attachRecord;
+        if (!record.Valid) InputMisses[0]++;
+        else if (!SameAttachmentInputs(ref state)) InputMisses[1]++;
         var repeat = SameAttachmentInputs(ref state) && _host.TryRepeatAttachments(
             ((ReadOnlySpan<ColorTargetState>)record.Outputs)[..(int)record.ColorCount],
             ((ReadOnlySpan<ImageLayout>)record.ColorLayouts)[..(int)record.ColorCount],
