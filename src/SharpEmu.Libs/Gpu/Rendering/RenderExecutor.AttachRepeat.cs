@@ -86,9 +86,10 @@ public sealed partial class RenderExecutor
             return AcquireAttachments(ref state);
         ReportAttachRepeat();
         var record = _attachRecord;
+        var sameInputs = SameAttachmentInputs(ref state); // [local] compared once; false without a record
         if (!record.Valid) InputMisses[0]++;
-        else if (!SameAttachmentInputs(ref state)) InputMisses[1]++;
-        var repeat = SameAttachmentInputs(ref state) && record.Registrations == GuestImageCache.RegistrationGeneration && _host.TryRepeatAttachments(
+        else if (!sameInputs) InputMisses[1]++;
+        var repeat = sameInputs && record.Registrations == GuestImageCache.RegistrationGeneration && _host.TryRepeatAttachments(
             ((ReadOnlySpan<ColorTargetState>)record.Outputs)[..(int)record.ColorCount],
             ((ReadOnlySpan<ImageLayout>)record.ColorLayouts)[..(int)record.ColorCount],
             in record.DepthInput, record.DepthLayout, in record.Rendering, record.Token,
