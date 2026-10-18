@@ -936,14 +936,36 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private int _fillBigLogs;
     private long _fillGpu, _fillGpuBytes, _fillCpu, _fillInvalidate, _fillObtain, _fillRecord, _fillReport, _fillClearMeta, _fillQuery, _fillImageInvalidate, _fillImageCount, _fillWrite;
     private static readonly ulong FillOnGpuMin = Convert.ToUInt64(Environment.GetEnvironmentVariable("SHARPEMU_FILL_ON_GPU_MIN") ?? "0", 16); // [local]
-    private uint[]? _fillPattern; // [local]
+    // [local] Large-fill patterns of 256 KB, one per recent value (GTA V alternates 0 and 0xFFFFFFF0), replaced in turn.
+    private readonly uint[]?[] _fillPatterns = new uint[]?[4];
+    private readonly uint[] _fillPatternValues = new uint[4];
+    private int _fillPatternNext;
     private static readonly bool ParallelFill = Environment.GetEnvironmentVariable("SHARPEMU_PARALLEL_FILL") != "0"; // [local] on by default (rt421)
     private const ulong ParallelFillMin = 2UL << 20;
-    private uint _fillPatternValue;
     private static readonly bool FastFill = Environment.GetEnvironmentVariable("SHARPEMU_FAST_FILL") != "0"; // [local] on by default (rt415: CommandMemoryTransfer 5.1 -> 3.4 ms/frame)
     // [local] experiment: a written binding over a GPU-modified range still uploads CPU-dirty pages first (SHARPEMU_WRITTEN_SYNC_CPU_DIRTY=1).
     private static readonly bool WrittenSyncCpuDirty = Environment.GetEnvironmentVariable("SHARPEMU_WRITTEN_SYNC_CPU_DIRTY") == "1";
     private static readonly bool HostWriteMarkDirty = Environment.GetEnvironmentVariable("SHARPEMU_HOSTWRITE_MARK_DIRTY") == "1"; // [local]
+
+    // [local] The 256 KB pattern of a value, built once while the value stays among the last four used.
+    private uint[] FillPattern(uint value)
+    {
+        for (var index = 0; index < _fillPatterns.Length; index++)
+        {
+            if (_fillPatterns[index] is { } pattern && _fillPatternValues[index] == value)
+            {
+                return pattern;
+            }
+        }
+
+        var slot = _fillPatternNext;
+        _fillPatternNext = (slot + 1) % _fillPatterns.Length;
+        var created = _fillPatterns[slot] ??= new uint[64 * 1024];
+        created.AsSpan().Fill(value);
+        _fillPatternValues[slot] = value;
+        if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.FillPatternRefill, created.Length * 4L); // [local] SHARPEMU_MEMCOPY_PROBE
+        return created;
+    }
 
     public void FillBuffer(ulong guestAddress, ulong size, uint value, bool isGds)
     {
@@ -1001,25 +1023,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             }
             var tw = FillLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             try {
-            // Labels and small clears dominate; fill a stack chunk once and repeat it.
-            Span<uint> values = stackalloc uint[(int)Math.Min(size / sizeof(uint), 1024UL)];
-            values.Fill(value);
-            if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.FillStackPattern, values.Length * 4L); // [local] SHARPEMU_MEMCOPY_PROBE
-            var bytes = MemoryMarshal.AsBytes(values);
-            if (FastFill && size > (ulong)bytes.Length)
+            // [local] The stack chunk below is 4 KB at most, so a fill above that takes the large path when FastFill is on;
+            // the chunk is only built on the path that writes it.
+            if (FastFill && size > 1024UL * sizeof(uint))
             {
                 // [local] A large fill: the guest copy by memset, each registered buffer by one GPU fill,
                 // instead of a staged copy per 4 KB chunk (rt406: ~21 MB/frame of fills in GTA V).
                 // 256 KB pieces: per-call overhead of the backing write dominated the 4 KB loop.
-                if (_fillPattern is null || _fillPatternValue != value)
-                {
-                    _fillPattern ??= new uint[64 * 1024];
-                    _fillPattern.AsSpan().Fill(value);
-                    _fillPatternValue = value;
-                }
-
                 if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.FillFast, (long)size); // [local] SHARPEMU_MEMCOPY_PROBE
-                var patternArray = _fillPattern;
+                var patternArray = FillPattern(value);
                 var pieceBytes = (ulong)patternArray.Length * sizeof(uint);
                 if (ParallelFill && size >= ParallelFillMin)
                 {
@@ -1076,6 +1088,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             }
 
             if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.FillSmall, (long)size); // [local] SHARPEMU_MEMCOPY_PROBE
+            // Labels and small clears dominate; fill a stack chunk once and repeat it.
+            Span<uint> values = stackalloc uint[(int)Math.Min(size / sizeof(uint), 1024UL)];
+            values.Fill(value);
+            if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.FillStackPattern, values.Length * 4L); // [local] SHARPEMU_MEMCOPY_PROBE
+            var bytes = MemoryMarshal.AsBytes(values);
             for (ulong offset = 0; offset < size;)
             {
                 var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);

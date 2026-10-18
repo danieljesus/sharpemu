@@ -21,6 +21,7 @@ internal static class MemCopyProbe
         FillFast,
         FillSmall,
         FillStackPattern,
+        FillPatternRefill,
         Count,
     }
 
