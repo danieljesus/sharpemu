@@ -1004,6 +1004,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             // Labels and small clears dominate; fill a stack chunk once and repeat it.
             Span<uint> values = stackalloc uint[(int)Math.Min(size / sizeof(uint), 1024UL)];
             values.Fill(value);
+            if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.FillStackPattern, values.Length * 4L); // [local] SHARPEMU_MEMCOPY_PROBE
             var bytes = MemoryMarshal.AsBytes(values);
             if (FastFill && size > (ulong)bytes.Length)
             {
@@ -1017,6 +1018,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     _fillPatternValue = value;
                 }
 
+                if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.FillFast, (long)size); // [local] SHARPEMU_MEMCOPY_PROBE
                 var patternArray = _fillPattern;
                 var pieceBytes = (ulong)patternArray.Length * sizeof(uint);
                 if (ParallelFill && size >= ParallelFillMin)
@@ -1073,6 +1075,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 return;
             }
 
+            if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.FillSmall, (long)size); // [local] SHARPEMU_MEMCOPY_PROBE
             for (ulong offset = 0; offset < size;)
             {
                 var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
@@ -2497,6 +2500,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
             readback.Complete(pending.Ticket, published == 0 ? null : (index, bytes) =>
             {
+                if (current[index] && MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.ReadbackPieces, bytes.Length); // [local] SHARPEMU_MEMCOPY_PROBE
                 if (current[index] && !_backing.TryWriteBacking(copies[index].Address, bytes))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
@@ -2632,6 +2636,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var copies = pending.Copies;
             readback.Complete(pending.Ticket, (index, bytes) =>
             {
+                if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.ReadbackPending, bytes.Length); // [local] SHARPEMU_MEMCOPY_PROBE
                 if (!_backing.TryWriteBacking(copies[index].Address, bytes))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
@@ -3057,6 +3062,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         readback.Read(pieces, waitTick, (index, bytes) =>
         {
             if (StoreTableVerify) VerifyExcludedBytes(copies[index].Address, bytes); // [local]
+            if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.ReadbackAsync, bytes.Length); // [local] SHARPEMU_MEMCOPY_PROBE
             if (!_backing.TryWriteBacking(copies[index].Address, bytes))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
@@ -3092,6 +3098,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var placement = copy.Placement;
             var offset = baseOffset + placement.DataOffset;
             _download.Invalidate(offset, placement.DataSize);
+            if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.ReadbackSync, (long)placement.DataSize); // [local] SHARPEMU_MEMCOPY_PROBE
             if (!_backing.TryWriteBacking(copy.Address, _download.Mapped.Slice((int)offset, (int)placement.DataSize)))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copy.Address:X16} size=0x{placement.DataSize:X16}");

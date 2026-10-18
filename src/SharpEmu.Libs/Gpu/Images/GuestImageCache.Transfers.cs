@@ -778,6 +778,7 @@ public sealed unsafe partial class GuestImageCache
         _scheduler.QueuePriorityCompletionAction(() =>
         {
             download.Invalidate(offset, range.Size);
+            if (Gpu.Buffers.MemCopyProbe.Enabled) Gpu.Buffers.MemCopyProbe.Add(Gpu.Buffers.MemCopyProbe.Site.ImageDownload, (long)range.Size); // [local] SHARPEMU_MEMCOPY_PROBE
             if (!backing.TryWriteBacking(range.Address, download.Mapped.Slice((int)offset, (int)range.Size)))
             {
                 throw SubmissionScheduler.Fatal($"The image readback could not be written to guest memory: address=0x{range.Address:X16} size=0x{range.Size:X}.");
