@@ -1034,8 +1034,10 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRenderingSetup);
             if (Gpu.Rendering.BatchSimulation.Enabled) Gpu.Rendering.BatchSimulation.NoteDraw(in state); // [local]
+            _beginRenderingCalls++; // [local] SHARPEMU_ATTACH_REPEAT
             if (_renderingActive && _renderingState == state)
             {
+                _scopeAtLastBegin = _renderingScopesBegun; // [local]
                 _renderingWritesMemory |= _nextDrawWritesMemory;
                 _nextDrawWritesMemory = false;
                 return;
@@ -1131,6 +1133,69 @@ internal static unsafe partial class VulkanVideoPresenter
             _renderingScopesBegun++;
             _renderingActive = true;
             _renderingState = state;
+            _scopeAtLastBegin = _renderingScopesBegun; // [local]
+        }
+
+        // [local] SHARPEMU_ATTACH_REPEAT: the BeginRendering calls and the scope the last one left open.
+        private long _beginRenderingCalls;
+        private long _scopeAtLastBegin = -1;
+
+        (ulong Tick, long BeginCalls) IRenderHost.AttachmentRepeatToken => (_scheduler.CurrentTick, _beginRenderingCalls);
+
+        // The previous draw acquired these attachments (token taken after it), and only its own BeginRendering ran
+        // since, leaving that scope open with the same rendering state, in the same recording tick. Each image must
+        // still be acquirable without work (IsRepeatableTarget), the layouts must be the ones this draw would pick
+        // (a color target bound as a texture takes General; a sampled depth target its sampling layout), a depth
+        // target must have no HTile clear to consume, and no image-state event may have happened since
+        // (StateGeneration, read last). The transitions the full path would make here only repeat the attachment
+        // accesses already deferred to the scope's end.
+        bool IRenderHost.TryRepeatAttachments(ReadOnlySpan<ColorTargetState> colors, ReadOnlySpan<ImageLayout> colorLayouts, in DepthAttachmentState depth,
+            ImageLayout depthLayout, in RenderingState rendering, (ulong Tick, long BeginCalls) token, long generation, bool apply)
+        {
+            if (_scheduler.CurrentTick != token.Tick || _beginRenderingCalls != token.BeginCalls + 1 || !_renderingActive ||
+                _renderingScopesBegun != _scopeAtLastBegin || _renderingState != rendering)
+                return false;
+            for (var index = 0; index < colors.Length; index++)
+            {
+                var image = colors[index].Image;
+                if (!_imageCache.IsRepeatableTarget(image, depth: false, stencilCompressed: false))
+                    return false;
+                var layout = _imageCache.GetImage(image).Binding.IsBound ? ImageLayout.General : ImageLayout.ColorAttachmentOptimal;
+                if (layout != colorLayouts[index])
+                    return false;
+            }
+
+            if (depth.HasTarget)
+            {
+                var target = depth.Target.Target;
+                if (!_imageCache.IsRepeatableTarget(depth.Image, depth: true, target.Request.Description.Metadata.StencilCompressed) ||
+                    target.DepthClearEnabled || depth.LoadClear ||
+                    (target.HasHtile && _imageCache.IsMetadataCleared(target.HtileAddress, target.Request.View.BaseLayer)))
+                    return false;
+                var loadState = depth.LoadState;
+                var layout = ((IRenderHost)this).SamplesDepthAttachment(in depth)
+                    ? loadState.AttachmentLayout(target.Format)
+                    : DepthStencilState.WritableAttachmentLayout(target.Format);
+                if (layout != depthLayout)
+                    return false;
+            }
+
+            if (GuestImageCache.StateGeneration != generation)
+                return false;
+            if (!apply)
+                return true;
+            for (var index = 0; index < colors.Length; index++)
+                _imageCache.ReplayTargetAcquire(colors[index].Image, depth: false);
+            if (depth.HasTarget)
+            {
+                _imageCache.ReplayTargetAcquire(depth.Image, depth: true);
+                _hasBoundDepth = true;
+                _boundDepth = depth;
+                _boundDepthLayout = depthLayout;
+                _boundDepthLoadState = depth.LoadState;
+            }
+
+            return true;
         }
 
         public void EndRendering()

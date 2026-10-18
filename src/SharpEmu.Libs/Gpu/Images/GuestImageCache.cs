@@ -21,6 +21,25 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly GpuDeviceInfo _device;
     private readonly SubmissionScheduler _scheduler;
     private readonly RegionLock _lock = new(RegionLock.Category.ImageCache);
+
+    // [local] A counter of the image-cache events that can change what acquiring an image as a target does: an image
+    // registered or removed, an image marked for rebinding, and a transition or transfer whose barriers change a
+    // subresource's layout or access (a repeated attachment access in the same layout does not). Readers compare it
+    // with Volatile.Read after their own checks. Counted only while a consumer asks for it (SHARPEMU_ATTACH_REPEAT or
+    // SHARPEMU_IMAGE_STATE_GENERATION=1).
+    public static readonly bool TrackStateGeneration =
+        (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ATTACH_REPEAT"), out var attachRepeat) && attachRepeat != 0) ||
+        Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_STATE_GENERATION") == "1";
+
+    private static long _stateGeneration;
+
+    public static long StateGeneration => Volatile.Read(ref _stateGeneration);
+
+    internal static void BumpStateGeneration()
+    {
+        if (TrackStateGeneration)
+            Interlocked.Increment(ref _stateGeneration);
+    }
     private readonly PageGuard _pages;
     private readonly ColorToMultisampleDepthBlit _blit;
     private readonly GpuTiler _tiler;
@@ -398,6 +417,44 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         TakeGpuOwnership(image);
         ScheduleReadback(imageIdentifier, image);
         return image.GetOrCreateView(request.View);
+    }
+
+    // [local] SHARPEMU_ATTACH_REPEAT: whether acquiring this image again as the same target would do only the
+    // bookkeeping that ReplayTargetAcquire repeats: registered and not to be found again, no CPU write pending or
+    // possible (no dirty state, no buffer copy, no watch hole whose page could have changed unseen), and nothing that
+    // reads guest memory on acquisition (DCC color metadata; a stencil plane that would be refreshed). The caller
+    // compares StateGeneration after this.
+    public bool IsRepeatableTarget(ResourceSlotIdentifier imageIdentifier, bool depth, bool stencilCompressed)
+    {
+        using var held = _lock.Hold();
+        var image = _slots.TryGet(imageIdentifier);
+        if (image is null || !image.Registered || image.DepthOwner.IsValid || image.Binding.NeedsRebind ||
+            image.IsCpuDirty || image.IsBufferModified || image.WatchHoles.Count != 0 || !image.IsWatched ||
+            image.WatchBegin != image.Description.Data.Address || image.WatchEnd != image.Description.Data.End)
+            return false;
+        if (!depth)
+            return image.Description.Metadata.Kind != MetadataKind.Dcc;
+        return !image.Description.HasStencil || stencilCompressed || image.Description.Samples != 1;
+    }
+
+    // [local] SHARPEMU_ATTACH_REPEAT: the bookkeeping of AcquireColorTargetView / AcquireDepthTargetView for an image
+    // IsRepeatableTarget accepted, in the same order: recency, GPU write order, use, ownership and readback.
+    public void ReplayTargetAcquire(ResourceSlotIdentifier imageIdentifier, bool depth)
+    {
+        using var held = _lock.Hold();
+        var image = _slots[imageIdentifier];
+        TouchImage(image);
+        image.MarkGpuModified();
+        if (depth)
+        {
+            image.Uses.DepthTarget = true;
+            TakeGpuOwnership(image);
+            return;
+        }
+
+        image.Uses.RenderTarget = true;
+        TakeGpuOwnership(image);
+        ScheduleReadback(imageIdentifier, image);
     }
 
     public ImageView AcquireDepthTargetView(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)

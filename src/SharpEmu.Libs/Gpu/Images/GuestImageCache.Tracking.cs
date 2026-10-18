@@ -31,6 +31,7 @@ public sealed partial class GuestImageCache
         }
 
         image.Registered = true;
+        BumpStateGeneration(); // [local]
         InvalidateLookups(first, lastExclusive);
         image.RecencyEntryIndex = _recencyQueue.Insert(imageIdentifier, _collectionTick);
         image.RecencyTick = _collectionTick;
@@ -69,6 +70,7 @@ public sealed partial class GuestImageCache
 
         _totalUsedMemory -= accounted;
         image.Registered = false;
+        BumpStateGeneration(); // [local]
         InvalidateLookups(first, lastExclusive);
     }
 

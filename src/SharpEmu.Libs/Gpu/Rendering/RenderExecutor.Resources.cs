@@ -265,7 +265,7 @@ public sealed partial class RenderExecutor
             DropUnwrittenColorTargets(context, ref state, pixelProgram);
         var attachStarted = AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
         var sameAttachments = attachStarted != 0 && AttachProbe.SameAsPrevious(BoundColors(ref state), in state.Depth);
-        state.Rendering = AcquireAttachments(ref state);
+        state.Rendering = AcquireOrRepeatAttachments(ref state); // [local] SHARPEMU_ATTACH_REPEAT
         if (attachStarted != 0)
             AttachProbe.Note(sameAttachments, System.Diagnostics.Stopwatch.GetTimestamp() - attachStarted);
         Span<IPreparedBindings> stages = pixelBindings is null ? [vertexBindings] : [vertexBindings, pixelBindings];
