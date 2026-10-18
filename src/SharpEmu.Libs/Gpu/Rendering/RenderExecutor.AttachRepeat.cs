@@ -32,6 +32,7 @@ public sealed partial class RenderExecutor
         public ImageLayout DepthLayout;
         public RenderingState Rendering;
         public (ulong Tick, long BeginCalls) Token;
+        public long Registrations;
         public readonly (object? Backing, long Version)[] Versions = new (object?, long)[ContextRegisters.ColorTargetCount + 1];
     }
 
@@ -87,7 +88,7 @@ public sealed partial class RenderExecutor
         var record = _attachRecord;
         if (!record.Valid) InputMisses[0]++;
         else if (!SameAttachmentInputs(ref state)) InputMisses[1]++;
-        var repeat = SameAttachmentInputs(ref state) && _host.TryRepeatAttachments(
+        var repeat = SameAttachmentInputs(ref state) && record.Registrations == GuestImageCache.RegistrationGeneration && _host.TryRepeatAttachments(
             ((ReadOnlySpan<ColorTargetState>)record.Outputs)[..(int)record.ColorCount],
             ((ReadOnlySpan<ImageLayout>)record.ColorLayouts)[..(int)record.ColorCount],
             in record.DepthInput, record.DepthLayout, in record.Rendering, record.Token,
@@ -153,6 +154,7 @@ public sealed partial class RenderExecutor
             record.Versions[index] = _host.AttachmentStateVersion(state.Colors[index].Image);
         record.Versions[count] = state.Depth.HasTarget ? _host.AttachmentStateVersion(state.Depth.Image) : default;
         record.Token = _host.AttachmentRepeatToken;
+        record.Registrations = GuestImageCache.RegistrationGeneration;
         return rendering;
     }
 }

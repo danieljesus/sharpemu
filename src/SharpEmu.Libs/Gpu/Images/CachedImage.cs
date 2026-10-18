@@ -327,6 +327,9 @@ public sealed unsafe partial class CachedImage : IDisposable
 
     public void AssociateDepth(ResourceSlotIdentifier depthImage) => DepthOwner = depthImage;
 
+    // [local] SHARPEMU_ATTACH_REPEAT: the stencil association the depth target's last acquisition refreshed.
+    public ResourceSlotIdentifier LastStencilAssociation = ResourceSlotIdentifier.Invalid;
+
     internal ulong LastCpuWriteAddress { get; private set; }
     internal ulong LastCpuWriteSize { get; private set; }
 

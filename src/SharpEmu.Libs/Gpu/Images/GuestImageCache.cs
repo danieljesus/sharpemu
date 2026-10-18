@@ -35,6 +35,13 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
     public static long StateGeneration => Volatile.Read(ref _stateGeneration);
 
+    // [local] SHARPEMU_ATTACH_REPEAT: images registered or removed (which image a stencil range resolves to).
+    private static long _registrationGeneration;
+
+    public static long RegistrationGeneration => Volatile.Read(ref _registrationGeneration);
+
+    internal static void BumpRegistrationGeneration() => Interlocked.Increment(ref _registrationGeneration);
+
     internal static void BumpStateGeneration()
     {
         if (TrackStateGeneration)
@@ -441,7 +448,20 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         // acquisition (ResolveDccAttachmentClear); one with a range does neither.
         if (!depth)
             return image.Description.Metadata.Kind != MetadataKind.Dcc || image.Description.Metadata.Range.Size != 0 || RepeatRefused(4);
-        return !image.Description.HasStencil || stencilCompressed || image.Description.Samples != 1 || RepeatRefused(offset + 4);
+        if (!image.Description.HasStencil)
+            return true;
+        // The stencil association is found again on acquisition (one more touch) and refreshed only when the
+        // plane is uncompressed single-sample: then it must be as clean as the image.
+        var association = image.LastStencilAssociation.IsValid ? _slots.TryGet(image.LastStencilAssociation) : null;
+        if (association is null || !association.Registered || association.DepthOwner != imageIdentifier ||
+            association.Description.Data.Address != image.Description.Stencil.Address)
+            return RepeatRefused(offset + 4);
+        if (stencilCompressed || image.Description.Samples != 1)
+            return true;
+        if (association.Binding.NeedsRebind || association.IsCpuDirty || association.IsBufferModified || association.WatchHoles.Count != 0 ||
+            !association.IsWatched || association.WatchBegin != association.Description.Data.Address || association.WatchEnd != association.Description.Data.End)
+            return RepeatRefused(offset + 5);
+        return true;
     }
 
     internal static readonly long[] RepeatRefusals = new long[12];
@@ -471,6 +491,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         if (depth)
         {
             image.Uses.DepthTarget = true;
+            if (image.Description.HasStencil && _slots.TryGet(image.LastStencilAssociation) is { } association)
+                TouchImage(association);
             TakeGpuOwnership(image);
             return;
         }
@@ -601,6 +623,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private void RefreshStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth, bool stencilCompressed)
     {
         var association = AssociateStencilRange(depthIdentifier, depth.Description.Stencil);
+        depth.LastStencilAssociation = association; // [local] SHARPEMU_ATTACH_REPEAT
         if (stencilCompressed || depth.Description.Samples != 1)
         {
             return;
