@@ -9,7 +9,7 @@ using SharpEmu.Libs.Gpu.Images;
 
 namespace SharpEmu.Libs.Gpu.Rendering;
 
-// [local] SHARPEMU_ATTACH_REPEAT (0 off by default): a draw whose resolved targets are byte for byte those of the
+// [local] SHARPEMU_ATTACH_REPEAT (1 by default; =0 turns it off): a draw whose resolved targets are byte for byte those of the
 // previous draw, while the previous draw's rendering scope is still open in the same tick and no barrier changed an
 // attachment's backing since (IRenderHost.TryRepeatAttachments), takes the previous acquisition: the same images, views,
 // layouts and rendering state, with only the bookkeeping replayed. Acquisitions that consumed a metadata clear or
@@ -18,7 +18,7 @@ namespace SharpEmu.Libs.Gpu.Rendering;
 public sealed partial class RenderExecutor
 {
     private static readonly int AttachRepeatMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ATTACH_REPEAT"), out var attachRepeat) ? attachRepeat : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ATTACH_REPEAT"), out var attachRepeat) ? attachRepeat : 1;
 
     private sealed class AttachRecord
     {

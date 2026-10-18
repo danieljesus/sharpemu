@@ -12,12 +12,12 @@ namespace SharpEmu.Libs.Gpu.Rendering;
 // pure function of its register words while no image is created, removed or replaced (the lookup generation), the
 // scheduler tick (the image's last-access tick) and the image cache's collection tick (its recency) stay the same,
 // so the draw reuses the image the previous lookup of the same words returned. DCC color targets always look up:
-// the host reads their guest metadata on every lookup. 1 reuses; 2 verifies (always looks up, compares, reports
-// [PERF][TARGET_MEMO]); 0 (default) off.
+// the host reads their guest metadata on every lookup. 1 (default) reuses; 2 verifies (always looks up, compares, reports
+// [PERF][TARGET_MEMO]); 0 off.
 public sealed partial class RenderExecutor
 {
     internal static readonly int TargetMemoMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TARGET_MEMO"), out var mode) && mode is >= 0 and <= 2 ? mode : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TARGET_MEMO"), out var mode) && mode is >= 0 and <= 2 ? mode : 1;
 
     private struct ColorTargetMemo
     {

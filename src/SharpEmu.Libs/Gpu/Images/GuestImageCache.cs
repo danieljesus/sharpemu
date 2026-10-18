@@ -28,7 +28,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     // with Volatile.Read after their own checks. Counted only while a consumer asks for it (SHARPEMU_ATTACH_REPEAT or
     // SHARPEMU_IMAGE_STATE_GENERATION=1).
     public static readonly bool TrackStateGeneration =
-        (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ATTACH_REPEAT"), out var attachRepeat) && attachRepeat != 0) ||
+        (!int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ATTACH_REPEAT"), out var attachRepeat) || attachRepeat != 0) ||
         Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_STATE_GENERATION") == "1";
 
     private static long _stateGeneration;
