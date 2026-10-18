@@ -1142,15 +1142,24 @@ internal static unsafe partial class VulkanVideoPresenter
 
         (ulong Tick, long BeginCalls) IRenderHost.AttachmentRepeatToken => (_scheduler.CurrentTick, _beginRenderingCalls);
 
+        (object? Backing, long Version) IRenderHost.AttachmentStateVersion(ResourceSlotIdentifier image) => _imageCache.TargetStateVersion(image);
+
+        private bool SameStateVersion(ResourceSlotIdentifier image, (object? Backing, long Version) recorded)
+        {
+            var now = _imageCache.TargetStateVersion(image);
+            return recorded.Backing is not null && ReferenceEquals(now.Backing, recorded.Backing) && now.Version == recorded.Version;
+        }
+
         // The previous draw acquired these attachments (token taken after it), and only its own BeginRendering ran
         // since, leaving that scope open with the same rendering state, in the same recording tick. Each image must
         // still be acquirable without work (IsRepeatableTarget), the layouts must be the ones this draw would pick
         // (a color target bound as a texture takes General; a sampled depth target its sampling layout), a depth
-        // target must have no HTile clear to consume, and no image-state event may have happened since
-        // (StateGeneration, read last). The transitions the full path would make here only repeat the attachment
+        // target must have no HTile clear to consume, and no barrier may have changed an attachment's backing
+        // since (the same backing and state version). The transitions the full path would make here only repeat the attachment
         // accesses already deferred to the scope's end.
         bool IRenderHost.TryRepeatAttachments(ReadOnlySpan<ColorTargetState> colors, ReadOnlySpan<ImageLayout> colorLayouts, in DepthAttachmentState depth,
-            ImageLayout depthLayout, in RenderingState rendering, (ulong Tick, long BeginCalls) token, long generation, bool apply)
+            ImageLayout depthLayout, in RenderingState rendering, (ulong Tick, long BeginCalls) token, ReadOnlySpan<(object? Backing, long Version)> versions,
+            bool apply)
         {
             if (_scheduler.CurrentTick != token.Tick || _beginRenderingCalls != token.BeginCalls + 1 || !_renderingActive ||
                 _renderingScopesBegun != _scopeAtLastBegin || _renderingState != rendering)
@@ -1158,7 +1167,7 @@ internal static unsafe partial class VulkanVideoPresenter
             for (var index = 0; index < colors.Length; index++)
             {
                 var image = colors[index].Image;
-                if (!_imageCache.IsRepeatableTarget(image, depth: false, stencilCompressed: false))
+                if (!_imageCache.IsRepeatableTarget(image, depth: false, stencilCompressed: false) || !SameStateVersion(image, versions[index]))
                     return false;
                 var layout = _imageCache.GetImage(image).Binding.IsBound ? ImageLayout.General : ImageLayout.ColorAttachmentOptimal;
                 if (layout != colorLayouts[index])
@@ -1169,6 +1178,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var target = depth.Target.Target;
                 if (!_imageCache.IsRepeatableTarget(depth.Image, depth: true, target.Request.Description.Metadata.StencilCompressed) ||
+                    !SameStateVersion(depth.Image, versions[colors.Length]) ||
                     target.DepthClearEnabled || depth.LoadClear ||
                     (target.HasHtile && _imageCache.IsMetadataCleared(target.HtileAddress, target.Request.View.BaseLayer)))
                     return false;
@@ -1180,8 +1190,6 @@ internal static unsafe partial class VulkanVideoPresenter
                     return false;
             }
 
-            if (GuestImageCache.StateGeneration != generation)
-                return false;
             if (!apply)
                 return true;
             for (var index = 0; index < colors.Length; index++)

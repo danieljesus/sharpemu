@@ -165,7 +165,11 @@ public interface IRenderHost
     (ulong Tick, long BeginCalls) AttachmentRepeatToken => (0, 0);
 
     bool TryRepeatAttachments(ReadOnlySpan<ColorTargetState> colors, ReadOnlySpan<ImageLayout> colorLayouts, in DepthAttachmentState depth,
-        ImageLayout depthLayout, in RenderingState rendering, (ulong Tick, long BeginCalls) token, long generation, bool apply) => false;
+        ImageLayout depthLayout, in RenderingState rendering, (ulong Tick, long BeginCalls) token, ReadOnlySpan<(object? Backing, long Version)> versions,
+        bool apply) => false;
+
+    // The backing of a target image and its access-state version (TryRepeatAttachments compares them).
+    (object? Backing, long Version) AttachmentStateVersion(ResourceSlotIdentifier image) => (null, -1);
 
     // The next draw stores to buffers or storage images; called before its BeginRendering.
     void PrepareMemoryWritingDraw() { }

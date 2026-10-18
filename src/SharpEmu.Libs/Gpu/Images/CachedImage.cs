@@ -50,6 +50,9 @@ public sealed class ImageBacking
     public Image Handle;
     public ImageAccessState State = ImageAccessState.Initial;
     public List<ImageAccessState>? SubresourceStates;
+    // [local] Moves with every barrier that changes a layout or an access of this backing (not a repeated
+    // attachment access in the same layout); render thread only.
+    public long StateVersion;
     public DeviceMemory Memory;
     public ulong AllocationSize;
 

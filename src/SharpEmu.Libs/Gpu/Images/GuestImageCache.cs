@@ -437,6 +437,14 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         return !image.Description.HasStencil || stencilCompressed || image.Description.Samples != 1;
     }
 
+    // [local] SHARPEMU_ATTACH_REPEAT: the backing behind an image and its state version, for comparing later.
+    public (object? Backing, long Version) TargetStateVersion(ResourceSlotIdentifier imageIdentifier)
+    {
+        using var held = _lock.Hold();
+        var image = _slots.TryGet(imageIdentifier);
+        return image is null ? (null, -1) : (image.Backing, image.Backing.StateVersion);
+    }
+
     // [local] SHARPEMU_ATTACH_REPEAT: the bookkeeping of AcquireColorTargetView / AcquireDepthTargetView for an image
     // IsRepeatableTarget accepted, in the same order: recency, GPU write order, use, ownership and readback.
     public void ReplayTargetAcquire(ResourceSlotIdentifier imageIdentifier, bool depth)

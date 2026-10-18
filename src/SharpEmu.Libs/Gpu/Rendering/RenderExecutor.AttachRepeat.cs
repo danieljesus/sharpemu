@@ -10,8 +10,8 @@ using SharpEmu.Libs.Gpu.Images;
 namespace SharpEmu.Libs.Gpu.Rendering;
 
 // [local] SHARPEMU_ATTACH_REPEAT (0 off by default): a draw whose resolved targets are byte for byte those of the
-// previous draw, while the previous draw's rendering scope is still open in the same tick and no image-state event
-// happened since (IRenderHost.TryRepeatAttachments), takes the previous acquisition: the same images, views,
+// previous draw, while the previous draw's rendering scope is still open in the same tick and no barrier changed an
+// attachment's backing since (IRenderHost.TryRepeatAttachments), takes the previous acquisition: the same images, views,
 // layouts and rendering state, with only the bookkeeping replayed. Acquisitions that consumed a metadata clear or
 // clear a depth target are never repeated. =2 runs the full acquisition on every repeat it would take and counts
 // the draws whose outputs differ or whose full path changed the image state.
@@ -32,7 +32,7 @@ public sealed partial class RenderExecutor
         public ImageLayout DepthLayout;
         public RenderingState Rendering;
         public (ulong Tick, long BeginCalls) Token;
-        public long Generation;
+        public readonly (object? Backing, long Version)[] Versions = new (object?, long)[ContextRegisters.ColorTargetCount + 1];
     }
 
     private readonly AttachRecord _attachRecord = new();
@@ -84,7 +84,8 @@ public sealed partial class RenderExecutor
         var repeat = SameAttachmentInputs(ref state) && _host.TryRepeatAttachments(
             ((ReadOnlySpan<ColorTargetState>)record.Outputs)[..(int)record.ColorCount],
             ((ReadOnlySpan<ImageLayout>)record.ColorLayouts)[..(int)record.ColorCount],
-            in record.DepthInput, record.DepthLayout, in record.Rendering, record.Token, record.Generation, apply: AttachRepeatMode != 2);
+            in record.DepthInput, record.DepthLayout, in record.Rendering, record.Token,
+            ((ReadOnlySpan<(object? Backing, long Version)>)record.Versions)[..((int)record.ColorCount + 1)], apply: AttachRepeatMode != 2);
         if (repeat && AttachRepeatMode != 2)
         {
             AttachRepeatHits++;
@@ -93,7 +94,6 @@ public sealed partial class RenderExecutor
             if (state.Depth.HasTarget)
                 state.Depth = record.DepthOutput;
             record.Token = _host.AttachmentRepeatToken;
-            record.Generation = GuestImageCache.StateGeneration;
             return record.Rendering;
         }
 
@@ -102,14 +102,18 @@ public sealed partial class RenderExecutor
         for (var index = 0; index < count; index++)
             inputs[index] = state.Colors[index];
         var depthInput = state.Depth;
-        var generationBefore = GuestImageCache.StateGeneration;
         var rendering = AcquireAttachments(ref state);
-        var generationAfter = GuestImageCache.StateGeneration;
         if (repeat)
         {
             AttachRepeatHits++;
             AttachRepeatChecked++;
-            var same = generationBefore == generationAfter && rendering == record.Rendering &&
+            // The full path must have left every attachment's access state as the repeat would have.
+            var versionsKept = true;
+            for (var index = 0; versionsKept && index < count; index++)
+                versionsKept = _host.AttachmentStateVersion(state.Colors[index].Image) == record.Versions[index];
+            if (versionsKept && state.Depth.HasTarget)
+                versionsKept = _host.AttachmentStateVersion(state.Depth.Image) == record.Versions[count];
+            var same = versionsKept && rendering == record.Rendering &&
                 (!state.Depth.HasTarget || SameBytes(in state.Depth, in record.DepthOutput));
             for (var index = 0; same && index < count; index++)
                 same = SameBytes(in state.Colors[index], in record.Outputs[index]);
@@ -117,7 +121,7 @@ public sealed partial class RenderExecutor
             {
                 AttachRepeatMismatches++;
                 if (++AttachRepeatMismatchTotal <= 20)
-                    Console.Error.WriteLine($"[ATTACH_REPEAT_MISMATCH] total={AttachRepeatMismatchTotal} generation={generationBefore}->{generationAfter} rendering={rendering == record.Rendering}");
+                    Console.Error.WriteLine($"[ATTACH_REPEAT_MISMATCH] total={AttachRepeatMismatchTotal} versions_kept={versionsKept} rendering={rendering == record.Rendering}");
             }
         }
 
@@ -139,8 +143,10 @@ public sealed partial class RenderExecutor
         record.DepthOutput = state.Depth;
         record.DepthLayout = state.Depth.HasTarget ? rendering.DepthStencilAttachment.Layout : default;
         record.Rendering = rendering;
+        for (var index = 0; index < count; index++)
+            record.Versions[index] = _host.AttachmentStateVersion(state.Colors[index].Image);
+        record.Versions[count] = state.Depth.HasTarget ? _host.AttachmentStateVersion(state.Depth.Image) : default;
         record.Token = _host.AttachmentRepeatToken;
-        record.Generation = generationAfter;
         return rendering;
     }
 }

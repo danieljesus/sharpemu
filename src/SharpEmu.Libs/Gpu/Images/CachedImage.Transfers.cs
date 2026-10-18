@@ -128,6 +128,7 @@ public sealed unsafe partial class CachedImage
         }
 
         Backing.State = new ImageAccessState(stage, access, layout);
+        if (barriers.Count != 0 && !OnlyRepeatsAttachmentAccess(barriers)) Backing.StateVersion++; // [local] SHARPEMU_ATTACH_REPEAT
         NoteStateBarriers(barriers); // [local]
         return sourceStages;
     }
