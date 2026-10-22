@@ -530,6 +530,7 @@ internal sealed unsafe class TlasHle : IDisposable
     }
 
     private const int VerifySlots = 4;
+    private static readonly bool PoisonBuildCounters = Environment.GetEnvironmentVariable("SHARPEMU_TLAS_HLE_POISON") == "1";
 
     private static ulong VerifySlotOffset(Chain chain) => (ulong)chain.Slot * (MaxNodes / VerifySlots) * 128UL;
 
@@ -597,6 +598,15 @@ internal sealed unsafe class TlasHle : IDisposable
                     continue; // the template's capacity bound (n / 2 nodes rounded up) covers the host's smaller tree
                 BinaryPrimitives.WriteUInt32LittleEndian(word, value);
                 _cache.WriteHostMemory(chain.Base + (ulong)dword * 4, word);
+            }
+
+            if (PoisonBuildCounters)
+            {
+                // [local] SHARPEMU_TLAS_HLE_POISON=1: +0x8C/+0x90 (0x35B8's, left at the template's 0) set to garbage,
+                // to show by the image that nothing outside the skipped chain reads them.
+                BinaryPrimitives.WriteUInt32LittleEndian(word, 0xDEADBEEF);
+                _cache.WriteHostMemory(chain.Base + 0x8C, word);
+                _cache.WriteHostMemory(chain.Base + 0x90, word);
             }
 
             _cache.WriteHostMemory(chain.Base + 0x100, MemoryMarshal.AsBytes<uint>(nodeWords));
