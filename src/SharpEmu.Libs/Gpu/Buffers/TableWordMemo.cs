@@ -22,6 +22,30 @@ internal static class TableWordMemo
     private static bool _dirtySort;
     [ThreadStatic] internal static ulong CurrentProgram;
 
+    // The program whose written bindings are being marked, for the length of the scope: GPU writes marked outside one
+    // (fills, copies, label writes) belong to no program, so no allowlisted writer can hide them.
+    internal static ProgramScope BeginProgram(ulong hash)
+    {
+        CurrentProgram = hash;
+        return default;
+    }
+
+    internal readonly struct ProgramScope : IDisposable
+    {
+        public void Dispose() => CurrentProgram = 0;
+    }
+
+    internal static void ResetForTests()
+    {
+        lock (_lock)
+        {
+            _values.Clear();
+            _sorted = [];
+            _dirtySort = false;
+            Volatile.Write(ref _count, 0);
+        }
+    }
+
     private static long _hits, _verified, _mismatches, _misses, _stores, _invalidGpu, _invalidCp;
     private static readonly Dictionary<ulong, long> _invalidByWriter = new();
     private static int _mismatchLogs;
@@ -80,6 +104,54 @@ internal static class TableWordMemo
         {
             _invalidGpu++;
             _invalidByWriter[CurrentProgram] = _invalidByWriter.GetValueOrDefault(CurrentProgram) + 1;
+        }
+    }
+
+    // [local] SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE=1 (off by default): a command-processor write carries its
+    // data, applied in stream order, so a remembered word it fully covers takes the new value instead of being dropped
+    // (CP-written descriptors in GPU-dirty pages, re-written each frame with the same layout). Partly covered words drop.
+    public static readonly bool CommandUpdates = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE") == "1";
+    private static long _cpUpdates, _hostStores;
+
+    public static void NoteCommandWrite(ulong address, ReadOnlySpan<byte> data)
+    {
+        if (Volatile.Read(ref _count) == 0)
+            return;
+        if (!CommandUpdates)
+        {
+            NoteOtherWrite(address, (ulong)data.Length);
+            return;
+        }
+
+        lock (_lock)
+        {
+            var end = address + (ulong)data.Length;
+            for (var word = address & ~3UL; word < end; word += 4)
+            {
+                if (!_values.ContainsKey(word))
+                    continue;
+                if (word >= address && word + 4 <= end)
+                {
+                    _values[word] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[(int)(word - address)..]);
+                    _cpUpdates++;
+                }
+                else if (Invalidate(word, 4))
+                {
+                    _invalidCp++;
+                }
+            }
+        }
+    }
+
+    // [local] SHARPEMU_TLAS_HLE: a word the host wrote in stream order (so its value at this point of the stream).
+    public static void StoreHostWrite(ulong address, uint value)
+    {
+        if (!CommandUpdates)
+            return;
+        lock (_lock)
+        {
+            StoreLocked(address, value);
+            _hostStores++;
         }
     }
 

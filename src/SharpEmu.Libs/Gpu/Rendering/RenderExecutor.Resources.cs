@@ -176,18 +176,9 @@ public sealed partial class RenderExecutor
 
     private IPreparedBindings PrepareBindings(in ShaderStageResources stage)
     {
-        if (Gpu.Buffers.TableWordMemo.Enabled) Gpu.Buffers.TableWordMemo.CurrentProgram = stage.Program?.Hash ?? 0; // [local]
         IPreparedBindings bindings;
-        try
-        {
+        using (Gpu.Buffers.TableWordMemo.BeginProgram(stage.Program?.Hash ?? 0)) // [local] written bindings are marked here only
             bindings = _host.PrepareBindings(stage);
-        }
-        finally
-        {
-            // [local] the written bindings are marked here; a later fill, copy or label write is no program's.
-            Gpu.Buffers.TableWordMemo.CurrentProgram = 0;
-        }
-
         NoteSampledTextures(stage);
         return bindings;
     }
