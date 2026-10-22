@@ -28,15 +28,29 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
+        // This queue's own store satisfies the wait whatever memory holds, so it is asked
+        // first: reading the label can make the host finish queued work and download GPU-written
+        // pages before it answers, and that round trip buys nothing when the store decides it.
+        // [local] SHARPEMU_WAIT_OWN_FIRST=0 restores the old order (memory first) for A/B.
+        if (WaitOwnFirst && TryReadOwnWrite(address, is64Bit, out var ownValue) &&
+            WaitOperation.TryCompare(ownValue, reference, mask, compareFunction, out var ownSatisfied) && ownSatisfied)
+        {
+            if (WaitOwnProbe) NoteWaitOwn(ownFirst: true, 0);
+            if (SharpEmu.Libs.VideoOut.LabelTrace.Enabled) SharpEmu.Libs.VideoOut.LabelTrace.WaitPolled(QueueId, address, ownValue, reference, compareFunction, true); // [local]
+            return;
+        }
+
+        var readStarted = WaitOwnProbe ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_WAIT_OWN_PROBE
         var value = is64Bit ? ReadQword(address) : ReadDword(address);
+        if (WaitOwnProbe) NoteWaitOwn(ownFirst: false, System.Diagnostics.Stopwatch.GetTimestamp() - readStarted);
         if (!WaitOperation.TryCompare(value, reference, mask, compareFunction, out var satisfied))
         {
             throw _host.Fatal($"The wait compare function is unknown: function={compareFunction} address=0x{address:X16}.");
         }
 
-        if (!satisfied && TryReadOwnWrite(address, is64Bit, out var ownValue))
+        if (!WaitOwnFirst && !satisfied && TryReadOwnWrite(address, is64Bit, out var lateOwnValue))
         {
-            _ = WaitOperation.TryCompare(ownValue, reference, mask, compareFunction, out satisfied);
+            _ = WaitOperation.TryCompare(lateOwnValue, reference, mask, compareFunction, out satisfied);
         }
 
         // [local] SHARPEMU_FRONT_PENDING_LABELS=1: another queue's release the front queued and the render thread has
@@ -59,6 +73,38 @@ public sealed partial class GpuCommandInterpreter
     }
 
     private static readonly bool WaitProbe = Environment.GetEnvironmentVariable("SHARPEMU_WAIT_MEM_PROBE") == "1"; // [local]
+    private static readonly bool WaitOwnFirst = Environment.GetEnvironmentVariable("SHARPEMU_WAIT_OWN_FIRST") != "0"; // [local]
+    // [local] SHARPEMU_WAIT_OWN_PROBE=1: every 5 s, waits decided by the queue's own store before any memory read, and
+    // the memory reads of the other waits with their time, as [WAIT_OWN] (per second, all queues).
+    private static readonly bool WaitOwnProbe = Environment.GetEnvironmentVariable("SHARPEMU_WAIT_OWN_PROBE") == "1";
+    private static long _waitOwnHits, _waitReads, _waitReadTicks, _waitOwnReportAt;
+
+    private static void NoteWaitOwn(bool ownFirst, long readTicks)
+    {
+        if (ownFirst) Interlocked.Increment(ref _waitOwnHits);
+        else
+        {
+            Interlocked.Increment(ref _waitReads);
+            Interlocked.Add(ref _waitReadTicks, readTicks);
+        }
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var due = Volatile.Read(ref _waitOwnReportAt);
+        if (due == 0)
+        {
+            Interlocked.CompareExchange(ref _waitOwnReportAt, now + System.Diagnostics.Stopwatch.Frequency * 5, 0);
+            return;
+        }
+
+        if (now < due || Interlocked.CompareExchange(ref _waitOwnReportAt, now + System.Diagnostics.Stopwatch.Frequency * 5, due) != due)
+        {
+            return;
+        }
+
+        var seconds = (now - due) / (double)System.Diagnostics.Stopwatch.Frequency + 5.0;
+        Console.Error.WriteLine(FormattableString.Invariant(
+            $"[WAIT_OWN] own_first={WaitOwnFirst} window_s={seconds:F1} own_hits_per_s={Interlocked.Exchange(ref _waitOwnHits, 0) / seconds:F0} reads_per_s={Interlocked.Exchange(ref _waitReads, 0) / seconds:F0} read_ms_per_s={Interlocked.Exchange(ref _waitReadTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency / seconds:F2}"));
+    }
     private long _waitMisses;
 
     // The wait bit is PredicationZPassWaitOp: 0 (kWaitForQueryResults) stalls the command
