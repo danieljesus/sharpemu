@@ -33,6 +33,7 @@ internal static class LabelLatencyProbe
         // its first slice to the packet (own slice time, other gfx / compute slice time, the rest idle or blocked).
         public long Wait, WaitGfx, WaitCompute, Own, OtherGfx, OtherCompute, Idle;
         public int Queue, Slices;
+        public (VideoOut.FrontProfile.SuspendKind Kind, ulong Address, long Ticks)[] Gaps = [];
     }
 
     private static readonly long[] Slices = new long[2];
@@ -87,6 +88,7 @@ internal static class LabelLatencyProbe
             split.OtherGfx = gfx - submission.ProbeGfxAtStart - (group == 0 ? submission.ProbeOwnTicks : 0);
             split.OtherCompute = compute - submission.ProbeComputeAtStart - (group == 1 ? submission.ProbeOwnTicks : 0);
             split.Idle = now - submission.ProbeStartedAt - split.Own - split.OtherGfx - split.OtherCompute;
+            if (submission.ProbeGaps is { } gaps) split.Gaps = gaps.ToArray();
         }
 
         Span<byte> label = stackalloc byte[8];
@@ -225,6 +227,17 @@ internal static class LabelLatencyProbe
             FormattableString.Invariant($"[LABEL_PROBE] split ms_p50/p90: before_first_slice={Stat(splits[0])} (other_gfx={Stat(splits[1])} other_compute={Stat(splits[2])}) "),
             FormattableString.Invariant($"first_slice_to_packet: own={Stat(splits[3])} other_gfx={Stat(splits[4])} other_compute={Stat(splits[5])} idle_or_blocked={Stat(splits[6])} slices={Stat(slices)} "),
             FormattableString.Invariant($"queues=[{string.Join(",", queues.Select(pair => FormattableString.Invariant($"{pair.Key}:{pair.Value}")))}]")));
+        var gapTotals = new Dictionary<(VideoOut.FrontProfile.SuspendKind, ulong), (double Ms, int Count)>();
+        foreach (var write in Finished)
+            foreach (var (kind, gapAddress, ticks) in write.Gaps)
+            {
+                var entry = gapTotals.GetValueOrDefault((kind, gapAddress));
+                gapTotals[(kind, gapAddress)] = (entry.Ms + Ms(ticks), entry.Count + 1);
+            }
+
+        Console.Error.WriteLine("[LABEL_PROBE] gaps before the label (kind@address total_ms/count per 5 s): " + string.Join(" ",
+            gapTotals.OrderByDescending(pair => pair.Value.Ms).Take(8).Select(pair =>
+                FormattableString.Invariant($"{pair.Key.Item1}@0x{pair.Key.Item2:X}={pair.Value.Ms:F1}/{pair.Value.Count}"))));
         var seconds = 5.0;
         var top = Enumerable.Range(0, PacketTicks.Length).Select(index => (Key: index, Ticks: Interlocked.Exchange(ref PacketTicks[index], 0), Count: Interlocked.Exchange(ref PacketCounts[index], 0)))
             .Where(entry => entry.Count != 0).OrderByDescending(entry => entry.Ticks).ToList();

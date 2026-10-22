@@ -103,6 +103,11 @@ public sealed class CommandSubmission
     public long CreatedAt { get; }
     internal long ProbeGfxAtCreate, ProbeComputeAtCreate, ProbeStartedAt, ProbeGfxAtStart, ProbeComputeAtStart, ProbeOwnTicks, ProbeSliceStart;
     internal int ProbeSlices;
+    // Gaps between this submission's slices, with the suspension that ended the earlier slice.
+    internal long ProbeLastSliceEnd;
+    internal VideoOut.FrontProfile.SuspendKind ProbeLastKind;
+    internal ulong ProbeLastAddress;
+    internal List<(VideoOut.FrontProfile.SuspendKind Kind, ulong Address, long Ticks)>? ProbeGaps;
 
     public int QueueId { get; }
 

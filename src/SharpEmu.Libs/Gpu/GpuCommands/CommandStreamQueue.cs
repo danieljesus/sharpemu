@@ -709,6 +709,8 @@ public sealed class CommandStreamQueue
             }
 
             submission.ProbeSliceStart = sliceStart;
+            if (submission.ProbeLastSliceEnd != 0)
+                (submission.ProbeGaps ??= new()).Add((submission.ProbeLastKind, submission.ProbeLastAddress, sliceStart - submission.ProbeLastSliceEnd));
         }
 
         _host.BeginSubmission(submission.QueueId, submission.SubmissionId, submission.GeometrySnapshots);
@@ -719,6 +721,9 @@ public sealed class CommandStreamQueue
             var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - submission.ProbeSliceStart;
             submission.ProbeOwnTicks += elapsed;
             submission.ProbeSliceStart = 0;
+            submission.ProbeLastSliceEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+            submission.ProbeLastKind = processor.LastSuspendKind;
+            submission.ProbeLastAddress = processor.LastSuspendAddress;
             Diagnostics.LabelLatencyProbe.AddSlice(submission.QueueId == 0 ? 0 : 1, elapsed);
         }
         submission.CommandsComplete = complete;
