@@ -228,6 +228,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (DeviceAddressPaging.ZeroPageMode != 0)
             _zeroPage = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, CachingPageSize);
         _tracker = new GuestPageTracker(pages);
+        RangeDumpProbe.Cache = this; // [local]
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
         _uploader = new GuestBufferUploader(device, scheduler, guest, _staging);
         if (ReadbackMirror.Mode != 0) // [local]
@@ -368,6 +369,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (!_guestMemory.TryRead(guestAddress, bytes)) return false;
         WriteHostMemory(guestAddress, bytes);
         return true;
+    }
+
+    // [local] SHARPEMU_RANGE_DUMP: a qword as a CPU reader sees it now (synchronizing; probes only).
+    internal ulong ReadQwordSynchronized(ulong address)
+    {
+        Span<byte> bytes = stackalloc byte[8];
+        return TrySynchronizeCpuRead(address, 8) && _guestMemory.TryRead(address, bytes)
+            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes)
+            : 0;
     }
 
     public void DumpDeviceRange(ulong guestAddress, ulong size, string path)
