@@ -61,6 +61,7 @@ public sealed partial class GpuCommandInterpreter
 
     // [local] SHARPEMU_LABEL_PROBE: the running submission's enqueue time and the packet being run.
     internal long ProbeSubmissionEnqueued { get; set; }
+    internal CommandSubmission? ProbeSubmission { get; set; }
     private uint _probeOpcode;
 
     public uint IndexTypeAndSize { get; private set; }
@@ -354,8 +355,12 @@ public sealed partial class GpuCommandInterpreter
             var packet = new PacketContext(header & ~1u, packetAddress, offset, remaining, total);
             uint consumed;
             if (FrontProfile.LoopEnabled) FrontProfile.Packets++;
+            var probePacketStart = Diagnostics.LabelLatencyProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
             using (FrontProfile.PhasesEnabled ? FrontProfile.Measure(FrontProfile.PacketPhase(opcode)) : default)
                 consumed = handler(this, in packet, payload) + 1;
+            if (probePacketStart != 0)
+                Diagnostics.LabelLatencyProbe.AddPacket(opcode == PacketOpcode.Nop ? 0x100u | PacketHeader.CustomCode(header) : opcode,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - probePacketStart);
             if (!KeepsWindow(opcode, header))
             {
                 DropWindow();
@@ -576,7 +581,7 @@ public sealed partial class GpuCommandInterpreter
     internal void WriteBytes(ulong address, ReadOnlySpan<byte> source)
     {
         if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, (ulong)source.Length)) // [local]
-            Diagnostics.LabelLatencyProbe.FrontWrite(source, address, _probeOpcode, ProbeSubmissionEnqueued);
+            Diagnostics.LabelLatencyProbe.FrontWrite(source, address, _probeOpcode, ProbeSubmissionEnqueued, ProbeSubmission);
         _host.WriteGuest(address, source);
         NoteOwnWrite(address, source);
     }
@@ -599,7 +604,7 @@ public sealed partial class GpuCommandInterpreter
     internal void WriteBytesNow(ulong address, ReadOnlySpan<byte> source)
     {
         if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, (ulong)source.Length)) // [local]
-            Diagnostics.LabelLatencyProbe.FrontWrite(source, address, _probeOpcode, ProbeSubmissionEnqueued);
+            Diagnostics.LabelLatencyProbe.FrontWrite(source, address, _probeOpcode, ProbeSubmissionEnqueued, ProbeSubmission);
         _host.WriteGuestNow(address, source);
         NoteOwnWrite(address, source);
     }
