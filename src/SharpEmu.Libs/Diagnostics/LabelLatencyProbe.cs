@@ -169,10 +169,10 @@ internal static class LabelLatencyProbe
 
         var pollMs = Polls.Select(p => p.Ms).ToList();
         var inFlight = Polls.Count == 0 ? 0 : Polls.Average(p => p.InFlight);
-        Console.Error.WriteLine(FormattableString.Invariant(
-            $"[LABEL_PROBE] address=0x{Address:X} writes_seen={Finished.Count} polls={Polls.Count} poll_ms_p50/p90={Stat(pollMs)} ticks_in_flight_at_poll={inFlight:F1} " +
-            $"ms_p50/p90: queue_to_front={Stat(segments[0])} front_to_record={Stat(segments[1])} record_to_gpu_submit={Stat(segments[2])} gpu_submit_to_complete={Stat(segments[3])} complete_to_guest_sees={Stat(segments[4])} total={Stat(segments[5])} " +
-            $"opcodes=[{string.Join(",", opcodes.Select(pair => FormattableString.Invariant($"0x{pair.Key:X2}:{pair.Value}")))}] unseen_writes={Applied.Count} front_pending={FrontPending.Count}"));
+        Console.Error.WriteLine(string.Concat(
+            FormattableString.Invariant($"[LABEL_PROBE] address=0x{Address:X} writes_seen={Finished.Count} polls={Polls.Count} poll_ms_p50/p90={Stat(pollMs)} ticks_in_flight_at_poll={inFlight:F1} "),
+            FormattableString.Invariant($"ms_p50/p90: queue_to_front={Stat(segments[0])} front_to_record={Stat(segments[1])} record_to_gpu_submit={Stat(segments[2])} gpu_submit_to_complete={Stat(segments[3])} complete_to_guest_sees={Stat(segments[4])} total={Stat(segments[5])} "),
+            FormattableString.Invariant($"opcodes=[{string.Join(",", opcodes.Select(pair => FormattableString.Invariant($"0x{pair.Key:X2}:{pair.Value}")))}] unseen_writes={Applied.Count} front_pending={FrontPending.Count}")));
         Console.Error.WriteLine($"[LABEL_PROBE] recent {string.Join(' ', Recent)}");
         Finished.Clear();
         Polls.Clear();
