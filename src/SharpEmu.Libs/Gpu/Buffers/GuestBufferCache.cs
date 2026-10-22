@@ -229,6 +229,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _zeroPage = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, CachingPageSize);
         _tracker = new GuestPageTracker(pages);
         RangeDumpProbe.Cache = this; // [local]
+        if (TlasHle.Enabled) TlasHle.Instance = new TlasHle(device, scheduler, this); // [local] SHARPEMU_TLAS_HLE
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
         _uploader = new GuestBufferUploader(device, scheduler, guest, _staging);
         if (ReadbackMirror.Mode != 0) // [local]
@@ -379,6 +380,16 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes)
             : 0;
     }
+
+    // [local] SHARPEMU_TLAS_HLE: guest bytes the GPU has not written since the CPU did (false otherwise), without waiting.
+    internal bool TryReadGuestClean(ulong address, Span<byte> destination) =>
+        !_tracker.HasGpuDirtyPages(address, (ulong)destination.Length) && _guestMemory.TryRead(address, destination);
+
+    // [local] SHARPEMU_TLAS_HLE: guest bytes as they are, whatever the GPU has written since.
+    internal bool TryReadGuestUnchecked(ulong address, Span<byte> destination) => _guestMemory.TryRead(address, destination);
+
+    // [local] SHARPEMU_TLAS_HLE: bytes for a binding, in the stream ring.
+    internal (GpuBuffer Buffer, ulong Offset) UploadStream(ReadOnlySpan<byte> source, ulong alignment) => (_stream, _stream.Copy(source, alignment));
 
     public void DumpDeviceRange(ulong guestAddress, ulong size, string path)
     {
