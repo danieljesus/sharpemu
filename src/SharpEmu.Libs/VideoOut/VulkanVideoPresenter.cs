@@ -165,14 +165,18 @@ internal static unsafe partial class VulkanVideoPresenter
     // wall-clock time spent draining per Render() call; leftover work stays
     // queued for the next frame. SHARPEMU_RENDER_WORK_BUDGET_MS overrides
     // (0 disables the cap); default 12ms keeps the macOS window interactive at
-    // ~60Hz. Windows and Linux use a dedicated render thread, so they drain
-    // without a time budget by default.
+    // ~60Hz. Windows and Linux use a dedicated render thread; they still cap
+    // the drain at 4ms by default, because an uncapped drain checks for a
+    // ready flip only after the whole backlog is gone, so a complete flip
+    // misses its vblank slot whenever guest work keeps arriving (GTA V at a
+    // 30Hz flip rate: pickup p50 12ms -> 2.4ms, no skipped slots with a
+    // ready flip). Set it to 0 to drain without a cap.
     private static readonly long _renderWorkBudgetTicks =
         (long.TryParse(
              Environment.GetEnvironmentVariable("SHARPEMU_RENDER_WORK_BUDGET_MS"),
              out var renderBudgetMs) && renderBudgetMs >= 0
             ? renderBudgetMs
-            : OperatingSystem.IsMacOS() ? 12L : 0L) *
+            : OperatingSystem.IsMacOS() ? 12L : 4L) *
         System.Diagnostics.Stopwatch.Frequency / 1000L;
     // Diagnostic: skip every compute dispatch (mistranslated compute shaders
     // run long / GPU-hang and starve the present). Isolates whether the
