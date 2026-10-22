@@ -537,6 +537,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // A CPU read fault: GPU-dirty pages download through the worker first.
     public bool DownloadToCpu(ulong address, ulong size)
     {
+        TlasHle.Instance?.NoteCpuRead(address, size, 0); // [local] SHARPEMU_TLAS_HLE_CONSUMERS: a guest CPU read
         var tracked = _tracker.HasRegion(address, size);
         var dirty = tracked && _tracker.HasGpuDirtyPages(address, size);
         if (dirty && ReadbackAudit && _storeDownloadLogs++ < 40) Console.Error.WriteLine($"[STORE_DOWNLOAD] address=0x{address:X} size=0x{size:X}"); // [local]

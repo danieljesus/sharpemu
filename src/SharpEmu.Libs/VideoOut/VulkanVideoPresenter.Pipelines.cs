@@ -551,6 +551,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (_guestMemory.TryRead(address, pre)) { _auditPre = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(pre); _auditArmed = true; }
                 }
 
+                Gpu.Buffers.TlasHle.Instance?.NoteCpuRead(address, sizeof(uint), Gpu.Buffers.TableWordMemo.CurrentProgram); // [local] SHARPEMU_TLAS_HLE_CONSUMERS
                 var memoPending = false; // [local] SHARPEMU_TABLE_WORD_MEMO
                 var memoValue = 0u;
                 if (!NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) && Gpu.Buffers.TableWordMemo.Enabled)

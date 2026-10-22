@@ -21,9 +21,9 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 //   0x02F1 (the final nodes; waits as well).
 // Here 0x0DA3 and 0x994A run; at 0xB198 the host writes the header fields and the tree topology (Morton order of the
 // translations of the CPU-written source records), records one pass that fills the boxes from 0x0DA3's records, and
-// the rest of the chain is skipped. A chain is intercepted only when its destination is a TLAS 0x8395 read (the pointer
-// at its user data 4/5 + 0x40) and 0xB198's user data match the 0x0DA3 of the same work header (records, count, node
-// area = base + 0x100).
+// the rest of the chain is skipped. A chain is intercepted only when its destination is a known TLAS (one 0x8395 read
+// through the pointer at its user data 4/5 + 0x40, or one 0x994A filled the instance table of in an earlier frame) and
+// 0xB198's user data match the 0x0DA3 of the same work header (records, count, node area = base + 0x100).
 //   =1 replace; =2 verify: the game's chain runs; the host builds into a buffer of its own and, after 0x02F1, compares
 //   with the game's tree once the batch completes (leaf box per instance, instance set, containment, header words).
 //
@@ -59,6 +59,7 @@ internal sealed unsafe class TlasHle : IDisposable
     private readonly GuestBufferCache _cache;
     private readonly Dictionary<ulong, ulong> _programByAddress = new();
     private readonly HashSet<ulong> _traversedBases = new();
+    private readonly HashSet<ulong> _instanceTableBases = new();
     private readonly Dictionary<ulong, Chain> _chains = new();
     private readonly GpuBuffer _scratch;
     private readonly GpuBuffer? _verifyOutput;
@@ -72,12 +73,14 @@ internal sealed unsafe class TlasHle : IDisposable
     private sealed class Chain
     {
         public required ulong Key;
+        public required int Slot;
         public ulong Records, Source, Base, Total;
         public uint Count;
         public bool Active, VerifyThis;
         public int Nodes, Builds;
         public uint[]? Topology;
         public GpuBuffer? HeaderBefore;
+        public readonly HashSet<ulong> Blocks = new();
     }
 
     private static long _pointerReads, _pointerMisses, _gameBadPointers;
@@ -166,6 +169,8 @@ internal sealed unsafe class TlasHle : IDisposable
     // The program at a shader address, once prepared (its hash is known only then).
     public void NoteProgram(ulong shaderAddress, ulong hash)
     {
+        if (ConsumerProbe)
+            _anyProgram[shaderAddress] = hash;
         if (IsChainHash(hash))
             _programByAddress[shaderAddress] = hash;
         else
@@ -179,6 +184,8 @@ internal sealed unsafe class TlasHle : IDisposable
     // out; Recorded when the host recorded work of its own (the caller rebinds its state).
     public (bool Skip, bool Recorded) BeforeDispatch(ulong shaderAddress, ReadOnlySpan<uint> userData, Action endRendering)
     {
+        if (ConsumerProbe && _builtBases.Count != 0)
+            ProbeConsumers(shaderAddress, userData);
         if (!_programByAddress.TryGetValue(shaderAddress, out var hash))
             return (false, false);
         switch (hash)
@@ -219,7 +226,17 @@ internal sealed unsafe class TlasHle : IDisposable
             case Hash02F1:
             {
                 // The TLAS base, the work header, the node area, ...
-                if (!_chains.TryGetValue(Pointer(userData, 2), out var chain) || !chain.Active || Pointer(userData, 0) != chain.Base)
+                if (!_chains.TryGetValue(Pointer(userData, 2), out var chain))
+                    return (false, false);
+                // The work blocks 0xF05B fills for it (lists and the shared table), for the next frames' matching.
+                for (var index = 6; index <= 10; index += 2)
+                {
+                    var block = Pointer(userData, index);
+                    if (block != 0)
+                        chain.Blocks.Add(block);
+                }
+
+                if (!chain.Active || Pointer(userData, 0) != chain.Base)
                     return (false, false);
                 chain.Active = false;
                 CountSkip(hash);
@@ -233,6 +250,9 @@ internal sealed unsafe class TlasHle : IDisposable
             }
 
             case Hash994A:
+                // The work header, the TLAS it fills the instance table of: a TLAS base for the next frames' builds.
+                if (_chains.ContainsKey(Pointer(userData, 0)) && Pointer(userData, 2) != 0)
+                    _instanceTableBases.Add(Pointer(userData, 2));
                 return (false, false);
 
             default:
@@ -264,6 +284,74 @@ internal sealed unsafe class TlasHle : IDisposable
         }
     }
 
+    // [local] SHARPEMU_TLAS_HLE_CONSUMERS=1: which programs reach a TLAS some chain built, through a user-data pointer
+    // or a qword in the first 512 bytes behind one (sampled), by the TLAS's instance count.
+    private static readonly bool ConsumerProbe = Environment.GetEnvironmentVariable("SHARPEMU_TLAS_HLE_CONSUMERS") == "1";
+    private readonly Dictionary<ulong, ulong> _anyProgram = new();
+    private readonly Dictionary<ulong, uint> _builtBases = new();
+    private readonly Dictionary<ulong, int> _probeTicks = new();
+    private static readonly Dictionary<string, long> _consumers = new();
+
+    // A CPU read (program 0: the guest's own; else a table read for that program's preparation) of a built TLAS: the
+    // header's +0x8C/+0x90 apart, as nothing else writes them.
+    public void NoteCpuRead(ulong address, ulong size, ulong program)
+    {
+        if (!ConsumerProbe || _builtBases.Count == 0)
+            return;
+        lock (_cpuReads)
+        {
+            foreach (var (tlas, count) in _builtBases)
+            {
+                var total = 0x100UL + count * 192UL;
+                if (address >= tlas + total || address + size <= tlas)
+                    continue;
+                var part = address < tlas + 0x100
+                    ? (address < tlas + 0x94 && address + size > tlas + 0x8C ? "hdr8C" : "hdr")
+                    : address < tlas + 0x100 + count * 64UL ? "nodes" : "instances";
+                var key = $"{(program == 0 ? "cpu" : $"{program >> 48:X4}")}/{part}/n{count}";
+                _cpuReads[key] = _cpuReads.GetValueOrDefault(key) + 1;
+            }
+        }
+    }
+
+    private static readonly Dictionary<string, long> _cpuReads = new();
+
+    private void ProbeConsumers(ulong shaderAddress, ReadOnlySpan<uint> userData)
+    {
+        if (!_anyProgram.TryGetValue(shaderAddress, out var hash) || (IsChainHash(hash) && hash != Hash8395))
+            return;
+        var tick = _probeTicks.GetValueOrDefault(shaderAddress);
+        _probeTicks[shaderAddress] = tick + 1;
+        var deep = tick % 16 == 0;
+        Span<byte> block = stackalloc byte[0x200];
+        for (var index = 0; index + 1 < userData.Length; index += 2)
+        {
+            var pointer = Pointer(userData, index);
+            if (pointer == 0)
+                continue;
+            if (_builtBases.TryGetValue(pointer, out var count))
+            {
+                Note(hash, $"ud{index}", count);
+                continue;
+            }
+
+            if (!deep || !_cache.TryReadGuestUnchecked(pointer, block))
+                continue;
+            for (var offset = 0; offset < block.Length; offset += 8)
+            {
+                var value = BinaryPrimitives.ReadUInt64LittleEndian(block[offset..]) & 0xFFFF_FFFF_FFFFUL;
+                if (value != 0 && _builtBases.TryGetValue(value, out count))
+                    Note(hash, $"ud{index}+{offset:X}", count);
+            }
+        }
+
+        static void Note(ulong hash, string where, uint count)
+        {
+            var key = $"{hash:X16}/{where}/n{count}";
+            _consumers[key] = _consumers.GetValueOrDefault(key) + 1;
+        }
+    }
+
     private static void CountSkip(ulong hash)
     {
         _skipped++;
@@ -277,7 +365,7 @@ internal sealed unsafe class TlasHle : IDisposable
         for (var index = 0; index + 1 < userData.Length; index++)
         {
             var pointer = Pointer(userData, index);
-            if ((pointer & ~1UL) == chain.Key || (pointer >= chain.Key - 0x100 && pointer < chain.Key) ||
+            if ((pointer & ~1UL) == chain.Key || (pointer >= chain.Key - 0x100 && pointer < chain.Key) || chain.Blocks.Contains(pointer) ||
                 (pointer >= chain.Base && pointer < chain.Base + chain.Total))
                 return true;
         }
@@ -294,10 +382,13 @@ internal sealed unsafe class TlasHle : IDisposable
         chain.Active = false;
         var tlas = Pointer(userData, 4) - 0x100;
         var traversed = _traversedBases.Contains(tlas);
+        var known = traversed || _instanceTableBases.Contains(tlas);
         var signature = chain.Records != 0 && Pointer(userData, 0) == chain.Records && userData[2] == chain.Count && userData[6] == chain.Count;
-        var seen = $"n{chain.Count}/{(traversed ? "traversed" : "other")}/{(signature ? "sig" : "nosig")}";
+        if (signature && ConsumerProbe)
+            lock (_cpuReads) _builtBases[tlas] = chain.Count;
+        var seen = $"n{chain.Count}/{(traversed ? "traversed" : known ? "994a" : "unknown")}/{(signature ? "sig" : "nosig")}";
         _chainsSeen[seen] = _chainsSeen.GetValueOrDefault(seen) + 1;
-        if (!traversed || !signature)
+        if (!known || !signature)
             return (false, false);
         chain.Base = tlas;
         chain.Total = 0x100UL + chain.Count * 64UL + chain.Count * 128UL;
@@ -319,7 +410,7 @@ internal sealed unsafe class TlasHle : IDisposable
     private Chain GetChain(ulong work)
     {
         if (!_chains.TryGetValue(work, out var chain))
-            _chains[work] = chain = new Chain { Key = work };
+            _chains[work] = chain = new Chain { Key = work, Slot = _chains.Count % VerifySlots };
         return chain;
     }
 
@@ -438,6 +529,10 @@ internal sealed unsafe class TlasHle : IDisposable
         ];
     }
 
+    private const int VerifySlots = 4;
+
+    private static ulong VerifySlotOffset(Chain chain) => (ulong)chain.Slot * (MaxNodes / VerifySlots) * 128UL;
+
     private bool TryBuild(Chain chain, out string reason)
     {
         reason = string.Empty;
@@ -467,7 +562,7 @@ internal sealed unsafe class TlasHle : IDisposable
         }
 
         var (entries, nodes) = BuildTopology(positions);
-        if (nodes > MaxNodes || (ulong)nodes * 128 > (ulong)count * 64)
+        if (nodes > (Mode == 2 ? MaxNodes / VerifySlots : MaxNodes) || (ulong)nodes * 128 > (ulong)count * 64)
         {
             reason = "node_area";
             return false;
@@ -485,10 +580,11 @@ internal sealed unsafe class TlasHle : IDisposable
             chain.HeaderBefore?.Dispose();
             chain.HeaderBefore = new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, 0x100);
             chain.HeaderBefore.CopyFrom(_scheduler.Current, game, gameOffset, 0, 0x100, destinationAfter: AccessFlags.HostReadBit);
+            // A slot per chain: the three chains of a frame build before any of them is compared.
             output = _verifyOutput!;
-            outputOffset = 0;
+            outputOffset = VerifySlotOffset(chain);
             var staging = _cache.UploadStream(MemoryMarshal.AsBytes<uint>(nodeWords), 4);
-            output.CopyFrom(_scheduler.Current, staging.Buffer, staging.Offset, 0, (ulong)nodeWords.Length * 4, AccessFlags.HostWriteBit);
+            output.CopyFrom(_scheduler.Current, staging.Buffer, staging.Offset, outputOffset, (ulong)nodeWords.Length * 4, AccessFlags.HostWriteBit);
         }
         else
         {
@@ -568,7 +664,7 @@ internal sealed unsafe class TlasHle : IDisposable
         var (game, gameOffset) = _cache.ObtainBuffer(chain.Base, gameBytes, isWritten: false);
         _scheduler.EndRendering();
         download.CopyFrom(_scheduler.Current, game, gameOffset, 0, gameBytes);
-        download.CopyFrom(_scheduler.Current, _verifyOutput, 0, gameBytes, ourBytes, destinationAfter: AccessFlags.HostReadBit);
+        download.CopyFrom(_scheduler.Current, _verifyOutput, VerifySlotOffset(chain), gameBytes, ourBytes, destinationAfter: AccessFlags.HostReadBit);
         var nodes = chain.Nodes;
         var tlas = chain.Base;
         _scheduler.QueueCompletionAction(() =>
@@ -723,6 +819,16 @@ internal sealed unsafe class TlasHle : IDisposable
                 _instanceSetDiff++;
     }
 
+    private static string CpuReads()
+    {
+        lock (_cpuReads)
+        {
+            var text = string.Join(",", _cpuReads.Select(pair => $"{pair.Key}/{pair.Value}"));
+            _cpuReads.Clear();
+            return text;
+        }
+    }
+
     public static string? TakeReport()
     {
         if (!Enabled)
@@ -739,10 +845,11 @@ internal sealed unsafe class TlasHle : IDisposable
             $"chains=[{string.Join(",", _chainsSeen.Select(pair => $"{pair.Key}/{pair.Value}"))}] verifies={_verifies} " +
             $"leaf_mismatches={_leafMismatches} instance_set_diff={_instanceSetDiff} containment={_containment} game_nodes={_gameNodes} our_nodes={_ourNodes} " +
             $"header_field_diff={_headerFieldDiff} [{string.Join(",", _headerDiffDwords.Select(pair => $"{pair.Key}/{pair.Value}"))}] " +
-            $"chain_written=[{string.Join(",", _chainWrittenDwords.Select(pair => $"{pair.Key}/{pair.Value}"))}] header=[{_headerSample}] ours=[{_oursSample}]";
+            $"chain_written=[{string.Join(",", _chainWrittenDwords.Select(pair => $"{pair.Key}/{pair.Value}"))}] header=[{_headerSample}] ours=[{_oursSample}] consumers=[{string.Join(",", _consumers.Select(pair => $"{pair.Key}/{pair.Value}"))}] cpu_reads=[{CpuReads()}]";
         _pointerReads = _pointerMisses = _gameBadPointers = _sourceGpuDirty = 0;
         _builds = _skipped = _fallbacks = _verifies = _leafMismatches = _instanceSetDiff = _containment = _gameNodes = _ourNodes = _headerFieldDiff = 0;
         _fallbackReasons.Clear();
+        _consumers.Clear();
         _skippedByHash.Clear();
         _unmatched.Clear();
         _chainsSeen.Clear();
