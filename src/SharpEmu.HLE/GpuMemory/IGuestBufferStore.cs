@@ -12,4 +12,8 @@ public interface IGuestBufferStore
 
     // True for current CPU data or an untracked range; false when required recovery fails.
     bool TrySynchronizeCpuRead(ulong address, ulong size) => DownloadToCpu(address, size);
+
+    // [local] SHARPEMU_FAULT_READ_EMULATE: the bytes of a faulting read when none of them is GPU-modified, so the backing
+    // already holds what a download would leave there; false when a download is needed.
+    bool TryReadUnmodified(ulong address, Span<byte> data) => false;
 }

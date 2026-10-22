@@ -123,6 +123,20 @@ public sealed class GuestGpuMemory : IDisposable
         }
     }
 
+    // [local] SHARPEMU_FAULT_READ_EMULATE: a faulting read served from the backing, without download or unprotection,
+    // when the guest may read the range and none of its bytes is GPU-modified.
+    public bool TryReadWithoutDownload(ulong address, Span<byte> data)
+    {
+        var size = (ulong)data.Length;
+        if (size == 0 || !Covers(address, size) || !GuestPermits(FaultKind.Read, address) ||
+            !GuestPermits(FaultKind.Read, address + size - 1))
+        {
+            return false;
+        }
+
+        return Buffers?.TryReadUnmodified(address, data) ?? false;
+    }
+
     private bool TryRetryReleasedWrite(ulong address, ulong size)
     {
         var version = _pages.GetWriteRestorationVersion(address);

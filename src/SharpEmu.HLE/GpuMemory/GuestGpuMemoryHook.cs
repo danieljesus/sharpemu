@@ -156,6 +156,10 @@ public static class GuestGpuMemoryHook
         _current.Unregister(address, size);
     }
 
+    // [local] SHARPEMU_FAULT_READ_EMULATE: see GuestGpuMemory.TryReadWithoutDownload.
+    public static bool TryReadWithoutDownload(ulong address, Span<byte> data) =>
+        _current?.TryReadWithoutDownload(address, data) ?? false;
+
     public static bool TryResolveFault(FaultKind kind, ulong address)
     {
         if (_current == null && Traces(address, 8))

@@ -136,7 +136,7 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
-			if (exceptionCode == 3221225477u && TryResolveGpuFault(exceptionRecord))
+			if (exceptionCode == 3221225477u && TryResolveGpuFault(exceptionRecord, contextRecord, rip))
 			{
 				return -1;
 			}
@@ -654,7 +654,7 @@ public sealed partial class DirectExecutionBackend
 	}
 
 	// Runs after the lazy-commit branch. That branch commits the page first.
-	private unsafe static bool TryResolveGpuFault(EXCEPTION_RECORD* exceptionRecord)
+	private unsafe static bool TryResolveGpuFault(EXCEPTION_RECORD* exceptionRecord, void* contextRecord, ulong rip)
 	{
 		if (exceptionRecord->NumberParameters < 2)
 		{
@@ -668,8 +668,23 @@ public sealed partial class DirectExecutionBackend
 			8 => FaultKind.Execute,
 			_ => FaultKind.Unknown,
 		};
-		return kind != FaultKind.Unknown
+		var verifyPending = false;
+		byte[] emulated = Array.Empty<byte>();
+		var emulatedSize = 0;
+		if (FaultReadEmulateMode != 0 && kind == FaultKind.Read && // [local] SHARPEMU_FAULT_READ_EMULATE
+			TryEmulateFaultingRead(contextRecord, rip, exceptionRecord->ExceptionInformation[1], out verifyPending, out emulated, out emulatedSize))
+		{
+			return true;
+		}
+
+		var resolved = kind != FaultKind.Unknown
 			&& GuestGpuMemoryHook.TryResolveFault(kind, exceptionRecord->ExceptionInformation[1]);
+		if (resolved && verifyPending)
+		{
+			VerifyFaultingRead(exceptionRecord->ExceptionInformation[1], emulated, emulatedSize);
+		}
+
+		return resolved;
 	}
 
 	private unsafe static bool TryRecoverGuestAllocatorHole(

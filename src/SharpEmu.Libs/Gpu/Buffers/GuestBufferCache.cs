@@ -562,6 +562,39 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     public bool MayHaveGpuDirtyPages(ulong address, ulong size) => _tracker.MayHaveGpuDirtyPages(address, size);
 
     // A CPU read fault: GPU-dirty pages download through the worker first.
+    // [local] SHARPEMU_FAULT_READ_EMULATE: on the GPU queue thread, in the order the download path would run, the
+    // asked bytes when none of them is GPU-modified (the download would leave them as the backing holds them).
+    public bool TryReadUnmodified(ulong address, Span<byte> data)
+    {
+        var size = (ulong)data.Length;
+        if (size == 0 || size > 16 || (!_relay.IsGpuQueueThread && SubmissionScheduler.InDeferredOperation))
+        {
+            return false;
+        }
+
+        var bytes = new byte[size];
+        var served = false;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        long entered = 0;
+        if (!_relay.TryRunOnGpuQueue(() =>
+            {
+                entered = System.Diagnostics.Stopwatch.GetTimestamp();
+                served = _tracker.HasRegion(address, size) && !_gpuModifiedRanges.Overlaps(address, size) &&
+                    _backing.TryReadBacking(address, bytes);
+            }))
+        {
+            return false;
+        }
+
+        FaultReadStats.NoteRelay(served, entered - started, System.Diagnostics.Stopwatch.GetTimestamp() - entered);
+        if (served)
+        {
+            bytes.CopyTo(data);
+        }
+
+        return served;
+    }
+
     public bool DownloadToCpu(ulong address, ulong size)
     {
         if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, size)) // [local] SHARPEMU_LABEL_PROBE
