@@ -551,6 +551,28 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (_guestMemory.TryRead(address, pre)) { _auditPre = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(pre); _auditArmed = true; }
                 }
 
+                Gpu.Buffers.TlasHle.Instance?.NoteCpuRead(address, sizeof(uint), Gpu.Buffers.TableWordMemo.CurrentProgram); // [local] SHARPEMU_TLAS_HLE_CONSUMERS
+                var memoPending = false; // [local] SHARPEMU_TABLE_WORD_MEMO
+                var memoValue = 0u;
+                if (!NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) && Gpu.Buffers.TableWordMemo.Enabled)
+                {
+                    if (Gpu.Buffers.TableWordMemo.TryGet(address, out memoValue))
+                    {
+                        Gpu.Buffers.TableWordMemo.NoteHit();
+                        if (Gpu.Buffers.TableWordMemo.Mode == 1)
+                        {
+                            word = memoValue;
+                            return true;
+                        }
+
+                        memoPending = true;
+                    }
+                    else
+                    {
+                        Gpu.Buffers.TableWordMemo.NoteMiss();
+                    }
+                }
+
                 if (!NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint))) // [local] ceiling experiment: read the stale CPU copy instead of waiting
                 {
                     if (Diagnostics.GpuReadTrace.Enabled)
@@ -609,6 +631,17 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
 
                     synchronized = true;
+                    if (Gpu.Buffers.TableWordMemo.Enabled) // [local] SHARPEMU_TABLE_WORD_MEMO
+                    {
+                        Span<byte> synced = stackalloc byte[sizeof(uint)];
+                        if (_guestMemory.TryRead(address, synced))
+                        {
+                            var syncedWord = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(synced);
+                            if (memoPending)
+                                Gpu.Buffers.TableWordMemo.Verify(address, memoValue, syncedWord);
+                            Gpu.Buffers.TableWordMemo.Store(address, syncedWord);
+                        }
+                    }
                 }
                 else
                 {

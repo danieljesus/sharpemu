@@ -54,6 +54,7 @@ public sealed partial class RenderExecutor
         }
 
         _host.RunPendingOperations();
+        using var memoProgram = new Gpu.Buffers.TableWordMemo.ProgramScope(); // [local] no program's once the dispatch is recorded
         var compute = banks.Shader.Compute;
         _host.SetDebugInformation(RecordedOperation.DispatchDirect, submitId, groupsX, groupsY, groupsZ, dispatchInitiator, compute.Address);
         if (compute.Address == 0)
@@ -76,6 +77,15 @@ public sealed partial class RenderExecutor
         var useThreadDimensions = (dispatchInitiator & DispatchInitiatorUseThreadDimensions) != 0;
         // [local] Thread counts left in GPU memory: handed over as zero counts with the address.
         var gpuThreadIndirect = useThreadDimensions && indirectArgumentsAddress != 0 && groupsX == 0 && groupsY == 0 && groupsZ == 0;
+        if (Gpu.Buffers.TlasHle.Instance is { } tlasHle) // [local] SHARPEMU_TLAS_HLE
+        {
+            var (skipDispatch, recorded) = tlasHle.BeforeDispatch(compute.Address, compute.UserScalars.Values.AsSpan(0, (int)compute.UserScalars.Count), _host.EndRendering);
+            if (recorded)
+                _host.ResetBindings();
+            if (skipDispatch)
+                return;
+        }
+
         ComputeProgram computeProgram;
         using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchProgram)) // [local]
             computeProgram = preparedProgram ?? _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
@@ -118,6 +128,7 @@ public sealed partial class RenderExecutor
 
         var input = computeProgram.Input;
         var program = input.Stage.Program ?? throw _host.Fatal($"The compute program is missing: shader=0x{compute.Address:X16}.");
+        Gpu.Buffers.TlasHle.Instance?.NoteProgram(compute.Address, program.Hash); // [local] SHARPEMU_TLAS_HLE
         if (Diagnostics.DccWriterTrace.Enabled)
         {
             Diagnostics.DccWriterTrace.CurrentProgram = program.Hash;
@@ -282,6 +293,7 @@ public sealed partial class RenderExecutor
             }
             if (DispatchBarriers)
                 _host.ShaderAccessBarrier();
+            if (Gpu.Buffers.RangeDumpProbe.Enabled) Gpu.Buffers.RangeDumpProbe.AfterDispatch(program.Hash, input.Stage.Resources.UserData, input.Stage.Resources.Buffers); // [local] SHARPEMU_RANGE_DUMP
             if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0 || (useThreadDimensions && _dimsLogs++ < 3000)) Console.Error.WriteLine($"[DISPATCH_DIMS] shader=0x{compute.Address:X} thread_dims={useThreadDimensions} dims={dimsX}x{dimsY}x{dimsZ} local={compute.ThreadsX}x{compute.ThreadsY}x{compute.ThreadsZ} indirect=0x{dimsIndirect:X} initiator=0x{dispatchInitiator:X} groups={physicalGroups[0]}x{physicalGroups[1]}x{physicalGroups[2]}"); // [local]
             var hook = Gpu.Buffers.GuestBufferCache.PostDispatchHook; // [local]
             if (hook != null) { Gpu.Buffers.GuestBufferCache.PostDispatchHook = null; hook(); }

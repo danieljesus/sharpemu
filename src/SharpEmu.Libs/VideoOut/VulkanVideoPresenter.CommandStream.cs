@@ -433,6 +433,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void WriteCommandData(ulong address, ReadOnlySpan<byte> data)
         {
             if (data.IsEmpty) return;
+            if (Gpu.Buffers.TableWordMemo.Enabled) Gpu.Buffers.TableWordMemo.NoteCommandWrite(address, data); // [local]
             SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(address, (ulong)data.Length, SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidationSource.CommandRender); // [local] applied on the render thread
             // A range the buffer cache tracks gets the bytes in both copies, the device one through a
             // copy recorded now; anything else is plain guest memory.

@@ -176,6 +176,7 @@ public sealed partial class RenderExecutor
 
     private IPreparedBindings PrepareBindings(in ShaderStageResources stage)
     {
+        Gpu.Buffers.TableWordMemo.CurrentProgram = stage.Program?.Hash ?? 0; // [local] until the draw or dispatch is recorded
         var bindings = _host.PrepareBindings(stage);
         NoteSampledTextures(stage);
         return bindings;
@@ -214,6 +215,7 @@ public sealed partial class RenderExecutor
         bool setAutoDebug)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawResourcePreparation);
+        using var memoProgram = new Gpu.Buffers.TableWordMemo.ProgramScope(); // [local] no program's once the draw is recorded
         var context = banks.Context;
         var vertexInput = state.Programs.VertexInput;
         var pixelInput = state.Programs.PixelInput;

@@ -228,6 +228,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (DeviceAddressPaging.ZeroPageMode != 0)
             _zeroPage = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, CachingPageSize);
         _tracker = new GuestPageTracker(pages);
+        RangeDumpProbe.Cache = this; // [local]
+        if (TlasHle.Enabled) TlasHle.Instance = new TlasHle(device, scheduler, this); // [local] SHARPEMU_TLAS_HLE
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
         _uploader = new GuestBufferUploader(device, scheduler, guest, _staging);
         if (ReadbackMirror.Mode != 0) // [local]
@@ -370,6 +372,25 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return true;
     }
 
+    // [local] SHARPEMU_RANGE_DUMP: a qword as a CPU reader sees it now (synchronizing; probes only).
+    internal ulong ReadQwordSynchronized(ulong address)
+    {
+        Span<byte> bytes = stackalloc byte[8];
+        return TrySynchronizeCpuRead(address, 8) && _guestMemory.TryRead(address, bytes)
+            ? System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(bytes)
+            : 0;
+    }
+
+    // [local] SHARPEMU_TLAS_HLE: guest bytes the GPU has not written since the CPU did (false otherwise), without waiting.
+    internal bool TryReadGuestClean(ulong address, Span<byte> destination) =>
+        !_tracker.HasGpuDirtyPages(address, (ulong)destination.Length) && _guestMemory.TryRead(address, destination);
+
+    // [local] SHARPEMU_TLAS_HLE: guest bytes as they are, whatever the GPU has written since.
+    internal bool TryReadGuestUnchecked(ulong address, Span<byte> destination) => _guestMemory.TryRead(address, destination);
+
+    // [local] SHARPEMU_TLAS_HLE: bytes for a binding, in the stream ring.
+    internal (GpuBuffer Buffer, ulong Offset) UploadStream(ReadOnlySpan<byte> source, ulong alignment) => (_stream, _stream.Copy(source, alignment));
+
     public void DumpDeviceRange(ulong guestAddress, ulong size, string path)
     {
         var buffer = _registry.GetBuffer(FindBuffer(guestAddress, size));
@@ -395,6 +416,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // A CPU write fault: true when the range is tracked and any GPU data reached guest memory.
     bool IGuestBufferStore.MarkCpuWrite(ulong address, ulong size)
     {
+        if (TableWordMemo.Enabled) TableWordMemo.NoteOtherWrite(address, size); // [local]
         SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(address, size, SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidationSource.CpuFault); // [local]
         var tracked = _tracker.InvalidateRegion(address, size, out var needsGpuFlush);
         var completed = !needsGpuFlush || ReadMemoryOrAwaitShutdown(address, size, isWrite: true,
@@ -515,6 +537,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // A CPU read fault: GPU-dirty pages download through the worker first.
     public bool DownloadToCpu(ulong address, ulong size)
     {
+        TlasHle.Instance?.NoteCpuRead(address, size, 0); // [local] SHARPEMU_TLAS_HLE_CONSUMERS: a guest CPU read
         var tracked = _tracker.HasRegion(address, size);
         var dirty = tracked && _tracker.HasGpuDirtyPages(address, size);
         if (dirty && ReadbackAudit && _storeDownloadLogs++ < 40) Console.Error.WriteLine($"[STORE_DOWNLOAD] address=0x{address:X} size=0x{size:X}"); // [local]
@@ -731,6 +754,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (size < BroadWriteBytes) _preciseGpuModifiedRanges.Add(guestAddress, size); // [local]
             if (StoreTableVerify && !conservativeWrite) _exactGpuModifiedRanges.Add(guestAddress, size); // [local]
             NoteEverGpuWritten(guestAddress, size); // [local]
+            if (TableWordMemo.Enabled) TableWordMemo.NoteGpuWrite(guestAddress, size); // [local]
             if (Diagnostics.TableReadCensus.Enabled) Diagnostics.TableReadCensus.NoteWrite(guestAddress, size, _scheduler.CurrentTick); // [local]
             if (EarlyWriterSubmit && !EarlySubmitPending) NoteHotWordWrite(guestAddress, size); // [local]
             if (ReadbackTickLog) // [local] diagnostic: last writer tick per 4 KB page
