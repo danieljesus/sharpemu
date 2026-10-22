@@ -537,6 +537,22 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // A CPU read fault: GPU-dirty pages download through the worker first.
     public bool DownloadToCpu(ulong address, ulong size)
     {
+        if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, size)) // [local] SHARPEMU_LABEL_PROBE
+        {
+            var probeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            var probeResult = DownloadToCpuCore(address, size);
+            Span<byte> label = stackalloc byte[8];
+            if (_backing.TryReadBacking(Diagnostics.LabelLatencyProbe.Address, label))
+                Diagnostics.LabelLatencyProbe.Poll(probeStarted, System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(label),
+                    _scheduler.CurrentTick, _scheduler.Timeline.CompletedTick);
+            return probeResult;
+        }
+
+        return DownloadToCpuCore(address, size);
+    }
+
+    private bool DownloadToCpuCore(ulong address, ulong size)
+    {
         TlasHle.Instance?.NoteCpuRead(address, size, 0); // [local] SHARPEMU_TLAS_HLE_CONSUMERS: a guest CPU read
         var tracked = _tracker.HasRegion(address, size);
         var dirty = tracked && _tracker.HasGpuDirtyPages(address, size);

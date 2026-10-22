@@ -433,6 +433,11 @@ internal static unsafe partial class VulkanVideoPresenter
         public void WriteCommandData(ulong address, ReadOnlySpan<byte> data)
         {
             if (data.IsEmpty) return;
+            if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, (ulong)data.Length)) // [local]
+            {
+                Diagnostics.LabelLatencyProbe.RenderApply(_scheduler.CurrentTick);
+                if (data.Length >= 8) Diagnostics.LabelLatencyProbe.RememberWrite(System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(data));
+            }
             if (Gpu.Buffers.TableWordMemo.Enabled) Gpu.Buffers.TableWordMemo.NoteCommandWrite(address, data); // [local]
             SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(address, (ulong)data.Length, SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidationSource.CommandRender); // [local] applied on the render thread
             // A range the buffer cache tracks gets the bytes in both copies, the device one through a

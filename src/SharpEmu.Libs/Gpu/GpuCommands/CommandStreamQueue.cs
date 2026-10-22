@@ -696,6 +696,7 @@ public sealed class CommandStreamQueue
         }
 
         SlicesRun++;
+        processor.ProbeSubmissionEnqueued = submission.CreatedAt; // [local] SHARPEMU_LABEL_PROBE
         _host.BeginSubmission(submission.QueueId, submission.SubmissionId, submission.GeometrySnapshots);
         processor.ConstantEngineComplete = true;
         var complete = processor.Process(submission.Commands, submission.Address, submission.DwordCount) == SubmissionProgress.Complete;

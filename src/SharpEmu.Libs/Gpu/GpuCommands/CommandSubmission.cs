@@ -82,6 +82,7 @@ public sealed class CommandSubmission
 {
     public CommandSubmission(CommandSubmissionKind kind, int queueId, ulong address, uint dwordCount, ulong submissionId, object? geometrySnapshots)
     {
+        CreatedAt = Diagnostics.LabelLatencyProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_LABEL_PROBE
         Kind = kind;
         QueueId = queueId;
         Address = address;
@@ -91,6 +92,9 @@ public sealed class CommandSubmission
     }
 
     public CommandSubmissionKind Kind { get; }
+
+    // [local] SHARPEMU_LABEL_PROBE: when the guest's submission was enqueued.
+    public long CreatedAt { get; }
 
     public int QueueId { get; }
 

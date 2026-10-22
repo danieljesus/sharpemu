@@ -59,6 +59,10 @@ public sealed partial class GpuCommandInterpreter
 
     public ulong SubmitId { get; set; }
 
+    // [local] SHARPEMU_LABEL_PROBE: the running submission's enqueue time and the packet being run.
+    internal long ProbeSubmissionEnqueued { get; set; }
+    private uint _probeOpcode;
+
     public uint IndexTypeAndSize { get; private set; }
 
     public uint IndexBufferSize { get; private set; }
@@ -327,6 +331,7 @@ public sealed partial class GpuCommandInterpreter
             }
 
             var opcode = PacketHeader.Opcode(header);
+            if (Diagnostics.LabelLatencyProbe.Enabled) _probeOpcode = opcode; // [local]
             // Only a wait or an inert NOP/marker may separate the store and its paired wait.
             // Draws, dispatches and transfers may produce a newer GPU value at the same address.
             if (opcode is not (PacketOpcode.WaitRegisterMemory or PacketOpcode.WaitRegisterMemory64) &&
@@ -570,6 +575,8 @@ public sealed partial class GpuCommandInterpreter
     // A label or event store: the host applies it in stream order.
     internal void WriteBytes(ulong address, ReadOnlySpan<byte> source)
     {
+        if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, (ulong)source.Length)) // [local]
+            Diagnostics.LabelLatencyProbe.FrontWrite(source, address, _probeOpcode, ProbeSubmissionEnqueued);
         _host.WriteGuest(address, source);
         NoteOwnWrite(address, source);
     }
@@ -591,6 +598,8 @@ public sealed partial class GpuCommandInterpreter
     // Data the stream itself may read back: the host applies it before the next packet runs.
     internal void WriteBytesNow(ulong address, ReadOnlySpan<byte> source)
     {
+        if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, (ulong)source.Length)) // [local]
+            Diagnostics.LabelLatencyProbe.FrontWrite(source, address, _probeOpcode, ProbeSubmissionEnqueued);
         _host.WriteGuestNow(address, source);
         NoteOwnWrite(address, source);
     }

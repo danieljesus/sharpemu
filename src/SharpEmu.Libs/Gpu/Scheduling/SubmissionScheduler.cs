@@ -559,6 +559,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             }
 
             if (submitted && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(tick); // [local]
+            if (submitted && Diagnostics.LabelLatencyProbe.Enabled) Diagnostics.LabelLatencyProbe.NoteSubmitted(tick); // [local]
 
             if (submitted && _completed is { } completed)
             {
@@ -661,6 +662,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
 
         if (submitted && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(item.Tick); // [local]
+        if (submitted && Diagnostics.LabelLatencyProbe.Enabled) Diagnostics.LabelLatencyProbe.NoteSubmitted(item.Tick); // [local]
 
         SubmitThreadStats.Submitted(joined - start, System.Diagnostics.Stopwatch.GetTimestamp() - joined);
         if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Submitted, -1, 0, item.Tick); // [local]

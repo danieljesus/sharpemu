@@ -55,6 +55,7 @@ public sealed class TickTimeline
             if (seen == known)
             {
                 if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteCompleted(counter); // [local]
+                if (Diagnostics.LabelLatencyProbe.Enabled) Diagnostics.LabelLatencyProbe.NoteCompleted(counter); // [local]
                 return;
             }
 
