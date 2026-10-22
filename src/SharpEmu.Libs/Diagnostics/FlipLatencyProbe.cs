@@ -63,13 +63,55 @@ internal static class FlipLatencyProbe
         lock (Gate) if (Open.TryGetValue(requestId, out var flip) && flip.T6 == 0) flip.T6 = Stopwatch.GetTimestamp();
     }
 
-    public static void Presented(ulong requestId)
+    // Pacing (2026-10-22): intervals between presentations and, per presentation, the slots of the fixed grid
+    // (port open + k * flip interval) it skipped: a skipped slot is "late" when the flip's tick was already complete at
+    // that slot's boundary (the presenter did not take it in time), "empty" when it was not.
+    private static long _lastPresentAt;
+    private static long _lastSlot = -1;
+    private static readonly long[] IntervalHistogram = new long[101];
+    private static readonly List<double> Intervals = new();
+    private static long _slotsLate, _slotsEmpty, _presents;
+    private static readonly List<double> PickupDelay = new();
+
+    public static void Presented(ulong requestId, long openedAt, long flipInterval)
     {
         lock (Gate)
         {
             if (!Open.Remove(requestId, out var flip)) return;
             flip.T7 = Stopwatch.GetTimestamp();
             Done.Add(flip);
+            double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
+            if (_lastPresentAt != 0)
+            {
+                var interval = Ms(flip.T7 - _lastPresentAt);
+                Intervals.Add(interval);
+                IntervalHistogram[Math.Clamp((int)interval, 0, 100)]++;
+            }
+
+            _lastPresentAt = flip.T7;
+            if (flipInterval > 0 && openedAt != 0)
+            {
+                _presents++;
+                var slot = (flip.T7 - openedAt) / flipInterval;
+                var slotBoundary = openedAt + slot * flipInterval;
+                var tickSlot = (int)(flip.Tick & (TickRing - 1));
+                long completed;
+                lock (CompletedAt) completed = CompletedTick[tickSlot] == flip.Tick ? CompletedAt[tickSlot] : 0;
+                if (_lastSlot >= 0)
+                {
+                    for (var skipped = _lastSlot + 1; skipped < slot; skipped++)
+                    {
+                        var boundary = openedAt + skipped * flipInterval;
+                        if (completed != 0 && completed <= boundary) _slotsLate++; else _slotsEmpty++;
+                    }
+                }
+
+                // How long after the flip could first be shown (its slot boundary or its completion) it was taken.
+                var earliest = Math.Max(completed, _lastSlot >= 0 ? openedAt + (_lastSlot + 1) * flipInterval : slotBoundary);
+                if (completed != 0) PickupDelay.Add(Ms(flip.T7 - earliest));
+                _lastSlot = slot;
+            }
+
             Report(flip.T7);
         }
     }
@@ -133,5 +175,19 @@ internal static class FlipLatencyProbe
             FormattableString.Invariant($"[FLIP_PROBE] flips={Done.Count} ms_p50/p90: front_to_render={Stat(segments[0])} render_capture={Stat(segments[1])} capture_to_gpu_submit={Stat(segments[2])} "),
             FormattableString.Invariant($"gpu_submit_to_complete={Stat(segments[3])} complete_to_flip_completed={Stat(segments[4])} completed_to_presented={Stat(segments[5])} total={Stat(segments[6])} queued_flips_at_reserve={Stat(depths)} open={Open.Count}")));
         Done.Clear();
+        if (Intervals.Count != 0)
+        {
+            var mean = Intervals.Average();
+            var histogram = string.Join(" ", Enumerable.Range(0, IntervalHistogram.Length).Where(index => IntervalHistogram[index] != 0)
+                .Select(index => FormattableString.Invariant($"{index}:{IntervalHistogram[index]}")));
+            Intervals.Sort();
+            double Pct(double fraction) => Intervals[Math.Min(Intervals.Count - 1, (int)(Intervals.Count * fraction))];
+            Console.Error.WriteLine(FormattableString.Invariant(
+                $"[FLIP_PACING] presents={_presents} interval_ms mean={mean:F2} p50={Pct(0.5):F2} p90={Pct(0.9):F2} p99={Pct(0.99):F2} skipped_slots late_with_flip_ready={_slotsLate} empty={_slotsEmpty} pickup_delay_ms_p50/p90={Stat(PickupDelay)} hist_1ms=[{histogram}]"));
+            Intervals.Clear();
+            Array.Clear(IntervalHistogram);
+            PickupDelay.Clear();
+            _slotsLate = _slotsEmpty = _presents = 0;
+        }
     }
 }

@@ -277,7 +277,9 @@ public static partial class VideoOutExports
             }
 
             request.Outcome = outcome;
-            if (outcome == FlipOutcome.Presented && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.Presented(requestId); // [local]
+            if (outcome == FlipOutcome.Presented && Diagnostics.FlipLatencyProbe.Enabled) // [local]
+                Diagnostics.FlipLatencyProbe.Presented(requestId, _ports.TryGetValue(request.Handle, out var probePort) ? probePort.OpenTimestamp : 0,
+                    probePort is null ? 0 : VideoOutDisplayClock.RefreshInterval(probePort.RefreshRate) * Math.Max(1L, (long)probePort.FlipRate + 1));
             if (outcome == FlipOutcome.Presented && request.BufferIndex >= 0 &&
                 _ports.TryGetValue(request.Handle, out var port))
             {
