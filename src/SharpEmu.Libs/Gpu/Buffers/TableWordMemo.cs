@@ -3,7 +3,7 @@
 
 namespace SharpEmu.Libs.Gpu.Buffers;
 
-// [local] SHARPEMU_TABLE_WORD_MEMO (off by default): a materialization's synchronizing read of a GPU-dirty table word
+// [local] SHARPEMU_TABLE_WORD_MEMO (=1 by default, =0 off): a materialization's synchronizing read of a GPU-dirty table word
 // remembers the value it got. A later read of the same word reuses it, without waiting, while every GPU write marked
 // over the word since then came from a program in SHARPEMU_TABLE_WORD_MEMO_WRITERS (hex hashes separated by '/', 0x5981 by
 // default: the BLAS refit, whose written binding spans the whole blob, header included, though the refit rewrites
@@ -11,7 +11,7 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // how often the value would have been wrong ([PERF][TABLE_WORD_MEMO]). Render thread only.
 internal static class TableWordMemo
 {
-    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO"), out var mode) ? mode : 0;
+    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO"), out var mode) ? mode : 1;
     public static bool Enabled => Mode != 0;
     private static readonly HashSet<ulong> Writers = (Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_WRITERS") ?? "5981037B07E391D5")
         .Split(['/', ','], StringSplitOptions.RemoveEmptyEntries).Select(hash => Convert.ToUInt64(hash, 16)).ToHashSet();

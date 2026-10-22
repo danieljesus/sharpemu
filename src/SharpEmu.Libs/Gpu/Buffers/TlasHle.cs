@@ -10,7 +10,7 @@ using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Buffers;
 
-// [local] SHARPEMU_TLAS_HLE (off by default): GTA V's TLAS that the reflection pass 0x8395 traverses, built by the host
+// [local] SHARPEMU_TLAS_HLE (=1 by default, =0 off): GTA V's TLAS that the reflection pass 0x8395 traverses, built by the host
 // in the game's format instead of by the game's chain of compute programs.
 //
 // One chain per TLAS and frame, keyed by its work header (a CP-written block in a shared work area):
@@ -33,7 +33,7 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // 0xFFFFFFFF. The game also packs two-child nodes in one unit, with 0x1E in the unused slots; the host does not.
 internal sealed unsafe class TlasHle : IDisposable
 {
-    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TLAS_HLE"), out var mode) ? mode : 0;
+    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TLAS_HLE"), out var mode) ? mode : 1;
     public static bool Enabled => Mode != 0;
     internal static TlasHle? Instance;
 
