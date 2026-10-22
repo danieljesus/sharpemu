@@ -54,6 +54,7 @@ public sealed class TickTimeline
             var seen = Interlocked.CompareExchange(ref _gpuTick, counter, known);
             if (seen == known)
             {
+                if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteCompleted(counter); // [local]
                 return;
             }
 

@@ -196,6 +196,7 @@ public static partial class VideoOutExports
     // Publish completion counters and events unless the request was cancelled.
     internal static void CompleteFlip(ulong requestId)
     {
+        if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.Completed(requestId); // [local] SHARPEMU_FLIP_PROBE
         FlipRequest request;
         lock (_stateGate)
         {
@@ -276,6 +277,7 @@ public static partial class VideoOutExports
             }
 
             request.Outcome = outcome;
+            if (outcome == FlipOutcome.Presented && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.Presented(requestId); // [local]
             if (outcome == FlipOutcome.Presented && request.BufferIndex >= 0 &&
                 _ports.TryGetValue(request.Handle, out var port))
             {

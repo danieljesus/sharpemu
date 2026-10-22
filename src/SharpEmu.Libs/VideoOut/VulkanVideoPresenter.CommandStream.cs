@@ -568,12 +568,14 @@ internal static unsafe partial class VulkanVideoPresenter
         // capture run here, in stream order, as they did inside PrepareFlip.
         internal void CompleteQueuedFlip(int handle, int index, int flipMode, long flipArgument, ulong requestId)
         {
+            if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.RenderStarted(requestId); // [local] SHARPEMU_FLIP_PROBE
             ResetMappedSizes();
             _ = BeginBatchedGuestCommands();
             _translation.PrepareFlip(handle, index);
             try
             {
                 CaptureFlip(handle, index, requestId, flipMode, flipArgument);
+                if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.Captured(requestId, _scheduler.CurrentTick); // [local]
             }
             catch
             {

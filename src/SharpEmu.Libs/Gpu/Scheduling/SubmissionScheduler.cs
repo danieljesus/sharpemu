@@ -558,6 +558,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                 submitted = _device.TrySubmit(buffer, submit, out failure);
             }
 
+            if (submitted && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(tick); // [local]
+
             if (submitted && _completed is { } completed)
             {
                 _priority.Enqueue(new TickWork(() => completed(tick), tick));
@@ -657,6 +659,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         {
             submitted = _device.TrySubmit(item.Buffer, item.Bundle, out failure);
         }
+
+        if (submitted && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(item.Tick); // [local]
 
         SubmitThreadStats.Submitted(joined - start, System.Diagnostics.Stopwatch.GetTimestamp() - joined);
         if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Submitted, -1, 0, item.Tick); // [local]

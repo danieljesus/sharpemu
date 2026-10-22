@@ -571,6 +571,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             Diagnostics.InjectedDelay.Spin(Diagnostics.InjectedDelay.FrontTicks); // [local] critical-path sensitivity probe
+            if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.Reserved(requestId); // [local]
             queue.Enqueue(() =>
             {
                 Diagnostics.InjectedDelay.Spin(Diagnostics.InjectedDelay.RenderTicks); // [local] critical-path sensitivity probe
