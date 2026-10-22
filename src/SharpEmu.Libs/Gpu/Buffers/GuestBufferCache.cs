@@ -1710,11 +1710,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     // [local] SHARPEMU_READBACK_WINDOW (bytes, power of two >= 4 KB): the GPU-written bytes one readback brings back
-    // around the requested range. GTA V reads 4-16 bytes at a time.
+    // around the requested range. GTA V reads 4-16 bytes at a time. 64 KB by default: 512 KB downloaded ~9 MB/frame for
+    // 22 KB/s asked for, and 64 KB cut the render thread's guest-memory copy by ~0.6 ms/frame without more waiting.
     private static readonly ulong ReadbackWindowBytes =
         ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_READBACK_WINDOW"), out var window) && window >= 4096 && (window & (window - 1)) == 0
             ? window
-            : 512 * 1024;
+            : 64 * 1024;
     private const long HotWindowLifetime = 512;
     private const int MaxEagerReadbacks = 4;
     private readonly Dictionary<ulong, HotWindow> _hotWindows = new();
