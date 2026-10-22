@@ -598,6 +598,8 @@ internal sealed unsafe class TlasHle : IDisposable
                     continue; // the template's capacity bound (n / 2 nodes rounded up) covers the host's smaller tree
                 BinaryPrimitives.WriteUInt32LittleEndian(word, value);
                 _cache.WriteHostMemory(chain.Base + (ulong)dword * 4, word);
+                if (TableWordMemo.Enabled)
+                    TableWordMemo.StoreHostWrite(chain.Base + (ulong)dword * 4, value);
             }
 
             if (PoisonBuildCounters)

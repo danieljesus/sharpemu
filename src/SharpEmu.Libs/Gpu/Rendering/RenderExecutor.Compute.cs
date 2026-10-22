@@ -54,6 +54,7 @@ public sealed partial class RenderExecutor
         }
 
         _host.RunPendingOperations();
+        using var memoProgram = new Gpu.Buffers.TableWordMemo.ProgramScope(); // [local] no program's once the dispatch is recorded
         var compute = banks.Shader.Compute;
         _host.SetDebugInformation(RecordedOperation.DispatchDirect, submitId, groupsX, groupsY, groupsZ, dispatchInitiator, compute.Address);
         if (compute.Address == 0)

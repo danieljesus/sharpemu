@@ -50,4 +50,47 @@ public sealed class TableWordMemoTests
 
         Assert.False(TableWordMemo.TryGet(Word, out _));
     }
+
+    [Fact]
+    public void ACommandWriteUpdatesWhatItCoversAndDropsWhatItSplits()
+    {
+        TableWordMemo.ResetForTests();
+        var updates = TableWordMemo.CommandUpdates;
+        TableWordMemo.CommandUpdates = true;
+        try
+        {
+            TableWordMemo.Store(Word, 7);
+            TableWordMemo.Store(Word + 4, 8);
+            TableWordMemo.NoteCommandWrite(Word, [1, 0, 0, 0, 9, 9]);
+
+            Assert.True(TableWordMemo.TryGet(Word, out var value));
+            Assert.Equal(1u, value);
+            Assert.False(TableWordMemo.TryGet(Word + 4, out _));
+        }
+        finally
+        {
+            TableWordMemo.CommandUpdates = updates;
+        }
+    }
+
+    [Fact]
+    public void AGpuWriteAfterTheCommandWriteStillDrops()
+    {
+        TableWordMemo.ResetForTests();
+        var updates = TableWordMemo.CommandUpdates;
+        TableWordMemo.CommandUpdates = true;
+        try
+        {
+            TableWordMemo.Store(Word, 7);
+            TableWordMemo.NoteCommandWrite(Word, [1, 0, 0, 0]);
+            using (TableWordMemo.BeginProgram(0x0DA37182659C9032))
+                TableWordMemo.NoteGpuWrite(Word, 4);
+
+            Assert.False(TableWordMemo.TryGet(Word, out _));
+        }
+        finally
+        {
+            TableWordMemo.CommandUpdates = updates;
+        }
+    }
 }

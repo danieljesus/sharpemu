@@ -22,8 +22,9 @@ internal static class TableWordMemo
     private static bool _dirtySort;
     [ThreadStatic] internal static ulong CurrentProgram;
 
-    // The program whose written bindings are being marked, for the length of the scope: GPU writes marked outside one
-    // (fills, copies, label writes) belong to no program, so no allowlisted writer can hide them.
+    // The program whose written bindings are being marked: set when a draw's or dispatch's bindings are prepared, cleared
+    // when it has been recorded (the scope's end), so GPU writes marked after it (fills, copies, label writes) belong to
+    // no program and no allowlisted writer can hide them.
     internal static ProgramScope BeginProgram(ulong hash)
     {
         CurrentProgram = hash;
@@ -110,7 +111,7 @@ internal static class TableWordMemo
     // [local] SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE=1 (off by default): a command-processor write carries its
     // data, applied in stream order, so a remembered word it fully covers takes the new value instead of being dropped
     // (CP-written descriptors in GPU-dirty pages, re-written each frame with the same layout). Partly covered words drop.
-    public static readonly bool CommandUpdates = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE") == "1";
+    internal static bool CommandUpdates = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE") == "1";
     private static long _cpUpdates, _hostStores;
 
     public static void NoteCommandWrite(ulong address, ReadOnlySpan<byte> data)
@@ -202,8 +203,8 @@ internal static class TableWordMemo
     {
         var writers = string.Join(",", _invalidByWriter.OrderByDescending(pair => pair.Value).Take(8).Select(pair => $"{pair.Key:X16}:{pair.Value}"));
         _invalidByWriter.Clear();
-        var line = $"[PERF][TABLE_WORD_MEMO] mode={Mode} words={_values.Count} hits={_hits} misses={_misses} stores={_stores} verified={_verified} mismatches={_mismatches} invalid_gpu={_invalidGpu} invalid_cp_cpu={_invalidCp} invalid_by_writer=[{writers}]";
-        _hits = _verified = _mismatches = _misses = _stores = _invalidGpu = _invalidCp = 0;
+        var line = $"[PERF][TABLE_WORD_MEMO] mode={Mode} words={_values.Count} hits={_hits} misses={_misses} stores={_stores} verified={_verified} mismatches={_mismatches} invalid_gpu={_invalidGpu} invalid_cp_cpu={_invalidCp} invalid_by_writer=[{writers}] cp_updates={_cpUpdates} host_stores={_hostStores}";
+        _hits = _verified = _mismatches = _misses = _stores = _invalidGpu = _invalidCp = _cpUpdates = _hostStores = 0;
         return line;
     }
 }
