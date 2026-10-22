@@ -57,6 +57,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private bool _zeroPageReady;
     private readonly GuestBufferRegistry<GpuBuffer> _registry = new(CachingPageSize, PageOwnerTable.AddressSpaceSize);
     private readonly SpanSet _gpuModifiedRanges = new();
+    // [local] SHARPEMU_FAULT_READ_EMULATE: the render thread changes _gpuModifiedRanges under this gate (its own reads
+    // need none); an emulated faulting load checks and reads the backing under it from the faulting thread.
+    private readonly object _gpuModifiedGate = new();
     private static readonly ulong DirtyWatch = Convert.ToUInt64(Environment.GetEnvironmentVariable("SHARPEMU_DIRTY_WATCH") ?? "0", 16); // [local]
     private int _dirtyWatchLogs; // [local]
     internal static readonly HashSet<ulong> WatchedModified = new(); // [local] 32-byte-aligned addresses whose dirty-mark removal is logged
@@ -76,7 +79,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     }
         }
 
-        _gpuModifiedRanges.Remove(address, size);
+        lock (_gpuModifiedGate) _gpuModifiedRanges.Remove(address, size); // [local] SHARPEMU_FAULT_READ_EMULATE
         _preciseGpuModifiedRanges.Remove(address, size); // [local]
         if (StoreTableVerify) _exactGpuModifiedRanges.Remove(address, size); // [local]
         Interlocked.Increment(ref _gpuModifiedRemovals); // [local] invalidates the written-obtain memo
@@ -572,26 +575,20 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return false;
         }
 
-        var bytes = new byte[size];
-        var served = false;
+        // [local] Under the gate the check and the read see one point of the render thread's sequence of GPU-modified
+        // changes, as a relay to the queue would, without interrupting it: no range can turn GPU-modified (and be
+        // downloaded into the backing) between the check and the read.
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
-        long entered = 0;
-        if (!_relay.TryRunOnGpuQueue(() =>
-            {
-                entered = System.Diagnostics.Stopwatch.GetTimestamp();
-                served = _tracker.HasRegion(address, size) && !_gpuModifiedRanges.Overlaps(address, size) &&
-                    _backing.TryReadBacking(address, bytes);
-            }))
+        bool served;
+        long entered;
+        lock (_gpuModifiedGate)
         {
-            return false;
+            entered = System.Diagnostics.Stopwatch.GetTimestamp();
+            served = _tracker.HasRegion(address, size) && !_gpuModifiedRanges.Overlaps(address, size) &&
+                _backing.TryReadBacking(address, data);
         }
 
         FaultReadStats.NoteRelay(served, entered - started, System.Diagnostics.Stopwatch.GetTimestamp() - entered);
-        if (served)
-        {
-            bytes.CopyTo(data);
-        }
-
         return served;
     }
 
@@ -843,7 +840,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     _pageWriteTicks[page] = _scheduler.CurrentTick;
             if (!_gpuModifiedRanges.Contains(guestAddress, size))
             {
-                _gpuModifiedRanges.Add(guestAddress, size);
+                lock (_gpuModifiedGate) _gpuModifiedRanges.Add(guestAddress, size); // [local] SHARPEMU_FAULT_READ_EMULATE
                 Interlocked.Increment(ref _gpuModifiedVersion);
             }
 
