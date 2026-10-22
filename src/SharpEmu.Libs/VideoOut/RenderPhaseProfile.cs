@@ -610,6 +610,8 @@ internal static class RenderPhaseProfile
             Console.Error.WriteLine(exactTables);
         if (Gpu.Buffers.GuestBufferCache.TakeStoreTableVerifyReport() is { } verifyTables) // [local]
             Console.Error.WriteLine(verifyTables);
+        if (Gpu.Buffers.TableWordMemo.TakeReport() is { } wordMemo) // [local] SHARPEMU_TABLE_WORD_MEMO
+            Console.Error.WriteLine(wordMemo);
         foreach (var split in SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.TakeReport()) // [local] SHARPEMU_PROFILE_MATERIALIZE_SPLIT
             Console.Error.WriteLine(split);
         Console.Error.WriteLine(Gpu.Pipelines.BackMaterializations.TakeReport()); // [local]
