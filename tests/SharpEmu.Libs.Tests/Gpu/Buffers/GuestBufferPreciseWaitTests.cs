@@ -70,8 +70,8 @@ public sealed class GuestBufferPreciseWaitTests(HeadlessVulkanFixture fixture) :
 
             Assert.Equal((1L, 0L), (harness.Cache.PreciseWaitReads, harness.Cache.PreciseWaitFallbacks));
             Assert.Equal(recording, harness.Worker.Run(() => harness.Scheduler.CurrentTick));
-            Assert.False(harness.Cache.HasGpuDirtyBytes(address + 8, 4));
-            Assert.True(harness.Cache.HasGpuDirtyBytes(address, 8));
+            // The finished piece of the window comes down whole; the neighbour still being written stays GPU-modified.
+            Assert.False(harness.Cache.HasGpuDirtyBytes(address, 0x100));
             Assert.True(harness.Cache.HasGpuDirtyBytes(address + 0x1000, 0x100));
             Assert.Equal(0x11111111u, BitConverter.ToUInt32(harness.Read(address + 8, 4)));
         }

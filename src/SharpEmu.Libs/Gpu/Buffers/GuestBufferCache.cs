@@ -2434,6 +2434,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             NoteHotReadback(guestAddress, size);
         }
+        if (copies.Count != 0)
+            CountReadback(); // [local]
         var slotsBusy = false;
         if (copies.Count != 0 && allowPending && TryBeginDownloadAsync(copies, out var ticket, out var writeTicks, out slotsBusy))
         {
@@ -2791,14 +2793,28 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return false;
         }
 
-        var copies = new List<DownloadPiece>(2);
-        foreach (var range in _gpuModifiedRanges.GetOverlappingRanges(guestAddress, size))
+        // [local] The whole readback window, as the ordinary path, but each GPU-modified piece only if its own last writer
+        // (precise) finished; a piece with a writer still pending, or none recorded, keeps only the requested bytes of it
+        // (finished: checked above) and the rest stays GPU-modified.
+        var window = CollectReadbackWindow(buffer, guestAddress, size, out var windowBegin, out var windowEnd);
+        var copies = new List<DownloadPiece>(window.Count);
+        var waitTick = precise;
+        foreach (var piece in window)
         {
-            var begin = Math.Max(range.Address, guestAddress);
-            var end = Math.Min(range.Address + range.Size, guestAddress + size);
+            var tick = GpuWriteHistory.LastWriteTick(piece.Address, piece.Size, PreciseWaitScan);
+            if (tick != 0 && tick < _scheduler.CurrentTick && _scheduler.IsTickComplete(tick))
+            {
+                copies.Add(piece);
+                waitTick = Math.Max(waitTick, tick);
+                continue;
+            }
+
+            PreciseWaitPendingPieces++;
+            var begin = Math.Max(piece.Address, guestAddress);
+            var end = Math.Min(piece.Address + piece.Size, guestAddress + size);
             if (begin < end)
             {
-                copies.Add(new DownloadPiece(buffer, buffer.Offset(begin), begin, end - begin));
+                copies.Add(piece with { SourceOffset = piece.SourceOffset + (begin - piece.Address), Address = begin, Size = end - begin });
             }
         }
 
@@ -2817,12 +2833,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (captureOnly)
         {
             var capture = new List<(ulong Address, byte[] Bytes)>(copies.Count);
-            readback.Read(pieces, precise, (index, bytes) => capture.Add((copies[index].Address, bytes.ToArray())));
+            readback.Read(pieces, waitTick, (index, bytes) => capture.Add((copies[index].Address, bytes.ToArray())));
             captured = capture;
             return true;
         }
 
-        readback.Read(pieces, precise, (index, bytes) =>
+        readback.Read(pieces, waitTick, (index, bytes) =>
         {
             if (!_backing.TryWriteBacking(copies[index].Address, bytes))
             {
@@ -2835,7 +2851,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         // Pages still holding GPU-modified bytes stay GPU-dirty.
-        for (var page = guestAddress & ~(TrackerLayout.PageBytes - 1); page < guestAddress + size; page += TrackerLayout.PageBytes)
+        for (var page = windowBegin & ~(TrackerLayout.PageBytes - 1); page < windowEnd; page += TrackerLayout.PageBytes)
         {
             if (!_gpuModifiedRanges.Overlaps(page, TrackerLayout.PageBytes))
             {
@@ -2844,8 +2860,24 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         PreciseWaitReads++;
-        RecordReadback(guestAddress, guestAddress + size, isWrite: false, copies, started, source);
+        RecordReadback(windowBegin, windowEnd, isWrite: false, copies, started, source);
         return true;
+    }
+
+    internal long PreciseWaitPendingPieces { get; private set; }
+
+    // [local] Every 20 s: the readbacks that downloaded something, ordinary and precise (always on: two counters).
+    private static long _ordinaryReadbacks, _preciseReadbacksReported, _readbackCountReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private void CountReadback()
+    {
+        _ordinaryReadbacks++;
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_readbackCountReport).TotalSeconds < 20)
+            return;
+        _readbackCountReport = System.Diagnostics.Stopwatch.GetTimestamp();
+        Console.Error.WriteLine($"[READBACK_COUNT] ordinary={_ordinaryReadbacks} precise={PreciseWaitReads - _preciseReadbacksReported} pending_pieces={PreciseWaitPendingPieces} fallbacks={PreciseWaitFallbacks}");
+        _ordinaryReadbacks = 0;
+        _preciseReadbacksReported = PreciseWaitReads;
     }
 
     private void ReportPreciseWait()
