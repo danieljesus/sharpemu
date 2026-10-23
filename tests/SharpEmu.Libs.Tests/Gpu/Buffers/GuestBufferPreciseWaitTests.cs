@@ -82,6 +82,34 @@ public sealed class GuestBufferPreciseWaitTests(HeadlessVulkanFixture fixture) :
     }
 
     [Fact]
+    public void TheVerificationCapturesThePreciseBytesThenTakesTheOrdinaryPathAndMatches()
+    {
+        if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
+        var harness = Start(_vulkan);
+        try
+        {
+            using var fatal = new FatalScope();
+            harness.Cache.ForcePreciseVerify = true;
+            var address = harness.MapBacked(0x10000, ReadWrite);
+            GpuWrite(harness, address, 0x55555555);
+            harness.Worker.Run(() => harness.Scheduler.Finish());
+            GpuWrite(harness, address + 0x1000, 0x66666666);
+
+            ShaderRead(harness, address + 8);
+
+            Assert.Equal((0L, 0L), (harness.Cache.PreciseWaitReads, harness.Cache.PreciseWaitFallbacks));
+            Assert.Equal((1L, 0L), (harness.Cache.PreciseVerifyChecks, harness.Cache.PreciseVerifyMismatches));
+            Assert.False(harness.Cache.HasGpuDirtyBytes(address, 0x100));
+            Assert.False(harness.Cache.HasGpuDirtyBytes(address + 0x1000, 0x100));
+            Assert.Equal(0x55555555u, BitConverter.ToUInt32(harness.Read(address + 8, 4)));
+        }
+        finally
+        {
+            Stop(harness);
+        }
+    }
+
+    [Fact]
     public void BytesWrittenInTheBatchBeingRecordedTakeTheOrdinaryPath()
     {
         if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;

@@ -2408,9 +2408,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return eager with { GuestAddress = guestAddress, Size = size, IsWrite = isWrite, Source = source };
         }
 
-        if (!isWrite && (PreciseWait || ForcePreciseWait) && TryPreciseRead(guestAddress, size, source, readbackStarted)) // [local]
+        List<(ulong Address, byte[] Bytes)>? preciseCapture = null;
+        if (!isWrite && (PreciseWait || ForcePreciseWait)) // [local]
         {
-            return null;
+            var verify = PreciseVerify || ForcePreciseVerify;
+            if (TryPreciseRead(guestAddress, size, source, readbackStarted, verify, out preciseCapture) && !verify)
+            {
+                return null;
+            }
         }
 
         var copies = CollectReadbackWindow(guestAddress, size, out var windowBegin, out var windowEnd);
@@ -2516,6 +2521,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (fallbackStarted != 0) Diagnostics.CheapProbe.NoteSlotFallback(System.Diagnostics.Stopwatch.GetTimestamp() - fallbackStarted);
         RecordReadback(windowBegin, windowEnd, isWrite, copies, readbackStarted, source);
+        if (preciseCapture is not null) // [local] SHARPEMU_READBACK_PRECISE_WAIT=2
+        {
+            CheckPreciseCapture(preciseCapture);
+        }
+
         return null;
     }
 
@@ -2727,8 +2737,32 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // recorded writer keeps the ordinary path. The rest of the window stays GPU-modified, and so do its pages.
     internal static readonly bool PreciseWait = GpuWriteHistory.PreciseWaitRequested;
 
+    // [local] SHARPEMU_READBACK_PRECISE_WAIT=2 (verification): the precise copy is only captured; the read then takes the
+    // ordinary path (window after the block ticks) and the captured bytes must match what it brought back.
+    internal static readonly bool PreciseVerify = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_PRECISE_WAIT") == "2";
+
     // Lets the precise-read tests turn the path on for one cache without the environment switch.
     internal bool ForcePreciseWait { get; set; }
+
+    internal bool ForcePreciseVerify { get; set; }
+
+    internal long PreciseVerifyChecks { get; private set; }
+
+    internal long PreciseVerifyMismatches { get; private set; }
+
+    private void CheckPreciseCapture(List<(ulong Address, byte[] Bytes)> captured)
+    {
+        foreach (var (address, bytes) in captured)
+        {
+            var current = new byte[bytes.Length];
+            PreciseVerifyChecks++;
+            if (!_backing.TryReadBacking(address, current) || !bytes.AsSpan().SequenceEqual(current))
+            {
+                if (PreciseVerifyMismatches++ < 60)
+                    Console.Error.WriteLine($"[READBACK_PRECISE_WAIT] mismatch address=0x{address:X} size=0x{bytes.Length:X} precise=0x{Convert.ToHexString(bytes)} ordinary=0x{Convert.ToHexString(current)} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16}");
+            }
+        }
+    }
 
     internal long PreciseWaitReads { get; private set; }
 
@@ -2737,8 +2771,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private const int PreciseWaitScan = 8192;
     private long _preciseWaitReported, _preciseWaitReport = System.Diagnostics.Stopwatch.GetTimestamp();
 
-    private bool TryPreciseRead(ulong guestAddress, ulong size, GuestMemoryProfile.ReadbackSource source, long started)
+    private bool TryPreciseRead(ulong guestAddress, ulong size, GuestMemoryProfile.ReadbackSource source, long started, bool captureOnly,
+        out List<(ulong Address, byte[] Bytes)>? captured)
     {
+        captured = null;
         if (size == 0 || size > 256 ||
             source is not (GuestMemoryProfile.ReadbackSource.ShaderResourceRead or GuestMemoryProfile.ReadbackSource.CommandMemoryRead) ||
             (SyncReadback ?? AsyncReadback) is not { } readback || !_gpuModifiedRanges.Overlaps(guestAddress, size))
@@ -2778,6 +2814,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             pieces[index] = new ReadbackPiece(copies[index].Buffer, copies[index].SourceOffset, copies[index].Size);
         }
 
+        if (captureOnly)
+        {
+            var capture = new List<(ulong Address, byte[] Bytes)>(copies.Count);
+            readback.Read(pieces, precise, (index, bytes) => capture.Add((copies[index].Address, bytes.ToArray())));
+            captured = capture;
+            return true;
+        }
+
         readback.Read(pieces, precise, (index, bytes) =>
         {
             if (!_backing.TryWriteBacking(copies[index].Address, bytes))
@@ -2812,7 +2856,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         _preciseWaitReport = System.Diagnostics.Stopwatch.GetTimestamp();
-        Console.Error.WriteLine($"[READBACK_PRECISE_WAIT] reads={PreciseWaitReads} fallbacks={PreciseWaitFallbacks} since_last={PreciseWaitReads - _preciseWaitReported}");
+        Console.Error.WriteLine($"[READBACK_PRECISE_WAIT] reads={PreciseWaitReads} fallbacks={PreciseWaitFallbacks} since_last={PreciseWaitReads - _preciseWaitReported} verify_checks={PreciseVerifyChecks} verify_mismatches={PreciseVerifyMismatches}");
         _preciseWaitReported = PreciseWaitReads;
     }
 

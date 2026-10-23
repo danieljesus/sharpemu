@@ -16,7 +16,7 @@ internal static class GpuWriteHistory
 
     // [local] SHARPEMU_READBACK_PRECISE_WAIT=1 also records the ring, without narrowing any tick or window: only the
     // render thread's small reads ask it (GuestBufferCache.TryPreciseRead).
-    public static readonly bool PreciseWaitRequested = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_PRECISE_WAIT") == "1";
+    public static readonly bool PreciseWaitRequested = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_PRECISE_WAIT") is "1" or "2";
 
     // [local] Lets the precise-read tests record the writes of one thread without the environment switches.
     internal static int ForceRecordingThread;
