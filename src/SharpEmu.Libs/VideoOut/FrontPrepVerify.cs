@@ -161,6 +161,65 @@ internal static class FrontPrepVerify
         return same;
     }
 
+    private static int _dumps;
+
+    // [local] The first differences between two stages' materialized resources, for a mismatch.
+    internal static void DumpStageDifference(string kind, ulong shader, in ShaderStageResources worker, in ShaderStageResources render)
+    {
+        if (Interlocked.Increment(ref _dumps) > 40)
+            return;
+        var lines = new List<string>();
+        if ((worker.Program?.Hash ?? 0) != (render.Program?.Hash ?? 0))
+            lines.Add($"program 0x{worker.Program?.Hash ?? 0:X} vs 0x{render.Program?.Hash ?? 0:X}");
+        if (worker.ShaderBase != render.ShaderBase)
+            lines.Add($"shader_base 0x{worker.ShaderBase:X} vs 0x{render.ShaderBase:X}");
+        if (worker.ThreadLimits != render.ThreadLimits)
+            lines.Add($"thread_limits {worker.ThreadLimits} vs {render.ThreadLimits}");
+        var a = worker.Resources;
+        var b = render.Resources;
+        if (a is null || b is null)
+        {
+            lines.Add($"resources null worker={a is null} render={b is null}");
+        }
+        else
+        {
+            Tables(lines, "buffer", a.Buffers, b.Buffers);
+            Tables(lines, "image", a.Images, b.Images);
+            Tables(lines, "sampler", a.Samplers, b.Samplers);
+            Words(lines, "table", a.FlattenedResourceTable, b.FlattenedResourceTable);
+            Words(lines, "user_data", a.UserData, b.UserData);
+            if (a.DeviceAddressRanges.Length != b.DeviceAddressRanges.Length)
+                lines.Add($"device_ranges count {a.DeviceAddressRanges.Length} vs {b.DeviceAddressRanges.Length}");
+            for (var index = 0; index < Math.Min(a.DeviceAddressRanges.Length, b.DeviceAddressRanges.Length); index++)
+                if (a.DeviceAddressRanges[index] != b.DeviceAddressRanges[index])
+                    lines.Add($"device_range[{index}] {a.DeviceAddressRanges[index]} vs {b.DeviceAddressRanges[index]}");
+        }
+
+        Console.Error.WriteLine($"[FRONT_PREP_VERIFY] diff kind={kind} shader=0x{shader:X} worker vs render: {string.Join(" | ", lines.Take(24))}");
+    }
+
+    private static void Tables(List<string> lines, string name, uint[][] a, uint[][] b)
+    {
+        if (a.Length != b.Length)
+            lines.Add($"{name} count {a.Length} vs {b.Length}");
+        for (var index = 0; index < Math.Min(a.Length, b.Length); index++)
+        {
+            var left = a[index] ?? [];
+            var right = b[index] ?? [];
+            if (!left.AsSpan().SequenceEqual(right))
+                lines.Add($"{name}[{index}] {string.Join(",", left.Select(word => word.ToString("X8")))} vs {string.Join(",", right.Select(word => word.ToString("X8")))}");
+        }
+    }
+
+    private static void Words(List<string> lines, string name, uint[] a, uint[] b)
+    {
+        if (a.Length != b.Length)
+            lines.Add($"{name} length {a.Length} vs {b.Length}");
+        for (var index = 0; index < Math.Min(a.Length, b.Length); index++)
+            if (a[index] != b[index])
+                lines.Add($"{name}[{index}] {a[index]:X8} vs {b[index]:X8}");
+    }
+
     internal static void NoteRenderEmpty()
     {
         Interlocked.Increment(ref _renderEmpty);

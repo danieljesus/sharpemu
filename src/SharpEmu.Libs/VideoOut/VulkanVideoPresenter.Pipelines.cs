@@ -347,7 +347,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     Span<ulong> renderParts = stackalloc ulong[FrontPrepVerify.Parts];
                     FrontPrepVerify.Fingerprint(result.Programs, in result.Inputs, workerParts);
                     FrontPrepVerify.Fingerprint(renderPrograms, in renderInputs, renderParts);
-                    FrontPrepVerify.Compare(workerParts, renderParts, "draw", result.Programs.VertexInput.Stage.Program?.Hash ?? 0, result.Programs.PixelInput.Stage.Program?.Hash ?? 0);
+                    if (!FrontPrepVerify.Compare(workerParts, renderParts, "draw", result.Programs.VertexInput.Stage.Program?.Hash ?? 0, result.Programs.PixelInput.Stage.Program?.Hash ?? 0))
+                    {
+                        FrontPrepVerify.DumpStageDifference("draw_vertex", result.Programs.VertexInput.Stage.Program?.Hash ?? 0, result.Programs.VertexInput.Stage, renderPrograms.VertexInput.Stage);
+                        FrontPrepVerify.DumpStageDifference("draw_pixel", result.Programs.PixelInput.Stage.Program?.Hash ?? 0, result.Programs.PixelInput.Stage, renderPrograms.PixelInput.Stage);
+                    }
                 }
 
                 if (FrontPrepVerify.UseRender)
@@ -395,7 +399,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     Span<ulong> renderParts = stackalloc ulong[FrontPrepVerify.Parts];
                     FrontPrepVerify.Fingerprint(program, workerParts);
                     FrontPrepVerify.Fingerprint(renderProgram, renderParts);
-                    FrontPrepVerify.Compare(workerParts, renderParts, "dispatch", program.Input.Stage.Program?.Hash ?? 0, 0);
+                    if (!FrontPrepVerify.Compare(workerParts, renderParts, "dispatch", program.Input.Stage.Program?.Hash ?? 0, 0))
+                        FrontPrepVerify.DumpStageDifference("dispatch", program.Input.Stage.Program?.Hash ?? 0, program.Input.Stage, renderProgram.Input.Stage);
                 }
 
                 if (FrontPrepVerify.UseRender)
