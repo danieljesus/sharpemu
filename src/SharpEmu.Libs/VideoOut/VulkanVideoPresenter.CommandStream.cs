@@ -433,6 +433,11 @@ internal static unsafe partial class VulkanVideoPresenter
         public void WriteCommandData(ulong address, ReadOnlySpan<byte> data)
         {
             if (data.IsEmpty) return;
+            if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, (ulong)data.Length)) // [local]
+            {
+                Diagnostics.LabelLatencyProbe.RenderApply(_scheduler.CurrentTick);
+                if (data.Length >= 8) Diagnostics.LabelLatencyProbe.RememberWrite(System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(data));
+            }
             if (Gpu.Buffers.TableWordMemo.Enabled) Gpu.Buffers.TableWordMemo.NoteCommandWrite(address, data); // [local]
             SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(address, (ulong)data.Length, SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidationSource.CommandRender); // [local] applied on the render thread
             // A range the buffer cache tracks gets the bytes in both copies, the device one through a
@@ -568,12 +573,14 @@ internal static unsafe partial class VulkanVideoPresenter
         // capture run here, in stream order, as they did inside PrepareFlip.
         internal void CompleteQueuedFlip(int handle, int index, int flipMode, long flipArgument, ulong requestId)
         {
+            if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.RenderStarted(requestId); // [local] SHARPEMU_FLIP_PROBE
             ResetMappedSizes();
             _ = BeginBatchedGuestCommands();
             _translation.PrepareFlip(handle, index);
             try
             {
                 CaptureFlip(handle, index, requestId, flipMode, flipArgument);
+                if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.Captured(requestId, _scheduler.CurrentTick); // [local]
             }
             catch
             {

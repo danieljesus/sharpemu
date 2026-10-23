@@ -571,6 +571,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             Diagnostics.InjectedDelay.Spin(Diagnostics.InjectedDelay.FrontTicks); // [local] critical-path sensitivity probe
+            if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.Reserved(requestId); // [local]
             queue.Enqueue(() =>
             {
                 Diagnostics.InjectedDelay.Spin(Diagnostics.InjectedDelay.RenderTicks); // [local] critical-path sensitivity probe
@@ -616,6 +617,25 @@ internal static unsafe partial class VulkanVideoPresenter
             var snapshot = Snapshot();
             var registers = DrawRegisters();
             var version = presenter.FrontPreparationVersion; // [local]
+            if (presenter.PrepWorker is { } worker) // [local] SHARPEMU_FRONT_PREP_WORKER
+            {
+                var job = presenter.SubmitPrepareOnWorker(worker, GraphicsKey(snapshot), version, () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default);
+                var indexed = arguments;
+                queue.Enqueue(() =>
+                {
+                    try
+                    {
+                        var programs = presenter.TakeWorkerPreparation(worker, job, out var workerInputs);
+                        presenter.ExecuteQueuedDraw(submitId, snapshot, true, in indexed, default, programs, in workerInputs, registers);
+                    }
+                    finally
+                    {
+                        _snapshots.Push(snapshot);
+                    }
+                }, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
             var copy = arguments;
             queue.Enqueue(() =>
@@ -643,6 +663,25 @@ internal static unsafe partial class VulkanVideoPresenter
             var snapshot = Snapshot();
             var registers = DrawRegisters();
             var version = presenter.FrontPreparationVersion; // [local]
+            if (presenter.PrepWorker is { } worker) // [local] SHARPEMU_FRONT_PREP_WORKER
+            {
+                var job = presenter.SubmitPrepareOnWorker(worker, GraphicsKey(snapshot), version, () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default);
+                var auto = arguments;
+                queue.Enqueue(() =>
+                {
+                    try
+                    {
+                        var programs = presenter.TakeWorkerPreparation(worker, job, out var workerInputs);
+                        presenter.ExecuteQueuedDraw(submitId, snapshot, false, default, in auto, programs, in workerInputs, registers);
+                    }
+                    finally
+                    {
+                        _snapshots.Push(snapshot);
+                    }
+                }, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
             var copy = arguments;
             queue.Enqueue(() =>
@@ -671,6 +710,27 @@ internal static unsafe partial class VulkanVideoPresenter
             if (indirectArgumentsAddress != 0) Interlocked.Increment(ref presenter.IndirectDirect); // [local]
             var computeScope = FrontProfile.Measure(FrontProfile.Phase.PrepareCompute);
             var version = presenter.FrontPreparationVersion; // [local]
+            if (presenter.PrepWorker is { } worker && FrontPrepWorker.Compute) // [local] SHARPEMU_FRONT_PREP_WORKER
+            {
+                var job = indirectArgumentsAddress == 0
+                    ? presenter.SubmitComputeOnWorker(worker, snapshot.Shader.Compute.Address, version, () => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator))
+                    : null;
+                computeScope.Dispose();
+                queue.Enqueue(() =>
+                {
+                    try
+                    {
+                        var program = presenter.TakeWorkerCompute(worker, job);
+                        presenter.ExecuteQueuedDispatch(submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, program);
+                    }
+                    finally
+                    {
+                        _snapshots.Push(snapshot);
+                    }
+                }, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             var prepared = indirectArgumentsAddress == 0
                 ? presenter.TryPrepareComputeOnFront(snapshot.Shader.Compute.Address, () => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator))
                 : null;
@@ -913,6 +973,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 };
             }
 
+            if (FrontPrepWorker.Enabled) // [local]
+            {
+                PrepWorker = new FrontPrepWorker(EnterPrepWorkerThread);
+                Console.Error.WriteLine("[LOADER][INFO] The front prepares draw programs on a worker thread (SHARPEMU_FRONT_PREP_WORKER=1).");
+            }
+
             _frontThread = new Thread(FrontLoop) { IsBackground = true, Name = "GPU front" };
             _frontThread.Start();
             Console.Error.WriteLine("[LOADER][INFO] Vulkan VideoOut interprets command streams on a front thread (SHARPEMU_RENDER_PIPELINE=1).");
@@ -929,6 +995,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _commandStream.Wake();
             _frontThread.Join();
             _frontThread = null;
+            PrepWorker?.Dispose(); // [local] after the front: nothing submits any more
+            PrepWorker = null;
         }
 
         // The render thread runs what the front queued, until the queue is empty or the deadline passes.

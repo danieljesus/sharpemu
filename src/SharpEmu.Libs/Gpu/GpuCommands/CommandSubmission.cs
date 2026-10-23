@@ -82,6 +82,12 @@ public sealed class CommandSubmission
 {
     public CommandSubmission(CommandSubmissionKind kind, int queueId, ulong address, uint dwordCount, ulong submissionId, object? geometrySnapshots)
     {
+        CreatedAt = Diagnostics.LabelLatencyProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_LABEL_PROBE
+        if (Diagnostics.LabelLatencyProbe.Enabled)
+        {
+            ProbeGfxAtCreate = Diagnostics.LabelLatencyProbe.SliceTicks(0);
+            ProbeComputeAtCreate = Diagnostics.LabelLatencyProbe.SliceTicks(1);
+        }
         Kind = kind;
         QueueId = queueId;
         Address = address;
@@ -91,6 +97,17 @@ public sealed class CommandSubmission
     }
 
     public CommandSubmissionKind Kind { get; }
+
+    // [local] SHARPEMU_LABEL_PROBE: when the guest's submission was enqueued, the front's cumulative slice time per queue
+    // group then and at its first slice, its own slice time so far and the start of the running slice.
+    public long CreatedAt { get; }
+    internal long ProbeGfxAtCreate, ProbeComputeAtCreate, ProbeStartedAt, ProbeGfxAtStart, ProbeComputeAtStart, ProbeOwnTicks, ProbeSliceStart;
+    internal int ProbeSlices;
+    // Gaps between this submission's slices, with the suspension that ended the earlier slice.
+    internal long ProbeLastSliceEnd;
+    internal VideoOut.FrontProfile.SuspendKind ProbeLastKind;
+    internal ulong ProbeLastAddress;
+    internal List<(VideoOut.FrontProfile.SuspendKind Kind, ulong Address, long Ticks)>? ProbeGaps;
 
     public int QueueId { get; }
 

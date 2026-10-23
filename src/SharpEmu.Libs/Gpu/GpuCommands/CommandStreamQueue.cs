@@ -696,9 +696,36 @@ public sealed class CommandStreamQueue
         }
 
         SlicesRun++;
+        processor.ProbeSubmissionEnqueued = submission.CreatedAt; // [local] SHARPEMU_LABEL_PROBE
+        processor.ProbeSubmission = submission;
+        if (Diagnostics.LabelLatencyProbe.Enabled)
+        {
+            var sliceStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (submission.ProbeSlices++ == 0)
+            {
+                submission.ProbeStartedAt = sliceStart;
+                submission.ProbeGfxAtStart = Diagnostics.LabelLatencyProbe.SliceTicks(0);
+                submission.ProbeComputeAtStart = Diagnostics.LabelLatencyProbe.SliceTicks(1);
+            }
+
+            submission.ProbeSliceStart = sliceStart;
+            if (submission.ProbeLastSliceEnd != 0)
+                (submission.ProbeGaps ??= new()).Add((submission.ProbeLastKind, submission.ProbeLastAddress, sliceStart - submission.ProbeLastSliceEnd));
+        }
+
         _host.BeginSubmission(submission.QueueId, submission.SubmissionId, submission.GeometrySnapshots);
         processor.ConstantEngineComplete = true;
         var complete = processor.Process(submission.Commands, submission.Address, submission.DwordCount) == SubmissionProgress.Complete;
+        if (Diagnostics.LabelLatencyProbe.Enabled) // [local]
+        {
+            var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - submission.ProbeSliceStart;
+            submission.ProbeOwnTicks += elapsed;
+            submission.ProbeSliceStart = 0;
+            submission.ProbeLastSliceEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+            submission.ProbeLastKind = processor.LastSuspendKind;
+            submission.ProbeLastAddress = processor.LastSuspendAddress;
+            Diagnostics.LabelLatencyProbe.AddSlice(submission.QueueId == 0 ? 0 : 1, elapsed);
+        }
         submission.CommandsComplete = complete;
         if (submission.Commands.MadeProgress)
         {

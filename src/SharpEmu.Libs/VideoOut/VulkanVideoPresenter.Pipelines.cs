@@ -144,7 +144,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // [local] Only the front thread may take the unsynchronized readers; the render thread
         // also runs with a front attached and must keep the synchronized ones.
-        private bool OnFrontThread => _frontThread is { } front && front.ManagedThreadId == Environment.CurrentManagedThreadId;
+        private bool OnFrontThread => _onPrepWorker || (_frontThread is { } front && front.ManagedThreadId == Environment.CurrentManagedThreadId);
+
+        // [local] SHARPEMU_FRONT_PREP_WORKER: the worker prepares with the front's readers, but never waits on the render
+        // thread (a read it would have to synchronize defers the preparation) and keeps no clean-page notes of its own.
+        [ThreadStatic] private static bool _onPrepWorker;
 
         // [local experiment] SHARPEMU_DEFER_PATCHED=1: a preparation that reads bytes only the
         // pending-write overlay supplies moves to the render thread.
@@ -152,7 +156,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void ApplyFrontOverlay(ulong address, Span<byte> destination)
         {
-            if (FrontOverlay.Apply(address, destination) != 0 && DeferPatched && DeferFrontPreparation && _preparingOnFront)
+            // [local] The prep worker runs behind the front, so a pending write it sees may come after the draw.
+            if (FrontOverlay.Apply(address, destination) != 0 && (_onPrepWorker || (DeferPatched && DeferFrontPreparation && _preparingOnFront)))
                 throw new DeferPreparationException();
         }
 
@@ -166,7 +171,7 @@ internal static unsafe partial class VulkanVideoPresenter
             return _backReadForPendingWrite || _bufferCache.EverGpuWritten(address, size);
         }
 
-        private bool _backReadForPendingWrite;
+        [ThreadStatic] private static bool _backReadForPendingWrite; // [local] per thread: the front and the prep worker
 
         // [local] SHARPEMU_FRONT_PREP_CHECK (on by default, =0 disables): the front reads guest memory directly only
         // where no GPU write has been recorded (NeedsBackRead), but it runs ahead of the render thread, so a write that
@@ -204,7 +209,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void NoteFrontDirectRead(ulong address, ulong size)
         {
-            if (!FrontStaleCheck || _back is not { } back || size == 0)
+            if (!FrontStaleCheck || _onPrepWorker || _back is not { } back || size == 0)
                 return;
             var serial = Volatile.Read(ref back.Enqueued);
             for (var page = address >> 12; page <= (address + size - 1) >> 12; page++)
@@ -269,11 +274,17 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool SkipFrontPreparation(ulong key)
         {
-            if (!SkipDeferring || !_frontEmptyPreparations.TryGetValue(key, out var empty) || empty < SkipAfterEmpty)
+            if (!SkipDeferring)
                 return false;
-            _frontEmptyPreparations[key] = empty + 1;
-            if ((empty - SkipAfterEmpty) % SkipRetryEvery == SkipRetryEvery - 1)
-                return false;
+            lock (_frontEmptyPreparations) // [local] the prep worker notes results while the front asks
+            {
+                if (!_frontEmptyPreparations.TryGetValue(key, out var empty) || empty < SkipAfterEmpty)
+                    return false;
+                _frontEmptyPreparations[key] = empty + 1;
+                if ((empty - SkipAfterEmpty) % SkipRetryEvery == SkipRetryEvery - 1)
+                    return false;
+            }
+
             SkippedPreparations++;
             return true;
         }
@@ -282,10 +293,78 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (!SkipDeferring)
                 return;
-            if (!empty)
-                _frontEmptyPreparations.Remove(key);
-            else if (_frontEmptyPreparations.GetValueOrDefault(key) is var count && count < SkipAfterEmpty && (count != 0 || _frontEmptyPreparations.Count < 65536))
-                _frontEmptyPreparations[key] = count + 1;
+            lock (_frontEmptyPreparations)
+            {
+                if (!empty)
+                    _frontEmptyPreparations.Remove(key);
+                else if (_frontEmptyPreparations.GetValueOrDefault(key) is var count && count < SkipAfterEmpty && (count != 0 || _frontEmptyPreparations.Count < 65536))
+                    _frontEmptyPreparations[key] = count + 1;
+            }
+        }
+
+        // [local] SHARPEMU_FRONT_PREP_WORKER=1: see FrontPrepWorker.
+        internal FrontPrepWorker? PrepWorker;
+        private Func<long, bool>? _frontPreparationStillValid;
+
+        internal FrontPrepWorker.Job<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)>? SubmitPrepareOnWorker(FrontPrepWorker worker, ulong key, long version,
+            Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare)
+        {
+            if (SkipFrontPreparation(key))
+                return null;
+            return worker.Submit(() =>
+            {
+                var programs = TryPrepareOnFront(prepare, out var inputs);
+                NoteFrontPreparation(key, programs is null);
+                return (programs, inputs);
+            }, version);
+        }
+
+        // On the render thread: the worker's result, or nothing (the render thread prepares the draw).
+        internal GraphicsPrograms? TakeWorkerPreparation(FrontPrepWorker worker, FrontPrepWorker.Job<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)>? job,
+            out RenderExecutor.DrawProgramInputs inputs)
+        {
+            worker.MaybeReport(Console.Error);
+            inputs = default;
+            if (job is null || !worker.TryTake(job, _frontPreparationStillValid ??= FrontPreparationStillValid, out var result))
+                return null;
+            if (result.Programs is null)
+            {
+                Interlocked.Increment(ref worker.Empty);
+                return null;
+            }
+
+            inputs = result.Inputs;
+            return result.Programs;
+        }
+
+        internal FrontPrepWorker.Job<ComputeProgram?>? SubmitComputeOnWorker(FrontPrepWorker worker, ulong key, long version, Func<ComputeProgram?> prepare)
+        {
+            if (SkipFrontPreparation(key))
+                return null;
+            return worker.Submit(() =>
+            {
+                var program = TryPrepareComputeOnFront(prepare);
+                NoteFrontPreparation(key, program is null);
+                return program;
+            }, version);
+        }
+
+        internal ComputeProgram? TakeWorkerCompute(FrontPrepWorker worker, FrontPrepWorker.Job<ComputeProgram?>? job)
+        {
+            if (job is null || !worker.TryTake(job, _frontPreparationStillValid ??= FrontPreparationStillValid, out var program))
+                return null;
+            if (program is null)
+                Interlocked.Increment(ref worker.Empty);
+            return program;
+        }
+
+        internal static void EnterPrepWorkerThread()
+        {
+            _onPrepWorker = true;
+            if (FrontPrepWorker.OnGuestLanes)
+                SharpEmu.HLE.Host.HostLaneReservation.ApplyToHelperThread();
+            else
+                SharpEmu.HLE.Host.HostLaneReservation.ApplyToFrontWorkerThread();
         }
 
         internal GraphicsPrograms? TryPrepareOnFront(ulong key, Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare, out RenderExecutor.DrawProgramInputs inputs)
@@ -318,7 +397,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 var (programs, prepared) = prepare();
                 inputs = prepared;
-                if (FrontProfile.LoopEnabled && programs is null) FrontProfile.DeferredPrepTicks += System.Diagnostics.Stopwatch.GetTimestamp() - started;
+                if (FrontProfile.LoopEnabled && programs is null && !_onPrepWorker) FrontProfile.DeferredPrepTicks += System.Diagnostics.Stopwatch.GetTimestamp() - started;
                 return programs;
             }
             catch (DeferPreparationException)
@@ -344,7 +423,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.CurrentPlanHash = 0; // [local]
                 var program = prepare();
-                if (FrontProfile.LoopEnabled && program is null) FrontProfile.DeferredPrepTicks += System.Diagnostics.Stopwatch.GetTimestamp() - started;
+                if (FrontProfile.LoopEnabled && program is null && !_onPrepWorker) FrontProfile.DeferredPrepTicks += System.Diagnostics.Stopwatch.GetTimestamp() - started;
                 if (FrontPrepLog && Interlocked.Increment(ref _frontPrepLogs) <= 20000)
                     Console.Error.WriteLine($"[FRONT_PREP] hash=0x{SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.CurrentPlanHash:X16} prepared={(program is null ? "no" : program.Available ? "yes" : "unavailable")} overlay={FrontOverlay.Count}");
                 return program;
@@ -362,6 +441,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private T RunBackRead<T>(Func<T> read)
         {
+            if (_onPrepWorker) // [local] SHARPEMU_FRONT_PREP_WORKER: the render thread may be waiting for this preparation
+            {
+                throw new DeferPreparationException();
+            }
+
             if (DeferFrontPreparation && _preparingOnFront && !(_backReadForPendingWrite && PendingWriteOverlay.Mode == 2)) // mode 3 defers like any synced read
             {
                 throw new DeferPreparationException();
@@ -425,6 +509,11 @@ internal static unsafe partial class VulkanVideoPresenter
         // thread, so only the mapping is checked.
         private void NoteFrontReadPage(ulong address, ulong size)
         {
+            if (_onPrepWorker) // [local] the table belongs to the front thread
+            {
+                return;
+            }
+
             if (!TryGetCleanReadPage(address, size, out var page, out var slot) || !_guestMemory.CanRead(page, CleanReadPageBytes))
             {
                 return;
@@ -800,7 +889,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // noted without the GPU-dirty check its own notes make.
         private CleanReadPages? _frontCleanReadPages;
 
-        private CleanReadPages? ThreadCleanReadPages => OnFrontThread ? _frontCleanReadPages : _cleanReadPages;
+        private CleanReadPages? ThreadCleanReadPages => _onPrepWorker ? null : OnFrontThread ? _frontCleanReadPages : _cleanReadPages;
         private bool _backingAliasAccess;
 
         private sealed class CleanReadPages
