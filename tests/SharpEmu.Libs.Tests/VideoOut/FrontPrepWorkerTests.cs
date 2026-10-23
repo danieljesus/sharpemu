@@ -45,11 +45,14 @@ public sealed class FrontPrepWorkerTests
     [Fact]
     public void APreparationNotStartedWhenTheDrawExecutesIsAbandonedAndNeverRuns()
     {
+        using var started = new ManualResetEventSlim();
         using var gate = new ManualResetEventSlim();
         using var worker = new FrontPrepWorker();
-        var first = worker.Submit(() => { gate.Wait(TimeSpan.FromSeconds(10)); return 1; }, version: 0);
+        var first = worker.Submit(() => { started.Set(); gate.Wait(TimeSpan.FromSeconds(10)); return 1; }, version: 0);
         var secondRan = false;
         var second = worker.Submit(() => { secondRan = true; return 2; }, version: 0);
+        // The worker holds the first one, so the second cannot have started.
+        Assert.True(started.Wait(TimeSpan.FromSeconds(10)));
 
         Assert.False(worker.TryTake(second, AlwaysValid, out var late));
         Assert.Equal(0, late);
