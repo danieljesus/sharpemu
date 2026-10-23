@@ -14,8 +14,19 @@ internal static class GpuWriteHistory
 {
     public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_WRITE_TICKS"), out var mode) ? mode : 0;
 
+    // [local] SHARPEMU_READBACK_PRECISE_WAIT=1 also records the ring, without narrowing any tick or window: only the
+    // render thread's small reads ask it (GuestBufferCache.TryPreciseRead).
+    public static readonly bool PreciseWaitRequested = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_PRECISE_WAIT") == "1";
+
+    // [local] Lets the precise-read tests record the writes of one thread without the environment switches.
+    internal static int ForceRecordingThread;
+
+    public static bool Recording => Mode != 0 || PreciseWaitRequested;
+
+    public static bool Queryable => (Recording || ForceRecordingThread != 0) && !_poisoned;
+
     private const int Capacity = 1 << 16;
-    private static readonly (ulong Begin, ulong End, ulong Tick)[] _ring = Mode != 0 ? new (ulong, ulong, ulong)[Capacity] : [];
+    private static (ulong Begin, ulong End, ulong Tick)[] _ring = Mode != 0 || PreciseWaitRequested ? new (ulong, ulong, ulong)[Capacity] : [];
     private static long _count;
     private static ulong _evictedTick;
     private static int _owner;
@@ -27,9 +38,14 @@ internal static class GpuWriteHistory
 
     public static void Note(ulong address, ulong size, ulong tick)
     {
-        if (Mode == 0 || size == 0)
+        if (size == 0 || (!Recording && (ForceRecordingThread == 0 || ForceRecordingThread != Environment.CurrentManagedThreadId)))
         {
             return;
+        }
+
+        if (_ring.Length == 0)
+        {
+            _ring = new (ulong, ulong, ulong)[Capacity];
         }
 
         var thread = Environment.CurrentManagedThreadId;
@@ -89,5 +105,38 @@ internal static class GpuWriteHistory
         }
 
         return _evictedTick;
+    }
+
+    // [local] As LastWriteTick, looking back at most `scan` entries: entries are in tick order, so a range with no
+    // write among them was last written no later than the oldest one looked at.
+    public static ulong LastWriteTick(ulong address, ulong size, int scan)
+    {
+        var end = address + size;
+        var count = Math.Min(Math.Min(_count, Capacity), scan);
+        for (long back = 1; back <= count; back++)
+        {
+            var entry = _ring[(int)((_count - back) & (Capacity - 1))];
+            if (entry.Begin < end && address < entry.End)
+            {
+                return Math.Max(entry.Tick, _evictedTick);
+            }
+        }
+
+        if (count < Math.Min(_count, Capacity))
+        {
+            return Math.Max(_ring[(int)((_count - count) & (Capacity - 1))].Tick, _evictedTick);
+        }
+
+        return _evictedTick;
+    }
+
+    // [local] Tests only: forget the recorded writes and the recording thread.
+    internal static void ResetForTests()
+    {
+        Array.Clear(_ring);
+        _count = 0;
+        _evictedTick = 0;
+        _owner = 0;
+        _poisoned = false;
     }
 }

@@ -880,7 +880,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private bool WrittenObtainMemoAllowed => !WrittenSyncCpuDirty && !EagerReadbacksOn && !ReadbackTickLog && DirtyWatch == 0 &&
         !EarlyWriterSubmit && !Diagnostics.TableReadCensus.Enabled && !Diagnostics.DccWriterTrace.Enabled && ReadbackMirror.Mode == 0 &&
-        !GpuWriteHistory.Enabled;
+        !GpuWriteHistory.Recording;
 
     private readonly Dictionary<(ulong Address, ulong Size), (GpuBuffer Buffer, ulong Offset)> _writtenMemo = new();
     private ulong _writtenMemoTick = ulong.MaxValue;
@@ -2408,6 +2408,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return eager with { GuestAddress = guestAddress, Size = size, IsWrite = isWrite, Source = source };
         }
 
+        if (!isWrite && (PreciseWait || ForcePreciseWait) && TryPreciseRead(guestAddress, size, source, readbackStarted)) // [local]
+        {
+            return null;
+        }
+
         var copies = CollectReadbackWindow(guestAddress, size, out var windowBegin, out var windowEnd);
         if (Diagnostics.LabelTimeline.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(guestAddress, size)) // [local] SHARPEMU_LABEL_TIMELINE
         {
@@ -2711,6 +2716,104 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             Console.Error.WriteLine($"[PRECISE_WRITE_TICKS] narrowed_reads={_narrowedReads} dropped_pieces={_narrowedDropped} split_pieces={_narrowedSplit} fallbacks={_narrowedFallback}");
             _narrowedReads = _narrowedDropped = _narrowedSplit = _narrowedFallback = 0;
         }
+    }
+
+    // [local] SHARPEMU_READBACK_PRECISE_WAIT=1 (off by default): a render-thread read of a few bytes (shader resources and
+    // command memory, <= 256 B) whose GPU-modified bytes were all last written, by the precise write history, in a batch
+    // that has finished downloads only those bytes, after only that batch. The ordinary path downloads the 64 KB window
+    // after its block ticks, and waits for the batch being recorded whenever a neighbour in a 16 KB block is written
+    // there (2D34<-91D5 and 91D5<-71AD: the precise writer finished in 100 % of the reads, the block tick was the
+    // current batch in ~95 %). A requested byte whose writer has not finished, a range no single buffer holds, or no
+    // recorded writer keeps the ordinary path. The rest of the window stays GPU-modified, and so do its pages.
+    internal static readonly bool PreciseWait = GpuWriteHistory.PreciseWaitRequested;
+
+    // Lets the precise-read tests turn the path on for one cache without the environment switch.
+    internal bool ForcePreciseWait { get; set; }
+
+    internal long PreciseWaitReads { get; private set; }
+
+    internal long PreciseWaitFallbacks { get; private set; }
+
+    private const int PreciseWaitScan = 8192;
+    private long _preciseWaitReported, _preciseWaitReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private bool TryPreciseRead(ulong guestAddress, ulong size, GuestMemoryProfile.ReadbackSource source, long started)
+    {
+        if (size == 0 || size > 256 ||
+            source is not (GuestMemoryProfile.ReadbackSource.ShaderResourceRead or GuestMemoryProfile.ReadbackSource.CommandMemoryRead) ||
+            (SyncReadback ?? AsyncReadback) is not { } readback || !_gpuModifiedRanges.Overlaps(guestAddress, size))
+        {
+            return false;
+        }
+
+        ReportPreciseWait();
+        var buffer = _registry.GetBuffer(FindBuffer(guestAddress, size));
+        var precise = GpuWriteHistory.Queryable ? GpuWriteHistory.LastWriteTick(guestAddress, size, PreciseWaitScan) : 0;
+        if (!buffer.IsInBounds(guestAddress, size) || precise == 0 || precise >= _scheduler.CurrentTick || !_scheduler.IsTickComplete(precise))
+        {
+            PreciseWaitFallbacks++;
+            return false;
+        }
+
+        var copies = new List<DownloadPiece>(2);
+        foreach (var range in _gpuModifiedRanges.GetOverlappingRanges(guestAddress, size))
+        {
+            var begin = Math.Max(range.Address, guestAddress);
+            var end = Math.Min(range.Address + range.Size, guestAddress + size);
+            if (begin < end)
+            {
+                copies.Add(new DownloadPiece(buffer, buffer.Offset(begin), begin, end - begin));
+            }
+        }
+
+        if (copies.Count == 0)
+        {
+            PreciseWaitFallbacks++;
+            return false;
+        }
+
+        var pieces = new ReadbackPiece[copies.Count];
+        for (var index = 0; index < pieces.Length; index++)
+        {
+            pieces[index] = new ReadbackPiece(copies[index].Buffer, copies[index].SourceOffset, copies[index].Size);
+        }
+
+        readback.Read(pieces, precise, (index, bytes) =>
+        {
+            if (!_backing.TryWriteBacking(copies[index].Address, bytes))
+            {
+                throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
+            }
+        });
+        foreach (var copy in copies)
+        {
+            RemoveGpuModified(copy.Address, copy.Size);
+        }
+
+        // Pages still holding GPU-modified bytes stay GPU-dirty.
+        for (var page = guestAddress & ~(TrackerLayout.PageBytes - 1); page < guestAddress + size; page += TrackerLayout.PageBytes)
+        {
+            if (!_gpuModifiedRanges.Overlaps(page, TrackerLayout.PageBytes))
+            {
+                _tracker.ClearGpuDirtyPages(page, TrackerLayout.PageBytes);
+            }
+        }
+
+        PreciseWaitReads++;
+        RecordReadback(guestAddress, guestAddress + size, isWrite: false, copies, started, source);
+        return true;
+    }
+
+    private void ReportPreciseWait()
+    {
+        if (!PreciseWait || System.Diagnostics.Stopwatch.GetElapsedTime(_preciseWaitReport).TotalSeconds < 20)
+        {
+            return;
+        }
+
+        _preciseWaitReport = System.Diagnostics.Stopwatch.GetTimestamp();
+        Console.Error.WriteLine($"[READBACK_PRECISE_WAIT] reads={PreciseWaitReads} fallbacks={PreciseWaitFallbacks} since_last={PreciseWaitReads - _preciseWaitReported}");
+        _preciseWaitReported = PreciseWaitReads;
     }
 
     // [local] SHARPEMU_PRECISE_WRITE_TICKS=2: the requested bytes are also copied after only their precise writer
