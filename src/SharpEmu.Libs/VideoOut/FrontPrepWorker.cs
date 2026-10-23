@@ -5,20 +5,21 @@ using System.Diagnostics;
 
 namespace SharpEmu.Libs.VideoOut;
 
-// [local] SHARPEMU_FRONT_PREP_WORKER=1 (off by default): the front hands each draw's program preparation to one worker
+// [local] SHARPEMU_FRONT_PREP_WORKER=1 (on by default, =0 off): the front hands each draw's program preparation to one worker
 // thread instead of running it inline, and goes on interpreting. The worker runs the preparations in the order the front
 // submitted them. When the render thread executes the draw it takes the result: a preparation the worker has not started
 // is abandoned (the worker skips it) and the render thread prepares the draw itself, as it does today for a preparation
 // that came back empty; one the worker is running is waited for; a finished one is used only if it is still valid (no
 // range became GPU-written since the front submitted it), otherwise the render thread prepares again. The worker only
 // reads guest memory, so nothing the guest can observe changes order. =1 runs the worker on the front's core (its other
-// SMT lane), =2 on the guest lanes. SHARPEMU_FRONT_PREP_WORKER_COMPUTE=0 keeps dispatch preparations on the front.
+// SMT lane), =2 on the guest lanes. Dispatch preparations stay on the front unless SHARPEMU_FRONT_PREP_WORKER_COMPUTE=1
+// (with them on the worker the static scene lost 0.68 FPS in w7S*; draws only: static +0.05 to +0.9, pan move=1 +1.48 in x3*).
 internal sealed class FrontPrepWorker : IDisposable
 {
     private static readonly string? Mode = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_WORKER");
-    public static readonly bool Enabled = Mode is "1" or "2";
+    public static readonly bool Enabled = Mode is null or "1" or "2";
     public static readonly bool OnGuestLanes = Mode == "2";
-    public static readonly bool Compute = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_WORKER_COMPUTE") != "0";
+    public static readonly bool Compute = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_WORKER_COMPUTE") == "1";
 
     internal abstract class Job
     {
