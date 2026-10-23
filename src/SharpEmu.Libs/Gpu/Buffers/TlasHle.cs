@@ -33,7 +33,7 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // 0xFFFFFFFF. The game also packs two-child nodes in one unit, with 0x1E in the unused slots; the host does not.
 internal sealed unsafe class TlasHle : IDisposable
 {
-    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TLAS_HLE"), out var mode) ? mode : 1;
+    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TLAS_HLE"), out var mode) ? mode : 0;
     public static bool Enabled => Mode != 0;
     internal static TlasHle? Instance;
 
