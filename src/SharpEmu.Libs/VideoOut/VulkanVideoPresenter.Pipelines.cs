@@ -321,7 +321,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // On the render thread: the worker's result, or nothing (the render thread prepares the draw).
         internal GraphicsPrograms? TakeWorkerPreparation(FrontPrepWorker worker, FrontPrepWorker.Job<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)>? job,
-            out RenderExecutor.DrawProgramInputs inputs)
+            out RenderExecutor.DrawProgramInputs inputs, Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)>? prepare = null)
         {
             worker.MaybeReport(Console.Error);
             inputs = default;
@@ -334,6 +334,29 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             inputs = result.Inputs;
+            if (FrontPrepVerify.Enabled && prepare is not null) // [local] SHARPEMU_FRONT_PREP_VERIFY
+            {
+                var (renderPrograms, renderInputs) = prepare();
+                if (renderPrograms is null)
+                {
+                    FrontPrepVerify.NoteRenderEmpty();
+                }
+                else
+                {
+                    Span<ulong> workerParts = stackalloc ulong[FrontPrepVerify.Parts];
+                    Span<ulong> renderParts = stackalloc ulong[FrontPrepVerify.Parts];
+                    FrontPrepVerify.Fingerprint(result.Programs, in result.Inputs, workerParts);
+                    FrontPrepVerify.Fingerprint(renderPrograms, in renderInputs, renderParts);
+                    FrontPrepVerify.Compare(workerParts, renderParts, "draw", result.Programs.VertexInput.Stage.Program?.Hash ?? 0, result.Programs.PixelInput.Stage.Program?.Hash ?? 0);
+                }
+
+                if (FrontPrepVerify.UseRender)
+                {
+                    inputs = renderInputs;
+                    return renderPrograms;
+                }
+            }
+
             return result.Programs;
         }
 
@@ -349,12 +372,36 @@ internal static unsafe partial class VulkanVideoPresenter
             }, version);
         }
 
-        internal ComputeProgram? TakeWorkerCompute(FrontPrepWorker worker, FrontPrepWorker.Job<ComputeProgram?>? job)
+        internal ComputeProgram? TakeWorkerCompute(FrontPrepWorker worker, FrontPrepWorker.Job<ComputeProgram?>? job, Func<ComputeProgram?>? prepare = null)
         {
             if (job is null || !worker.TryTake(job, _frontPreparationStillValid ??= FrontPreparationStillValid, out var program))
                 return null;
             if (program is null)
+            {
                 Interlocked.Increment(ref worker.Empty);
+                return null;
+            }
+
+            if (FrontPrepVerify.Enabled && prepare is not null) // [local] SHARPEMU_FRONT_PREP_VERIFY
+            {
+                var renderProgram = prepare();
+                if (renderProgram is null)
+                {
+                    FrontPrepVerify.NoteRenderEmpty();
+                }
+                else
+                {
+                    Span<ulong> workerParts = stackalloc ulong[FrontPrepVerify.Parts];
+                    Span<ulong> renderParts = stackalloc ulong[FrontPrepVerify.Parts];
+                    FrontPrepVerify.Fingerprint(program, workerParts);
+                    FrontPrepVerify.Fingerprint(renderProgram, renderParts);
+                    FrontPrepVerify.Compare(workerParts, renderParts, "dispatch", program.Input.Stage.Program?.Hash ?? 0, 0);
+                }
+
+                if (FrontPrepVerify.UseRender)
+                    return renderProgram;
+            }
+
             return program;
         }
 

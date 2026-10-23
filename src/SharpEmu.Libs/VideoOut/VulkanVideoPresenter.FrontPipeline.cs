@@ -619,13 +619,14 @@ internal static unsafe partial class VulkanVideoPresenter
             var version = presenter.FrontPreparationVersion; // [local]
             if (presenter.PrepWorker is { } worker) // [local] SHARPEMU_FRONT_PREP_WORKER
             {
-                var job = presenter.SubmitPrepareOnWorker(worker, GraphicsKey(snapshot), version, () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default);
+                Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare = () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default;
+                var job = presenter.SubmitPrepareOnWorker(worker, GraphicsKey(snapshot), version, prepare);
                 var indexed = arguments;
                 queue.Enqueue(() =>
                 {
                     try
                     {
-                        var programs = presenter.TakeWorkerPreparation(worker, job, out var workerInputs);
+                        var programs = presenter.TakeWorkerPreparation(worker, job, out var workerInputs, prepare);
                         presenter.ExecuteQueuedDraw(submitId, snapshot, true, in indexed, default, programs, in workerInputs, registers);
                     }
                     finally
@@ -665,13 +666,14 @@ internal static unsafe partial class VulkanVideoPresenter
             var version = presenter.FrontPreparationVersion; // [local]
             if (presenter.PrepWorker is { } worker) // [local] SHARPEMU_FRONT_PREP_WORKER
             {
-                var job = presenter.SubmitPrepareOnWorker(worker, GraphicsKey(snapshot), version, () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default);
+                Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare = () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default;
+                var job = presenter.SubmitPrepareOnWorker(worker, GraphicsKey(snapshot), version, prepare);
                 var auto = arguments;
                 queue.Enqueue(() =>
                 {
                     try
                     {
-                        var programs = presenter.TakeWorkerPreparation(worker, job, out var workerInputs);
+                        var programs = presenter.TakeWorkerPreparation(worker, job, out var workerInputs, prepare);
                         presenter.ExecuteQueuedDraw(submitId, snapshot, false, default, in auto, programs, in workerInputs, registers);
                     }
                     finally
@@ -712,15 +714,16 @@ internal static unsafe partial class VulkanVideoPresenter
             var version = presenter.FrontPreparationVersion; // [local]
             if (presenter.PrepWorker is { } worker && FrontPrepWorker.Compute) // [local] SHARPEMU_FRONT_PREP_WORKER
             {
+                Func<ComputeProgram?> prepareCompute = () => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator);
                 var job = indirectArgumentsAddress == 0
-                    ? presenter.SubmitComputeOnWorker(worker, snapshot.Shader.Compute.Address, version, () => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator))
+                    ? presenter.SubmitComputeOnWorker(worker, snapshot.Shader.Compute.Address, version, prepareCompute)
                     : null;
                 computeScope.Dispose();
                 queue.Enqueue(() =>
                 {
                     try
                     {
-                        var program = presenter.TakeWorkerCompute(worker, job);
+                        var program = presenter.TakeWorkerCompute(worker, job, prepareCompute);
                         presenter.ExecuteQueuedDispatch(submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, program);
                     }
                     finally
