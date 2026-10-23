@@ -145,7 +145,14 @@ internal static class FrontPrepVerify
             Interlocked.Increment(ref _mismatched);
             if (Interlocked.Increment(ref _logs) <= 200)
             {
-                var differing = string.Join(",", Enumerable.Range(0, Parts).Where(part => worker[part] != render[part]).Select(part => PartNames[part]));
+                var names = new List<string>(Parts);
+                for (var part = 0; part < Parts; part++)
+                {
+                    if (worker[part] != render[part])
+                        names.Add(PartNames[part]);
+                }
+
+                var differing = string.Join(",", names);
                 Console.Error.WriteLine($"[FRONT_PREP_VERIFY] mismatch kind={kind} shader=0x{shader:X} pixel=0x{pixelShader:X} parts={differing}");
             }
         }
