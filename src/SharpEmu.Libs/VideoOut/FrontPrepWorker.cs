@@ -5,7 +5,7 @@ using System.Diagnostics;
 
 namespace SharpEmu.Libs.VideoOut;
 
-// [local] SHARPEMU_FRONT_PREP_WORKER=1 (off by default): the front hands each draw's program preparation to one worker
+// [local] SHARPEMU_FRONT_PREP_WORKER=1 (on by default, =0 disables): the front hands each draw's program preparation to one worker
 // thread instead of running it inline, and goes on interpreting. The worker runs the preparations in the order the front
 // submitted them. When the render thread executes the draw it takes the result: a preparation the worker has not started
 // is abandoned (the worker skips it) and the render thread prepares the draw itself, as it does today for a preparation
@@ -15,7 +15,7 @@ namespace SharpEmu.Libs.VideoOut;
 // SMT lane), =2 on the guest lanes. SHARPEMU_FRONT_PREP_WORKER_COMPUTE=0 keeps dispatch preparations on the front.
 internal sealed class FrontPrepWorker : IDisposable
 {
-    private static readonly string? Mode = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_WORKER");
+    private static readonly string? Mode = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_WORKER") ?? "1";
     public static readonly bool Enabled = Mode is "1" or "2";
     public static readonly bool OnGuestLanes = Mode == "2";
     public static readonly bool Compute = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_WORKER_COMPUTE") != "0";
