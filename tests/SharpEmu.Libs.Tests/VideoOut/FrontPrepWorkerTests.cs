@@ -110,4 +110,34 @@ public sealed class FrontPrepWorkerTests
         Assert.Equal(9, result);
         Assert.Equal(1, worker.Failures);
     }
+
+    [Fact]
+    public void AResultThatReadStoreTablesIsDiscardedWhenATableWriteWasAppliedSince()
+    {
+        var applied = 5L;
+        var usedTables = true;
+        using var worker = new FrontPrepWorker(beginMark: () => Volatile.Read(ref applied), endMark: mark => usedTables ? mark : -1);
+        Func<long, bool> tablesStillValid = mark => mark == Volatile.Read(ref applied);
+
+        var unchanged = worker.Submit(() => 1, version: 0);
+        while (Volatile.Read(ref unchanged.State) != FrontPrepWorker.Job.Done)
+            Thread.Yield();
+        Assert.True(worker.TryTake(unchanged, AlwaysValid, out var kept, tablesStillValid));
+        Assert.Equal(1, kept);
+
+        var written = worker.Submit(() => 2, version: 0);
+        while (Volatile.Read(ref written.State) != FrontPrepWorker.Job.Done)
+            Thread.Yield();
+        Volatile.Write(ref applied, 6);
+        Assert.False(worker.TryTake(written, AlwaysValid, out _, tablesStillValid));
+        Assert.Equal(1, worker.Stale);
+
+        usedTables = false;
+        var noTables = worker.Submit(() => 3, version: 0);
+        while (Volatile.Read(ref noTables.State) != FrontPrepWorker.Job.Done)
+            Thread.Yield();
+        Volatile.Write(ref applied, 7);
+        Assert.True(worker.TryTake(noTables, AlwaysValid, out var free, tablesStillValid));
+        Assert.Equal(3, free);
+    }
 }

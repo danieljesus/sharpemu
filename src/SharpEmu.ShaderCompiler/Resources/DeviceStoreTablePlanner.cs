@@ -199,6 +199,35 @@ public static class DeviceStoreTablePlanner
     private static readonly int BulkMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_BULK"), out var bulkMode) ? bulkMode : 1;
     private const int BulkChunkEntries = 4096;
 
+    // [local] Before a table is scanned: its bounds join the invalidation filter first, so a write landing during the
+    // scan is counted; the generation the scan starts from.
+    internal static long BeginScan(ulong tableBase, ulong tableBytes)
+    {
+        lock (AllCaches)
+        {
+            if (tableBase < _tableBegin) Volatile.Write(ref _tableBegin, tableBase);
+            if (tableBase + tableBytes > _tableEnd) Volatile.Write(ref _tableEnd, tableBase + tableBytes);
+        }
+
+        return Interlocked.Read(ref _scanGeneration);
+    }
+
+    // [local] After the scan: cached only if no invalidation landed while it ran. True when cached.
+    internal static bool CommitScan(ulong tableBase, ulong tableBytes, long generation, List<DeviceAddressRange> ranges) =>
+        CommitScan(Cache, tableBase, tableBytes, generation, ranges);
+
+    private static bool CommitScan(TableCache cache, ulong tableBase, ulong tableBytes, long generation, List<DeviceAddressRange> ranges)
+    {
+        if (Interlocked.Read(ref _scanGeneration) != generation)
+            return false;
+        cache.Entries[(tableBase, tableBytes)] = ranges;
+        return true;
+    }
+
+    // [local] Tests: this thread's cached ranges of a table.
+    internal static bool TryGetCached(ulong tableBase, ulong tableBytes, out List<DeviceAddressRange>? ranges) =>
+        Cache.Entries.TryGetValue((tableBase, tableBytes), out ranges);
+
     public static void InvalidateTables(ulong address, ulong size, int source = 0) // [local]
     {
         // Cheap reject first: this runs on every command-processor write, and IsEmpty/Keys on a
@@ -347,13 +376,7 @@ public static class DeviceStoreTablePlanner
                 continue;
             }
 
-            lock (AllCaches) // [local] bounds before the scan, so an invalidation during it is counted
-            {
-                if (tableBase < _tableBegin) Volatile.Write(ref _tableBegin, tableBase);
-                if (tableBase + tableBytes > _tableEnd) Volatile.Write(ref _tableEnd, tableBase + tableBytes);
-            }
-
-            var generation = Interlocked.Read(ref _scanGeneration);
+            var generation = BeginScan(tableBase, tableBytes);
             var entries = (int)System.Math.Min(tableBytes / 16, MaxEntries);
             var before = ranges.Count; // [local]
             var scanStarted = Profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -449,10 +472,7 @@ public static class DeviceStoreTablePlanner
 
             if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
                 System.Console.Error.WriteLine($"[STORE_TABLE_USE] hash=0x{plan.Hash:X16} thread={System.Environment.CurrentManagedThreadId} table=0x{tableBase:X} bytes=0x{tableBytes:X} scan ranges={Describe(ranges.GetRange(before, ranges.Count - before))}");
-            if (Interlocked.Read(ref _scanGeneration) == generation) // a write that landed during the scan keeps it out
-            {
-                tableCache.Entries[(tableBase, tableBytes)] = ranges.GetRange(before, ranges.Count - before);
-            }
+            CommitScan(tableCache, tableBase, tableBytes, generation, ranges.GetRange(before, ranges.Count - before));
             if (_logs++ < 40 && System.Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local]
                 System.Console.Error.WriteLine($"[STORE_TABLE] hash=0x{plan.Hash:X16} table=0x{tableBase:X} bytes=0x{tableBytes:X} ranges={ranges.Count - before} first={(ranges.Count > before ? $"0x{ranges[before].Base:X}+0x{ranges[before].Size:X}" : "-")}");
         }
