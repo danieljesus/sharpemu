@@ -31,6 +31,7 @@ internal sealed class FrontPrepWorker : IDisposable
         internal bool Failed;
         internal bool Waiting;
         internal long Version;
+        internal long Mark = -1; // [local] from endMark: what else the result depends on, checked when taken (-1 nothing)
         internal long SubmittedTicks;
 
         internal abstract void Run();
@@ -50,6 +51,8 @@ internal sealed class FrontPrepWorker : IDisposable
     private readonly Queue<Job> _queue = new();
     private readonly Thread _thread;
     private readonly Action? _threadStart;
+    private readonly Func<long>? _beginMark;
+    private readonly Func<long, long>? _endMark;
     private readonly long _reportTicks;
     private bool _idle;
     private bool _stop;
@@ -67,9 +70,12 @@ internal sealed class FrontPrepWorker : IDisposable
     internal long RunTicks;
     internal long LeadTicks;
 
-    public FrontPrepWorker(Action? threadStart = null, string name = "GPU front prep", double reportSeconds = 20)
+    public FrontPrepWorker(Action? threadStart = null, string name = "GPU front prep", double reportSeconds = 20,
+        Func<long>? beginMark = null, Func<long, long>? endMark = null)
     {
         _threadStart = threadStart;
+        _beginMark = beginMark;
+        _endMark = endMark;
         _reportTicks = (long)(reportSeconds * Stopwatch.Frequency);
         _lastReport = Stopwatch.GetTimestamp();
         _thread = new Thread(Loop) { IsBackground = true, Name = name };
@@ -91,7 +97,7 @@ internal sealed class FrontPrepWorker : IDisposable
     }
 
     // On the render thread, when the draw executes. False: prepare the draw there.
-    public bool TryTake<T>(Job<T> job, Func<long, bool> stillValid, out T? result)
+    public bool TryTake<T>(Job<T> job, Func<long, bool> stillValid, out T? result, Func<long, bool>? markStillValid = null)
     {
         result = default;
         var state = Interlocked.CompareExchange(ref job.State, Job.Abandoned, Job.Pending);
@@ -123,7 +129,7 @@ internal sealed class FrontPrepWorker : IDisposable
 
         if (job.Failed)
             return false;
-        if (!stillValid(job.Version))
+        if (!stillValid(job.Version) || (job.Mark >= 0 && markStillValid is not null && !markStillValid(job.Mark)))
         {
             Interlocked.Increment(ref Stale);
             return false;
@@ -164,7 +170,9 @@ internal sealed class FrontPrepWorker : IDisposable
             Interlocked.Add(ref LeadTicks, started - job.SubmittedTicks);
             try
             {
+                var mark = _beginMark?.Invoke() ?? -1;
                 job.Run();
+                job.Mark = _endMark?.Invoke(mark) ?? -1;
             }
             catch (Exception)
             {

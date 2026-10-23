@@ -637,17 +637,23 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
+            Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepareOnFront = () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default;
+            var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
+            var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), prepareOnFront, out var inputs);
+            tableMark = Presenter.EndTableMark(tableMark);
             var copy = arguments;
             queue.Enqueue(() =>
             {
                 try
                 {
-                    if (prepared is not null && !presenter.FrontPreparationStillValid(version)) // [local]
+                    if (prepared is not null && (!presenter.FrontPreparationStillValid(version) || !presenter.TablesStillValid(tableMark))) // [local]
                     {
                         prepared = null;
                         inputs = default;
                     }
+
+                    if (prepared is not null && FrontPrepVerify.Enabled) // [local] SHARPEMU_FRONT_PREP_VERIFY
+                        prepared = Presenter.VerifyGraphics(prepared, ref inputs, prepareOnFront);
 
                     presenter.ExecuteQueuedDraw(submitId, snapshot, true, in copy, default, prepared, in inputs, registers);
                 }
@@ -684,17 +690,23 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default, out var inputs);
+            Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepareOnFront = () => presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default;
+            var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
+            var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), prepareOnFront, out var inputs);
+            tableMark = Presenter.EndTableMark(tableMark);
             var copy = arguments;
             queue.Enqueue(() =>
             {
                 try
                 {
-                    if (prepared is not null && !presenter.FrontPreparationStillValid(version)) // [local]
+                    if (prepared is not null && (!presenter.FrontPreparationStillValid(version) || !presenter.TablesStillValid(tableMark))) // [local]
                     {
                         prepared = null;
                         inputs = default;
                     }
+
+                    if (prepared is not null && FrontPrepVerify.Enabled) // [local] SHARPEMU_FRONT_PREP_VERIFY
+                        prepared = Presenter.VerifyGraphics(prepared, ref inputs, prepareOnFront);
 
                     presenter.ExecuteQueuedDraw(submitId, snapshot, false, default, in copy, prepared, in inputs, registers);
                 }
@@ -734,16 +746,21 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            Func<ComputeProgram?> prepareOnFront = () => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator);
+            var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
             var prepared = indirectArgumentsAddress == 0
-                ? presenter.TryPrepareComputeOnFront(snapshot.Shader.Compute.Address, () => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator))
+                ? presenter.TryPrepareComputeOnFront(snapshot.Shader.Compute.Address, prepareOnFront)
                 : null;
+            tableMark = Presenter.EndTableMark(tableMark);
             computeScope.Dispose();
             queue.Enqueue(() =>
             {
                 try
                 {
-                    if (prepared is not null && !presenter.FrontPreparationStillValid(version)) // [local]
+                    if (prepared is not null && (!presenter.FrontPreparationStillValid(version) || !presenter.TablesStillValid(tableMark))) // [local]
                         prepared = null;
+                    if (prepared is not null && FrontPrepVerify.Enabled) // [local] SHARPEMU_FRONT_PREP_VERIFY
+                        prepared = Presenter.VerifyCompute(prepared, prepareOnFront);
                     presenter.ExecuteQueuedDispatch(submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, prepared);
                 }
                 finally
@@ -978,7 +995,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (FrontPrepWorker.Enabled) // [local]
             {
-                PrepWorker = new FrontPrepWorker(EnterPrepWorkerThread);
+                PrepWorker = new FrontPrepWorker(EnterPrepWorkerThread, beginMark: BeginTableMark, endMark: EndTableMark);
                 Console.Error.WriteLine("[LOADER][INFO] The front prepares draw programs on a worker thread (SHARPEMU_FRONT_PREP_WORKER=1).");
             }
 

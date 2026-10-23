@@ -32,6 +32,32 @@ public static class DeviceStoreTablePlanner
     private static TableCache? _threadCache;
     private static readonly List<TableCache> AllCaches = new();
 
+    // [local] Every invalidation inside the table bounds, whichever cache holds the table: a scan is cached only if none
+    // landed while it ran. The per-cache generation only moved when that cache already held an overlapping entry, so a
+    // write landing during the first scan of a table (or a rescan after a drop) from another thread was missed and the
+    // pre-write ranges stayed cached until the next write.
+    private static long _scanGeneration;
+
+    // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK (on by default, =0 disables): the invalidations that change table memory
+    // now (CPU faults, and command-processor, fill and copy writes the render thread applies), counted so a preparation
+    // made ahead of the render thread (front or prep worker) can be checked when its draw or dispatch executes: a write
+    // applied after the preparation read the tables precedes the draw in stream order and the preparation missed it.
+    public static readonly bool AppliedCheck = System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_APPLIED_CHECK") != "0";
+    private static long _appliedGeneration;
+
+    public static long AppliedGeneration => Interlocked.Read(ref _appliedGeneration);
+
+    [System.ThreadStatic]
+    private static bool _usedTables;
+
+    // [local] Whether this thread evaluated a store table since the last call.
+    public static bool TakeUsedTables()
+    {
+        var used = _usedTables;
+        _usedTables = false;
+        return used;
+    }
+
     private static TableCache Cache
     {
         get
@@ -179,6 +205,9 @@ public static class DeviceStoreTablePlanner
         // ConcurrentDictionary take all its locks (rt429: ~2 ms per frame of lock waits).
         if (size == 0 || address >= Volatile.Read(ref _tableEnd) || address + size <= Volatile.Read(ref _tableBegin))
             return;
+        Interlocked.Increment(ref _scanGeneration);
+        if (source is InvalidationSource.CpuFault or InvalidationSource.CommandRender or InvalidationSource.FillRender or InvalidationSource.CopyRender)
+            Interlocked.Increment(ref _appliedGeneration);
         TableCache[] caches;
         lock (AllCaches) caches = AllCaches.ToArray();
         var dropped = 0;
@@ -305,8 +334,8 @@ public static class DeviceStoreTablePlanner
             if (Profile)
                 Interlocked.Increment(ref _evaluated);
             // [local experiment] the whole table, scanned once per table address and cached.
+            _usedTables = true;
             var tableCache = Cache;
-            var generation = Interlocked.Read(ref tableCache.Generation);
             if (tableCache.Entries.TryGetValue((tableBase, tableBytes), out var cached) &&
                 (RescanEvery == 0 || ++_uses % RescanEvery != 0)) // [local] periodic rescan
             {
@@ -318,6 +347,13 @@ public static class DeviceStoreTablePlanner
                 continue;
             }
 
+            lock (AllCaches) // [local] bounds before the scan, so an invalidation during it is counted
+            {
+                if (tableBase < _tableBegin) Volatile.Write(ref _tableBegin, tableBase);
+                if (tableBase + tableBytes > _tableEnd) Volatile.Write(ref _tableEnd, tableBase + tableBytes);
+            }
+
+            var generation = Interlocked.Read(ref _scanGeneration);
             var entries = (int)System.Math.Min(tableBytes / 16, MaxEntries);
             var before = ranges.Count; // [local]
             var scanStarted = Profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -413,14 +449,8 @@ public static class DeviceStoreTablePlanner
 
             if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
                 System.Console.Error.WriteLine($"[STORE_TABLE_USE] hash=0x{plan.Hash:X16} thread={System.Environment.CurrentManagedThreadId} table=0x{tableBase:X} bytes=0x{tableBytes:X} scan ranges={Describe(ranges.GetRange(before, ranges.Count - before))}");
-            if (Interlocked.Read(ref tableCache.Generation) == generation) // a write that landed during the scan keeps it out
+            if (Interlocked.Read(ref _scanGeneration) == generation) // a write that landed during the scan keeps it out
             {
-                lock (AllCaches) // bounds before the entry, so an invalidation never misses it
-                {
-                    if (tableBase < _tableBegin) Volatile.Write(ref _tableBegin, tableBase);
-                    if (tableBase + tableBytes > _tableEnd) Volatile.Write(ref _tableEnd, tableBase + tableBytes);
-                }
-
                 tableCache.Entries[(tableBase, tableBytes)] = ranges.GetRange(before, ranges.Count - before);
             }
             if (_logs++ < 40 && System.Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local]

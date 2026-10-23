@@ -325,7 +325,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             worker.MaybeReport(Console.Error);
             inputs = default;
-            if (job is null || !worker.TryTake(job, _frontPreparationStillValid ??= FrontPreparationStillValid, out var result))
+            if (job is null || !worker.TryTake(job, _frontPreparationStillValid ??= FrontPreparationStillValid, out var result, _tablesStillValid ??= TablesStillValid))
                 return null;
             if (result.Programs is null)
             {
@@ -334,34 +334,90 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             inputs = result.Inputs;
-            if (FrontPrepVerify.Enabled && prepare is not null) // [local] SHARPEMU_FRONT_PREP_VERIFY
-            {
-                var (renderPrograms, renderInputs) = prepare();
-                if (renderPrograms is null)
-                {
-                    FrontPrepVerify.NoteRenderEmpty();
-                }
-                else
-                {
-                    Span<ulong> workerParts = stackalloc ulong[FrontPrepVerify.Parts];
-                    Span<ulong> renderParts = stackalloc ulong[FrontPrepVerify.Parts];
-                    FrontPrepVerify.Fingerprint(result.Programs, in result.Inputs, workerParts);
-                    FrontPrepVerify.Fingerprint(renderPrograms, in renderInputs, renderParts);
-                    if (!FrontPrepVerify.Compare(workerParts, renderParts, "draw", result.Programs.VertexInput.Stage.Program?.Hash ?? 0, result.Programs.PixelInput.Stage.Program?.Hash ?? 0))
-                    {
-                        FrontPrepVerify.DumpStageDifference("draw_vertex", result.Programs.VertexInput.Stage.Program?.Hash ?? 0, result.Programs.VertexInput.Stage, renderPrograms.VertexInput.Stage);
-                        FrontPrepVerify.DumpStageDifference("draw_pixel", result.Programs.PixelInput.Stage.Program?.Hash ?? 0, result.Programs.PixelInput.Stage, renderPrograms.PixelInput.Stage);
-                    }
-                }
+            return prepare is null ? result.Programs : VerifyGraphics(result.Programs, ref inputs, prepare);
+        }
 
-                if (FrontPrepVerify.UseRender)
-                {
-                    inputs = renderInputs;
-                    return renderPrograms;
-                }
+        // [local] SHARPEMU_FRONT_PREP_VERIFY: a preparation made ahead of the render thread (front or prep worker) is
+        // prepared again here and compared; the render thread's result is used on a mismatch (and always with =2).
+        internal static GraphicsPrograms? VerifyGraphics(GraphicsPrograms prepared, ref RenderExecutor.DrawProgramInputs inputs,
+            Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare)
+        {
+            if (!FrontPrepVerify.Enabled)
+                return prepared;
+            var (renderPrograms, renderInputs) = prepare();
+            if (renderPrograms is null)
+            {
+                FrontPrepVerify.NoteRenderEmpty();
+                inputs = default;
+                return null;
             }
 
-            return result.Programs;
+            Span<ulong> aheadParts = stackalloc ulong[FrontPrepVerify.Parts];
+            Span<ulong> renderParts = stackalloc ulong[FrontPrepVerify.Parts];
+            FrontPrepVerify.Fingerprint(prepared, in inputs, aheadParts);
+            FrontPrepVerify.Fingerprint(renderPrograms, in renderInputs, renderParts);
+            var same = FrontPrepVerify.Compare(aheadParts, renderParts, _onPrepWorker ? "draw_worker" : "draw", prepared.VertexInput.Stage.Program?.Hash ?? 0, prepared.PixelInput.Stage.Program?.Hash ?? 0);
+            if (!same)
+            {
+                FrontPrepVerify.DumpStageDifference("draw_vertex", prepared.VertexInput.Stage.Program?.Hash ?? 0, prepared.VertexInput.Stage, renderPrograms.VertexInput.Stage);
+                FrontPrepVerify.DumpStageDifference("draw_pixel", prepared.PixelInput.Stage.Program?.Hash ?? 0, prepared.PixelInput.Stage, renderPrograms.PixelInput.Stage);
+            }
+
+            if (same && !FrontPrepVerify.UseRender)
+                return prepared;
+            inputs = renderInputs;
+            return renderPrograms;
+        }
+
+        internal static ComputeProgram? VerifyCompute(ComputeProgram prepared, Func<ComputeProgram?> prepare)
+        {
+            if (!FrontPrepVerify.Enabled)
+                return prepared;
+            var renderProgram = prepare();
+            if (renderProgram is null)
+            {
+                FrontPrepVerify.NoteRenderEmpty();
+                return null;
+            }
+
+            Span<ulong> aheadParts = stackalloc ulong[FrontPrepVerify.Parts];
+            Span<ulong> renderParts = stackalloc ulong[FrontPrepVerify.Parts];
+            FrontPrepVerify.Fingerprint(prepared, aheadParts);
+            FrontPrepVerify.Fingerprint(renderProgram, renderParts);
+            var same = FrontPrepVerify.Compare(aheadParts, renderParts, "dispatch", prepared.Input.Stage.Program?.Hash ?? 0, 0);
+            if (!same)
+                FrontPrepVerify.DumpStageDifference("dispatch", prepared.Input.Stage.Program?.Hash ?? 0, prepared.Input.Stage, renderProgram.Input.Stage);
+            return same && !FrontPrepVerify.UseRender ? prepared : renderProgram;
+        }
+
+        // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK (see DeviceStoreTablePlanner.AppliedCheck): a preparation that
+        // evaluated a store table keeps the applied-write generation it started from, and is used only if no table
+        // write was applied since.
+        private Func<long, bool>? _tablesStillValid;
+        internal long DiscardedTablePreparations;
+        private long _tableDiscardReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        internal static long BeginTableMark()
+        {
+            SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TakeUsedTables();
+            return SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.AppliedGeneration;
+        }
+
+        internal static long EndTableMark(long mark) =>
+            SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TakeUsedTables() && SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.AppliedCheck ? mark : -1;
+
+        internal bool TablesStillValid(long mark)
+        {
+            if (mark < 0 || SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.AppliedGeneration == mark)
+                return true;
+            DiscardedTablePreparations++;
+            if (System.Diagnostics.Stopwatch.GetElapsedTime(_tableDiscardReport).TotalSeconds >= 20)
+            {
+                _tableDiscardReport = System.Diagnostics.Stopwatch.GetTimestamp();
+                Console.Error.WriteLine($"[STORE_TABLE_APPLIED] discarded_preparations={DiscardedTablePreparations}");
+            }
+
+            return false;
         }
 
         internal FrontPrepWorker.Job<ComputeProgram?>? SubmitComputeOnWorker(FrontPrepWorker worker, ulong key, long version, Func<ComputeProgram?> prepare)
@@ -378,7 +434,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         internal ComputeProgram? TakeWorkerCompute(FrontPrepWorker worker, FrontPrepWorker.Job<ComputeProgram?>? job, Func<ComputeProgram?>? prepare = null)
         {
-            if (job is null || !worker.TryTake(job, _frontPreparationStillValid ??= FrontPreparationStillValid, out var program))
+            if (job is null || !worker.TryTake(job, _frontPreparationStillValid ??= FrontPreparationStillValid, out var program, _tablesStillValid ??= TablesStillValid))
                 return null;
             if (program is null)
             {
@@ -386,28 +442,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return null;
             }
 
-            if (FrontPrepVerify.Enabled && prepare is not null) // [local] SHARPEMU_FRONT_PREP_VERIFY
-            {
-                var renderProgram = prepare();
-                if (renderProgram is null)
-                {
-                    FrontPrepVerify.NoteRenderEmpty();
-                }
-                else
-                {
-                    Span<ulong> workerParts = stackalloc ulong[FrontPrepVerify.Parts];
-                    Span<ulong> renderParts = stackalloc ulong[FrontPrepVerify.Parts];
-                    FrontPrepVerify.Fingerprint(program, workerParts);
-                    FrontPrepVerify.Fingerprint(renderProgram, renderParts);
-                    if (!FrontPrepVerify.Compare(workerParts, renderParts, "dispatch", program.Input.Stage.Program?.Hash ?? 0, 0))
-                        FrontPrepVerify.DumpStageDifference("dispatch", program.Input.Stage.Program?.Hash ?? 0, program.Input.Stage, renderProgram.Input.Stage);
-                }
-
-                if (FrontPrepVerify.UseRender)
-                    return renderProgram;
-            }
-
-            return program;
+            return prepare is null ? program : VerifyCompute(program, prepare);
         }
 
         internal static void EnterPrepWorkerThread()
