@@ -776,9 +776,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 _hdrAges[i] = (address, tick, next + 1);
             }
         }
+        // [local] The probe body is its own method: its lambdas capture hash, index and descriptor, and C# allocates that
+        // closure on entry to the method that declares them, so with the probes off every bound buffer paid for it.
         private void ProbeBvhRefitBuffer(ulong hash, int index, BufferDescriptorWords descriptor, ulong requested, ulong size, PreparedStageBindings prepared)
         {
             if (!BvhProbes) { DumpSlotIfRequested(hash, index, descriptor, requested); return; } // [local]
+            ProbeBvhRefitBufferCore(hash, index, descriptor, requested, size, prepared);
+        }
+
+        private void ProbeBvhRefitBufferCore(ulong hash, int index, BufferDescriptorWords descriptor, ulong requested, ulong size, PreparedStageBindings prepared)
+        {
             if (!_buildTracked && Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1") // [local] follow the roots of one small and one large dynamic BLAS from the start (addresses stable across runs)
             {
                 _buildTracked = true;
