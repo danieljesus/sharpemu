@@ -89,6 +89,9 @@ public static unsafe class HostLaneReservation
     // [local] SHARPEMU_HOST_HELPER_LANES=1: on the GPU front thread.
     public static void ApplyToFrontThread() => ApplyToHelperCore(FrontMask, "GPU front thread");
 
+    // [local] SHARPEMU_FRONT_PREP_WORKER=1: the front's program preparation worker shares the front's core.
+    public static void ApplyToFrontWorkerThread() => ApplyToHelperCore(FrontMask, "GPU front prep worker");
+
     // [local] SHARPEMU_HOST_HELPER_LANES=1: the GPU submit, priority and deferred upload threads share the guest lanes.
     public static void ApplyToHelperThread()
     {
