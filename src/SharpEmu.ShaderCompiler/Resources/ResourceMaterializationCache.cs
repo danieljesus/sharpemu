@@ -28,11 +28,94 @@ public sealed class ResourceMaterializationCache
     private byte[] _scratch = new byte[256];
     private ReadRecorder? _spareRecorder;
 
-    public ResourceMaterializationCache(int generationCapacity = 16384, bool stampStoreTables = false)
+    public ResourceMaterializationCache(int generationCapacity = 16384, bool stampStoreTables = false, bool currentStoreTables = false)
     {
         _generationCapacity = Math.Max(1, generationCapacity);
-        _stampStoreTables = stampStoreTables;
+        _currentStoreTables = currentStoreTables && DeviceStoreTablePlanner.ExactMode == 0;
+        _stampStoreTables = stampStoreTables || _currentStoreTables;
     }
+
+    // [local] SHARPEMU_PROGRAM_GATE_TABLES=3: a walk records none of the store-table scan's words, and every hit, refresh
+    // or shift of a plan with store tables evaluates its tables again from the thread's scan cache (CurrentTables): the
+    // V# words were validated, a cached scan is a list lookup, and a dropped one is rescanned, as a fresh walk would.
+    // The ranges the snapshot carries are then always a fresh walk's, without walking the rest of the plan again.
+    private readonly bool _currentStoreTables;
+    private readonly List<DeviceAddressRange> _tableRanges = new();
+    private static long _totalTablesSame, _totalTablesEqual, _totalTablesChanged, _totalTablesFailed;
+
+    private bool CurrentTables(Entry entry, ResourceRuntimeInputs inputs, ref ResourceSnapshot snapshot)
+    {
+        var used = entry.UsedScans;
+        var ranges = snapshot.DeviceAddressRanges;
+        var tableCount = 0;
+        foreach (var scan in used)
+            tableCount += scan.Ranges.Count;
+        var prefix = ranges.Length - tableCount;
+        var current = _tableRanges;
+        current.Clear();
+        DeviceStoreTablePlanner.BeginUsedScans();
+        bool same;
+        DeviceStoreTablePlanner.UsedScan[]? rescans;
+        try
+        {
+            DeviceStoreTablePlanner.Evaluate(entry.Plan, inputs, current);
+        }
+        finally
+        {
+            same = DeviceStoreTablePlanner.EndUsedScansSame(used, out rescans);
+        }
+
+        if (prefix < 0)
+        {
+            Interlocked.Increment(ref _totalTablesFailed);
+            return false;
+        }
+
+        if (same)
+        {
+            Interlocked.Increment(ref _totalTablesSame);
+            return true;
+        }
+
+        // The scans moved (a drop and a rescan, or another table): the snapshot holds while their ranges are the same.
+        var equal = current.Count == tableCount;
+        for (var index = 0; equal && index < tableCount; index++)
+            equal = SameRange(current[index], ranges[prefix + index]);
+        var owned = ReferenceEquals(snapshot, entry.Snapshot);
+        if (equal)
+        {
+            Interlocked.Increment(ref _totalTablesEqual);
+            if (owned)
+                entry.UsedScans = rescans!;
+            return true;
+        }
+
+        Interlocked.Increment(ref _totalTablesChanged);
+        var next = new DeviceAddressRange[prefix + current.Count];
+        Array.Copy(ranges, next, prefix);
+        current.CopyTo(next, prefix);
+        snapshot = new ResourceSnapshot
+        {
+            Buffers = snapshot.Buffers,
+            Images = snapshot.Images,
+            Samplers = snapshot.Samplers,
+            FlattenedResourceTable = snapshot.FlattenedResourceTable,
+            UserData = snapshot.UserData,
+            DeviceAddressRanges = next,
+        };
+        if (owned)
+        {
+            entry.Snapshot = snapshot;
+            entry.UsedScans = rescans!;
+        }
+
+        return true;
+    }
+
+    // A range's handle is a label the scan cache replays from the scan that filled it.
+    private static bool SameRange(DeviceAddressRange left, DeviceAddressRange right) =>
+        left.Base == right.Base && left.Size == right.Size && left.Planned == right.Planned && left.Written == right.Written &&
+        left.Conservative == right.Conservative;
 
     // [local] SHARPEMU_PROGRAM_GATE's per-thread caches: the store-table ranges of a walk come from the thread's scan
     // cache, whose words the recorder does not see when the scan was cached, so an entry of a plan with store tables
@@ -84,7 +167,7 @@ public sealed class ResourceMaterializationCache
         var refreshes = Interlocked.Exchange(ref _totalRefreshes, 0);
         var total = hits + misses;
         return FormattableString.Invariant(
-            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} table_stale={Interlocked.Exchange(ref _totalTableStale, 0)} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)} block_builds={Interlocked.Exchange(ref ReadRecorder.BlockBuilds, 0)} block_fallbacks={Interlocked.Exchange(ref ReadRecorder.BlockFallbacks, 0)} block_checked={Interlocked.Exchange(ref ReadRecorder.BlockChecked, 0)} block_mismatches={Interlocked.Exchange(ref ReadRecorder.BlockMismatches, 0)}{TakeRebaseReport()}{TakeSyncValidateReport()}{TakeInPlaceReport()}");
+            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} table_stale={Interlocked.Exchange(ref _totalTableStale, 0)} tables_same={Interlocked.Exchange(ref _totalTablesSame, 0)} tables_equal={Interlocked.Exchange(ref _totalTablesEqual, 0)} tables_changed={Interlocked.Exchange(ref _totalTablesChanged, 0)} tables_failed={Interlocked.Exchange(ref _totalTablesFailed, 0)} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)} block_builds={Interlocked.Exchange(ref ReadRecorder.BlockBuilds, 0)} block_fallbacks={Interlocked.Exchange(ref ReadRecorder.BlockFallbacks, 0)} block_checked={Interlocked.Exchange(ref ReadRecorder.BlockChecked, 0)} block_mismatches={Interlocked.Exchange(ref ReadRecorder.BlockMismatches, 0)}{TakeRebaseReport()}{TakeSyncValidateReport()}{TakeInPlaceReport()}");
     }
 
     public bool Materialize(
@@ -100,12 +183,13 @@ public sealed class ResourceMaterializationCache
         var key = KeyOf(plan, inputs);
         var found = TryFind(key, plan, inputs, out var cached);
         var stamps = StampsTables(plan);
-        if (found && stamps)
+        var current = stamps && _currentStoreTables; // [local] the tables are evaluated again instead of stamped
+        if (found && stamps && !current)
         {
-            var current = false;
-            for (var variant = cached; variant is not null && !current; variant = variant.Next)
-                current = TablesCurrent(variant);
-            if (!current)
+            var scansHeld = false;
+            for (var variant = cached; variant is not null && !scansHeld; variant = variant.Next)
+                scansHeld = TablesCurrent(variant);
+            if (!scansHeld)
             {
                 Interlocked.Increment(ref _totalTableStale);
                 found = false; // every variant predates a table invalidation: walk, and drop them
@@ -120,14 +204,14 @@ public sealed class ResourceMaterializationCache
             Entry? previous = null;
             for (var variant = cached; variant is not null; previous = variant, variant = variant.Next)
             {
-                if (!variant.Matches(plan, inputs) || (stamps && !TablesCurrent(variant)))
+                if (!variant.Matches(plan, inputs) || (stamps && !current && !TablesCurrent(variant)))
                     continue;
                 var validateStarted = MaterializeSplitProfile.Start(); // [local]
                 var validated = Validate(variant, inputs, residentReader, out var variantUnreadable, residentComparer);
                 MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Validate, validateStarted);
                 if (validated && StaleLog) _lastStaleReason = "snapshot";
                 var syncValidated = _syncValidated;
-                if (validated && variant.SnapshotFor(inputs, _patches) is { } hit)
+                if (validated && variant.SnapshotFor(inputs, _patches) is { } hit && (!current || CurrentTables(variant, inputs, ref hit)))
                 {
                     if (syncValidated)
                     {
@@ -164,7 +248,7 @@ public sealed class ResourceMaterializationCache
 
             var refreshStarted = MaterializeSplitProfile.Start(); // [local]
             Entry refreshed = null!;
-            var refreshedTable = (!stamps || TablesCurrent(cached)) && cached.UserDataEquals(inputs) && TryRefreshTable(key, cached, plan, inputs, residentReader, out refreshed);
+            var refreshedTable = (!stamps || current || TablesCurrent(cached)) && cached.UserDataEquals(inputs) && TryRefreshTable(key, cached, plan, inputs, residentReader, out refreshed);
             MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Refresh, refreshStarted);
             if (refreshedTable)
             {
@@ -172,6 +256,8 @@ public sealed class ResourceMaterializationCache
                 TableRefreshes++;
                 Interlocked.Increment(ref _totalRefreshes);
                 snapshot = refreshed.Snapshot;
+                if (current && !CurrentTables(refreshed, inputs, ref snapshot))
+                    goto Walk;
                 specialization = refreshed.Specialization;
                 failure = default;
                 return true;
@@ -181,13 +267,18 @@ public sealed class ResourceMaterializationCache
             {
                 for (var variant = cached; variant is not null && shifted is null; variant = variant.Next)
                 {
-                    if (variant.Matches(plan, inputs) && (!stamps || TablesCurrent(variant)))
+                    if (variant.Matches(plan, inputs) && (!stamps || current || TablesCurrent(variant)))
                     {
                         var shiftStarted = MaterializeSplitProfile.Start(); // [local]
                         shifted = TryShift(variant, inputs, residentReader);
                         MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Shift, shiftStarted);
                         if (shifted is not null)
+                        {
                             shifted.UsedScans = variant.UsedScans;
+                            var shiftedSnapshot = shifted.Snapshot; // [local] owned: CurrentTables updates the entry
+                            if (current && !CurrentTables(shifted, inputs, ref shiftedSnapshot))
+                                shifted = null;
+                        }
                     }
                 }
 
@@ -242,7 +333,7 @@ public sealed class ResourceMaterializationCache
             };
             var walkStarted = MaterializeSplitProfile.Start(); // [local]
             if (stamps)
-                DeviceStoreTablePlanner.BeginUsedScans();
+                DeviceStoreTablePlanner.BeginUsedScans(unrecorded: current);
             bool walked;
             DeviceStoreTablePlanner.UsedScan[] usedScans;
             try
@@ -1822,6 +1913,8 @@ public sealed class ResourceMaterializationCache
 
         private bool Read(GuestWordReader inner, ulong address, out uint word, bool clean)
         {
+            if (DeviceStoreTablePlanner.ScanUnrecorded) // [local] SHARPEMU_PROGRAM_GATE_TABLES=3
+                return inner(address, out word);
             var key = (address << 1) | (clean ? 1UL : 0UL);
             if (ReadMemo && _memo.TryGetValue(key, out word))
             {
@@ -1858,6 +1951,8 @@ public sealed class ResourceMaterializationCache
         {
             if (!_residentReader!(address, destination, clean))
                 return false;
+            if (DeviceStoreTablePlanner.ScanUnrecorded) // [local] SHARPEMU_PROGRAM_GATE_TABLES=3
+                return true;
 
             if (BlockMode != 0 && _blocksAllowed && destination.Length >= BlockMinBytes)
             {

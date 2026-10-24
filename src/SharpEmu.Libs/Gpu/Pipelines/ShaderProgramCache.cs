@@ -183,7 +183,10 @@ internal sealed class ShaderProgramCache
     //      for these few dispatches);
     //   1: the thread's cache, which refuses a hit once a scan it used was dropped (a fresh walk's result always,
     //      at the cost of rescanning the tables after every invalidation);
-    //   2: the thread's cache as it is (stale more often than the shared one).
+    //   2: the thread's cache as it is (stale more often than the shared one);
+    //   3: the thread's cache, whose entries keep none of the scanned table words and evaluate the tables again on every
+    //      hit from the thread's scan cache (a dropped scan is rescanned once, as a fresh walk would): a fresh walk's
+    //      ranges without re-walking the plan (ResourceMaterializationCache.CurrentTables).
     internal static readonly int StoreTableMode =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE_TABLES"), out var storeTableMode) ? storeTableMode : 0;
     private ulong _nextProgramId;
@@ -238,7 +241,7 @@ internal sealed class ShaderProgramCache
             SynchronizeRanges = synchronizeRanges,
         }));
         _threadMaterializations = LockFree && _materializations is not null
-            ? new ThreadLocal<ResourceMaterializationCache>(static () => new(stampStoreTables: StoreTableMode == 1))
+            ? new ThreadLocal<ResourceMaterializationCache>(static () => new(stampStoreTables: StoreTableMode == 1, currentStoreTables: StoreTableMode == 3))
             : null;
     }
 

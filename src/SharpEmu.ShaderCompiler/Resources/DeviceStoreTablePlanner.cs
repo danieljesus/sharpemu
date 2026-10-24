@@ -48,20 +48,56 @@ public static class DeviceStoreTablePlanner
     public static long AppliedGeneration => Interlocked.Read(ref _appliedGeneration);
 
     // [local] SHARPEMU_PROGRAM_GATE_TABLE_STAMP: the scans an evaluation took from this thread's cache, or committed to
-    // it (null when the commit lost to an invalidation), while a caller records them. A cached scan's words are not
-    // read again, so a materialization that used one holds only while the cache still holds the same scan.
-    public readonly record struct UsedScan(ulong TableBase, ulong TableBytes, List<DeviceAddressRange>? Ranges);
+    // it (Committed false when the commit lost to an invalidation), while a caller records them. A cached scan's words
+    // are not read again, so a materialization that used one holds only while the cache still holds the same scan.
+    public readonly record struct UsedScan(ulong TableBase, ulong TableBytes, List<DeviceAddressRange> Ranges, bool Committed);
 
     [System.ThreadStatic]
     private static List<UsedScan>? _usedScans;
 
-    public static void BeginUsedScans() => (_usedScans ??= new()).Clear();
+    [System.ThreadStatic]
+    private static List<UsedScan>? _usedScansSpare;
+
+    // [local] SHARPEMU_PROGRAM_GATE_TABLES=3: while set, a table scan's reads bypass the materialization recorder, so an
+    // entry carries none of the table's words (up to 2 MB validated on every hit) and the cache checks the scans it
+    // used instead (ResourceMaterializationCache.CurrentTables).
+    [System.ThreadStatic]
+    private static bool _unrecordedScans;
+
+    [System.ThreadStatic]
+    private static bool _scanning;
+
+    public static bool ScanUnrecorded => _scanning;
+
+    public static void BeginUsedScans(bool unrecorded = false)
+    {
+        _usedScans = _usedScansSpare ??= new();
+        _usedScans.Clear();
+        _unrecordedScans = unrecorded;
+    }
 
     public static UsedScan[] EndUsedScans()
     {
         var used = _usedScans is { Count: > 0 } scans ? scans.ToArray() : [];
         _usedScans = null;
+        _unrecordedScans = false;
         return used;
+    }
+
+    // [local] Ends a recording begun by BeginUsedScans: true when it used the same scan lists as previous, in order;
+    // otherwise the scans it used.
+    public static bool EndUsedScansSame(UsedScan[] previous, out UsedScan[]? used)
+    {
+        var scans = _usedScans!;
+        _usedScans = null;
+        _unrecordedScans = false;
+        used = null;
+        var same = scans.Count == previous.Length;
+        for (var index = 0; same && index < previous.Length; index++)
+            same = ReferenceEquals(scans[index].Ranges, previous[index].Ranges);
+        if (!same)
+            used = scans.ToArray();
+        return same;
     }
 
     public static bool ScansCurrent(UsedScan[] used)
@@ -71,7 +107,7 @@ public static class DeviceStoreTablePlanner
         var cache = Cache;
         foreach (var scan in used)
         {
-            if (scan.Ranges is null || !cache.Entries.TryGetValue((scan.TableBase, scan.TableBytes), out var current) ||
+            if (!scan.Committed || !cache.Entries.TryGetValue((scan.TableBase, scan.TableBytes), out var current) ||
                 !ReferenceEquals(current, scan.Ranges))
                 return false;
         }
@@ -417,7 +453,7 @@ public static class DeviceStoreTablePlanner
                 (RescanEvery == 0 || ++_uses % RescanEvery != 0)) // [local] periodic rescan
             {
                 ranges.AddRange(cached);
-                _usedScans?.Add(new UsedScan(tableBase, tableBytes, cached));
+                _usedScans?.Add(new UsedScan(tableBase, tableBytes, cached, true));
                 if (Profile)
                     Interlocked.Increment(ref _hits);
                 if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
@@ -431,6 +467,7 @@ public static class DeviceStoreTablePlanner
             var scanStarted = Profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var bulk = BulkMode != 0 ? inputs.ReadResidentMemory : null;
             var chunk = bulk is null ? null : System.Buffers.ArrayPool<byte>.Shared.Rent(BulkChunkEntries * 16);
+            _scanning = _usedScans is not null && _unrecordedScans; // [local] only the scan: the V# words above stay recorded
             try
             {
                 for (var first = 0; first < entries; first += BulkChunkEntries)
@@ -520,6 +557,7 @@ public static class DeviceStoreTablePlanner
             }
             finally
             {
+                _scanning = false;
                 if (chunk is not null)
                     System.Buffers.ArrayPool<byte>.Shared.Return(chunk);
             }
@@ -558,7 +596,7 @@ public static class DeviceStoreTablePlanner
                 System.Console.Error.WriteLine($"[STORE_TABLE_USE] hash=0x{plan.Hash:X16} thread={System.Environment.CurrentManagedThreadId} table=0x{tableBase:X} bytes=0x{tableBytes:X} scan ranges={Describe(ranges.GetRange(before, ranges.Count - before))}");
             var scanned = ranges.GetRange(before, ranges.Count - before);
             var committed = CommitScan(tableCache, tableBase, tableBytes, generation, scanned);
-            _usedScans?.Add(new UsedScan(tableBase, tableBytes, committed ? scanned : null));
+            _usedScans?.Add(new UsedScan(tableBase, tableBytes, scanned, committed));
             if (_logs++ < 40 && System.Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local]
                 System.Console.Error.WriteLine($"[STORE_TABLE] hash=0x{plan.Hash:X16} table=0x{tableBase:X} bytes=0x{tableBytes:X} ranges={ranges.Count - before} first={(ranges.Count > before ? $"0x{ranges[before].Base:X}+0x{ranges[before].Size:X}" : "-")}");
         }
