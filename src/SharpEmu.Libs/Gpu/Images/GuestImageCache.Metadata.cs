@@ -23,12 +23,23 @@ public sealed partial class GuestImageCache
         }
 
         _dccClearCounts[(int)DccClearCount.Dcc]++;
+        if (!DccClearTimed)
+        {
+            MaterializeDccClearCore(imageIdentifier, request, metadataBaseLayer);
+            return;
+        }
+
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var cleared = _dccClearCounts[(int)DccClearCount.Cleared];
         MaterializeDccClearCore(imageIdentifier, request, metadataBaseLayer);
         var ticks = System.Diagnostics.Stopwatch.GetTimestamp() - started;
         _dccClearCounts[cleared == _dccClearCounts[(int)DccClearCount.Cleared] ? (int)DccClearCount.NoClearTicks : (int)DccClearCount.ClearTicks] += ticks;
     }
+
+    // [local] SHARPEMU_DCC_CLEAR_TIMING_GATE (on by default, =0 off): the two timestamps per DCC lookup feed only the
+    // [PERF][DCC_CLEAR] times, printed with the render profile; without it they are not taken.
+    private static readonly bool DccClearTimed =
+        Environment.GetEnvironmentVariable("SHARPEMU_DCC_CLEAR_TIMING_GATE") == "0" || SharpEmu.Libs.VideoOut.RenderPhaseProfile.Enabled;
 
     // [local] SHARPEMU_DCC_CLEAR_LEAN (on by default): the slices' keys are read first, and only when one decodes to a
     // clear does the lookup rent the scan buffer and run the scan-and-clear loop, which reads the keys again. Lookups

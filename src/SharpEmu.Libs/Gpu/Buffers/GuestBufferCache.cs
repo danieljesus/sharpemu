@@ -158,10 +158,37 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private readonly SpanSet _everGpuWritten = new();
     private readonly ReaderWriterLockSlim _everGpuWrittenLock = new();
 
+    // [local] SHARPEMU_EVER_WRITTEN_FAST (on by default, =0 off): the thread that adds to the set asks Contains without
+    // the lock. Only that thread modifies the set (every other thread only reads it under the read lock), so its own
+    // unlocked read sees the set exactly as the locked one would. Another thread still takes the locked path.
+    private static readonly bool EverWrittenFast = Environment.GetEnvironmentVariable("SHARPEMU_EVER_WRITTEN_FAST") != "0";
+    private int _everGpuWrittenWriter;
+
     private void NoteEverGpuWritten(ulong guestAddress, ulong size)
     {
         if (size == 0)
             return;
+        if (EverWrittenFast)
+        {
+            var thread = Environment.CurrentManagedThreadId;
+            var writer = Volatile.Read(ref _everGpuWrittenWriter);
+            if (writer == 0)
+            {
+                var previous = Interlocked.CompareExchange(ref _everGpuWrittenWriter, thread, 0);
+                writer = previous == 0 ? thread : previous;
+            }
+            if (writer == thread)
+            {
+                if (_everGpuWritten.Contains(guestAddress, size))
+                    return;
+            }
+            else if (writer != -1 && Interlocked.Exchange(ref _everGpuWrittenWriter, -1) != -1)
+            {
+                // A second writer thread: the unlocked read is no longer exact, so it stops for good.
+                Console.Error.WriteLine($"[GPU][WARN] SHARPEMU_EVER_WRITTEN_FAST: a second thread ({thread}) adds GPU-written ranges; the unlocked check is off.");
+            }
+        }
+
         _everGpuWrittenLock.EnterUpgradeableReadLock();
         try
         {
@@ -626,7 +653,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return FormattableString.Invariant(
             $"[PERF][BUFFER_OBTAIN] stream={counts[0]} stream_prefound={counts[1]} stream_failed={counts[2]} cached_prefound={counts[3]} cached_lookup={counts[4]} cached_stream_candidate={counts[5]} ") +
             FormattableString.Invariant($"written={counts[6]} written_memo_hits={counts[7]} written_memo_verified={counts[8]} written_memo_mismatches={counts[9]} written_memo_mismatches_total={Interlocked.Read(ref _writtenMemoMismatchTotal)}") +
-            FormattableString.Invariant($" cp_writes={Interlocked.Exchange(ref _cpWrites, 0)} cp_bytes={Interlocked.Exchange(ref _cpBytes, 0)} cp_consecutive={Interlocked.Exchange(ref _cpConsecutive, 0)} cp_adjacent={Interlocked.Exchange(ref _cpAdjacent, 0)} cp_same_range={Interlocked.Exchange(ref _cpSameRange, 0)} cp_same_range_any={Interlocked.Exchange(ref _cpSameRangeAny, 0)}");
+            FormattableString.Invariant($" cp_writes={Interlocked.Exchange(ref _cpWrites, 0)} cp_bytes={Interlocked.Exchange(ref _cpBytes, 0)} cp_consecutive={Interlocked.Exchange(ref _cpConsecutive, 0)} cp_adjacent={Interlocked.Exchange(ref _cpAdjacent, 0)} cp_same_range={Interlocked.Exchange(ref _cpSameRange, 0)} cp_same_range_any={Interlocked.Exchange(ref _cpSameRangeAny, 0)}") +
+            " " + TakeTexelCleanReport();
     }
 
     // [local] SHARPEMU_WRITTEN_OBTAIN_MEMO (idea from a Kyty fork, todojuegos67-bot c128d6b9): a written, unformatted
@@ -3427,7 +3455,29 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         profileScope.SwitchPhase(isWritten
             ? RenderPhaseProfile.Phase.BufferDirtySyncWritten
             : isTexelBuffer ? RenderPhaseProfile.Phase.BufferDirtySyncTexel : RenderPhaseProfile.Phase.BufferDirtySyncUpload);
+        // [local] SHARPEMU_TEXEL_CLEAN_SKIP (1 by default, =2 verify, =0 off): a texel read of a range without CPU-dirty
+        // pages takes the same shortcut as any other read (first test above) for its upload, which has nothing to
+        // copy, and still synchronizes from an image below. =2 runs the upload anyway and counts the ones that copied.
+        var texelClean = TexelCleanSkipMode != 0 && isTexelBuffer && !isWritten && !preserveCpuWriteHotPages &&
+            !_tracker.MayHaveCpuDirtyPages(guestAddress, size);
+        if (texelClean && TexelCleanSkipMode != 2)
+        {
+            _texelCleanSkips++;
+            return SynchronizeTexelFromImage(buffer, guestAddress, size);
+        }
+
         var collection = CollectUploadRanges(buffer, guestAddress, size, isWritten, preserveCpuWriteHotPages);
+        if (texelClean)
+        {
+            _texelCleanChecked++;
+            if (collection.Source != null || collection.Collected.Count != 0)
+            {
+                _texelCleanMismatches++;
+                if (_texelCleanLogs++ < 20)
+                    Console.Error.WriteLine($"[GPU][TEXEL_CLEAN_MISMATCH] range=0x{guestAddress:X}+0x{size:X} copies={collection.Collected.Count} bytes=0x{collection.CollectedSize:X}");
+            }
+        }
+
         try
         {
             var copies = collection.Collected;
@@ -3494,18 +3544,33 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (isTexelBuffer)
         {
-            var copiedFromImage = RequireImageCache().TrySynchronizeBufferFromImage(buffer, guestAddress, size);
-            if (copiedFromImage) GuestGpuMemoryHook.Trace(guestAddress, size, $"host-copy-from-image submission_tick={_scheduler.CurrentTick}"); // [local]
-            if (copiedFromImage)
-            {
-                buffer.NoteGpuWrite(buffer.Offset(guestAddress), size);
-            }
-
-            return copiedFromImage;
+            return SynchronizeTexelFromImage(buffer, guestAddress, size);
         }
 
         return false;
     }
+
+    private bool SynchronizeTexelFromImage(GpuBuffer buffer, ulong guestAddress, ulong size)
+    {
+        var copiedFromImage = RequireImageCache().TrySynchronizeBufferFromImage(buffer, guestAddress, size);
+        if (copiedFromImage) GuestGpuMemoryHook.Trace(guestAddress, size, $"host-copy-from-image submission_tick={_scheduler.CurrentTick}"); // [local]
+        if (copiedFromImage)
+        {
+            buffer.NoteGpuWrite(buffer.Offset(guestAddress), size);
+        }
+
+        return copiedFromImage;
+    }
+
+    internal static readonly int TexelCleanSkipMode =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TEXEL_CLEAN_SKIP"), out var texelSkip) ? texelSkip : 1;
+    private static long _texelCleanSkips, _texelCleanChecked, _texelCleanMismatches;
+    private static int _texelCleanLogs;
+
+    // [local] SHARPEMU_TEXEL_CLEAN_SKIP: skips, verified and mismatched texel uploads since the last report; the
+    // mismatch total is kept.
+    internal static string TakeTexelCleanReport() => FormattableString.Invariant(
+        $"texel_clean_skips={Interlocked.Exchange(ref _texelCleanSkips, 0)} texel_clean_checked={Interlocked.Exchange(ref _texelCleanChecked, 0)} texel_clean_mismatches_total={Interlocked.Read(ref _texelCleanMismatches)}");
 
     private GpuBuffer? FindOwner(ulong guestAddress, ulong size)
     {

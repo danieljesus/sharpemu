@@ -274,6 +274,42 @@ internal static unsafe partial class VulkanVideoPresenter
             if (Render2Probe.Enabled) Render2Probe.NoteMappedReset(); // [local]
             _mappedSizes?.Clear();
             _mappedSizesGeneration = _guestMemory.MappingGeneration;
+            _mappedEpoch++;
+        }
+
+        // [local] SHARPEMU_BUFFER_SIZE_REUSE (1 by default, =2 verify, =0 off): BindStorageBuffer takes the size FindBuffers
+        // clamped for the same descriptor in the same preparation instead of asking ClampMappedSize again. Both calls
+        // answer from the same memo while the epoch (bumped by every reset of the per-frame answers) and the mapping
+        // generation are those of the first call; otherwise the size is clamped again. =2 clamps again every time and
+        // counts the reused sizes that differ.
+        internal static readonly int BufferSizeReuseMode =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BUFFER_SIZE_REUSE"), out var reuseMode) ? reuseMode : 1;
+        private long _mappedEpoch;
+        internal static readonly bool MappedSizeSingle = Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_SIZE_SINGLE") != "0";
+        private static int _sizeReuseLogs;
+
+        private ulong ReuseClampedSize(ulong address, ulong requested, ulong clampedSize)
+        {
+            if (clampedSize == 0 || _guestMemory.MappingGeneration != _mappedSizesGeneration || _mappedSizesGeneration == long.MinValue)
+            {
+                return ClampMappedSize(address, requested);
+            }
+
+            if (BufferSizeReuseMode != 2)
+            {
+                return clampedSize;
+            }
+
+            Render2Probe.SizeReuseChecked++;
+            var check = ClampMappedSize(address, requested);
+            if (check != clampedSize)
+            {
+                Render2Probe.SizeReuseMismatches++;
+                if (_sizeReuseLogs++ < 20)
+                    Console.Error.WriteLine($"[BUFFER_SIZE_REUSE_MISMATCH] address=0x{address:X} requested=0x{requested:X} reused=0x{clampedSize:X} now=0x{check:X}");
+            }
+
+            return check;
         }
 
         // [local] SHARPEMU_MAPPED_SIZE_KEEP (1 by default, =2 verify, =0 off): a range found mapped in full stays known across
@@ -297,6 +333,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (generation != _mappedSizesGeneration)
             {
+                if (Render2Probe.Enabled) Render2Probe.MappedGenerationChanges++; // [local]
                 ResetMappedSizes();
             }
 
@@ -347,7 +384,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (Render2Probe.Enabled) Render2Probe.NoteMapped(false); // [local]
             mapped = ClampMappedSizeCore(address, size, prepared, bufferIndex);
-            sizes[(address, size)] = mapped;
+            // [local] SHARPEMU_MAPPED_SIZE_SINGLE (on by default, =0 off): a full answer is kept in the fully-mapped set
+            // only, which every call asks first; the per-frame map holds the clamped ones. A full answer the set
+            // dropped at its size limit is computed again, unchanged while the mapping generation stays.
+            if (fullyMapped is null || mapped != size || !MappedSizeSingle)
+                sizes[(address, size)] = mapped;
             if (fullyMapped is not null && mapped == size) // [local] SHARPEMU_MAPPED_SIZE_KEEP
             {
                 if (fullyMapped.Count >= MaxFullyMapped)

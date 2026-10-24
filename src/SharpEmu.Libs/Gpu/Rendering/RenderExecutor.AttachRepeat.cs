@@ -41,13 +41,24 @@ public sealed partial class RenderExecutor
     internal static readonly long[] InputMisses = new long[2];
     public static Func<string>? HostMissReport { get; set; }
     private static long _attachDraws, _attachWindow = System.Diagnostics.Stopwatch.GetTimestamp();
+    // [local] SHARPEMU_ATTACH_REPORT_TICK (on by default, =0 off): the per-draw check for the 5 s report reads the
+    // millisecond tick count instead of the performance counter; the window is still timed with the counter.
+    private static readonly bool AttachReportTick = Environment.GetEnvironmentVariable("SHARPEMU_ATTACH_REPORT_TICK") != "0";
+    private static long _attachWindowTick = Environment.TickCount64;
 
     private static void ReportAttachRepeat()
     {
         _attachDraws++;
+        if (AttachReportTick)
+        {
+            if (Environment.TickCount64 - _attachWindowTick < 5000)
+                return;
+            _attachWindowTick = Environment.TickCount64;
+        }
+
         var now = System.Diagnostics.Stopwatch.GetTimestamp();
         var seconds = (now - _attachWindow) / (double)System.Diagnostics.Stopwatch.Frequency;
-        if (seconds < 5)
+        if (seconds < 5 && !AttachReportTick)
             return;
         Console.Error.WriteLine(FormattableString.Invariant(
             $"[ATTACH_REPEAT] window_s={seconds:F1} draws={_attachDraws} repeats={AttachRepeatHits} ({100.0 * AttachRepeatHits / Math.Max(1, _attachDraws):F1}%) checked={AttachRepeatChecked} mismatches={AttachRepeatMismatches} mismatches_total={AttachRepeatMismatchTotal} generation={GuestImageCache.StateGeneration} no_record={InputMisses[0]} other_targets={InputMisses[1]} host=[{HostMissReport?.Invoke()}]"));

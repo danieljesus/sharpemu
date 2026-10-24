@@ -9,6 +9,11 @@ public sealed class SpanSet
 
     public bool IsEmpty => _spans.Count == 0;
 
+    // [local] SHARPEMU_SPANSET_ADD_CONTAINED (on by default, =0 off): adding a range one span already holds leaves the
+    // set as it was. Spans never touch (Add merges touching ones, Remove only widens gaps), so the merge loop below
+    // would remove that one span and insert it again unchanged: two array shifts of the whole list.
+    internal static readonly bool AddContainedShortcut = Environment.GetEnvironmentVariable("SHARPEMU_SPANSET_ADD_CONTAINED") != "0";
+
     public void Add(ulong address, ulong size)
     {
         ValidateRange(address, size);
@@ -16,6 +21,11 @@ public sealed class SpanSet
         var end = address + size;
 
         var index = UpperBound(start);
+        if (AddContainedShortcut && index > 0 && _spans.GetValueAtIndex(index - 1) >= end)
+        {
+            return;
+        }
+
         if (index > 0 && _spans.GetValueAtIndex(index - 1) >= start)
         {
             index--;

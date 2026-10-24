@@ -599,12 +599,16 @@ public sealed unsafe partial class GuestImageCache
         _tiler.TileImage(image, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(color.Regions), destination.Handle, destinationOffset, destinationSize, color.LinearSize, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(color.Tiles), swap);
     }
 
+    private readonly List<ResourceSlotIdentifier> _bufferSyncMatches = new();
+
     // Copies image data into the buffer without transferring GPU ownership to the buffer.
     public bool TrySynchronizeBufferFromImage(GpuBuffer buffer, ulong address, ulong size)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageDownload);
         using var held = _lock.Hold();
-        var matches = new List<ResourceSlotIdentifier>();
+        // [local] One list reused under the cache lock instead of a new one per texel buffer synchronization.
+        var matches = _bufferSyncMatches;
+        matches.Clear();
         foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: false))
         {
             var owner = _slots.TryGet(imageIdentifier);

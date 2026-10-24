@@ -35,7 +35,7 @@ internal static unsafe partial class VulkanVideoPresenter
             public readonly RenderScratchPool<Sampler> Samplers = new();
             public readonly RenderScratchPool<uint> ShaderData = new();
             public readonly RenderScratchPool<BufferView> Buffers = new();
-            public readonly RenderScratchPool<(BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer)> Sources = new();
+            public readonly RenderScratchPool<(BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer, ulong Size)> Sources = new();
             // [local] SHARPEMU_RENDER_POOLS: the stage objects and image bindings of closed preparations.
             public readonly Stack<PreparedStageBindings> Stages = new();
             public readonly Stack<TextureResource> Textures = new();
@@ -90,6 +90,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _program = program;
                 Descriptors.Reset();
                 BufferSources = [];
+                MappedEpoch = long.MinValue;
                 ShaderData = [];
                 ImagesPrepared = false;
             }
@@ -111,7 +112,10 @@ internal static unsafe partial class VulkanVideoPresenter
 
             public StageDescriptors Descriptors { get; } = new();
 
-            public (BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer)[] BufferSources { get; set; } = [];
+            public (BufferDescriptorWords Descriptor, ResourceSlotIdentifier Buffer, ulong Size)[] BufferSources { get; set; } = [];
+
+            // [local] SHARPEMU_BUFFER_SIZE_REUSE: the mapped-size epoch the sizes in BufferSources were clamped in.
+            public long MappedEpoch { get; set; } = long.MinValue;
 
             public uint[] ShaderData { get; set; } = [];
 
@@ -639,12 +643,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (descriptor.Address == 0 || requested == 0)
                 {
                     if (ResolveProfile.Enabled) ResolveProfile.CountNullBuffer(); // [local]
-                    sources[index] = (descriptor, default);
+                    sources[index] = (descriptor, default, 0);
                     continue;
                 }
 
                 var size = ClampMappedSize(descriptor.Address, requested, prepared, index);
-                sources[index] = (descriptor, _bufferCache.FindBuffer(descriptor.Address, size));
+                sources[index] = (descriptor, _bufferCache.FindBuffer(descriptor.Address, size), size);
                 ProbeBvhRefitBuffer(program.Hash, index, descriptor, requested, size, prepared);
             }
 
@@ -656,6 +660,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             prepared.BufferSources = sources;
+            prepared.MappedEpoch = _mappedEpoch;
         }
 
         // [local] Prints the resolved buffers of GTA V's BVH refit (0x5981...) for the first dispatches,
@@ -1155,6 +1160,7 @@ internal static unsafe partial class VulkanVideoPresenter
             ShaderProgramInfo program,
             int slot,
             ResourceSlotIdentifier bufferIdentifier,
+            ulong clampedSize,
             out uint memoryOffset)
         {
             memoryOffset = 0;
@@ -1165,7 +1171,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return NullStorageBuffer();
             }
 
-            var size = ClampMappedSize(address, requested);
+            var size = ReuseClampedSize(address, requested, clampedSize);
             var alignment = _minStorageBufferOffsetAlignment;
             var maxRange = _deviceInfo.MaxStorageBufferRange;
             if (alignment == 0 || size > maxRange)
@@ -1247,8 +1253,9 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             for (var index = 0; index < views.Length; index++)
             {
-                var (descriptor, bufferIdentifier) = prepared.BufferSources[index];
-                views[index] = BindStorageBuffer(in descriptor, info.Buffers[index], program, index, bufferIdentifier, out var memoryOffset);
+                var (descriptor, bufferIdentifier, clampedSize) = prepared.BufferSources[index];
+                views[index] = BindStorageBuffer(in descriptor, info.Buffers[index], program, index, bufferIdentifier,
+                    BufferSizeReuseMode != 0 && prepared.MappedEpoch == _mappedEpoch ? clampedSize : 0, out var memoryOffset);
                 var dword = layout.MemoryOffsetDword + (uint)index / 4;
                 var shift = ((uint)index % 4) * 8;
                 shaderData[dword] |= memoryOffset << (int)shift;

@@ -21,6 +21,8 @@ internal static class Render2Probe
     private static readonly long[] BlockedTicks = new long[(int)SpinSite.Count];
     private static long _mappedHits, _mappedMisses, _mappedResets;
     internal static long MappedKeepHits, MappedKeepChecked, MappedKeepMismatches; // SHARPEMU_MAPPED_SIZE_KEEP
+    internal static long SizeReuseChecked, SizeReuseMismatches; // SHARPEMU_BUFFER_SIZE_REUSE=2
+    internal static long MappedGenerationChanges; // generation moves the mapped-size memo saw
     private static readonly Dictionary<string, (long Count, long Ticks)> Relay = new();
 
     [ThreadStatic] private static int t_render;
@@ -92,6 +94,8 @@ internal static class Render2Probe
         _mappedHits = _mappedMisses = _mappedResets = 0;
         text.Append(CultureInfo.InvariantCulture,
             $" mapped_keep_hits={Interlocked.Exchange(ref MappedKeepHits, 0) / f:F0} mapped_keep_checked={Interlocked.Exchange(ref MappedKeepChecked, 0) / f:F0} mapped_keep_mismatches={Interlocked.Read(ref MappedKeepMismatches)}");
+        text.Append(CultureInfo.InvariantCulture,
+            $" size_reuse_checked={Interlocked.Exchange(ref SizeReuseChecked, 0) / f:F0} size_reuse_mismatches={Interlocked.Read(ref SizeReuseMismatches)} mapped_generation_changes={Interlocked.Exchange(ref MappedGenerationChanges, 0) / f:F2}");
         lock (Relay)
         {
             text.Append(" relay=[");

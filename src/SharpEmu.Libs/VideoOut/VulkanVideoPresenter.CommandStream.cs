@@ -597,7 +597,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DrawIndexed(ulong submitId, in DrawIndexedArguments arguments)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
-            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             try
             {
@@ -605,7 +605,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             finally
             {
-                Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                if (PerfDrawTiming) Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
                 if (ResolveProfile.Enabled) EndResolveDraw(in resolveToken, dispatch: false); // [local]
             }
         }
@@ -613,7 +613,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DrawAuto(ulong submitId, in DrawAutoArguments arguments)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
-            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             try
             {
@@ -621,7 +621,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             finally
             {
-                Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                if (PerfDrawTiming) Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
                 if (ResolveProfile.Enabled) EndResolveDraw(in resolveToken, dispatch: false); // [local]
             }
         }
@@ -648,7 +648,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDispatchTranslation);
-            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             try
             {
@@ -656,7 +656,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             finally
             {
-                Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                if (PerfDrawTiming) Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
                 if (ResolveProfile.Enabled) EndResolveDraw(in resolveToken, dispatch: true); // [local]
             }
         }

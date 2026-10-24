@@ -33,6 +33,53 @@ public sealed class SpanSetTests
         Assert.False(set.IsEmpty);
     }
 
+    // [local] SHARPEMU_SPANSET_ADD_CONTAINED: adding contained, touching and overlapping ranges after removals keeps
+    // the merged spans of a plain coverage model (one flag per 0x10 unit).
+    [Fact]
+    public void AddAndRemove_MatchACoverageModel()
+    {
+        const int Units = 256;
+        var random = new Random(1234);
+        var set = new SpanSet();
+        var covered = new bool[Units];
+        for (var step = 0; step < 4000; step++)
+        {
+            var start = random.Next(Units);
+            var length = 1 + random.Next(Math.Min(24, Units - start));
+            var add = random.Next(3) != 0;
+            if (add)
+            {
+                set.Add(0x1000 + (ulong)start * 0x10, (ulong)length * 0x10);
+            }
+            else
+            {
+                set.Remove(0x1000 + (ulong)start * 0x10, (ulong)length * 0x10);
+            }
+
+            Array.Fill(covered, add, start, length);
+            var expected = new List<GuestSpan>();
+            for (var unit = 0; unit < Units;)
+            {
+                if (!covered[unit])
+                {
+                    unit++;
+                    continue;
+                }
+
+                var end = unit;
+                while (end < Units && covered[end])
+                {
+                    end++;
+                }
+
+                expected.Add(new GuestSpan(0x1000 + (ulong)unit * 0x10, (ulong)(end - unit) * 0x10));
+                unit = end;
+            }
+
+            Assert.Equal(expected, Snapshot(set));
+        }
+    }
+
     [Fact]
     public void Remove_TrimsHeadTailSplitsAndClearsWhole()
     {

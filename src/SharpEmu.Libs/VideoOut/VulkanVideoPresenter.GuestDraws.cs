@@ -12,6 +12,14 @@ internal static unsafe partial class VulkanVideoPresenter
 
     private static long _perfDrawCount;
     private static long _perfDrawTicks;
+
+    // [local] SHARPEMU_DRAW_TIMING_GATE (on by default, =0 off): the draw and dispatch translations are timed (two
+    // timestamps and an interlocked add each) only when the [LOADER][PERF] line that prints their sum is on; =0 times
+    // them always, as before.
+    private static readonly bool PerfDrawTiming =
+        Environment.GetEnvironmentVariable("SHARPEMU_DRAW_TIMING_GATE") == "0" ||
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT_FPS") == "1" ||
+        Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_PERFORMANCE") == "1";
     private static long _perfPipelineCreations;
     private static long _perfSpirvCompilations;
 

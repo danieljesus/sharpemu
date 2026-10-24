@@ -367,6 +367,32 @@ public sealed class BindingLayout : IEquatable<BindingLayout>
     // [local] A plain loop: the lambda allocated a closure and a delegate on every call (three per prepared stage).
     public DescriptorBinding? Find(DescriptorBindingKind kind)
     {
+        // [local] SHARPEMU_LAYOUT_FIND_TABLE (on by default, =0 off): the first descriptor of each kind, found once per
+        // layout (its descriptors are set at construction) instead of a scan on every call (three per prepared stage).
+        if (FindTable && (uint)kind < (uint)DescriptorBindingKind.Count)
+        {
+            return (_firstOfKind ??= BuildFirstOfKind())[(int)kind];
+        }
+
+        return Scan(kind);
+    }
+
+    internal static readonly bool FindTable = Environment.GetEnvironmentVariable("SHARPEMU_LAYOUT_FIND_TABLE") != "0";
+    private DescriptorBinding?[]? _firstOfKind;
+
+    private DescriptorBinding?[] BuildFirstOfKind()
+    {
+        var table = new DescriptorBinding?[(int)DescriptorBindingKind.Count];
+        for (var kind = 0; kind < table.Length; kind++)
+        {
+            table[kind] = Scan((DescriptorBindingKind)kind);
+        }
+
+        return table;
+    }
+
+    private DescriptorBinding? Scan(DescriptorBindingKind kind)
+    {
         var descriptors = Descriptors;
         for (var index = 0; index < descriptors.Count; index++)
         {
