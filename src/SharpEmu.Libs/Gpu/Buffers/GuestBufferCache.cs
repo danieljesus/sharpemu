@@ -567,6 +567,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, size)) // [local] SHARPEMU_LABEL_PROBE
         {
             var probeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            Diagnostics.LabelTimeline.Log('g', _scheduler.CurrentTick, _scheduler.Timeline.CompletedTick, size);
             var probeResult = DownloadToCpuCore(address, size);
             if (Diagnostics.LabelPollSplit.Enabled) // [local] does the fault's page stay GPU-dirty (the guest faults again)?
                 Diagnostics.LabelPollSplit.NoteFault(probeStarted, _tracker.HasGpuDirtyPages(address & ~(TrackerLayout.PageBytes - 1), TrackerLayout.PageBytes));
@@ -1760,10 +1761,19 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
                 var waitStarted = GuestReadSplit ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 readback.Wait(pending.Ticket);
+                var timelineLabel = Diagnostics.LabelTimeline.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(guestAddress, size); // [local]
+                if (timelineLabel) Diagnostics.LabelTimeline.Log('a', _scheduler.Timeline.CompletedTick);
                 if (GuestReadSplit) NoteGuestReadSplit(relayStarted, relayEntered, waitStarted, System.Diagnostics.Stopwatch.GetTimestamp());
                 var lastAttempt = attempt >= AsyncReadbackRetries;
                 var applied = false;
-                if (!_relay.TryRunOnGpuQueue(() => applied = CompleteReadMemoryOnGpu(pending, retrySynchronously: lastAttempt)))
+                // [local] SHARPEMU_RELAY_PUMP_IN_WAITS: a completion that cannot record a synchronous retry may also run while
+                // the GPU worker waits for the GPU.
+                Action complete = () =>
+                {
+                    if (timelineLabel) Diagnostics.LabelTimeline.Log('b', _scheduler.CurrentTick);
+                    applied = CompleteReadMemoryOnGpu(pending, retrySynchronously: lastAttempt);
+                };
+                if (!(lastAttempt ? _relay.TryRunOnGpuQueue(complete) : _relay.TryRunNestableOnGpuQueue(complete)))
                 {
                     return AwaitShutdown();
                 }
@@ -2130,7 +2140,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static long _reportedRetried;
 
     public static string TakeAsyncReadbackReport() => FormattableString.Invariant(
-        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} published_pieces={Interlocked.Exchange(ref _reportedPublishedPieces, 0)} stale_pieces={Interlocked.Exchange(ref _reportedStalePieces, 0)} uniform_image_sources={TakeUniformImageSources()} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)} eager_muted={Interlocked.Exchange(ref _reportedEagerMuted, 0)}");
+        $"[PERF][ASYNC_READBACK] applied={Interlocked.Exchange(ref _reportedApplied, 0)} retried={Interlocked.Exchange(ref _reportedRetried, 0)} async_retried={Interlocked.Exchange(ref _reportedAsyncRetried, 0)} published_pieces={Interlocked.Exchange(ref _reportedPublishedPieces, 0)} stale_pieces={Interlocked.Exchange(ref _reportedStalePieces, 0)} uniform_image_sources={TakeUniformImageSources()} eager_started={Interlocked.Exchange(ref _reportedEagerStarted, 0)} eager_used={Interlocked.Exchange(ref _reportedEagerUsed, 0)} eager_stale={Interlocked.Exchange(ref _reportedEagerStale, 0)} eager_muted={Interlocked.Exchange(ref _reportedEagerMuted, 0)} pumped_in_waits={GpuWorkerRelay.TakePumpedInWaits()}");
 
     private sealed record PendingDownload
     {
@@ -2165,6 +2175,17 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var copies = CollectReadbackWindow(guestAddress, size, out var windowBegin, out var windowEnd);
+        if (Diagnostics.LabelTimeline.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(guestAddress, size)) // [local] SHARPEMU_LABEL_TIMELINE
+        {
+            ulong block = 0, precise = 0;
+            foreach (var copy in copies)
+            {
+                block = Math.Max(block, copy.Buffer.BlockWriteTick(copy.SourceOffset, copy.Size));
+                if (GpuWriteHistory.Enabled) precise = Math.Max(precise, GpuWriteHistory.LastWriteTick(copy.Address, copy.Size));
+            }
+
+            Diagnostics.LabelTimeline.Log('w', block, precise, _scheduler.CurrentTick, copies.Count);
+        }
         if (markHot && copies.Count != 0)
         {
             NoteHotReadback(guestAddress, size);

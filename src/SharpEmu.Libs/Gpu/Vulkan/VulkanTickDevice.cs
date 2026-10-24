@@ -269,11 +269,28 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         {
             // [local] A wait over GpuStallReport.TimeoutNs reports where the queues stand, then keeps waiting.
             var reports = 0;
-            while ((result = _vk.WaitSemaphores(_device, &waitInfo, GpuStallReport.TimeoutNs)) == Result.Timeout)
+            if (GpuWorkerRelay.CanPumpInWait) // [local] SHARPEMU_RELAY_PUMP_IN_WAITS: wait in slices, running nestable relay work
             {
-                if (reports++ < GpuStallReport.MaxReportsPerWait)
+                GpuWorkerRelay.PumpNestableInWait();
+                var sliced = System.Diagnostics.Stopwatch.GetTimestamp();
+                while ((result = _vk.WaitSemaphores(_device, &waitInfo, GpuWorkerRelay.PumpSliceNs)) == Result.Timeout)
                 {
-                    GpuStallReport.Report($"timeline wait over {GpuStallReport.TimeoutNs / 1_000_000_000 * (ulong)reports} s: wait_tick={tick}");
+                    GpuWorkerRelay.PumpNestableInWait();
+                    if (System.Diagnostics.Stopwatch.GetElapsedTime(sliced).TotalMilliseconds >= GpuStallReport.TimeoutMs * (reports + 1.0) &&
+                        reports++ < GpuStallReport.MaxReportsPerWait)
+                    {
+                        GpuStallReport.Report($"timeline wait over {GpuStallReport.TimeoutNs / 1_000_000_000 * (ulong)reports} s: wait_tick={tick}");
+                    }
+                }
+            }
+            else
+            {
+                while ((result = _vk.WaitSemaphores(_device, &waitInfo, GpuStallReport.TimeoutNs)) == Result.Timeout)
+                {
+                    if (reports++ < GpuStallReport.MaxReportsPerWait)
+                    {
+                        GpuStallReport.Report($"timeline wait over {GpuStallReport.TimeoutNs / 1_000_000_000 * (ulong)reports} s: wait_tick={tick}");
+                    }
                 }
             }
         }

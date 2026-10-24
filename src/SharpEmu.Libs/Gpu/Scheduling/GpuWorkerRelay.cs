@@ -13,6 +13,13 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
 
     private readonly object _gate = new();
     private readonly Queue<Action> _commands = new();
+    // [local] SHARPEMU_RELAY_PUMP_IN_WAITS: nestable work, run in order with the commands by RunPendingCommands and
+    // also by PumpNestableInWait while this worker waits for the GPU outside a relay command.
+    private readonly Queue<Action> _nestable = new();
+    private int _nestableCount;
+    private int _commandDepth;
+    private bool _pumping;
+    private static long _pumpedInWaits;
     private readonly Action _wake;
     private readonly Func<Action, Action, bool>? _tryEnqueueAfterPendingWork;
     private int _pendingCount;
@@ -70,7 +77,93 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
 
     public bool IsGpuQueueThread => _boundWorker == this;
 
-    public bool HasPendingCommands => Volatile.Read(ref _pendingCount) != 0;
+    // [local] SHARPEMU_LABEL_TIMELINE: the calling thread runs some relay's GPU queue.
+    internal static bool OnAnyGpuQueueThread => _boundWorker is not null;
+
+    public bool HasPendingCommands => Volatile.Read(ref _pendingCount) != 0 || Volatile.Read(ref _nestableCount) != 0;
+
+    // [local] SHARPEMU_RELAY_PUMP_IN_WAITS=1 (off by default): a guest download's completion, which records nothing, also
+    // runs while the GPU worker waits for the GPU (timeline and readback waits, which then wait in 0.2 ms slices),
+    // unless the wait is inside a relay command. The guest thread that faulted no longer waits for the worker to
+    // finish its own wait.
+    internal static readonly bool PumpInWaits = Environment.GetEnvironmentVariable("SHARPEMU_RELAY_PUMP_IN_WAITS") == "1";
+
+    internal static bool CanPumpInWait => PumpInWaits && _boundWorker is { _commandDepth: 0, _pumping: false };
+
+    internal const ulong PumpSliceNs = 200_000;
+
+    internal static long TakePumpedInWaits() => Interlocked.Exchange(ref _pumpedInWaits, 0);
+
+    // Runs the queued nestable work of this thread's relay; false when there was none or pumping is not allowed here.
+    internal static bool PumpNestableInWait()
+    {
+        if (!CanPumpInWait || _boundWorker is not { } worker || Volatile.Read(ref worker._nestableCount) == 0)
+        {
+            return false;
+        }
+
+        worker._pumping = true;
+        try
+        {
+            var ran = false;
+            while (worker.TryTakeNestable(out var work))
+            {
+                work();
+                ran = true;
+                Interlocked.Increment(ref _pumpedInWaits);
+            }
+
+            return ran;
+        }
+        finally
+        {
+            worker._pumping = false;
+        }
+    }
+
+    private bool TryTakeNestable(out Action work)
+    {
+        lock (_gate)
+        {
+            if (_nestable.Count == 0)
+            {
+                work = null!;
+                return false;
+            }
+
+            work = _nestable.Dequeue();
+            Interlocked.Decrement(ref _nestableCount);
+            return true;
+        }
+    }
+
+    public bool TryRunNestableOnGpuQueue(Action work)
+    {
+        if (!PumpInWaits || IsGpuQueueThread)
+        {
+            return TryRunOnGpuQueue(work);
+        }
+
+        using var done = new SemaphoreSlim(0);
+        lock (_gate)
+        {
+            if (!_accepting)
+            {
+                return false;
+            }
+
+            _nestable.Enqueue(() =>
+            {
+                work();
+                done.Release();
+            });
+            Interlocked.Increment(ref _nestableCount);
+        }
+
+        _wake();
+        done.Wait();
+        return true;
+    }
 
     public void BindCurrentThread() => _boundWorker = this;
 
@@ -114,7 +207,7 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
         }
 
         var ran = false;
-        while (HasPendingCommands)
+        while (Volatile.Read(ref _pendingCount) != 0)
         {
             Action command;
             lock (_gate)
@@ -123,20 +216,34 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
                 Interlocked.Decrement(ref _pendingCount);
             }
 
-            if (VideoOut.Render2Probe.Enabled) // [local] SHARPEMU_RENDER2_PROBE
+            _commandDepth++;
+            try
             {
-                var started = System.Diagnostics.Stopwatch.GetTimestamp();
-                command();
-                Delegate named = command;
-                if (command.Target?.GetType().GetField("work")?.GetValue(command.Target) is Delegate inner)
-                    named = inner;
-                VideoOut.Render2Probe.NoteRelay(named, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                if (VideoOut.Render2Probe.Enabled) // [local] SHARPEMU_RENDER2_PROBE
+                {
+                    var started = System.Diagnostics.Stopwatch.GetTimestamp();
+                    command();
+                    Delegate named = command;
+                    if (command.Target?.GetType().GetField("work")?.GetValue(command.Target) is Delegate inner)
+                        named = inner;
+                    VideoOut.Render2Probe.NoteRelay(named, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                }
+                else
+                {
+                    command();
+                }
             }
-            else
+            finally
             {
-                command();
+                _commandDepth--;
             }
 
+            ran = true;
+        }
+
+        while (TryTakeNestable(out var work))
+        {
+            work();
             ran = true;
         }
 

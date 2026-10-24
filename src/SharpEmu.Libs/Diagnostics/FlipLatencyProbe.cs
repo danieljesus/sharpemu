@@ -35,6 +35,7 @@ internal static class FlipLatencyProbe
 
     public static void Reserved(ulong requestId)
     {
+        LabelTimeline.Log('V', requestId);
         lock (Gate)
         {
             var depth = 0;
@@ -75,6 +76,7 @@ internal static class FlipLatencyProbe
 
     public static void Presented(ulong requestId, long openedAt, long flipInterval)
     {
+        LabelTimeline.Log('P', requestId);
         lock (Gate)
         {
             if (!Open.Remove(requestId, out var flip)) return;

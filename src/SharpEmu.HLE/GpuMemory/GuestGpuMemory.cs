@@ -18,6 +18,10 @@ public interface IGpuQueueRelay
     bool TryRunOnGpuQueue(Action work);
 
     bool TryRunAfterPendingWork(Action work) => TryRunOnGpuQueue(work);
+
+    // [local] SHARPEMU_RELAY_PUMP_IN_WAITS: work that records no GPU commands and may also run while the GPU worker
+    // waits for the GPU outside any relay command. Return after it completes.
+    bool TryRunNestableOnGpuQueue(Action work) => TryRunOnGpuQueue(work);
 }
 
 public sealed class GuestGpuMemory : IDisposable

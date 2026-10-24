@@ -88,6 +88,7 @@ public sealed class CommandSubmission
             ProbeGfxAtCreate = Diagnostics.LabelLatencyProbe.SliceTicks(0);
             ProbeComputeAtCreate = Diagnostics.LabelLatencyProbe.SliceTicks(1);
         }
+        if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.Log('Q', (ulong)queueId, dwordCount); // [local] SHARPEMU_LABEL_TIMELINE
         Kind = kind;
         QueueId = queueId;
         Address = address;

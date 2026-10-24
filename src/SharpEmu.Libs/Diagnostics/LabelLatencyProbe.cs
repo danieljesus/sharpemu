@@ -104,6 +104,7 @@ internal static class LabelLatencyProbe
             split.T1 = now;
             split.Value = BitConverter.ToUInt64(label);
             split.Opcode = opcode;
+            LabelTimeline.Log('F', split.Value, opcode);
             FrontPending.Enqueue(split);
         }
     }
@@ -116,6 +117,7 @@ internal static class LabelLatencyProbe
             if (!FrontPending.TryDequeue(out var write)) return;
             write.T2 = Stopwatch.GetTimestamp();
             write.Tick = tick;
+            LabelTimeline.Log('R', tick, write.Value);
             Applied.Add(write);
         }
     }
@@ -125,6 +127,7 @@ internal static class LabelLatencyProbe
         var slot = (int)(tick & (TickRing - 1));
         SubmittedAt[slot] = Stopwatch.GetTimestamp();
         Volatile.Write(ref SubmittedTick[slot], tick);
+        LabelTimeline.Log('S', tick);
     }
 
     public static void NoteCompleted(ulong counter)
@@ -139,6 +142,7 @@ internal static class LabelLatencyProbe
                 CompletedTickRing[slot] = tick;
             }
 
+            if (counter > _completedTick) LabelTimeline.Log('C', counter);
             _completedTick = Math.Max(_completedTick, counter);
             _completedAt = now;
         }
@@ -151,6 +155,7 @@ internal static class LabelLatencyProbe
         lock (Gate)
         {
             Polls.Add(((now - started) * 1000.0 / Stopwatch.Frequency, (long)(current - Math.Min(current, completed))));
+            LabelTimeline.Log('G', value, current, completed, (now - started) * 1000.0 / Stopwatch.Frequency);
             for (var index = 0; index < Applied.Count; index++)
             {
                 var write = Applied[index];

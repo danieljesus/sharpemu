@@ -243,11 +243,28 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             {
                 var reports = 0;
                 Result result;
-                while ((result = vk.WaitSemaphores(_device.Device, &waitInfo, GpuStallReport.TimeoutNs)) == Result.Timeout)
+                if (GpuWorkerRelay.CanPumpInWait) // [local] SHARPEMU_RELAY_PUMP_IN_WAITS: wait in slices, running nestable relay work
                 {
-                    if (reports++ < GpuStallReport.MaxReportsPerWait)
+                    GpuWorkerRelay.PumpNestableInWait();
+                    var sliced = System.Diagnostics.Stopwatch.GetTimestamp();
+                    while ((result = vk.WaitSemaphores(_device.Device, &waitInfo, GpuWorkerRelay.PumpSliceNs)) == Result.Timeout)
                     {
-                        ReportStall(ticket, reports);
+                        GpuWorkerRelay.PumpNestableInWait();
+                        if (System.Diagnostics.Stopwatch.GetElapsedTime(sliced).TotalMilliseconds >= GpuStallReport.TimeoutMs * (reports + 1.0) &&
+                            reports++ < GpuStallReport.MaxReportsPerWait)
+                        {
+                            ReportStall(ticket, reports);
+                        }
+                    }
+                }
+                else
+                {
+                    while ((result = vk.WaitSemaphores(_device.Device, &waitInfo, GpuStallReport.TimeoutNs)) == Result.Timeout)
+                    {
+                        if (reports++ < GpuStallReport.MaxReportsPerWait)
+                        {
+                            ReportStall(ticket, reports);
+                        }
                     }
                 }
 
@@ -255,6 +272,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             }
             if (VideoOut.Render2Probe.Enabled) VideoOut.Render2Probe.NoteBlocked(VideoOut.Render2Probe.SpinSite.Readback, System.Diagnostics.Stopwatch.GetTimestamp() - probeStart); // [local]
             VideoOut.RenderWaitProbe.Record("readback", probeStart, (long)ticket.WaitTick - (long)probeCompleted);
+            if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.NoteWait(probeStart, ticket.WaitTick, 1, Scheduling.GpuWorkerRelay.OnAnyGpuQueueThread); // [local]
         }
         finally
         {

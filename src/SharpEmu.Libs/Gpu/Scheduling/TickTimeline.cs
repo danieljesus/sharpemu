@@ -77,7 +77,9 @@ public sealed class TickTimeline
         }
 
         var probeStart = WaitProbe ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        var timelineStart = Diagnostics.LabelTimeline.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
         var waited = _device.TryWaitTimeline(tick, out var failure);
+        if (timelineStart != 0) Diagnostics.LabelTimeline.NoteWait(timelineStart, tick, 0, GpuWorkerRelay.OnAnyGpuQueueThread); // [local]
         if (WaitProbe) RecordWait(tick, probeStart); // [local]
         if (!waited)
         {

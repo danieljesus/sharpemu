@@ -107,6 +107,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void RenderCore()
         {
             using var profileScope = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Unattributed);
+            Diagnostics.LabelTimeline.Log('K', 0); // [local] SHARPEMU_LABEL_TIMELINE
             RenderDocCapture.DiscardTimedOutFrame();
 
             if (Volatile.Read(ref _presenterCloseRequested))
@@ -162,6 +163,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 FlushBatchedGuestCommands();
             }
+            Diagnostics.LabelTimeline.Log('K', 2); // [local]
 
             PerfOverlay.SetGuestCacheStatistics(
                 _bufferCache.TotalUsedMemory, _imageCache.TotalUsedMemory, _deviceInfo.LiveAllocations, _deviceInfo.PeakAllocations);
@@ -325,6 +327,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
 
+            Diagnostics.LabelTimeline.Log('K', 4); // [local]
             uint imageIndex;
             Result acquireResult;
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Acquire))
@@ -468,6 +471,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
+            Diagnostics.LabelTimeline.Log('K', 6); // [local]
             recreateAfterPresent |= presentResult == Result.SuboptimalKhr;
             VideoOutExports.ReportPresentedFrame();
             PerfOverlay.RecordPresent();
