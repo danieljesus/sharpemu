@@ -1053,17 +1053,18 @@ public sealed class ResourceMaterializationCache
 
     // [local] SHARPEMU_VALIDATE_IN_PLACE (=1 on, =2 verify, 0 off): a recorded range of InPlaceMinBytes or more is compared
     // with the guest bytes where they lie (the reader's own ownership checks first) instead of copied out and compared;
-    // equal ranges skip the copy, anything else takes the copy path unchanged. =2 also takes the copy path after every
+    // an equal range skips the copy, a different one of an entry without word patches fails as the copy would, and
+    // anything else takes the copy path unchanged. =2 also takes the copy path after every
     // in-place verdict and counts a different verdict as a race when a second in-place compare agrees with the copy
     // (the memory changed in between), else as a mismatch.
     public static readonly int ValidateInPlaceMode =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_VALIDATE_IN_PLACE"), out var inPlaceMode) ? inPlaceMode : 0;
     private const int InPlaceMinBytes = 4096;
-    private static long _inPlaceCompared, _inPlaceEqual, _inPlaceUnhandled, _inPlaceKb, _inPlaceChecked, _inPlaceRaces, _inPlaceMismatches, _inPlaceMismatchTotal;
+    private static long _inPlaceCompared, _inPlaceEqual, _inPlaceStale, _inPlaceUnhandled, _inPlaceUnhandledFront, _inPlaceKb, _inPlaceChecked, _inPlaceRaces, _inPlaceMismatches, _inPlaceMismatchTotal;
     private static int _inPlaceMismatchLogs;
 
     private static string TakeInPlaceReport() => ValidateInPlaceMode == 0 ? string.Empty :
-        $" in_place_compared={Interlocked.Exchange(ref _inPlaceCompared, 0)} in_place_equal={Interlocked.Exchange(ref _inPlaceEqual, 0)} in_place_unhandled={Interlocked.Exchange(ref _inPlaceUnhandled, 0)} in_place_kb={Interlocked.Exchange(ref _inPlaceKb, 0)} in_place_checked={Interlocked.Exchange(ref _inPlaceChecked, 0)} in_place_races={Interlocked.Exchange(ref _inPlaceRaces, 0)} in_place_mismatches={Interlocked.Exchange(ref _inPlaceMismatches, 0)} in_place_mismatches_total={Interlocked.Read(ref _inPlaceMismatchTotal)}";
+        $" in_place_compared={Interlocked.Exchange(ref _inPlaceCompared, 0)} in_place_equal={Interlocked.Exchange(ref _inPlaceEqual, 0)} in_place_stale={Interlocked.Exchange(ref _inPlaceStale, 0)} in_place_unhandled={Interlocked.Exchange(ref _inPlaceUnhandled, 0)} in_place_unhandled_front={Interlocked.Exchange(ref _inPlaceUnhandledFront, 0)} in_place_kb={Interlocked.Exchange(ref _inPlaceKb, 0)} in_place_checked={Interlocked.Exchange(ref _inPlaceChecked, 0)} in_place_races={Interlocked.Exchange(ref _inPlaceRaces, 0)} in_place_mismatches={Interlocked.Exchange(ref _inPlaceMismatches, 0)} in_place_mismatches_total={Interlocked.Read(ref _inPlaceMismatchTotal)}";
 
     private static void CheckInPlace(bool equal, ResidentGuestBytesComparer comparer, ulong address, ReadOnlySpan<byte> current,
         ReadOnlySpan<byte> cached, bool readable, bool clean)
@@ -1106,6 +1107,8 @@ public sealed class ResourceMaterializationCache
                 if (!inPlace)
                 {
                     Interlocked.Increment(ref _inPlaceUnhandled);
+                    if (System.Threading.Thread.CurrentThread.Name == "GPU front")
+                        Interlocked.Increment(ref _inPlaceUnhandledFront);
                 }
                 else
                 {
@@ -1117,6 +1120,14 @@ public sealed class ResourceMaterializationCache
                     {
                         MaterializeSplitProfile.NoteValidatedBytes(length);
                         continue;
+                    }
+
+                    // A changed range without patchable words fails below whatever the copy holds.
+                    if (!inPlaceEqual && entry.WordPatches is null && ValidateInPlaceMode != 2 && !StaleLog)
+                    {
+                        Interlocked.Increment(ref _inPlaceStale);
+                        MaterializeSplitProfile.NoteValidatedBytes(length);
+                        return false;
                     }
                 }
             }
