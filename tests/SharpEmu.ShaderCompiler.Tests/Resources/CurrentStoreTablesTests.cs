@@ -17,6 +17,18 @@ public sealed class CurrentStoreTablesTests
 
         public bool Read(ulong address, out uint word) => Words.TryGetValue(address, out word);
 
+        public bool ReadResident(ulong address, Span<byte> destination, bool clean)
+        {
+            for (var offset = 0; offset < destination.Length; offset += 4)
+            {
+                if (!Words.TryGetValue(address + (ulong)offset, out var word))
+                    return false;
+                BitConverter.TryWriteBytes(destination[offset..], word);
+            }
+
+            return true;
+        }
+
         public void SetEntry(ulong address, ulong baseAddress, uint bytes)
         {
             Words[address] = (uint)baseAddress;
@@ -97,5 +109,88 @@ public sealed class CurrentStoreTablesTests
         Assert.Equal(1, cache.Hits);
         Assert.Equal(Ranges(first), Ranges(second));
         Assert.Equal(Ranges(Walk(plan, memory, userData)), Ranges(second));
+    }
+
+    [Fact]
+    public void ARescanOfTheSameBytesKeepsTheScansListAndAChangedByteDecodesAgain()
+    {
+        const ulong table = 0x7E2000000;
+        var plan = Plan();
+        var memory = new Memory();
+        memory.SetEntry(table, 0x10000, 0x100);
+        memory.SetEntry(table + 16, 0, 0);
+        var inputs = new ResourceRuntimeInputs
+        {
+            UserData = [unchecked((uint)table), (uint)(table >> 32), 0x20, 0],
+            ReadMemory = memory.Read,
+            ReadCleanMemory = memory.Read,
+            ReadResidentMemory = memory.ReadResident,
+        };
+        var previous = DeviceStoreTablePlanner.DiffMode;
+        DeviceStoreTablePlanner.DiffMode = 1;
+        try
+        {
+            DeviceStoreTablePlanner.Evaluate(plan, inputs, []);
+            Assert.True(DeviceStoreTablePlanner.TryGetCached(table, 0x20, out var first));
+
+            DeviceStoreTablePlanner.InvalidateTables(table + 16, 8, DeviceStoreTablePlanner.InvalidationSource.CpuFault);
+            DeviceStoreTablePlanner.Evaluate(plan, inputs, []);
+            Assert.True(DeviceStoreTablePlanner.TryGetCached(table, 0x20, out var again));
+            Assert.Same(first, again);
+
+            memory.SetEntry(table + 16, 0x30000, 0x80);
+            DeviceStoreTablePlanner.InvalidateTables(table + 16, 8, DeviceStoreTablePlanner.InvalidationSource.CpuFault);
+            var ranges = new List<DeviceAddressRange>();
+            DeviceStoreTablePlanner.Evaluate(plan, inputs, ranges);
+            Assert.True(DeviceStoreTablePlanner.TryGetCached(table, 0x20, out var changed));
+            Assert.NotSame(first, changed);
+            Assert.Contains(ranges, range => range.Base == 0x30000 && range.Size == 0x80);
+        }
+        finally
+        {
+            DeviceStoreTablePlanner.DiffMode = previous;
+        }
+    }
+
+    [Fact]
+    public void ARescanWhoseSecondChunkChangedDecodesWhatAFullScanDecodes()
+    {
+        const ulong table = 0x7E3000000;
+        const int entries = 4097; // two chunks of the bulk read
+        var plan = Plan();
+        var memory = new Memory();
+        for (var entry = 0; entry < entries; entry++)
+            memory.SetEntry(table + (ulong)entry * 16, 0, 0);
+        memory.SetEntry(table, 0x10000, 0x100);
+        var inputs = new ResourceRuntimeInputs
+        {
+            UserData = [unchecked((uint)table), (uint)(table >> 32), entries * 16, 0],
+            ReadMemory = memory.Read,
+            ReadCleanMemory = memory.Read,
+            ReadResidentMemory = memory.ReadResident,
+        };
+        var previous = DeviceStoreTablePlanner.DiffMode;
+        try
+        {
+            DeviceStoreTablePlanner.DiffMode = 1;
+            DeviceStoreTablePlanner.Evaluate(plan, inputs, []);
+
+            memory.SetEntry(table + 4096 * 16, 0x900000, 0x80);
+            DeviceStoreTablePlanner.InvalidateTables(table + 4096 * 16, 8, DeviceStoreTablePlanner.InvalidationSource.CpuFault);
+            var rescanned = new List<DeviceAddressRange>();
+            DeviceStoreTablePlanner.Evaluate(plan, inputs, rescanned);
+
+            DeviceStoreTablePlanner.InvalidateTables(table, 8, DeviceStoreTablePlanner.InvalidationSource.CpuFault);
+            DeviceStoreTablePlanner.DiffMode = 0;
+            var full = new List<DeviceAddressRange>();
+            DeviceStoreTablePlanner.Evaluate(plan, inputs, full);
+
+            Assert.Contains(rescanned, range => range.Base == 0x900000 && range.Size == 0x80);
+            Assert.Equal(full.Select(range => range with { Handle = 0 }), rescanned.Select(range => range with { Handle = 0 }));
+        }
+        finally
+        {
+            DeviceStoreTablePlanner.DiffMode = previous;
+        }
     }
 }

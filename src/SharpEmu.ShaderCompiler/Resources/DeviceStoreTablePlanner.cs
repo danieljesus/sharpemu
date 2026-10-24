@@ -26,7 +26,28 @@ public static class DeviceStoreTablePlanner
     {
         public readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Base, ulong Bytes), List<DeviceAddressRange>> Entries = new();
         public long Generation;
+        // [local] SHARPEMU_STORE_TABLE_DIFF: the bytes and ranges of the owner thread's last scan of each table, kept
+        // across drops; only the owner thread touches it.
+        public readonly Dictionary<(ulong Base, ulong Bytes), RawScan> Raw = new();
     }
+
+    private sealed class RawScan
+    {
+        public byte[] Bytes = [];
+        public byte[]? Spare;
+        public List<DeviceAddressRange>? Ranges;
+    }
+
+    // [local] SHARPEMU_STORE_TABLE_DIFF (=0 off, =1 on, the default, =2 check): a scan reads the table and compares
+    // it, chunk by chunk, with the bytes of the thread's last scan of it; when they are the same it uses that scan's
+    // ranges again: they are a pure function of the bytes, and the same list keeps the materializations that used it
+    // (GATE_TABLES=3) on their fast path. A drop still rereads every byte, as a full scan would; only the decode,
+    // sort and merge are skipped (GTA: the CPU rewrites 8 identical bytes of a 2 MB table every frame, 1.9 -> 0.33
+    // ms per rescan). Any chunk the resident reader refuses scans the table the old way. =2 decodes anyway and
+    // counts the differences.
+    internal static int DiffMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_DIFF"), out var diffMode) ? diffMode : 1;
+    private static long _diffReused, _diffDecoded, _diffRefused, _diffMismatches;
+    private const int RawScansKept = 8;
 
     [System.ThreadStatic]
     private static TableCache? _threadCache;
@@ -232,6 +253,8 @@ public static class DeviceStoreTablePlanner
     // tables scanned most often. Camera moves rescan store tables of tens of thousands of entries on the front.
     internal static readonly bool Profile = System.Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_STORE_TABLES") == "1";
     private static long _evaluated, _hits, _scans, _scanEntries, _scanTicks, _bulkChunks, _bulkFallbacks, _bulkMismatches, _bulkRaces;
+    private static long _totalScanTicks; // [local] the scan with its sort and merge
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Scans, long Ticks)> _scansByThread = new();
     private static int _bulkMismatchLogs;
     private static readonly string[] SourceNames = ["other", "cpu_fault", "cp_front", "dma_front", "cp_render", "fill_render", "copy_render"];
     private static readonly long[] _dropCalls = new long[SourceNames.Length];
@@ -254,8 +277,12 @@ public static class DeviceStoreTablePlanner
         var drops = string.Join(" ", Enumerable.Range(1, SourceNames.Length - 1).Select(index =>
             $"{SourceNames[index]}={Interlocked.Exchange(ref _drops[index], 0)}/{Interlocked.Exchange(ref _dropCalls[index], 0)}/{Interlocked.Exchange(ref _dropBytes[index], 0)}b"));
         var top = string.Join(",", keys.OrderByDescending(pair => pair.Value).Take(4).Select(pair => $"0x{pair.Key.Base:X}+0x{pair.Key.Bytes:X}:{pair.Value}"));
+        var threads = _scansByThread.ToArray();
+        foreach (var (name, _) in threads)
+            _scansByThread.TryRemove(name, out _);
+        var byThread = string.Join(",", threads.Select(pair => System.FormattableString.Invariant($"{pair.Key}:{pair.Value.Scans}/{pair.Value.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}ms")));
         return System.FormattableString.Invariant(
-            $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} bulk_races={Interlocked.Exchange(ref _bulkRaces, 0)} keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]") + FastReport();
+            $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} bulk_races={Interlocked.Exchange(ref _bulkRaces, 0)} total_ms={Interlocked.Exchange(ref _totalScanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} diff_reused={Interlocked.Exchange(ref _diffReused, 0)} diff_decoded={Interlocked.Exchange(ref _diffDecoded, 0)} diff_refused={Interlocked.Exchange(ref _diffRefused, 0)} diff_mismatches={Interlocked.Read(ref _diffMismatches)} by_thread=[{byThread}] keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]") + FastReport();
     }
 
     // [local] SHARPEMU_STORE_TABLE_BULK (1 by default, =0 turns it off): a scan reads the table in 64 KB chunks through the
@@ -466,15 +493,91 @@ public static class DeviceStoreTablePlanner
             var before = ranges.Count; // [local]
             var scanStarted = Profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var bulk = BulkMode != 0 ? inputs.ReadResidentMemory : null;
-            var chunk = bulk is null ? null : System.Buffers.ArrayPool<byte>.Shared.Rent(BulkChunkEntries * 16);
             _scanning = _usedScans is not null && _unrecordedScans; // [local] only the scan: the V# words above stay recorded
+            RawScan? raw = null; // [local] SHARPEMU_STORE_TABLE_DIFF
+            byte[]? whole = null;
+            List<DeviceAddressRange>? reuse = null, check = null;
+            if (DiffMode != 0 && BulkMode == 1 && bulk is not null && !FilterGpuWritable)
+            {
+                if (!tableCache.Raw.TryGetValue((tableBase, tableBytes), out raw))
+                {
+                    if (tableCache.Raw.Count >= RawScansKept) // up to 4 MB each: a game that moves its tables starts over
+                        tableCache.Raw.Clear();
+                    tableCache.Raw[(tableBase, tableBytes)] = raw = new RawScan();
+                }
+                var length = entries * 16;
+                var previous = raw.Ranges is not null && raw.Bytes.Length == length ? raw.Bytes : null;
+                var differs = previous is null ? 0 : -1; // the first entry of the first chunk that differs, -1 none
+                var refused = false;
+                var probe = previous is null ? null : System.Buffers.ArrayPool<byte>.Shared.Rent(BulkChunkEntries * 16);
+                try
+                {
+                    // Chunk by chunk against the previous scan: an unchanged table is read once and never copied whole.
+                    for (var first = 0; probe is not null && differs < 0 && first < entries; first += BulkChunkEntries)
+                    {
+                        var count = System.Math.Min(BulkChunkEntries, entries - first);
+                        var bytes = probe.AsSpan(0, count * 16);
+                        if (!bulk(tableBase + (ulong)first * 16, bytes, false))
+                        {
+                            refused = true;
+                            break;
+                        }
+
+                        if (!bytes.SequenceEqual(previous!.AsSpan(first * 16, count * 16)))
+                            differs = first;
+                    }
+
+                    if (!refused && differs >= 0)
+                    {
+                        whole = raw.Spare is { } spare && spare.Length == length ? spare : new byte[length];
+                        if (previous is not null)
+                            previous.AsSpan(0, differs * 16).CopyTo(whole); // the chunks just found equal
+                        for (var first = differs; first < entries; first += BulkChunkEntries)
+                        {
+                            var count = System.Math.Min(BulkChunkEntries, entries - first);
+                            if (first == differs && probe is not null)
+                                probe.AsSpan(0, count * 16).CopyTo(whole.AsSpan(first * 16));
+                            else if (!bulk(tableBase + (ulong)first * 16, whole.AsSpan(first * 16, count * 16), false))
+                            {
+                                refused = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    _scanning = false;
+                    throw;
+                }
+                finally
+                {
+                    if (probe is not null)
+                        System.Buffers.ArrayPool<byte>.Shared.Return(probe);
+                }
+
+                if (refused)
+                {
+                    whole = null;
+                    Interlocked.Increment(ref _diffRefused);
+                }
+                else if (differs < 0)
+                {
+                    if (DiffMode == 2)
+                        (check, whole) = (raw.Ranges, previous);
+                    else
+                        reuse = raw.Ranges;
+                }
+            }
+
+            var chunk = bulk is null || whole is not null ? null : System.Buffers.ArrayPool<byte>.Shared.Rent(BulkChunkEntries * 16);
             try
             {
-                for (var first = 0; first < entries; first += BulkChunkEntries)
+                for (var first = 0; reuse is null && first < entries; first += BulkChunkEntries)
                 {
                     var count = System.Math.Min(BulkChunkEntries, entries - first);
-                    var chunkBytes = chunk is null ? default : chunk.AsSpan(0, count * 16);
-                    var bulkRead = bulk is not null && bulk(tableBase + (ulong)first * 16, chunkBytes, false);
+                    var chunkBytes = whole is not null ? whole.AsSpan(first * 16, count * 16) : chunk is null ? default : chunk.AsSpan(0, count * 16);
+                    var bulkRead = whole is not null || (bulk is not null && bulk(tableBase + (ulong)first * 16, chunkBytes, false));
                     if (Profile && bulk is not null)
                         Interlocked.Increment(ref bulkRead ? ref _bulkChunks : ref _bulkFallbacks);
                     var piecesRead = false;
@@ -569,7 +672,9 @@ public static class DeviceStoreTablePlanner
                 Interlocked.Add(ref _scanTicks, System.Diagnostics.Stopwatch.GetTimestamp() - scanStarted);
                 _scannedKeys.AddOrUpdate((tableBase, tableBytes), 1, static (_, value) => value + 1);
             }
-            if (MergeGap != ulong.MaxValue && ranges.Count - before > 1) // [local] coalesce neighbouring V# ranges
+            if (reuse is not null)
+                ranges.AddRange(reuse);
+            else if (MergeGap != ulong.MaxValue && ranges.Count - before > 1) // [local] coalesce neighbouring V# ranges
             {
                 var found = ranges.GetRange(before, ranges.Count - before);
                 found.Sort((a, b) => a.Base.CompareTo(b.Base));
@@ -594,7 +699,31 @@ public static class DeviceStoreTablePlanner
 
             if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
                 System.Console.Error.WriteLine($"[STORE_TABLE_USE] hash=0x{plan.Hash:X16} thread={System.Environment.CurrentManagedThreadId} table=0x{tableBase:X} bytes=0x{tableBytes:X} scan ranges={Describe(ranges.GetRange(before, ranges.Count - before))}");
-            var scanned = ranges.GetRange(before, ranges.Count - before);
+            var scanned = reuse ?? ranges.GetRange(before, ranges.Count - before);
+            if (raw is not null)
+            {
+                if (Profile)
+                    Interlocked.Increment(ref reuse is not null ? ref _diffReused : ref _diffDecoded);
+                if (check is not null && !SameRanges(check, scanned) && Interlocked.Increment(ref _diffMismatches) <= 20)
+                    System.Console.Error.WriteLine($"[STORE_TABLE_DIFF_MISMATCH] table=0x{tableBase:X} bytes=0x{tableBytes:X} kept={Describe(check)} decoded={Describe(scanned)}");
+                if (whole is not null && reuse is null)
+                {
+                    if (!ReferenceEquals(raw.Bytes, whole))
+                    {
+                        raw.Spare = raw.Bytes.Length == whole.Length ? raw.Bytes : null;
+                        raw.Bytes = whole;
+                    }
+
+                    raw.Ranges = scanned;
+                }
+            }
+
+            if (Profile)
+            {
+                var ticks = System.Diagnostics.Stopwatch.GetTimestamp() - scanStarted;
+                Interlocked.Add(ref _totalScanTicks, ticks);
+                _scansByThread.AddOrUpdate((System.Threading.Thread.CurrentThread.Name ?? "other") + (reuse is not null ? "/reused" : ""), (1, ticks), (_, value) => (value.Scans + 1, value.Ticks + ticks));
+            }
             var committed = CommitScan(tableCache, tableBase, tableBytes, generation, scanned);
             _usedScans?.Add(new UsedScan(tableBase, tableBytes, scanned, committed));
             if (_logs++ < 40 && System.Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local]
@@ -611,6 +740,20 @@ public static class DeviceStoreTablePlanner
 
             ranges.AddRange(exact);
         }
+    }
+
+    // [local] Two scans' ranges, labels aside.
+    private static bool SameRanges(List<DeviceAddressRange> left, List<DeviceAddressRange> right)
+    {
+        if (left.Count != right.Count)
+            return false;
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (left[index] with { Handle = 0 } != right[index] with { Handle = 0 })
+                return false;
+        }
+
+        return true;
     }
 
     // Base and byte size of a buffer V#: 48-bit base, a 14-bit stride, and a record

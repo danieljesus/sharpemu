@@ -179,16 +179,17 @@ internal sealed class ShaderProgramCache
     // [local] SHARPEMU_PROGRAM_GATE_TABLES: where a plan with store tables materializes when the gate is off. A hit's
     // store-table ranges come from a scan cache whose words a cached walk does not record, so they can be older than
     // a fresh walk's; which cache serves decides how often.
-    //   0 (default): the shared cache under the gate, as before the change (the same results; the front still waits
-    //      for these few dispatches);
+    //   0: the shared cache under the gate, as before the change (the same results; the front still waits for these
+    //      few dispatches);
     //   1: the thread's cache, which refuses a hit once a scan it used was dropped (a fresh walk's result always,
     //      at the cost of rescanning the tables after every invalidation);
     //   2: the thread's cache as it is (stale more often than the shared one);
-    //   3: the thread's cache, whose entries keep none of the scanned table words and evaluate the tables again on every
-    //      hit from the thread's scan cache (a dropped scan is rescanned once, as a fresh walk would): a fresh walk's
-    //      ranges without re-walking the plan (ResourceMaterializationCache.CurrentTables).
+    //   3 (default): the thread's cache, whose entries keep none of the scanned table words and evaluate the tables
+    //      again on every hit from the thread's scan cache (a dropped scan is rescanned once, as a fresh walk would): a
+    //      fresh walk's ranges without re-walking the plan (ResourceMaterializationCache.CurrentTables). With
+    //      SHARPEMU_STORE_TABLE_DIFF the rescan of an unchanged table is a read and a compare.
     internal static readonly int StoreTableMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE_TABLES"), out var storeTableMode) ? storeTableMode : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE_TABLES"), out var storeTableMode) ? storeTableMode : 3;
     private ulong _nextProgramId;
 
     public ResourceMaterializationCache? Materializations => _materializations;
