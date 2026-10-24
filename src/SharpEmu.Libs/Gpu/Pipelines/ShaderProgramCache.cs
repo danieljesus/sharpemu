@@ -150,10 +150,12 @@ internal sealed class ShaderProgramCache
     private readonly CpuContext _context;
     private readonly IGuestGpuBackend _compiler;
     private readonly IShaderPipelineHost _host;
-    // [local] SHARPEMU_PROGRAM_GATE (1 = on): a lookup that finds its entry and permutation takes no lock. Entries and
-    // permutations are only added (under _gate), the per-lookup scratch is per thread, and each thread materializes with
-    // its own cache. 0 = the old behaviour: the caller holds the gate for the whole lookup, with one shared cache.
-    internal static readonly bool LockFreeDefault = Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE") == "1";
+    // [local] SHARPEMU_PROGRAM_GATE (on by default): a lookup that finds its entry and permutation takes no lock. Entries
+    // and permutations are only added (under _gate), the per-lookup scratch is per thread, and each thread materializes
+    // with its own cache (plans with store tables: see StoreTableMode). =0 is the old behaviour: the caller holds the gate
+    // for the whole lookup, with one shared cache. The front lost 6.4 ms/frame (static) and 7.6 (pan) waiting for the
+    // gate; static 26.81 -> 28.28 fps, pan 24.17 -> 24.31 (3 alternating pairs each).
+    internal static readonly bool LockFreeDefault = Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE") != "0";
     internal bool LockFree { get; }
     // [local] SHARPEMU_PROGRAM_GATE_VERIFY=1: every lock-free hit is looked up again under the gate the old way (shared
     // cache, the published list) and compared; ProgramGateVerify reports the differences every 20 s.
@@ -174,9 +176,16 @@ internal sealed class ShaderProgramCache
     // [local] SHARPEMU_PROGRAM_GATE: one cache per thread (a cache is not thread safe); _materializations is then only
     // used under the gate, by the verify.
     private readonly ThreadLocal<ResourceMaterializationCache>? _threadMaterializations;
-    // [local] SHARPEMU_PROGRAM_GATE_TABLE_STAMP (on by default; =0 disables): the per-thread caches refuse a hit for a
-    // plan with store tables once a table invalidation has landed since its walk (see ResourceMaterializationCache).
-    private static readonly bool StampStoreTables = Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE_TABLE_STAMP") != "0";
+    // [local] SHARPEMU_PROGRAM_GATE_TABLES: where a plan with store tables materializes when the gate is off. A hit's
+    // store-table ranges come from a scan cache whose words a cached walk does not record, so they can be older than
+    // a fresh walk's; which cache serves decides how often.
+    //   0 (default): the shared cache under the gate, as before the change (the same results; the front still waits
+    //      for these few dispatches);
+    //   1: the thread's cache, which refuses a hit once a scan it used was dropped (a fresh walk's result always,
+    //      at the cost of rescanning the tables after every invalidation);
+    //   2: the thread's cache as it is (stale more often than the shared one).
+    internal static readonly int StoreTableMode =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE_TABLES"), out var storeTableMode) ? storeTableMode : 0;
     private ulong _nextProgramId;
 
     public ResourceMaterializationCache? Materializations => _materializations;
@@ -227,7 +236,7 @@ internal sealed class ShaderProgramCache
             SynchronizeRanges = synchronizeRanges,
         }));
         _threadMaterializations = LockFree && _materializations is not null
-            ? new ThreadLocal<ResourceMaterializationCache>(static () => new(stampStoreTables: StampStoreTables))
+            ? new ThreadLocal<ResourceMaterializationCache>(static () => new(stampStoreTables: StoreTableMode == 1))
             : null;
     }
 
@@ -399,6 +408,11 @@ internal sealed class ShaderProgramCache
         }
 
         var materializations = _threadMaterializations is { } perThread ? perThread.Value : _materializations;
+        var sharedForTables = _threadMaterializations is not null && StoreTableMode == 0 && entry.Plan.DeviceStoreTables.Count != 0;
+        if (sharedForTables)
+        {
+            materializations = _materializations;
+        }
 
         var snapshot = EmptySnapshot;
         var specialization = EmptySpecialization;
@@ -425,11 +439,22 @@ internal sealed class ShaderProgramCache
             var resolveStarted = SharpEmu.Libs.VideoOut.ResolveProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var waitsBefore = resolveStarted != 0 ? SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaits : 0;
             var waitTicksBefore = resolveStarted != 0 ? SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaitTicks : 0;
-            var materialized = materializations is not null && captureIndirectImageFailure is null
-                ? materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
-                    out var materializationFailure)
-                : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
-                    captureIndirectImageFailure);
+            bool materialized;
+            ResourceMaterializationFailure materializationFailure;
+            if (sharedForTables)
+            {
+                SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
+                lock (_gate)
+                {
+                    SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.Materialize);
+                    materialized = MaterializeWith(materializations, entry, inputs, ref snapshot, ref specialization, out materializationFailure, captureIndirectImageFailure);
+                }
+            }
+            else
+            {
+                materialized = MaterializeWith(materializations, entry, inputs, ref snapshot, ref specialization, out materializationFailure, captureIndirectImageFailure);
+            }
+
             if (resolveStarted != 0)
                 SharpEmu.Libs.VideoOut.ResolveProfile.NoteMaterialize(source.Hash, System.Diagnostics.Stopwatch.GetTimestamp() - resolveStarted,
                     materializations is { } hitCache && hitCache.Hits != hitsBefore,
@@ -500,6 +525,13 @@ internal sealed class ShaderProgramCache
             return permutation.Handle;
         }
     }
+
+    private bool MaterializeWith(ResourceMaterializationCache? materializations, ProgramSourceEntry entry, ResourceRuntimeInputs inputs,
+        ref ResourceSnapshot snapshot, ref ResourceSpecialization specialization, out ResourceMaterializationFailure failure,
+        Action<IndirectImageFailure>? captureIndirectImageFailure) =>
+        materializations is not null && captureIndirectImageFailure is null
+            ? materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization, out failure)
+            : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out failure, captureIndirectImageFailure);
 
     private static ProgramKeyLookup LookupOf(ShaderSource source, List<uint> staticState) =>
         new(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, CollectionsMarshal.AsSpan(staticState));

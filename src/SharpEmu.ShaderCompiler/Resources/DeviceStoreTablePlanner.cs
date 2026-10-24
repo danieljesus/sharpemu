@@ -47,8 +47,37 @@ public static class DeviceStoreTablePlanner
 
     public static long AppliedGeneration => Interlocked.Read(ref _appliedGeneration);
 
-    // [local] Moves on every invalidation inside the table bounds: while it holds still, every cached scan holds.
-    public static long ScanGeneration => Interlocked.Read(ref _scanGeneration);
+    // [local] SHARPEMU_PROGRAM_GATE_TABLE_STAMP: the scans an evaluation took from this thread's cache, or committed to
+    // it (null when the commit lost to an invalidation), while a caller records them. A cached scan's words are not
+    // read again, so a materialization that used one holds only while the cache still holds the same scan.
+    public readonly record struct UsedScan(ulong TableBase, ulong TableBytes, List<DeviceAddressRange>? Ranges);
+
+    [System.ThreadStatic]
+    private static List<UsedScan>? _usedScans;
+
+    public static void BeginUsedScans() => (_usedScans ??= new()).Clear();
+
+    public static UsedScan[] EndUsedScans()
+    {
+        var used = _usedScans is { Count: > 0 } scans ? scans.ToArray() : [];
+        _usedScans = null;
+        return used;
+    }
+
+    public static bool ScansCurrent(UsedScan[] used)
+    {
+        if (used.Length == 0)
+            return true;
+        var cache = Cache;
+        foreach (var scan in used)
+        {
+            if (scan.Ranges is null || !cache.Entries.TryGetValue((scan.TableBase, scan.TableBytes), out var current) ||
+                !ReferenceEquals(current, scan.Ranges))
+                return false;
+        }
+
+        return true;
+    }
 
     [System.ThreadStatic]
     private static bool _usedTables;
@@ -372,6 +401,7 @@ public static class DeviceStoreTablePlanner
                 (RescanEvery == 0 || ++_uses % RescanEvery != 0)) // [local] periodic rescan
             {
                 ranges.AddRange(cached);
+                _usedScans?.Add(new UsedScan(tableBase, tableBytes, cached));
                 if (Profile)
                     Interlocked.Increment(ref _hits);
                 if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
@@ -475,7 +505,9 @@ public static class DeviceStoreTablePlanner
 
             if (TableLog && Interlocked.Increment(ref _tableLogs) <= 20000)
                 System.Console.Error.WriteLine($"[STORE_TABLE_USE] hash=0x{plan.Hash:X16} thread={System.Environment.CurrentManagedThreadId} table=0x{tableBase:X} bytes=0x{tableBytes:X} scan ranges={Describe(ranges.GetRange(before, ranges.Count - before))}");
-            CommitScan(tableCache, tableBase, tableBytes, generation, ranges.GetRange(before, ranges.Count - before));
+            var scanned = ranges.GetRange(before, ranges.Count - before);
+            var committed = CommitScan(tableCache, tableBase, tableBytes, generation, scanned);
+            _usedScans?.Add(new UsedScan(tableBase, tableBytes, committed ? scanned : null));
             if (_logs++ < 40 && System.Environment.GetEnvironmentVariable("SHARPEMU_LOG_GLOBAL_STORES") == "1") // [local]
                 System.Console.Error.WriteLine($"[STORE_TABLE] hash=0x{plan.Hash:X16} table=0x{tableBase:X} bytes=0x{tableBytes:X} ranges={ranges.Count - before} first={(ranges.Count > before ? $"0x{ranges[before].Base:X}+0x{ranges[before].Size:X}" : "-")}");
         }

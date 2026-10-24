@@ -33,12 +33,12 @@ public sealed class ResourceMaterializationCache
 
     // [local] SHARPEMU_PROGRAM_GATE's per-thread caches: the store-table ranges of a walk come from the thread's scan
     // cache, whose words the recorder does not see when the scan was cached, so an entry of a plan with store tables
-    // only serves while no table invalidation has landed since its walk (DeviceStoreTablePlanner.ScanGeneration).
+    // only serves while the thread's scan cache still holds the scans its walk used (DeviceStoreTablePlanner.UsedScan).
     private readonly bool _stampStoreTables;
 
     private bool StampsTables(ShaderResourcePlan plan) => _stampStoreTables && plan.DeviceStoreTables.Count != 0;
 
-    private static bool TablesCurrent(Entry entry, long generation) => entry.TableGeneration == generation;
+    private static bool TablesCurrent(Entry entry) => DeviceStoreTablePlanner.ScansCurrent(entry.UsedScans);
 
     private static long _totalHits;
     private static long _totalMisses;
@@ -51,7 +51,7 @@ public sealed class ResourceMaterializationCache
     private static long _totalStale;
     private static long _totalStaleUnreadable;
     private static long _totalRefreshes;
-    private static long _totalTableStale; // [local] hits refused because a store table was invalidated since the walk
+    private static long _totalTableStale; // [local] hits refused because a store-table scan they used was dropped
 
     [ThreadStatic]
     private static bool _readingTable;
@@ -96,12 +96,11 @@ public sealed class ResourceMaterializationCache
         var key = KeyOf(plan, inputs);
         var found = TryFind(key, plan, inputs, out var cached);
         var stamps = StampsTables(plan);
-        var tableGeneration = stamps ? DeviceStoreTablePlanner.ScanGeneration : 0;
         if (found && stamps)
         {
             var current = false;
             for (var variant = cached; variant is not null && !current; variant = variant.Next)
-                current = TablesCurrent(variant, tableGeneration);
+                current = TablesCurrent(variant);
             if (!current)
             {
                 Interlocked.Increment(ref _totalTableStale);
@@ -117,7 +116,7 @@ public sealed class ResourceMaterializationCache
             Entry? previous = null;
             for (var variant = cached; variant is not null; previous = variant, variant = variant.Next)
             {
-                if (!variant.Matches(plan, inputs) || (stamps && !TablesCurrent(variant, tableGeneration)))
+                if (!variant.Matches(plan, inputs) || (stamps && !TablesCurrent(variant)))
                     continue;
                 var validateStarted = MaterializeSplitProfile.Start(); // [local]
                 var validated = Validate(variant, inputs, residentReader, out var variantUnreadable);
@@ -161,11 +160,11 @@ public sealed class ResourceMaterializationCache
 
             var refreshStarted = MaterializeSplitProfile.Start(); // [local]
             Entry refreshed = null!;
-            var refreshedTable = (!stamps || TablesCurrent(cached, tableGeneration)) && cached.UserDataEquals(inputs) && TryRefreshTable(key, cached, plan, inputs, residentReader, out refreshed);
+            var refreshedTable = (!stamps || TablesCurrent(cached)) && cached.UserDataEquals(inputs) && TryRefreshTable(key, cached, plan, inputs, residentReader, out refreshed);
             MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Refresh, refreshStarted);
             if (refreshedTable)
             {
-                refreshed.TableGeneration = cached.TableGeneration;
+                refreshed.UsedScans = cached.UsedScans;
                 TableRefreshes++;
                 Interlocked.Increment(ref _totalRefreshes);
                 snapshot = refreshed.Snapshot;
@@ -178,13 +177,13 @@ public sealed class ResourceMaterializationCache
             {
                 for (var variant = cached; variant is not null && shifted is null; variant = variant.Next)
                 {
-                    if (variant.Matches(plan, inputs) && (!stamps || TablesCurrent(variant, tableGeneration)))
+                    if (variant.Matches(plan, inputs) && (!stamps || TablesCurrent(variant)))
                     {
                         var shiftStarted = MaterializeSplitProfile.Start(); // [local]
                         shifted = TryShift(variant, inputs, residentReader);
                         MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Shift, shiftStarted);
                         if (shifted is not null)
-                            shifted.TableGeneration = variant.TableGeneration;
+                            shifted.UsedScans = variant.UsedScans;
                     }
                 }
 
@@ -238,7 +237,18 @@ public sealed class ResourceMaterializationCache
                 TablePhase = recorder.TablePhase,
             };
             var walkStarted = MaterializeSplitProfile.Start(); // [local]
-            var walked = ResourceMaterializer.Materialize(plan, recording, ref snapshot, ref specialization, out failure);
+            if (stamps)
+                DeviceStoreTablePlanner.BeginUsedScans();
+            bool walked;
+            DeviceStoreTablePlanner.UsedScan[] usedScans;
+            try
+            {
+                walked = ResourceMaterializer.Materialize(plan, recording, ref snapshot, ref specialization, out failure);
+            }
+            finally
+            {
+                usedScans = stamps ? DeviceStoreTablePlanner.EndUsedScans() : [];
+            }
             MaterializeSplitProfile.Note(recorder.RecordedWords > MaterializeSplitProfile.BigReads ? MaterializeSplitProfile.Kind.BigWalk : MaterializeSplitProfile.Kind.Walk, walkStarted);
             MaterializeSplitProfile.NoteReads(recorder.RecordedWords);
             if (!walked)
@@ -262,7 +272,7 @@ public sealed class ResourceMaterializationCache
             var buildStarted = MaterializeSplitProfile.Start(); // [local]
             var bigBuild = recorder.RecordedWords > MaterializeSplitProfile.BigReads;
             var built = recorder.Build(plan, inputs, snapshot, specialization);
-            built.TableGeneration = tableGeneration; // read before the walk: an invalidation during it fails the next hit
+            built.UsedScans = usedScans;
             MaterializeSplitProfile.Note(bigBuild ? MaterializeSplitProfile.Kind.BigBuild : MaterializeSplitProfile.Kind.Build, buildStarted);
             if (shifted is not null)
                 NoteRebaseVerdict(plan.Hash, shifted, snapshot, specialization, built, null);
@@ -1110,8 +1120,8 @@ public sealed class ResourceMaterializationCache
 
     private sealed class Entry
     {
-        // [local] DeviceStoreTablePlanner.ScanGeneration before the walk, for a cache that stamps store tables.
-        public long TableGeneration;
+        // [local] The store-table scans the walk used, for a cache that stamps store tables.
+        public DeviceStoreTablePlanner.UsedScan[] UsedScans = [];
         public required ShaderResourcePlan Plan { get; init; }
         public required uint[] UserData { get; init; }
         public required ulong ShaderBase { get; init; }
