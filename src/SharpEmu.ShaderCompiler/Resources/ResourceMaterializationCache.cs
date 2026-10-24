@@ -890,7 +890,7 @@ public sealed class ResourceMaterializationCache
         var offset = 0;
         while (offset < current.Length)
         {
-            offset += current[offset..].CommonPrefixLength(bytes[offset..]) & ~(sizeof(uint) - 1);
+            offset = NextChangedWord(current, bytes, offset);
             if (offset >= current.Length)
                 break;
             if (!cached.WordTableOnly[offset / sizeof(uint)])
@@ -1110,14 +1110,14 @@ public sealed class ResourceMaterializationCache
             Console.Error.WriteLine($"[MATERIALIZE_SYNC_VALIDATE_MISMATCH] plan=0x{planHash:X16} total={total} {difference}");
     }
 
-    // [local] SHARPEMU_VALIDATE_IN_PLACE (=1 on, =2 verify, 0 off): a recorded range of InPlaceMinBytes or more is compared
+    // [local] SHARPEMU_VALIDATE_IN_PLACE (1 by default, =2 verify, =0 off): a recorded range of InPlaceMinBytes or more is compared
     // with the guest bytes where they lie (the reader's own ownership checks first) instead of copied out and compared;
     // an equal range skips the copy, a different one of an entry without word patches fails as the copy would, and
     // anything else takes the copy path unchanged. =2 also takes the copy path after every
     // in-place verdict and counts a different verdict as a race when a second in-place compare agrees with the copy
     // (the memory changed in between), else as a mismatch.
     public static readonly int ValidateInPlaceMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_VALIDATE_IN_PLACE"), out var inPlaceMode) ? inPlaceMode : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_VALIDATE_IN_PLACE"), out var inPlaceMode) ? inPlaceMode : 1;
     private const int InPlaceMinBytes = 4096;
     private static long _inPlaceCompared, _inPlaceEqual, _inPlaceStale, _inPlaceUnhandled, _inPlaceUnhandledFront, _inPlaceKb, _inPlaceChecked, _inPlaceRaces, _inPlaceMismatches, _inPlaceMismatchTotal;
     private static int _inPlaceMismatchLogs;
@@ -1163,6 +1163,11 @@ public sealed class ResourceMaterializationCache
         return true;
     }
 
+    // [local] The offset of the first word at or after offset (a word offset) that differs between the two spans of the
+    // same length, or their length when none does: the equal bytes are skipped vectorized.
+    internal static int NextChangedWord(ReadOnlySpan<byte> current, ReadOnlySpan<byte> cached, int offset) =>
+        offset + (current[offset..].CommonPrefixLength(cached[offset..]) & ~(sizeof(uint) - 1));
+
     // [local] CollectPatches with every run of equal bytes skipped at once: the same changed words, in the same order.
     private static bool CollectPatchesSkippingEqual(Entry entry, int index, ReadOnlySpan<byte> current, ReadOnlySpan<byte> cached,
         List<(int Word, uint Value)> patches)
@@ -1170,7 +1175,7 @@ public sealed class ResourceMaterializationCache
         var offset = 0;
         while (offset < current.Length)
         {
-            offset += current[offset..].CommonPrefixLength(cached[offset..]) & ~(sizeof(uint) - 1);
+            offset = NextChangedWord(current, cached, offset);
             if (offset >= current.Length)
                 break;
             var word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(current[offset..]);

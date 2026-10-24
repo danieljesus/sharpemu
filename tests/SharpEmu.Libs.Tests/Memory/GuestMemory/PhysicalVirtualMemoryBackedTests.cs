@@ -179,6 +179,31 @@ public sealed unsafe class PhysicalVirtualMemoryBackedTests
         Assert.Contains(memory.SnapshotRegions(), r => r.VirtualAddress == first);
     }
 
+    // [local] SHARPEMU_VALIDATE_IN_PLACE: a backed view compares in place, with the verdict either way, whatever the
+    // guest protection of the view.
+    [Fact]
+    public void BackedViewsCompareInPlaceWithTheVerdict()
+    {
+        if (!Supported) return;
+        var host = HostViewMemory.Create();
+        using var memory = new PhysicalVirtualMemory(viewHost: host, backingBytes: BackingSize);
+        var first = Hold(memory, host);
+        Assert.True(memory.TryMapBacked(first, Segment, 0, GuestPageProtection.Read, out _), "map");
+        Assert.True(memory.TryWrite(first + 8, BitConverter.GetBytes(Marker)), "write");
+        Assert.True(memory.TryProtect(first, Segment, GuestPageProtection.None), "protect");
+        Assert.True(memory.TryCompare(first + 8, BitConverter.GetBytes(Marker), out var equal), "compare equal");
+        Assert.True(equal);
+        Assert.True(memory.TryCompare(first + 8, BitConverter.GetBytes(~Marker), out equal), "compare different");
+        Assert.False(equal);
+        var page = new byte[0x1000];
+        BitConverter.TryWriteBytes(page.AsSpan(8), Marker);
+        Assert.True(memory.TryCompare(first, page, out equal), "compare page");
+        Assert.True(equal);
+        page[0x0FFF] = 1;
+        Assert.True(memory.TryCompare(first, page, out equal), "compare changed page");
+        Assert.False(equal);
+    }
+
     [Fact]
     public void ClearKeepsTheSameMemoryObjectUsable()
     {

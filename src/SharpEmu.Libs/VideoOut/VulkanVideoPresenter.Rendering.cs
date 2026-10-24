@@ -276,12 +276,12 @@ internal static unsafe partial class VulkanVideoPresenter
             _mappedSizesGeneration = _guestMemory.MappingGeneration;
         }
 
-        // [local] SHARPEMU_MAPPED_SIZE_KEEP (=1 on, =2 verify, 0 off): a range found mapped in full stays known across
+        // [local] SHARPEMU_MAPPED_SIZE_KEEP (1 by default, =2 verify, =0 off): a range found mapped in full stays known across
         // flips until the mapping generation moves. Only an unmap or a clear can make a mapped range unreadable, and
         // both move the generation (a new mapping only widens what is readable, so clamped answers stay per frame as
         // before). =2 recomputes every kept answer and counts the ones that differ.
         internal static readonly int MappedSizeKeepMode =
-            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_SIZE_KEEP"), out var keepMode) ? keepMode : 0;
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_SIZE_KEEP"), out var keepMode) ? keepMode : 1;
         private const int MaxFullyMapped = 1 << 16;
         private HashSet<(ulong Address, ulong Size)>? _fullyMapped;
         private long _fullyMappedGeneration = long.MinValue;
