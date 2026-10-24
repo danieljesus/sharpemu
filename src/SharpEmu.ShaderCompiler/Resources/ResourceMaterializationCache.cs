@@ -744,25 +744,45 @@ public sealed class ResourceMaterializationCache
         if (!cached.TableRefreshable)
             return false;
 
-        var current = new byte[cached.Bytes.Length];
+        // [local] SHARPEMU_VALIDATE_IN_PLACE: the ranges are read into a reused buffer, copied out only when the refresh
+        // goes ahead, and the change scan skips equal runs at once (the same verdict, =2 counts any other).
+        var fastScan = ValidateInPlaceMode != 0;
+        byte[] current;
+        if (fastScan)
+        {
+            if (_refreshScratch.Length < cached.Bytes.Length)
+                _refreshScratch = new byte[Math.Max(cached.Bytes.Length, _refreshScratch.Length * 2)];
+            current = _refreshScratch;
+        }
+        else
+        {
+            current = new byte[cached.Bytes.Length];
+        }
+
         for (var index = 0; index < cached.RangeAddresses.Length; index++)
         {
             if (!residentReader(cached.RangeAddresses[index], current.AsSpan(cached.RangeOffsets[index], cached.RangeLengths[index]), cached.RangeClean[index]))
                 return false;
         }
 
-        var changed = false;
-        for (var offset = 0; offset < current.Length; offset += sizeof(uint))
+        var currentBytes = current.AsSpan(0, cached.Bytes.Length);
+        var changed = fastScan ? TableWordsChangedSkippingEqual(currentBytes, cached) : TableWordsChanged(currentBytes, cached);
+        if (ValidateInPlaceMode == 2)
         {
-            if (current.AsSpan(offset, sizeof(uint)).SequenceEqual(cached.Bytes.AsSpan(offset, sizeof(uint))))
-                continue;
-            if (!cached.WordTableOnly[offset / sizeof(uint)])
-                return false;
-            changed = true;
+            Interlocked.Increment(ref _refreshScanChecked);
+            if (changed != TableWordsChanged(currentBytes, cached))
+            {
+                Interlocked.Increment(ref _refreshScanMismatches);
+                Interlocked.Increment(ref _inPlaceMismatchTotal);
+                if (Interlocked.Increment(ref _inPlaceMismatchLogs) <= 20)
+                    Console.Error.WriteLine($"[REFRESH_SCAN_MISMATCH] plan=0x{plan.Hash:X16} bytes={currentBytes.Length} fast={changed}");
+            }
         }
 
-        if (!changed)
+        if (changed != true)
             return false;
+        if (fastScan)
+            current = currentBytes.ToArray();
 
         var recorder = TakeRecorder();
         try
@@ -841,6 +861,45 @@ public sealed class ResourceMaterializationCache
         {
             ReturnRecorder(recorder);
         }
+    }
+
+    private byte[] _refreshScratch = [];
+    private static long _refreshScanChecked, _refreshScanMismatches;
+
+    // True when only flattened-table words changed (some did), false when none did, null when another word changed.
+    private static bool? TableWordsChanged(ReadOnlySpan<byte> current, Entry cached)
+    {
+        var changed = false;
+        for (var offset = 0; offset < current.Length; offset += sizeof(uint))
+        {
+            if (current.Slice(offset, sizeof(uint)).SequenceEqual(cached.Bytes.AsSpan(offset, sizeof(uint))))
+                continue;
+            if (!cached.WordTableOnly[offset / sizeof(uint)])
+                return null;
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    // [local] TableWordsChanged with every run of equal bytes skipped at once.
+    private static bool? TableWordsChangedSkippingEqual(ReadOnlySpan<byte> current, Entry cached)
+    {
+        var changed = false;
+        var bytes = cached.Bytes.AsSpan(0, current.Length);
+        var offset = 0;
+        while (offset < current.Length)
+        {
+            offset += current[offset..].CommonPrefixLength(bytes[offset..]) & ~(sizeof(uint) - 1);
+            if (offset >= current.Length)
+                break;
+            if (!cached.WordTableOnly[offset / sizeof(uint)])
+                return null;
+            changed = true;
+            offset += sizeof(uint);
+        }
+
+        return changed;
     }
 
     private ReadRecorder TakeRecorder()
@@ -1064,7 +1123,7 @@ public sealed class ResourceMaterializationCache
     private static int _inPlaceMismatchLogs;
 
     private static string TakeInPlaceReport() => ValidateInPlaceMode == 0 ? string.Empty :
-        $" in_place_compared={Interlocked.Exchange(ref _inPlaceCompared, 0)} in_place_equal={Interlocked.Exchange(ref _inPlaceEqual, 0)} in_place_stale={Interlocked.Exchange(ref _inPlaceStale, 0)} in_place_unhandled={Interlocked.Exchange(ref _inPlaceUnhandled, 0)} in_place_unhandled_front={Interlocked.Exchange(ref _inPlaceUnhandledFront, 0)} in_place_kb={Interlocked.Exchange(ref _inPlaceKb, 0)} in_place_checked={Interlocked.Exchange(ref _inPlaceChecked, 0)} in_place_races={Interlocked.Exchange(ref _inPlaceRaces, 0)} in_place_mismatches={Interlocked.Exchange(ref _inPlaceMismatches, 0)} in_place_mismatches_total={Interlocked.Read(ref _inPlaceMismatchTotal)}";
+        $" in_place_compared={Interlocked.Exchange(ref _inPlaceCompared, 0)} in_place_equal={Interlocked.Exchange(ref _inPlaceEqual, 0)} in_place_stale={Interlocked.Exchange(ref _inPlaceStale, 0)} in_place_unhandled={Interlocked.Exchange(ref _inPlaceUnhandled, 0)} in_place_unhandled_front={Interlocked.Exchange(ref _inPlaceUnhandledFront, 0)} in_place_kb={Interlocked.Exchange(ref _inPlaceKb, 0)} in_place_checked={Interlocked.Exchange(ref _inPlaceChecked, 0)} in_place_races={Interlocked.Exchange(ref _inPlaceRaces, 0)} in_place_mismatches={Interlocked.Exchange(ref _inPlaceMismatches, 0)} patch_scan_checked={Interlocked.Exchange(ref _patchScanChecked, 0)} patch_scan_mismatches={Interlocked.Exchange(ref _patchScanMismatches, 0)} refresh_scan_checked={Interlocked.Exchange(ref _refreshScanChecked, 0)} refresh_scan_mismatches={Interlocked.Exchange(ref _refreshScanMismatches, 0)} in_place_mismatches_total={Interlocked.Read(ref _inPlaceMismatchTotal)}";
 
     private static void CheckInPlace(bool equal, ResidentGuestBytesComparer comparer, ulong address, ReadOnlySpan<byte> current,
         ReadOnlySpan<byte> cached, bool readable, bool clean)
@@ -1083,6 +1142,72 @@ public sealed class ResourceMaterializationCache
         Interlocked.Increment(ref _inPlaceMismatchTotal);
         if (Interlocked.Increment(ref _inPlaceMismatchLogs) <= 20)
             Console.Error.WriteLine($"[VALIDATE_IN_PLACE_MISMATCH] address=0x{address:X} bytes={cached.Length} in_place={equal} copy={copyEqual} readable={readable} clean={clean}");
+    }
+
+    // The patches of a changed range, word by word; false at the first changed word that cannot be patched.
+    private static bool CollectPatches(Entry entry, int index, ReadOnlySpan<byte> current, ReadOnlySpan<byte> cached,
+        List<(int Word, uint Value)> patches)
+    {
+        for (var offset = 0; offset < current.Length; offset += sizeof(uint))
+        {
+            var word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(current[offset..]);
+            var was = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cached[offset..]);
+            if (word == was)
+                continue;
+            var wordIndex = (entry.RangeOffsets[index] + offset) / sizeof(uint);
+            if (!entry.WordPatches!.TryGetValue(wordIndex, out var targets) || !Entry.PatchAllowed(targets, word, was))
+                return false;
+            patches.Add((wordIndex, word));
+        }
+
+        return true;
+    }
+
+    // [local] CollectPatches with every run of equal bytes skipped at once: the same changed words, in the same order.
+    private static bool CollectPatchesSkippingEqual(Entry entry, int index, ReadOnlySpan<byte> current, ReadOnlySpan<byte> cached,
+        List<(int Word, uint Value)> patches)
+    {
+        var offset = 0;
+        while (offset < current.Length)
+        {
+            offset += current[offset..].CommonPrefixLength(cached[offset..]) & ~(sizeof(uint) - 1);
+            if (offset >= current.Length)
+                break;
+            var word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(current[offset..]);
+            var was = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cached[offset..]);
+            var wordIndex = (entry.RangeOffsets[index] + offset) / sizeof(uint);
+            if (!entry.WordPatches!.TryGetValue(wordIndex, out var targets) || !Entry.PatchAllowed(targets, word, was))
+                return false;
+            patches.Add((wordIndex, word));
+            offset += sizeof(uint);
+        }
+
+        return true;
+    }
+
+    private static long _patchScanChecked, _patchScanMismatches;
+    private readonly List<(int Word, uint Value)> _patchCheck = new();
+
+    private void CheckPatchScan(Entry entry, int index, ReadOnlySpan<byte> current, ReadOnlySpan<byte> cached, bool patched, int patchesBefore)
+    {
+        Interlocked.Increment(ref _patchScanChecked);
+        _patchCheck.Clear();
+        var expected = CollectPatches(entry, index, current, cached, _patchCheck);
+        var same = expected == patched;
+        if (same && expected)
+        {
+            same = _patches.Count - patchesBefore == _patchCheck.Count;
+            for (var item = 0; same && item < _patchCheck.Count; item++)
+                same = _patches[patchesBefore + item] == _patchCheck[item];
+        }
+
+        if (!same)
+        {
+            Interlocked.Increment(ref _patchScanMismatches);
+            Interlocked.Increment(ref _inPlaceMismatchTotal);
+            if (Interlocked.Increment(ref _inPlaceMismatchLogs) <= 20)
+                Console.Error.WriteLine($"[VALIDATE_PATCH_SCAN_MISMATCH] plan=0x{entry.Plan.Hash:X16} range={index} bytes={current.Length} fast={patched}/{_patches.Count - patchesBefore} slow={expected}/{_patchCheck.Count}");
+        }
     }
 
     private bool Validate(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader, out bool unreadable,
@@ -1178,17 +1303,19 @@ public sealed class ResourceMaterializationCache
             }
             if (entry.WordPatches is null)
                 return false;
-            for (var offset = 0; offset < length; offset += sizeof(uint))
+            if (ValidateInPlaceMode == 0)
             {
-                var word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(current[offset..]);
-                var was = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cached[offset..]);
-                if (word == was)
-                    continue;
-                var wordIndex = (entry.RangeOffsets[index] + offset) / sizeof(uint);
-                if (!entry.WordPatches.TryGetValue(wordIndex, out var targets) || !Entry.PatchAllowed(targets, word, was))
+                if (!CollectPatches(entry, index, current, cached, _patches))
                     return false;
-                _patches.Add((wordIndex, word));
+                continue;
             }
+
+            var patchesBefore = _patches.Count; // [local] SHARPEMU_VALIDATE_IN_PLACE: equal runs skipped vectorized
+            var patched = CollectPatchesSkippingEqual(entry, index, current, cached, _patches);
+            if (ValidateInPlaceMode == 2)
+                CheckPatchScan(entry, index, current, cached, patched, patchesBefore);
+            if (!patched)
+                return false;
         }
 
         return true;

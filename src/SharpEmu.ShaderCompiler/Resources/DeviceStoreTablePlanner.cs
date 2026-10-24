@@ -231,21 +231,19 @@ public static class DeviceStoreTablePlanner
     private static readonly int BulkMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_BULK"), out var bulkMode) ? bulkMode : 1;
     private const int BulkChunkEntries = 4096;
 
-    // [local] SHARPEMU_STORE_TABLE_FAST (=1 on, =2 verify, 0 off; with SHARPEMU_STORE_TABLE_BULK=1): three changes to a
-    // scan that keep its result. (a) A chunk the resident reader refuses is read again through it 4 KB at a time, and
-    // only the 4 KB pieces it refuses again go word by word: the resident reader accepts a piece under the same
-    // ownership rules as the whole chunk, and the word reader returns the same words for memory it accepts. (b) An
-    // entry whose 48-bit base is zero is skipped before its other words are read (TryDecode rejects it). (c) The found
-    // ranges are not sorted when they already are in base order (the merge only compares bases and ends). =2 also
-    // reads every word of an accepted piece of a refused chunk through the word reader and counts the differences as
-    // races (a second resident read agrees with the word reader) or mismatches.
+    // [local] SHARPEMU_STORE_TABLE_FAST (=1 on, =2 verify, 0 off; with SHARPEMU_STORE_TABLE_BULK=1): a chunk the resident
+    // reader refuses is read again through it 4 KB at a time, and only the 4 KB pieces it refuses again go word by word:
+    // the resident reader accepts a piece under the same ownership rules as the whole chunk, and the word reader returns
+    // the same words for memory it accepts. =2 also reads every word of an accepted piece of a refused chunk through
+    // the word reader and counts the differences as races (a second resident read agrees with the word reader) or
+    // mismatches.
     public static readonly int FastMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_FAST"), out var fastMode) ? fastMode : 0;
     private const int PieceEntries = 256;
-    private static long _fastPieces, _fastPieceFallbacks, _fastSkipped, _fastSortSkipped, _fastChecked, _fastRaces, _fastMismatches, _fastMismatchTotal;
+    private static long _fastPieces, _fastPieceFallbacks, _fastChecked, _fastRaces, _fastMismatches, _fastMismatchTotal;
     private static int _fastMismatchLogs;
 
     private static string FastReport() => FastMode == 0 ? string.Empty : System.FormattableString.Invariant(
-        $" fast_pieces={Interlocked.Exchange(ref _fastPieces, 0)} fast_piece_fallbacks={Interlocked.Exchange(ref _fastPieceFallbacks, 0)} fast_skipped={Interlocked.Exchange(ref _fastSkipped, 0)} fast_sort_skipped={Interlocked.Exchange(ref _fastSortSkipped, 0)} fast_checked={Interlocked.Exchange(ref _fastChecked, 0)} fast_races={Interlocked.Exchange(ref _fastRaces, 0)} fast_mismatches={Interlocked.Exchange(ref _fastMismatches, 0)} fast_mismatches_total={Interlocked.Read(ref _fastMismatchTotal)}");
+        $" fast_pieces={Interlocked.Exchange(ref _fastPieces, 0)} fast_piece_fallbacks={Interlocked.Exchange(ref _fastPieceFallbacks, 0)} fast_checked={Interlocked.Exchange(ref _fastChecked, 0)} fast_races={Interlocked.Exchange(ref _fastRaces, 0)} fast_mismatches={Interlocked.Exchange(ref _fastMismatches, 0)} fast_mismatches_total={Interlocked.Read(ref _fastMismatchTotal)}");
 
     // [local] Before a table is scanned: its bounds join the invalidation filter first, so a write landing during the
     // scan is counted; the generation the scan starts from.
@@ -443,7 +441,7 @@ public static class DeviceStoreTablePlanner
                     if (Profile && bulk is not null)
                         Interlocked.Increment(ref bulkRead ? ref _bulkChunks : ref _bulkFallbacks);
                     var piecesRead = false;
-                    if (!bulkRead && fast && bulk is not null) // [local] (a) the refused chunk again, 4 KB at a time
+                    if (!bulkRead && fast && bulk is not null) // [local] the refused chunk again, 4 KB at a time
                     {
                         for (var piece = 0; piece * PieceEntries < count; piece++)
                         {
@@ -463,12 +461,6 @@ public static class DeviceStoreTablePlanner
                         if (bulkRead || pieceBytes)
                         {
                             var offset = (entry - first) * 16;
-                            if (fast && (System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(chunkBytes.Slice(offset, 8)) & 0xFFFF_FFFF_FFFFUL) == 0)
-                            {
-                                _fastSkipped++; // [local] (b) TryDecode rejects a zero base
-                                continue;
-                            }
-
                             for (var dword = 0; dword < 4; dword++)
                                 words[dword] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes[(offset + dword * 4)..]);
                             if (BulkMode == 2)
@@ -542,13 +534,7 @@ public static class DeviceStoreTablePlanner
             if (MergeGap != ulong.MaxValue && ranges.Count - before > 1) // [local] coalesce neighbouring V# ranges
             {
                 var found = ranges.GetRange(before, ranges.Count - before);
-                var sorted = fast; // [local] (c) already in base order: the merge below reads only bases and ends
-                for (var index = 1; sorted && index < found.Count; index++)
-                    sorted = found[index - 1].Base <= found[index].Base;
-                if (sorted)
-                    _fastSortSkipped++;
-                else
-                    found.Sort((a, b) => a.Base.CompareTo(b.Base));
+                found.Sort((a, b) => a.Base.CompareTo(b.Base));
                 ranges.RemoveRange(before, ranges.Count - before);
                 var start = found[0].Base;
                 var end = found[0].Base + found[0].Size;
