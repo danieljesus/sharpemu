@@ -43,19 +43,19 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     private readonly object _pipelineGate = new();
     // Called before the masked-copy adaptation writes guest memory.
     internal static Action? BeforeGuestWrite;
-    // One per stage, refilled under the gate for every lookup.
-    private readonly StageCompileOptions _vertexOptions = new();
-    private readonly StageCompileOptions _pixelOptions = new();
-    private readonly StageCompileOptions _computeOptions = new();
+    // One per stage, refilled for every lookup. [local] Per thread: with SHARPEMU_PROGRAM_GATE a hit takes no lock.
+    [ThreadStatic] private static StageCompileOptions? _vertexOptions;
+    [ThreadStatic] private static StageCompileOptions? _pixelOptions;
+    [ThreadStatic] private static StageCompileOptions? _computeOptions;
     private readonly bool _strictShaders = Environment.GetEnvironmentVariable("SHARPEMU_STRICT_COMPUTE") != "0";
     private readonly HashSet<(ShaderStage Stage, ulong Hash, uint CodeSize)> _reportedShaderSkips = [];
 
-    public ShaderPipelineCache(CpuContext context, IShaderPipelineHost host, IGuestGpuBackend compiler, ShaderHeaderRegistry registry)
+    public ShaderPipelineCache(CpuContext context, IShaderPipelineHost host, IGuestGpuBackend compiler, ShaderHeaderRegistry registry, bool? lockFree = null)
     {
         _context = context;
         _host = host;
         _registry = registry;
-        _programs = new ShaderProgramCache(context, compiler, host);
+        _programs = new ShaderProgramCache(context, compiler, host, _gate, lockFree);
     }
 
     public ShaderProgramCache Programs => _programs;
@@ -214,29 +214,27 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         ShaderProgram pixelProgramHandle = default;
         ShaderStageResources vertexStage;
         ShaderStageResources pixelStage = default;
-        SharpEmu.HLE.LockProbe.Probe(_gate, 24 + 1, "pipelines.gate_1");
-        SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
-        lock (_gate)
+        bool prepared;
+        if (_programs.LockFree)
         {
             SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramLookup);
-            var pushDataCursor = 0u;
-            if (pixelSource is not null)
-            {
-                var pixelOptions = _pixelOptions.Reset();
-                pixelOptions.PixelInfo = pixelInfo;
-                pixelOptions.PixelOutputs = pixelOutputs;
-                pixelOptions.PixelInputEnable = shaderInterface.PixelInputEnable;
-                pixelOptions.PixelInputAddress = shaderInterface.PixelInputAddress;
-                if (!TryPrepareProgram(pixelSource, pixelOptions, ref pushDataCursor, out pixelProgramHandle, out pixelStage))
-                    return new GraphicsPrograms { Available = false };
-            }
-
-            var vertexOptions = _vertexOptions.Reset();
-            vertexOptions.VertexInfo = vertexInfo;
-            vertexOptions.RequiredVertexOutputCount = (int)attributeCount;
-            if (!TryPrepareProgram(vertexSource, vertexOptions, ref pushDataCursor, out vertexProgram, out vertexStage))
-                return new GraphicsPrograms { Available = false };
+            prepared = TryPrepareGraphicsStages(vertexSource, vertexInfo, pixelSource, pixelInfo, pixelOutputs, shaderInterface, attributeCount,
+                out vertexProgram, out vertexStage, out pixelProgramHandle, out pixelStage);
         }
+        else
+        {
+            SharpEmu.HLE.LockProbe.Probe(_gate, 24 + 1, "pipelines.gate_1");
+            SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
+            lock (_gate)
+            {
+                SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramLookup);
+                prepared = TryPrepareGraphicsStages(vertexSource, vertexInfo, pixelSource, pixelInfo, pixelOutputs, shaderInterface, attributeCount,
+                    out vertexProgram, out vertexStage, out pixelProgramHandle, out pixelStage);
+            }
+        }
+
+        if (!prepared)
+            return new GraphicsPrograms { Available = false };
 
         SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramTail);
         vertexInfo.Stage = vertexStage;
@@ -272,6 +270,33 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             DisableBlending = disableBlending,
             PositionStream = FindPositionStream(vertexInfo),
         };
+    }
+
+    // The pixel program first, then the vertex program, on one push-data cursor.
+    private bool TryPrepareGraphicsStages(ShaderSource vertexSource, VertexInputInfo vertexInfo, ShaderSource? pixelSource,
+        PixelInputInfo? pixelInfo, Gen5PixelOutputBinding[] pixelOutputs, ShaderInterfaceRegisters shaderInterface, uint attributeCount,
+        out ShaderProgram vertexProgram, out ShaderStageResources vertexStage, out ShaderProgram pixelProgram, out ShaderStageResources pixelStage)
+    {
+        vertexProgram = default;
+        vertexStage = default;
+        pixelProgram = default;
+        pixelStage = default;
+        var pushDataCursor = 0u;
+        if (pixelSource is not null)
+        {
+            var pixelOptions = (_pixelOptions ??= new()).Reset();
+            pixelOptions.PixelInfo = pixelInfo;
+            pixelOptions.PixelOutputs = pixelOutputs;
+            pixelOptions.PixelInputEnable = shaderInterface.PixelInputEnable;
+            pixelOptions.PixelInputAddress = shaderInterface.PixelInputAddress;
+            if (!TryPrepareProgram(pixelSource, pixelOptions, ref pushDataCursor, out pixelProgram, out pixelStage))
+                return false;
+        }
+
+        var vertexOptions = (_vertexOptions ??= new()).Reset();
+        vertexOptions.VertexInfo = vertexInfo;
+        vertexOptions.RequiredVertexOutputCount = (int)attributeCount;
+        return TryPrepareProgram(vertexSource, vertexOptions, ref pushDataCursor, out vertexProgram, out vertexStage);
     }
 
     // The vertex tables of the draw and the clip-space transform when clipping is off.
@@ -434,24 +459,41 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
 
         ShaderProgram handle;
         ShaderStageResources stage;
-        SharpEmu.HLE.LockProbe.Probe(_gate, 24 + 2, "pipelines.gate_2");
-        SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
-        lock (_gate)
+        bool prepared;
+        if (_programs.LockFree)
         {
             SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramLookup);
-            var pushDataCursor = 0u;
-            var computeOptions = _computeOptions.Reset();
-            computeOptions.ComputeInfo = input;
-            computeOptions.ComputeSystemRegisters = systemRegisters;
-            if (!TryPrepareProgram(source, computeOptions, ref pushDataCursor, out handle, out stage))
+            prepared = TryPrepareComputeStage(source, input, systemRegisters, out handle, out stage);
+        }
+        else
+        {
+            SharpEmu.HLE.LockProbe.Probe(_gate, 24 + 2, "pipelines.gate_2");
+            SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
+            lock (_gate)
             {
-                return new ComputeProgram { Available = false };
+                SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramLookup);
+                prepared = TryPrepareComputeStage(source, input, systemRegisters, out handle, out stage);
             }
+        }
+
+        if (!prepared)
+        {
+            return new ComputeProgram { Available = false };
         }
 
         SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.PrepareCompute);
         input.Stage = stage;
         return new ComputeProgram { Program = handle, Input = input };
+    }
+
+    private bool TryPrepareComputeStage(ShaderSource source, ComputeInputInfo input, Gen5ComputeSystemRegisters systemRegisters,
+        out ShaderProgram handle, out ShaderStageResources stage)
+    {
+        var pushDataCursor = 0u;
+        var computeOptions = (_computeOptions ??= new()).Reset();
+        computeOptions.ComputeInfo = input;
+        computeOptions.ComputeSystemRegisters = systemRegisters;
+        return TryPrepareProgram(source, computeOptions, ref pushDataCursor, out handle, out stage);
     }
 
     private bool TryPrepareProgram(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor,
@@ -460,7 +502,13 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         if (_programs.TryGetProgram(source, options, _strictShaders && source.Hash != 0xD44EDA1B8D4FAA6B /* [local] GTA V Fidelity: heterogeneous image table, skip */, ref pushDataCursor, out program, out stage, out var rejection))
             return true;
 
-        if (_reportedShaderSkips.Add((source.Stage, source.Hash, source.CodeSize)))
+        bool firstSkip;
+        lock (_reportedShaderSkips)
+        {
+            firstSkip = _reportedShaderSkips.Add((source.Stage, source.Hash, source.CodeSize));
+        }
+
+        if (firstSkip)
         {
             var tag = source.Stage == ShaderStage.Compute ? "COMPUTE_SKIPPED" : "DRAW_SKIPPED";
             Console.Error.WriteLine($"[GPU][WARN][{tag}] {rejection} " +

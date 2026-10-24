@@ -136,6 +136,9 @@ internal sealed class ProgramSourceEntry
     public EmbeddedVertexFetchPlan? EmbeddedFetch { get; init; }
     public ShaderVertexInput[] VertexInputs { get; init; } = [];
     public List<ProgramPermutation> Permutations { get; } = new(8);
+    // [local] SHARPEMU_PROGRAM_GATE: the permutations as an array replaced whole under the gate, so a lookup scans it
+    // without the gate (Permutations itself is only touched under it).
+    public ProgramPermutation[] Published = [];
 }
 
 // Programs keyed by identity and static state; each draw materializes its resources and reuses
@@ -147,15 +150,33 @@ internal sealed class ShaderProgramCache
     private readonly CpuContext _context;
     private readonly IGuestGpuBackend _compiler;
     private readonly IShaderPipelineHost _host;
-    private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new(ProgramKeyComparer.Instance);
+    // [local] SHARPEMU_PROGRAM_GATE (1 = on): a lookup that finds its entry and permutation takes no lock. Entries and
+    // permutations are only added (under _gate), the per-lookup scratch is per thread, and each thread materializes with
+    // its own cache. 0 = the old behaviour: the caller holds the gate for the whole lookup, with one shared cache.
+    internal static readonly bool LockFreeDefault = Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE") == "1";
+    internal bool LockFree { get; }
+    // [local] SHARPEMU_PROGRAM_GATE_VERIFY=1: every lock-free hit is looked up again under the gate the old way (shared
+    // cache, the published list) and compared; ProgramGateVerify reports the differences every 20 s.
+    // =2 instead checks every hit, gated or not, against a fresh walk without a materialization cache, so both modes
+    // can be measured against the same reference.
+    private static readonly string? VerifyRequested = Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE_VERIFY");
+    private readonly bool _verify;
+    private readonly bool _walkCheck = VerifyRequested == "2";
+    private readonly object _gate;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ProgramKey, ProgramSourceEntry> _programs = new(ProgramKeyComparer.Instance);
     // [local] Decode runs outside ShaderPipelineCache's program gate, from the front thread and the render thread at
     // once: both tables are concurrent (a plain Dictionary threw "same key already added" here, 2026-10-12 p1a).
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Hash, uint CodeSize), Gen5ShaderProgram> _decoded = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Hash, uint CodeSize), ShaderCodeCapture> _codeCaptures = new();
-    private readonly List<uint> _staticState = new(StageStaticKey.MaxWords);
     // Draws that re-bind unchanged resources reuse the last materialization.
     // SHARPEMU_RESOURCE_CACHE=0 materializes every draw, for A/B comparisons.
     private readonly ResourceMaterializationCache? _materializations = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZATION_CACHE") == "0" ? null : (Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_CACHE") == "0" ? null : new());
+    // [local] SHARPEMU_PROGRAM_GATE: one cache per thread (a cache is not thread safe); _materializations is then only
+    // used under the gate, by the verify.
+    private readonly ThreadLocal<ResourceMaterializationCache>? _threadMaterializations;
+    // [local] SHARPEMU_PROGRAM_GATE_TABLE_STAMP (on by default; =0 disables): the per-thread caches refuse a hit for a
+    // plan with store tables once a table invalidation has landed since its walk (see ResourceMaterializationCache).
+    private static readonly bool StampStoreTables = Environment.GetEnvironmentVariable("SHARPEMU_PROGRAM_GATE_TABLE_STAMP") != "0";
     private ulong _nextProgramId;
 
     public ResourceMaterializationCache? Materializations => _materializations;
@@ -166,8 +187,16 @@ internal sealed class ShaderProgramCache
 
     private readonly GuestWordReader _readGuestWord;
     private readonly GuestWordReader _readCleanGuestWord;
-    // Refilled per lookup: the readers never change and nothing keeps the instance.
-    private readonly ResourceRuntimeInputs _inputs;
+    // Refilled per lookup: the readers never change and nothing keeps the instance. [local] One per thread, with the
+    // static-state scratch.
+    private sealed class LookupScratch(ResourceRuntimeInputs inputs)
+    {
+        public readonly ResourceRuntimeInputs Inputs = inputs;
+        public readonly List<uint> StaticState = new(StageStaticKey.MaxWords);
+        public readonly List<uint> VerifyState = new(StageStaticKey.MaxWords);
+    }
+
+    private readonly ThreadLocal<LookupScratch> _scratch;
     // The materializer replaces both outputs on success and the caller stops on failure,
     // so no lookup builds its own to be thrown away.
     private static readonly ResourceSnapshot EmptySnapshot = new();
@@ -177,22 +206,29 @@ internal sealed class ShaderProgramCache
 
     private static readonly bool PrefetchEnabled = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_PREFETCH") != "0";
 
-    public ShaderProgramCache(CpuContext context, IGuestGpuBackend compiler, IShaderPipelineHost host)
+    public ShaderProgramCache(CpuContext context, IGuestGpuBackend compiler, IShaderPipelineHost host, object? gate = null, bool? lockFree = null)
     {
+        LockFree = lockFree ?? LockFreeDefault;
+        _verify = LockFree && VerifyRequested == "1";
         _context = context;
         _compiler = compiler;
         _host = host;
+        _gate = gate ?? new object();
         _readGuestWord = host.TryReadGuestWord;
         _readCleanGuestWord = host.TryReadCleanGuestWord;
         _readResidentGuestBytes = host.TryReadResidentGuestBytes;
         _prefetchResidentGuestBytes = PrefetchEnabled ? _readResidentGuestBytes : null;
-        _inputs = new ResourceRuntimeInputs
+        var synchronizeRanges = ResourceMaterializationCache.SyncValidateMode != 0 ? host.TrySynchronizeGuestRanges : (GuestRangeSynchronizer?)null; // [local]
+        _scratch = new ThreadLocal<LookupScratch>(() => new LookupScratch(new ResourceRuntimeInputs
         {
             ReadMemory = _readGuestWord,
             ReadCleanMemory = _readCleanGuestWord,
             ReadResidentMemory = _prefetchResidentGuestBytes,
-            SynchronizeRanges = ResourceMaterializationCache.SyncValidateMode != 0 ? host.TrySynchronizeGuestRanges : null, // [local]
-        };
+            SynchronizeRanges = synchronizeRanges,
+        }));
+        _threadMaterializations = LockFree && _materializations is not null
+            ? new ThreadLocal<ResourceMaterializationCache>(static () => new(stampStoreTables: StampStoreTables))
+            : null;
     }
 
     public int ProgramCount => _programs.Count;
@@ -318,13 +354,15 @@ internal sealed class ShaderProgramCache
 
     private ShaderProgram GetOrCompileCore(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor, out ShaderStageResources stage)
     {
+        var scratch = _scratch.Value!;
+        var staticState = scratch.StaticState;
         ProgramKey? key = null;
         ProgramSourceEntry? entry;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramCacheLookup))
         using (SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramKey))
         {
-            BuildStaticState(source.Stage, options);
-            var lookup = new ProgramKeyLookup(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, CollectionsMarshal.AsSpan(_staticState));
+            BuildStaticState(source.Stage, options, staticState);
+            var lookup = LookupOf(source, staticState);
             if (!_programs.GetAlternateLookup<ProgramKeyLookup>().TryGetValue(lookup, out entry))
             {
                 key = ProgramKeyComparer.Instance.Create(lookup);
@@ -336,7 +374,7 @@ internal sealed class ShaderProgramCache
             RenderTrace.Write($"ProgramCache lookup stage={source.Label} hash=0x{source.Hash:X16} cached={entry is not null} permutations={entry?.Permutations.Count ?? 0}");
         }
 
-        var inputs = _inputs;
+        var inputs = scratch.Inputs;
         inputs.UserData = source.UserData;
         inputs.ShaderBase = source.Address;
         inputs.ComputeState = source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeState
@@ -346,10 +384,21 @@ internal sealed class ShaderProgramCache
             : null;
         if (entry is null)
         {
-            entry = CreateEntry(source, options);
-            _programs.Add(key!, entry);
-            ShaderCacheCounters.CountProgram();
+            // [local] Decoded and planned outside the gate: an entry is a pure function of its key, and a thread that
+            // loses the race uses the entry that won.
+            var created = CreateEntry(source, options);
+            entry = _programs.GetOrAdd(key!, created);
+            if (ReferenceEquals(entry, created))
+            {
+                ShaderCacheCounters.CountProgram();
+            }
+            else
+            {
+                key = null;
+            }
         }
+
+        var materializations = _threadMaterializations is { } perThread ? perThread.Value : _materializations;
 
         var snapshot = EmptySnapshot;
         var specialization = EmptySpecialization;
@@ -370,25 +419,25 @@ internal sealed class ShaderProgramCache
         {
             // Failure capture needs the full walk, so a dump run bypasses the cache.
             var frontStarted = SharpEmu.Libs.VideoOut.FrontProfile.Active ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
-            var hitsBefore = _materializations?.Hits ?? 0;
-            var refreshesBefore = _materializations?.TableRefreshes ?? 0;
+            var hitsBefore = materializations?.Hits ?? 0;
+            var refreshesBefore = materializations?.TableRefreshes ?? 0;
             // [local] SHARPEMU_PROFILE_RESOLVE: this materialization's time and completion waits, by program.
             var resolveStarted = SharpEmu.Libs.VideoOut.ResolveProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var waitsBefore = resolveStarted != 0 ? SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaits : 0;
             var waitTicksBefore = resolveStarted != 0 ? SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaitTicks : 0;
-            var materialized = _materializations is not null && captureIndirectImageFailure is null
-                ? _materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
+            var materialized = materializations is not null && captureIndirectImageFailure is null
+                ? materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization,
                     out var materializationFailure)
                 : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out materializationFailure,
                     captureIndirectImageFailure);
             if (resolveStarted != 0)
                 SharpEmu.Libs.VideoOut.ResolveProfile.NoteMaterialize(source.Hash, System.Diagnostics.Stopwatch.GetTimestamp() - resolveStarted,
-                    _materializations is { } hitCache && hitCache.Hits != hitsBefore,
+                    materializations is { } hitCache && hitCache.Hits != hitsBefore,
                     SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaits - waitsBefore,
                     SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaitTicks - waitTicksBefore);
             if (frontStarted != 0)
                 SharpEmu.Libs.VideoOut.FrontProfile.NoteMaterialize(
-                    _materializations is { } cache && cache.Hits != hitsBefore ? 0 : _materializations is { } refreshed && refreshed.TableRefreshes != refreshesBefore ? 1 : 2,
+                    materializations is { } cache && cache.Hits != hitsBefore ? 0 : materializations is { } refreshed && refreshed.TableRefreshes != refreshesBefore ? 1 : 2,
                     System.Diagnostics.Stopwatch.GetTimestamp() - frontStarted);
             if (!materialized)
             {
@@ -402,39 +451,231 @@ internal sealed class ShaderProgramCache
         // [local] An indirect dispatch by threads needs the layout that keeps its limits in ShaderData.
         var needsShaderDataLimits = IndirectLimitsInShaderData && source.Stage == ShaderStage.Compute && options.ComputeInfo is { } computeInfo &&
             IsIndirectThreadDispatch(computeInfo);
+        var published = Volatile.Read(ref entry.Published);
+        ProgramPermutation? found;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ProgramPermutationLookup))
         using (SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.Permutation))
         {
-            foreach (var candidate in entry.Permutations)
-            {
-                var layout = candidate.Bindings;
-                if ((!needsShaderDataLimits || layout.LimitsInShaderData) &&
-                    layout.PushDataStartDword == (layout.LimitsInShaderData ? PushData.NoStart : PushData.StartFor(pushDataCursor, layout.ShaderDataDwordCount)) && candidate.Specialization.Equals(specialization)) // [local] a layout forced to ShaderData has no push start
-                {
-                    stage = CreateStageResources(candidate.Program, snapshot, source, options);
-                    layout.AdvancePushData(ref pushDataCursor);
-                    if (RenderTrace.Enabled && RenderTrace.Pipeline())
-                    {
-                        RenderTrace.Write($"ProgramCache hit stage={source.Label} hash=0x{source.Hash:X16} id=0x{candidate.Handle.Id:X16}");
-                    }
+            found = FindPermutation(published, 0, needsShaderDataLimits, pushDataCursor, specialization);
+        }
 
-                    return candidate.Handle;
-                }
+        if (found is not null)
+        {
+            if (_verify)
+            {
+                VerifyHit(source, options, scratch, entry, found, snapshot, specialization, pushDataCursor, needsShaderDataLimits);
+            }
+
+            if (_walkCheck)
+            {
+                WalkCheckHit(source, scratch, entry, snapshot, specialization);
+            }
+
+            return UsePermutation(found, snapshot, source, options, ref pushDataCursor, out stage);
+        }
+
+        // A miss compiles under the gate; another thread may have compiled the same permutation meanwhile.
+        if (LockFree) SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
+        lock (_gate)
+        {
+            if (LockFree) SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.Permutation);
+            found = FindPermutation(entry.Published, published.Length, needsShaderDataLimits, pushDataCursor, specialization);
+            if (found is not null)
+            {
+                return UsePermutation(found, snapshot, source, options, ref pushDataCursor, out stage);
+            }
+
+            key ??= new ProgramKey(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, staticState.ToArray());
+            var permutation = CompilePermutation(source, options, entry, specialization, pushDataCursor, key, sourceWasCached);
+            entry.Permutations.Add(permutation);
+            Volatile.Write(ref entry.Published, entry.Permutations.ToArray());
+            ShaderCacheCounters.CountPermutation();
+            stage = CreateStageResources(permutation.Program, snapshot, source, options);
+            permutation.Bindings.AdvancePushData(ref pushDataCursor);
+            if (RenderTrace.Enabled && RenderTrace.Pipeline())
+            {
+                RenderTrace.Write($"ProgramCache insert stage={source.Label} hash=0x{source.Hash:X16} id=0x{permutation.Handle.Id:X16} permutation={entry.Permutations.Count - 1}");
+            }
+
+            return permutation.Handle;
+        }
+    }
+
+    private static ProgramKeyLookup LookupOf(ShaderSource source, List<uint> staticState) =>
+        new(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, CollectionsMarshal.AsSpan(staticState));
+
+    // The first permutation from start on whose specialization and push-data start the draw matches.
+    private static ProgramPermutation? FindPermutation(ProgramPermutation[] permutations, int start, bool needsShaderDataLimits,
+        uint pushDataCursor, ResourceSpecialization specialization)
+    {
+        for (var index = start; index < permutations.Length; index++)
+        {
+            var candidate = permutations[index];
+            var layout = candidate.Bindings;
+            if ((!needsShaderDataLimits || layout.LimitsInShaderData) &&
+                layout.PushDataStartDword == (layout.LimitsInShaderData ? PushData.NoStart : PushData.StartFor(pushDataCursor, layout.ShaderDataDwordCount)) && candidate.Specialization.Equals(specialization)) // [local] a layout forced to ShaderData has no push start
+            {
+                return candidate;
             }
         }
 
-        key ??= new ProgramKey(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, _staticState.ToArray());
-        var permutation = CompilePermutation(source, options, entry, specialization, pushDataCursor, key, sourceWasCached);
-        entry.Permutations.Add(permutation);
-        ShaderCacheCounters.CountPermutation();
-        stage = CreateStageResources(permutation.Program, snapshot, source, options);
-        permutation.Bindings.AdvancePushData(ref pushDataCursor);
+        return null;
+    }
+
+    private static ShaderProgram UsePermutation(ProgramPermutation candidate, ResourceSnapshot snapshot, ShaderSource source,
+        StageCompileOptions options, ref uint pushDataCursor, out ShaderStageResources stage)
+    {
+        stage = CreateStageResources(candidate.Program, snapshot, source, options);
+        candidate.Bindings.AdvancePushData(ref pushDataCursor);
         if (RenderTrace.Enabled && RenderTrace.Pipeline())
         {
-            RenderTrace.Write($"ProgramCache insert stage={source.Label} hash=0x{source.Hash:X16} id=0x{permutation.Handle.Id:X16} permutation={entry.Permutations.Count - 1}");
+            RenderTrace.Write($"ProgramCache hit stage={source.Label} hash=0x{source.Hash:X16} id=0x{candidate.Handle.Id:X16}");
         }
 
-        return permutation.Handle;
+        return candidate.Handle;
+    }
+
+    // [local] SHARPEMU_PROGRAM_GATE_VERIFY: the hit found without the gate, looked up again under it as before the
+    // change (the shared cache, the entry list) without compiling anything.
+    private void VerifyHit(ShaderSource source, StageCompileOptions options, LookupScratch scratch, ProgramSourceEntry entry,
+        ProgramPermutation found, ResourceSnapshot snapshot, ResourceSpecialization specialization, uint pushDataCursor,
+        bool needsShaderDataLimits)
+    {
+        string? difference;
+        lock (_gate)
+        {
+            try
+            {
+                difference = VerifyUnderGate(source, options, scratch, entry, found, snapshot, specialization, pushDataCursor, needsShaderDataLimits);
+            }
+            catch (Exception exception)
+            {
+                ProgramGateVerify.NoteError(source, exception);
+                return;
+            }
+        }
+
+        ProgramGateVerify.Note(source, difference);
+    }
+
+    private void WalkCheckHit(ShaderSource source, LookupScratch scratch, ProgramSourceEntry entry, ResourceSnapshot snapshot,
+        ResourceSpecialization specialization)
+    {
+        string? difference;
+        lock (_gate)
+        {
+            try
+            {
+                var walkSnapshot = EmptySnapshot;
+                var walkSpecialization = EmptySpecialization;
+                if (!ResourceMaterializer.Materialize(entry.Plan, scratch.Inputs, ref walkSnapshot, ref walkSpecialization, out var failure, null))
+                    difference = $"walk_failed_{failure}";
+                else if (!walkSpecialization.Equals(specialization))
+                    difference = "walk_specialization";
+                else if (SameIgnoringLabels(snapshot, walkSnapshot))
+                    difference = null;
+                else
+                {
+                    var detail = ResourceMaterializationCache.SnapshotDifference(snapshot, walkSnapshot)!;
+                    var field = new string(detail.TakeWhile(static c => char.IsLetter(c) || c == '_').ToArray());
+                    difference = $"walk_{field} thread={Thread.CurrentThread.Name ?? Environment.CurrentManagedThreadId.ToString()} " +
+                        $"{RangesDifference(snapshot.DeviceAddressRanges, walkSnapshot.DeviceAddressRanges)}";
+                }
+            }
+            catch (Exception exception)
+            {
+                ProgramGateVerify.NoteError(source, exception);
+                return;
+            }
+        }
+
+        ProgramGateVerify.Note(source, difference);
+    }
+
+    private string? VerifyUnderGate(ShaderSource source, StageCompileOptions options, LookupScratch scratch, ProgramSourceEntry entry,
+        ProgramPermutation found, ResourceSnapshot snapshot, ResourceSpecialization specialization, uint pushDataCursor,
+        bool needsShaderDataLimits)
+    {
+        var staticState = scratch.VerifyState;
+        BuildStaticState(source.Stage, options, staticState);
+        if (!CollectionsMarshal.AsSpan(staticState).SequenceEqual(CollectionsMarshal.AsSpan(scratch.StaticState)))
+            return "static_state";
+        if (!_programs.GetAlternateLookup<ProgramKeyLookup>().TryGetValue(LookupOf(source, staticState), out var reference))
+            return "entry_missing";
+        if (!ReferenceEquals(reference, entry))
+            return "entry";
+        var referenceSnapshot = EmptySnapshot;
+        var referenceSpecialization = EmptySpecialization;
+        var materialized = _materializations is not null
+            ? _materializations.Materialize(entry.Plan, scratch.Inputs, _readResidentGuestBytes, ref referenceSnapshot, ref referenceSpecialization, out var failure)
+            : ResourceMaterializer.Materialize(entry.Plan, scratch.Inputs, ref referenceSnapshot, ref referenceSpecialization, out failure, null);
+        if (!materialized)
+            return $"materialize_failed_{failure}";
+        if (!referenceSpecialization.Equals(specialization))
+            return "specialization";
+        var labelsOnly = false;
+        if (ResourceMaterializationCache.SnapshotDifference(snapshot, referenceSnapshot) is { } snapshotDifference)
+        {
+            // A device range's handle is a label (diagnostics name it, nothing binds by it) that the store-table scan
+            // cache replays from the scan that filled it, so it depends on history with or without the gate.
+            if (!snapshotDifference.StartsWith("device_ranges", StringComparison.Ordinal) ||
+                !snapshot.DeviceAddressRanges.AsSpan().SequenceEqual(referenceSnapshot.DeviceAddressRanges, RangeWithoutHandle.Instance))
+            {
+                // Which of the two a fresh walk (no materialization cache) agrees with now.
+                var walkSnapshot = EmptySnapshot;
+                var walkSpecialization = EmptySpecialization;
+                var walked = ResourceMaterializer.Materialize(entry.Plan, scratch.Inputs, ref walkSnapshot, ref walkSpecialization, out _, null);
+                var lockFreeAgrees = walked && SameIgnoringLabels(snapshot, walkSnapshot);
+                var sharedAgrees = walked && SameIgnoringLabels(referenceSnapshot, walkSnapshot);
+                var field = new string(snapshotDifference.TakeWhile(static c => char.IsLetter(c) || c == '_').ToArray());
+                return $"snapshot_{field}_walk_{(!walked ? "failed" : lockFreeAgrees ? sharedAgrees ? "both" : "lockfree" : sharedAgrees ? "shared" : "neither")} " +
+                    $"thread={Thread.CurrentThread.Name ?? Environment.CurrentManagedThreadId.ToString()} " +
+                    $"{RangesDifference(snapshot.DeviceAddressRanges, referenceSnapshot.DeviceAddressRanges)} ({snapshotDifference})";
+            }
+
+            labelsOnly = true;
+        }
+
+        ProgramPermutation? referenceFound = null;
+        foreach (var candidate in entry.Permutations)
+        {
+            if (FindPermutation([candidate], 0, needsShaderDataLimits, pushDataCursor, referenceSpecialization) is not null)
+            {
+                referenceFound = candidate;
+                break;
+            }
+        }
+
+        if (referenceFound is null)
+            return "permutation_missing";
+        if (!ReferenceEquals(referenceFound, found))
+            return "permutation";
+        return labelsOnly ? ProgramGateVerify.LabelsOnly : null;
+    }
+
+    private static bool SameIgnoringLabels(ResourceSnapshot left, ResourceSnapshot right) =>
+        ResourceMaterializationCache.SnapshotDifference(left, right) is not { } difference ||
+        (difference.StartsWith("device_ranges", StringComparison.Ordinal) &&
+            left.DeviceAddressRanges.AsSpan().SequenceEqual(right.DeviceAddressRanges, RangeWithoutHandle.Instance));
+
+    // The counts and the first entries that differ, handles aside.
+    private static string RangesDifference(DeviceAddressRange[] left, DeviceAddressRange[] right)
+    {
+        var index = 0;
+        while (index < left.Length && index < right.Length && RangeWithoutHandle.Instance.Equals(left[index], right[index]))
+            index++;
+        static string At(DeviceAddressRange[] ranges, int index) =>
+            index < ranges.Length ? $"{ranges[index].Base:X}+{ranges[index].Size:X}{(ranges[index].Written ? "w" : "")}" : "-";
+        return $"counts={left.Length}/{right.Length} first_diff={index} lockfree={At(left, index)},{At(left, index + 1)} shared={At(right, index)},{At(right, index + 1)}";
+    }
+
+    private sealed class RangeWithoutHandle : IEqualityComparer<DeviceAddressRange>
+    {
+        public static readonly RangeWithoutHandle Instance = new();
+
+        public bool Equals(DeviceAddressRange x, DeviceAddressRange y) => (x with { Handle = 0 }) == (y with { Handle = 0 });
+
+        public int GetHashCode(DeviceAddressRange range) => (range with { Handle = 0 }).GetHashCode();
     }
 
     private static ShaderStageResources CreateStageResources(
@@ -450,18 +691,18 @@ internal sealed class ShaderProgramCache
         };
     }
 
-    private void BuildStaticState(ShaderStage stage, StageCompileOptions options)
+    private static void BuildStaticState(ShaderStage stage, StageCompileOptions options, List<uint> staticState)
     {
         switch (stage)
         {
             case ShaderStage.Vertex:
-                StageStaticKey.Build(options.VertexInfo ?? throw new ArgumentException("The vertex lookup has no vertex input info."), options.RequiredVertexOutputCount, _staticState);
+                StageStaticKey.Build(options.VertexInfo ?? throw new ArgumentException("The vertex lookup has no vertex input info."), options.RequiredVertexOutputCount, staticState);
                 break;
             case ShaderStage.Pixel:
-                StageStaticKey.Build(options.PixelInfo ?? throw new ArgumentException("The pixel lookup has no pixel input info."), _staticState);
+                StageStaticKey.Build(options.PixelInfo ?? throw new ArgumentException("The pixel lookup has no pixel input info."), staticState);
                 break;
             default:
-                StageStaticKey.Build(options.ComputeInfo ?? throw new ArgumentException("The compute lookup has no compute input info."), _staticState);
+                StageStaticKey.Build(options.ComputeInfo ?? throw new ArgumentException("The compute lookup has no compute input info."), staticState);
                 break;
         }
     }

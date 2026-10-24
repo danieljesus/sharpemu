@@ -47,6 +47,9 @@ public static class DeviceStoreTablePlanner
 
     public static long AppliedGeneration => Interlocked.Read(ref _appliedGeneration);
 
+    // [local] Moves on every invalidation inside the table bounds: while it holds still, every cached scan holds.
+    public static long ScanGeneration => Interlocked.Read(ref _scanGeneration);
+
     [System.ThreadStatic]
     private static bool _usedTables;
 
