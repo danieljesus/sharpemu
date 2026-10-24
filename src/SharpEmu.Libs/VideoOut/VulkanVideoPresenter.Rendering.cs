@@ -271,9 +271,21 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void ResetMappedSizes()
         {
+            if (Render2Probe.Enabled) Render2Probe.NoteMappedReset(); // [local]
             _mappedSizes?.Clear();
             _mappedSizesGeneration = _guestMemory.MappingGeneration;
         }
+
+        // [local] SHARPEMU_MAPPED_SIZE_KEEP (=1 on, =2 verify, 0 off): a range found mapped in full stays known across
+        // flips until the mapping generation moves. Only an unmap or a clear can make a mapped range unreadable, and
+        // both move the generation (a new mapping only widens what is readable, so clamped answers stay per frame as
+        // before). =2 recomputes every kept answer and counts the ones that differ.
+        internal static readonly int MappedSizeKeepMode =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_SIZE_KEEP"), out var keepMode) ? keepMode : 0;
+        private const int MaxFullyMapped = 1 << 16;
+        private HashSet<(ulong Address, ulong Size)>? _fullyMapped;
+        private long _fullyMappedGeneration = long.MinValue;
+        private static int _mappedKeepLogs;
 
         private ulong ClampMappedSize(ulong address, ulong size, PreparedStageBindings? prepared, int bufferIndex)
         {
@@ -288,14 +300,61 @@ internal static unsafe partial class VulkanVideoPresenter
                 ResetMappedSizes();
             }
 
+            HashSet<(ulong Address, ulong Size)>? fullyMapped = null;
+            if (MappedSizeKeepMode != 0) // [local]
+            {
+                if (generation != _fullyMappedGeneration)
+                {
+                    _fullyMapped?.Clear();
+                    _fullyMappedGeneration = generation;
+                }
+
+                fullyMapped = _fullyMapped ??= new HashSet<(ulong Address, ulong Size)>();
+                if (fullyMapped.Contains((address, size)))
+                {
+                    Render2Probe.MappedKeepHits++;
+                    if (MappedSizeKeepMode != 2)
+                    {
+                        return size;
+                    }
+
+                    Render2Probe.MappedKeepChecked++;
+                    var check = ClampMappedSizeCore(address, size, prepared, bufferIndex);
+                    if (check != size)
+                    {
+                        Render2Probe.MappedKeepMismatches++;
+                        if (_mappedKeepLogs++ < 20)
+                            Console.Error.WriteLine($"[MAPPED_SIZE_KEEP_MISMATCH] address=0x{address:X} size=0x{size:X} now=0x{check:X} generation={generation}");
+                    }
+
+                    return check;
+                }
+            }
+
             var sizes = _mappedSizes ??= new Dictionary<(ulong Address, ulong Size), ulong>();
             if (sizes.TryGetValue((address, size), out var mapped))
             {
+                if (Render2Probe.Enabled) Render2Probe.NoteMapped(true); // [local]
+                if (fullyMapped is not null && mapped == size) // [local] answered this frame before it could be kept
+                {
+                    if (fullyMapped.Count >= MaxFullyMapped)
+                        fullyMapped.Clear();
+                    fullyMapped.Add((address, size));
+                }
+
                 return mapped;
             }
 
+            if (Render2Probe.Enabled) Render2Probe.NoteMapped(false); // [local]
             mapped = ClampMappedSizeCore(address, size, prepared, bufferIndex);
             sizes[(address, size)] = mapped;
+            if (fullyMapped is not null && mapped == size) // [local] SHARPEMU_MAPPED_SIZE_KEEP
+            {
+                if (fullyMapped.Count >= MaxFullyMapped)
+                    fullyMapped.Clear();
+                fullyMapped.Add((address, size));
+            }
+
             return mapped;
         }
 

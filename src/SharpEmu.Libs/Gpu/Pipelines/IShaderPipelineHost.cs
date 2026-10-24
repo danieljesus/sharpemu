@@ -73,6 +73,13 @@ internal interface IShaderPipelineHost
     // the resource cache then re-materializes instead of trusting a stale copy.
     bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean) => false;
 
+    // [local] SHARPEMU_VALIDATE_IN_PLACE: TryReadResidentGuestBytes's bytes compared in place; false when not compared.
+    bool TryCompareResidentGuestBytes(ulong address, ReadOnlySpan<byte> expected, bool clean, out bool equal)
+    {
+        equal = false;
+        return false;
+    }
+
     // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: GPU-owned ranges brought back in one readback; true when the first is.
     bool TrySynchronizeGuestRanges(ReadOnlySpan<(ulong Address, int Length)> ranges) => false;
 

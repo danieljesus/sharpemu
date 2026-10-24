@@ -219,7 +219,7 @@ public static class DeviceStoreTablePlanner
             $"{SourceNames[index]}={Interlocked.Exchange(ref _drops[index], 0)}/{Interlocked.Exchange(ref _dropCalls[index], 0)}/{Interlocked.Exchange(ref _dropBytes[index], 0)}b"));
         var top = string.Join(",", keys.OrderByDescending(pair => pair.Value).Take(4).Select(pair => $"0x{pair.Key.Base:X}+0x{pair.Key.Bytes:X}:{pair.Value}"));
         return System.FormattableString.Invariant(
-            $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} bulk_races={Interlocked.Exchange(ref _bulkRaces, 0)} keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]");
+            $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} bulk_races={Interlocked.Exchange(ref _bulkRaces, 0)} keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]") + FastReport();
     }
 
     // [local] SHARPEMU_STORE_TABLE_BULK (1 by default, =0 turns it off): a scan reads the table in 64 KB chunks through the
@@ -230,6 +230,22 @@ public static class DeviceStoreTablePlanner
     // one that still differs is a difference between the two readers (bulk_mismatches, logged).
     private static readonly int BulkMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_BULK"), out var bulkMode) ? bulkMode : 1;
     private const int BulkChunkEntries = 4096;
+
+    // [local] SHARPEMU_STORE_TABLE_FAST (=1 on, =2 verify, 0 off; with SHARPEMU_STORE_TABLE_BULK=1): three changes to a
+    // scan that keep its result. (a) A chunk the resident reader refuses is read again through it 4 KB at a time, and
+    // only the 4 KB pieces it refuses again go word by word: the resident reader accepts a piece under the same
+    // ownership rules as the whole chunk, and the word reader returns the same words for memory it accepts. (b) An
+    // entry whose 48-bit base is zero is skipped before its other words are read (TryDecode rejects it). (c) The found
+    // ranges are not sorted when they already are in base order (the merge only compares bases and ends). =2 also
+    // reads every word of an accepted piece of a refused chunk through the word reader and counts the differences as
+    // races (a second resident read agrees with the word reader) or mismatches.
+    public static readonly int FastMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_FAST"), out var fastMode) ? fastMode : 0;
+    private const int PieceEntries = 256;
+    private static long _fastPieces, _fastPieceFallbacks, _fastSkipped, _fastSortSkipped, _fastChecked, _fastRaces, _fastMismatches, _fastMismatchTotal;
+    private static int _fastMismatchLogs;
+
+    private static string FastReport() => FastMode == 0 ? string.Empty : System.FormattableString.Invariant(
+        $" fast_pieces={Interlocked.Exchange(ref _fastPieces, 0)} fast_piece_fallbacks={Interlocked.Exchange(ref _fastPieceFallbacks, 0)} fast_skipped={Interlocked.Exchange(ref _fastSkipped, 0)} fast_sort_skipped={Interlocked.Exchange(ref _fastSortSkipped, 0)} fast_checked={Interlocked.Exchange(ref _fastChecked, 0)} fast_races={Interlocked.Exchange(ref _fastRaces, 0)} fast_mismatches={Interlocked.Exchange(ref _fastMismatches, 0)} fast_mismatches_total={Interlocked.Read(ref _fastMismatchTotal)}");
 
     // [local] Before a table is scanned: its bounds join the invalidation filter first, so a write landing during the
     // scan is counted; the generation the scan starts from.
@@ -379,6 +395,8 @@ public static class DeviceStoreTablePlanner
 
         Span<uint> words = stackalloc uint[4];
         Span<byte> again = stackalloc byte[4]; // [local] SHARPEMU_STORE_TABLE_BULK=2
+        var fast = FastMode != 0 && BulkMode == 1; // [local] SHARPEMU_STORE_TABLE_FAST
+        Span<bool> pieceRead = stackalloc bool[BulkChunkEntries / PieceEntries];
         foreach (var table in plan.DeviceStoreTables)
         {
             var known = true;
@@ -424,13 +442,33 @@ public static class DeviceStoreTablePlanner
                     var bulkRead = bulk is not null && bulk(tableBase + (ulong)first * 16, chunkBytes, false);
                     if (Profile && bulk is not null)
                         Interlocked.Increment(ref bulkRead ? ref _bulkChunks : ref _bulkFallbacks);
+                    var piecesRead = false;
+                    if (!bulkRead && fast && bulk is not null) // [local] (a) the refused chunk again, 4 KB at a time
+                    {
+                        for (var piece = 0; piece * PieceEntries < count; piece++)
+                        {
+                            var pieceFirst = piece * PieceEntries;
+                            var pieceCount = System.Math.Min(PieceEntries, count - pieceFirst);
+                            pieceRead[piece] = bulk(tableBase + (ulong)(first + pieceFirst) * 16, chunkBytes.Slice(pieceFirst * 16, pieceCount * 16), false);
+                            piecesRead |= pieceRead[piece];
+                            Interlocked.Increment(ref pieceRead[piece] ? ref _fastPieces : ref _fastPieceFallbacks);
+                        }
+                    }
+
                     for (var entry = first; entry < first + count; entry++)
                     {
                         var address = tableBase + (ulong)entry * 16;
                         var readable = true;
-                        if (bulkRead)
+                        var pieceBytes = !bulkRead && piecesRead && pieceRead[(entry - first) / PieceEntries];
+                        if (bulkRead || pieceBytes)
                         {
                             var offset = (entry - first) * 16;
+                            if (fast && (System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(chunkBytes.Slice(offset, 8)) & 0xFFFF_FFFF_FFFFUL) == 0)
+                            {
+                                _fastSkipped++; // [local] (b) TryDecode rejects a zero base
+                                continue;
+                            }
+
                             for (var dword = 0; dword < 4; dword++)
                                 words[dword] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes[(offset + dword * 4)..]);
                             if (BulkMode == 2)
@@ -449,6 +487,27 @@ public static class DeviceStoreTablePlanner
                                     Interlocked.Increment(ref _bulkMismatches);
                                     if (Interlocked.Increment(ref _bulkMismatchLogs) <= 20)
                                         System.Console.Error.WriteLine($"[STORE_TABLE_BULK_MISMATCH] thread={System.Environment.CurrentManagedThreadId} address=0x{address + (ulong)dword * 4:X} bulk=0x{words[dword]:X8} word=0x{checkWord:X8}");
+                                }
+                            }
+
+                            if (pieceBytes && FastMode == 2) // [local] SHARPEMU_STORE_TABLE_FAST=2
+                            {
+                                for (var dword = 0; dword < 4; dword++)
+                                {
+                                    Interlocked.Increment(ref _fastChecked);
+                                    if (read(address + (ulong)dword * 4, out var checkWord) && checkWord == words[dword])
+                                        continue;
+                                    if (bulk!(address + (ulong)dword * 4, again, false) &&
+                                        System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(again) == checkWord)
+                                    {
+                                        Interlocked.Increment(ref _fastRaces);
+                                        continue;
+                                    }
+
+                                    Interlocked.Increment(ref _fastMismatches);
+                                    Interlocked.Increment(ref _fastMismatchTotal);
+                                    if (Interlocked.Increment(ref _fastMismatchLogs) <= 20)
+                                        System.Console.Error.WriteLine($"[STORE_TABLE_FAST_MISMATCH] thread={System.Environment.CurrentManagedThreadId} address=0x{address + (ulong)dword * 4:X} piece=0x{words[dword]:X8} word=0x{checkWord:X8}");
                                 }
                             }
                         }
@@ -483,7 +542,13 @@ public static class DeviceStoreTablePlanner
             if (MergeGap != ulong.MaxValue && ranges.Count - before > 1) // [local] coalesce neighbouring V# ranges
             {
                 var found = ranges.GetRange(before, ranges.Count - before);
-                found.Sort((a, b) => a.Base.CompareTo(b.Base));
+                var sorted = fast; // [local] (c) already in base order: the merge below reads only bases and ends
+                for (var index = 1; sorted && index < found.Count; index++)
+                    sorted = found[index - 1].Base <= found[index].Base;
+                if (sorted)
+                    _fastSortSkipped++;
+                else
+                    found.Sort((a, b) => a.Base.CompareTo(b.Base));
                 ranges.RemoveRange(before, ranges.Count - before);
                 var start = found[0].Base;
                 var end = found[0].Base + found[0].Size;

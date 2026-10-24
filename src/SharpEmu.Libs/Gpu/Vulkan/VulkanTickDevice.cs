@@ -245,7 +245,10 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
     private bool TryWaitTimelineCore(ulong tick, out string failure)
     {
         var target = tick;
-        if (GpuWaitSpin.TrySpin(() => ReadTimeline() >= target))
+        var spinStart = Render2Probe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        var spun = GpuWaitSpin.TrySpin(() => ReadTimeline() >= target);
+        if (spinStart != 0) Render2Probe.NoteSpin(Render2Probe.SpinSite.Tick, spun, System.Diagnostics.Stopwatch.GetTimestamp() - spinStart); // [local]
+        if (spun)
         {
             failure = Result.Success.ToString();
             return true;
@@ -274,6 +277,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
                 }
             }
         }
+        if (Render2Probe.Enabled) Render2Probe.NoteBlocked(Render2Probe.SpinSite.Tick, System.Diagnostics.Stopwatch.GetTimestamp() - probeStart); // [local]
         RenderWaitProbe.Record("timeline", probeStart, (long)tick - (long)probeCompleted);
         failure = result.ToString();
         return result == Result.Success && WaitRetired(tick);

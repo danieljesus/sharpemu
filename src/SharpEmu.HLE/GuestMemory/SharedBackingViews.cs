@@ -172,6 +172,26 @@ public sealed unsafe class SharedBackingViews : IDisposable
         }
     }
 
+    // [local] The lock-free single-view compare only, as TryReadSingleView reads; false (equal unset) for anything else.
+    public bool TryCompareSingleView(ulong address, ReadOnlySpan<byte> expected, out bool equal)
+    {
+        equal = false;
+        if (!TryAccessSingleView(address, (ulong)expected.Length, out var source))
+        {
+            return false;
+        }
+
+        try
+        {
+            equal = new ReadOnlySpan<byte>((void*)source, expected.Length).SequenceEqual(expected);
+            return true;
+        }
+        finally
+        {
+            ExitAccess();
+        }
+    }
+
     // [local] The lock-free single-view write only; false (with nothing written) for anything else.
     // Adapted from 2838b258 by Berk (par274), co-authored by Astellou.
     public bool TryWriteSingleView(ulong address, ReadOnlySpan<byte> data)

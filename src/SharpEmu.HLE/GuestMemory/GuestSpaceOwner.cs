@@ -112,6 +112,8 @@ public sealed class GuestSpaceOwner : IDisposable
     // Reads through a view that covers the whole range without any lock; false otherwise.
     public bool TryReadSingleView(ulong address, Span<byte> data) => _views.TryReadSingleView(address, data);
 
+    public bool TryCompareSingleView(ulong address, ReadOnlySpan<byte> expected, out bool equal) => _views.TryCompareSingleView(address, expected, out equal); // [local]
+
     public bool TryWriteSingleView(ulong address, ReadOnlySpan<byte> data) => _views.TryWriteSingleView(address, data);
 
     public bool TryCopySingleView(ulong destination, ulong source, ulong size) => _views.TryCopySingleView(destination, source, size);

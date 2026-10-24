@@ -123,7 +123,20 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
                 Interlocked.Decrement(ref _pendingCount);
             }
 
-            command();
+            if (VideoOut.Render2Probe.Enabled) // [local] SHARPEMU_RENDER2_PROBE
+            {
+                var started = System.Diagnostics.Stopwatch.GetTimestamp();
+                command();
+                Delegate named = command;
+                if (command.Target?.GetType().GetField("work")?.GetValue(command.Target) is Delegate inner)
+                    named = inner;
+                VideoOut.Render2Probe.NoteRelay(named, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+            }
+            else
+            {
+                command();
+            }
+
             ran = true;
         }
 

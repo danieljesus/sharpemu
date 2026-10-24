@@ -10,6 +10,9 @@ namespace SharpEmu.ShaderCompiler.Resources;
 // returns false so the caller falls back to a full materialization.
 public delegate bool ResidentGuestBytesReader(ulong address, Span<byte> destination, bool clean);
 
+// [local] SHARPEMU_VALIDATE_IN_PLACE: the reader's bytes compared with expected in place; false when not compared.
+public delegate bool ResidentGuestBytesComparer(ulong address, ReadOnlySpan<byte> expected, bool clean, out bool equal);
+
 // Materialization is a pure function of the plan, the draw's user data, the shader
 // base, the compute state and the guest words it reads. This cache records exactly
 // those words and reuses the result while every one of them is unchanged, so a draw
@@ -81,7 +84,7 @@ public sealed class ResourceMaterializationCache
         var refreshes = Interlocked.Exchange(ref _totalRefreshes, 0);
         var total = hits + misses;
         return FormattableString.Invariant(
-            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} table_stale={Interlocked.Exchange(ref _totalTableStale, 0)} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)} block_builds={Interlocked.Exchange(ref ReadRecorder.BlockBuilds, 0)} block_fallbacks={Interlocked.Exchange(ref ReadRecorder.BlockFallbacks, 0)} block_checked={Interlocked.Exchange(ref ReadRecorder.BlockChecked, 0)} block_mismatches={Interlocked.Exchange(ref ReadRecorder.BlockMismatches, 0)}{TakeRebaseReport()}{TakeSyncValidateReport()}");
+            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} table_stale={Interlocked.Exchange(ref _totalTableStale, 0)} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)} block_builds={Interlocked.Exchange(ref ReadRecorder.BlockBuilds, 0)} block_fallbacks={Interlocked.Exchange(ref ReadRecorder.BlockFallbacks, 0)} block_checked={Interlocked.Exchange(ref ReadRecorder.BlockChecked, 0)} block_mismatches={Interlocked.Exchange(ref ReadRecorder.BlockMismatches, 0)}{TakeRebaseReport()}{TakeSyncValidateReport()}{TakeInPlaceReport()}");
     }
 
     public bool Materialize(
@@ -90,7 +93,8 @@ public sealed class ResourceMaterializationCache
         ResidentGuestBytesReader residentReader,
         ref ResourceSnapshot snapshot,
         ref ResourceSpecialization specialization,
-        out ResourceMaterializationFailure failure)
+        out ResourceMaterializationFailure failure,
+        ResidentGuestBytesComparer? residentComparer = null)
     {
         CurrentPlanHash = plan.Hash; // [local] for overlay diagnostics
         var key = KeyOf(plan, inputs);
@@ -119,7 +123,7 @@ public sealed class ResourceMaterializationCache
                 if (!variant.Matches(plan, inputs) || (stamps && !TablesCurrent(variant)))
                     continue;
                 var validateStarted = MaterializeSplitProfile.Start(); // [local]
-                var validated = Validate(variant, inputs, residentReader, out var variantUnreadable);
+                var validated = Validate(variant, inputs, residentReader, out var variantUnreadable, residentComparer);
                 MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Validate, validateStarted);
                 if (validated && StaleLog) _lastStaleReason = "snapshot";
                 var syncValidated = _syncValidated;
@@ -1047,7 +1051,41 @@ public sealed class ResourceMaterializationCache
             Console.Error.WriteLine($"[MATERIALIZE_SYNC_VALIDATE_MISMATCH] plan=0x{planHash:X16} total={total} {difference}");
     }
 
-    private bool Validate(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader, out bool unreadable)
+    // [local] SHARPEMU_VALIDATE_IN_PLACE (=1 on, =2 verify, 0 off): a recorded range of InPlaceMinBytes or more is compared
+    // with the guest bytes where they lie (the reader's own ownership checks first) instead of copied out and compared;
+    // equal ranges skip the copy, anything else takes the copy path unchanged. =2 also takes the copy path after every
+    // in-place verdict and counts a different verdict as a race when a second in-place compare agrees with the copy
+    // (the memory changed in between), else as a mismatch.
+    public static readonly int ValidateInPlaceMode =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_VALIDATE_IN_PLACE"), out var inPlaceMode) ? inPlaceMode : 0;
+    private const int InPlaceMinBytes = 4096;
+    private static long _inPlaceCompared, _inPlaceEqual, _inPlaceUnhandled, _inPlaceKb, _inPlaceChecked, _inPlaceRaces, _inPlaceMismatches, _inPlaceMismatchTotal;
+    private static int _inPlaceMismatchLogs;
+
+    private static string TakeInPlaceReport() => ValidateInPlaceMode == 0 ? string.Empty :
+        $" in_place_compared={Interlocked.Exchange(ref _inPlaceCompared, 0)} in_place_equal={Interlocked.Exchange(ref _inPlaceEqual, 0)} in_place_unhandled={Interlocked.Exchange(ref _inPlaceUnhandled, 0)} in_place_kb={Interlocked.Exchange(ref _inPlaceKb, 0)} in_place_checked={Interlocked.Exchange(ref _inPlaceChecked, 0)} in_place_races={Interlocked.Exchange(ref _inPlaceRaces, 0)} in_place_mismatches={Interlocked.Exchange(ref _inPlaceMismatches, 0)} in_place_mismatches_total={Interlocked.Read(ref _inPlaceMismatchTotal)}";
+
+    private static void CheckInPlace(bool equal, ResidentGuestBytesComparer comparer, ulong address, ReadOnlySpan<byte> current,
+        ReadOnlySpan<byte> cached, bool readable, bool clean)
+    {
+        Interlocked.Increment(ref _inPlaceChecked);
+        var copyEqual = readable && current.SequenceEqual(cached);
+        if (copyEqual == equal)
+            return;
+        if (comparer(address, cached, clean, out var again) && again == copyEqual)
+        {
+            Interlocked.Increment(ref _inPlaceRaces);
+            return;
+        }
+
+        Interlocked.Increment(ref _inPlaceMismatches);
+        Interlocked.Increment(ref _inPlaceMismatchTotal);
+        if (Interlocked.Increment(ref _inPlaceMismatchLogs) <= 20)
+            Console.Error.WriteLine($"[VALIDATE_IN_PLACE_MISMATCH] address=0x{address:X} bytes={cached.Length} in_place={equal} copy={copyEqual} readable={readable} clean={clean}");
+    }
+
+    private bool Validate(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader, out bool unreadable,
+        ResidentGuestBytesComparer? residentComparer = null)
     {
         unreadable = false;
         _syncValidated = false;
@@ -1060,12 +1098,37 @@ public sealed class ResourceMaterializationCache
                 return false;
             }
             var length = entry.RangeLengths[index];
+            var inPlace = false; // [local] SHARPEMU_VALIDATE_IN_PLACE
+            var inPlaceEqual = false;
+            if (residentComparer is not null && length >= InPlaceMinBytes)
+            {
+                inPlace = residentComparer(address, entry.Bytes.AsSpan(entry.RangeOffsets[index], length), entry.RangeClean[index], out inPlaceEqual);
+                if (!inPlace)
+                {
+                    Interlocked.Increment(ref _inPlaceUnhandled);
+                }
+                else
+                {
+                    Interlocked.Increment(ref _inPlaceCompared);
+                    Interlocked.Add(ref _inPlaceKb, length / 1024);
+                    if (inPlaceEqual)
+                        Interlocked.Increment(ref _inPlaceEqual);
+                    if (inPlaceEqual && ValidateInPlaceMode != 2)
+                    {
+                        MaterializeSplitProfile.NoteValidatedBytes(length);
+                        continue;
+                    }
+                }
+            }
+
             if (_scratch.Length < length)
                 _scratch = new byte[Math.Max(length, _scratch.Length * 2)];
             var current = _scratch.AsSpan(0, length);
             if (!residentReader(address, current, entry.RangeClean[index]) &&
                 !(SyncValidateMode != 0 && !entry.RangeClean[index] && TrySyncRead(inputs, entry.Plan.Hash, address, current, residentReader)))
             {
+                if (inPlace && ValidateInPlaceMode == 2)
+                    CheckInPlace(inPlaceEqual, residentComparer!, address, current, entry.Bytes.AsSpan(entry.RangeOffsets[index], length), readable: false, entry.RangeClean[index]);
                 unreadable = true;
                 if (StaleLog) _lastStaleReason = $"unreadable:r{index}:clean{entry.RangeClean[index]}";
                 return false;
@@ -1073,6 +1136,8 @@ public sealed class ResourceMaterializationCache
 
             var cached = entry.Bytes.AsSpan(entry.RangeOffsets[index], length);
             MaterializeSplitProfile.NoteValidatedBytes(length); // [local]
+            if (inPlace && ValidateInPlaceMode == 2)
+                CheckInPlace(inPlaceEqual, residentComparer!, address, current, cached, readable: true, entry.RangeClean[index]);
             if (current.SequenceEqual(cached))
                 continue;
             if (StaleLog)

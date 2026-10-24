@@ -204,11 +204,14 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         try
         {
             var vk = _device.Vk;
-            if (GpuWaitSpin.TrySpin(() =>
+            var spinStart = VideoOut.Render2Probe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+            var spun = GpuWaitSpin.TrySpin(() =>
                 {
                     ulong value;
                     return vk.GetSemaphoreCounterValue(_device.Device, _timeline, &value) == Result.Success && value >= ticket.Value;
-                }))
+                });
+            if (spinStart != 0) VideoOut.Render2Probe.NoteSpin(VideoOut.Render2Probe.SpinSite.Readback, spun, System.Diagnostics.Stopwatch.GetTimestamp() - spinStart); // [local]
+            if (spun)
             {
                 return;
             }
@@ -238,6 +241,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
 
                 Require(result, "vkWaitSemaphores(readback)");
             }
+            if (VideoOut.Render2Probe.Enabled) VideoOut.Render2Probe.NoteBlocked(VideoOut.Render2Probe.SpinSite.Readback, System.Diagnostics.Stopwatch.GetTimestamp() - probeStart); // [local]
             VideoOut.RenderWaitProbe.Record("readback", probeStart, (long)ticket.WaitTick - (long)probeCompleted);
         }
         finally

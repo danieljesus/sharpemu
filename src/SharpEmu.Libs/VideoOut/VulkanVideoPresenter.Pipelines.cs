@@ -929,6 +929,23 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            if (!ResidentReadAllowed(address, size, clean))
+            {
+                return false;
+            }
+
+            if (TryGetAliasPointer(address, size, out var alias))
+            {
+                new ReadOnlySpan<byte>(alias, destination.Length).CopyTo(destination);
+                return true;
+            }
+
+            return _guestMemory.TryRead(address, destination);
+        }
+
+        // The render thread's ownership checks of TryReadResidentGuestBytes, shared with the in-place compare.
+        private bool ResidentReadAllowed(ulong address, ulong size, bool clean)
+        {
             if (clean || !IsCleanReadPage(address, size))
             {
                 if (!_guestMemory.CanRead(address, size) ||
@@ -941,13 +958,34 @@ internal static unsafe partial class VulkanVideoPresenter
                 NoteCleanReadPage(address, size);
             }
 
+            return true;
+        }
+
+        // [local] SHARPEMU_VALIDATE_IN_PLACE: what TryReadResidentGuestBytes would read, compared with expected where it
+        // lies instead of copied out first. True with equal set when compared; false when the read would fail or take
+        // another path (the front thread, memory outside a single backing view): the caller then reads as before.
+        public bool TryCompareResidentGuestBytes(ulong address, ReadOnlySpan<byte> expected, bool clean, out bool equal)
+        {
+            equal = false;
+            if (OnFrontThread || expected.IsEmpty)
+            {
+                return false;
+            }
+
+            if (!LazyBackReads) AllocateEagerClosure(this, address); // [local]
+            var size = (ulong)expected.Length;
+            if (!ResidentReadAllowed(address, size, clean))
+            {
+                return false;
+            }
+
             if (TryGetAliasPointer(address, size, out var alias))
             {
-                new ReadOnlySpan<byte>(alias, destination.Length).CopyTo(destination);
+                equal = new ReadOnlySpan<byte>(alias, expected.Length).SequenceEqual(expected);
                 return true;
             }
 
-            return _guestMemory.TryRead(address, destination);
+            return _guestMemory.TryCompare(address, expected, out equal);
         }
 
         // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: on the render thread, the GPU-owned ranges among these are

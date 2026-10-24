@@ -2277,6 +2277,13 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         out bool equal)
     {
         equal = false;
+        // [local] Backed guest memory compares in place through the lock-free single-view alias, as TryRead reads.
+        if (!expected.IsEmpty && _backedSpace is { } backed && !_disposed &&
+            backed.TryCompareSingleView(virtualAddress, expected, out equal))
+        {
+            return true;
+        }
+
         _gate.EnterReadLock();
         try
         {

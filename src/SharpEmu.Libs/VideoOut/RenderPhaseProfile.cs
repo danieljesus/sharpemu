@@ -599,6 +599,7 @@ internal static class RenderPhaseProfile
         if (Gpu.Scheduling.SubmitThreadStats.TakeReport(seconds, frames) is { } submitReport) Console.Error.WriteLine(submitReport); // [local]
         foreach (var vkCallLine in Gpu.Vulkan.VkCallProbe.TakeReport(seconds, frames)) Console.Error.WriteLine(vkCallLine); // [local]
         foreach (var ringLine in Gpu.Vulkan.CommandRing.TakeReport(seconds, frames)) Console.Error.WriteLine(ringLine); // [local]
+        if (Render2Probe.TakeReport(frames) is { } render2) Console.Error.WriteLine(render2); // [local] SHARPEMU_RENDER2_PROBE
         ReportImageUploads();
         BufferUploadProfile.Report();
         Console.Error.WriteLine(SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.TakeReport());

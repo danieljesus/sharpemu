@@ -211,6 +211,7 @@ internal sealed class ShaderProgramCache
     private static readonly ResourceSnapshot EmptySnapshot = new();
     private static readonly ResourceSpecialization EmptySpecialization = new();
     private readonly ResidentGuestBytesReader _readResidentGuestBytes;
+    private readonly ResidentGuestBytesComparer? _compareResidentGuestBytes; // [local] SHARPEMU_VALIDATE_IN_PLACE
     private readonly ResidentGuestBytesReader? _prefetchResidentGuestBytes;
 
     private static readonly bool PrefetchEnabled = Environment.GetEnvironmentVariable("SHARPEMU_RESOURCE_PREFETCH") != "0";
@@ -226,6 +227,7 @@ internal sealed class ShaderProgramCache
         _readGuestWord = host.TryReadGuestWord;
         _readCleanGuestWord = host.TryReadCleanGuestWord;
         _readResidentGuestBytes = host.TryReadResidentGuestBytes;
+        _compareResidentGuestBytes = ResourceMaterializationCache.ValidateInPlaceMode != 0 ? host.TryCompareResidentGuestBytes : null; // [local]
         _prefetchResidentGuestBytes = PrefetchEnabled ? _readResidentGuestBytes : null;
         var synchronizeRanges = ResourceMaterializationCache.SyncValidateMode != 0 ? host.TrySynchronizeGuestRanges : (GuestRangeSynchronizer?)null; // [local]
         _scratch = new ThreadLocal<LookupScratch>(() => new LookupScratch(new ResourceRuntimeInputs
@@ -530,7 +532,7 @@ internal sealed class ShaderProgramCache
         ref ResourceSnapshot snapshot, ref ResourceSpecialization specialization, out ResourceMaterializationFailure failure,
         Action<IndirectImageFailure>? captureIndirectImageFailure) =>
         materializations is not null && captureIndirectImageFailure is null
-            ? materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization, out failure)
+            ? materializations.Materialize(entry.Plan, inputs, _readResidentGuestBytes, ref snapshot, ref specialization, out failure, _compareResidentGuestBytes)
             : ResourceMaterializer.Materialize(entry.Plan, inputs, ref snapshot, ref specialization, out failure, captureIndirectImageFailure);
 
     private static ProgramKeyLookup LookupOf(ShaderSource source, List<uint> staticState) =>
