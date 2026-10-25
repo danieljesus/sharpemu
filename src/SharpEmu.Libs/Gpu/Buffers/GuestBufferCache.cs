@@ -568,6 +568,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             var probeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             var probeResult = DownloadToCpuCore(address, size);
+            if (Diagnostics.LabelPollSplit.Enabled) // [local] does the fault's page stay GPU-dirty (the guest faults again)?
+                Diagnostics.LabelPollSplit.NoteFault(probeStarted, _tracker.HasGpuDirtyPages(address & ~(TrackerLayout.PageBytes - 1), TrackerLayout.PageBytes));
             Span<byte> label = stackalloc byte[8];
             if (_backing.TryReadBacking(Diagnostics.LabelLatencyProbe.Address, label))
                 Diagnostics.LabelLatencyProbe.Poll(probeStarted, System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(label),
@@ -1730,10 +1732,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 PendingDownload? pending = null;
                 var relayStarted = GuestReadSplit ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
                 long relayEntered = 0;
+                var split = source == GuestMemoryProfile.ReadbackSource.StoreDownload && Diagnostics.LabelPollSplit.Measures(guestAddress, size) // [local]
+                    ? new Diagnostics.LabelPollSplit.Sample { Started = System.Diagnostics.Stopwatch.GetTimestamp() }
+                    : null;
                 if (!_relay.TryRunOnGpuQueue(() =>
                     {
                         if (GuestReadSplit) relayEntered = System.Diagnostics.Stopwatch.GetTimestamp();
+                        if (split is not null) BeginSplit(split);
                         pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true);
+                        if (split is not null) EndSplitBegin(split, pending, guestAddress, size);
                     }))
                 {
                     return AwaitShutdown();
@@ -1741,6 +1748,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
                 if (pending is null)
                 {
+                    if (split is not null)
+                    {
+                        split.Applied = true;
+                        split.Completed = System.Diagnostics.Stopwatch.GetTimestamp();
+                        Diagnostics.LabelPollSplit.Add(split);
+                    }
+
                     return true;
                 }
 
@@ -1752,6 +1766,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 if (!_relay.TryRunOnGpuQueue(() => applied = CompleteReadMemoryOnGpu(pending, retrySynchronously: lastAttempt)))
                 {
                     return AwaitShutdown();
+                }
+
+                if (split is not null)
+                {
+                    split.Applied = applied;
+                    split.Completed = System.Diagnostics.Stopwatch.GetTimestamp();
+                    if (split.DoneAt == 0) split.WaitStarted = split.WriterAt = split.AheadAt = split.DoneAt = split.Completed; // an eager download
+                    Diagnostics.LabelPollSplit.Add(split);
                 }
 
                 if (applied || lastAttempt)
@@ -2022,6 +2044,58 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         double Ms(ref long ticks) => Interlocked.Exchange(ref ticks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         Console.Error.WriteLine(FormattableString.Invariant(
             $"[GUEST_READ_SPLIT] reads={count} relay_ms={Ms(ref _splitRelay):F0} begin_ms={Ms(ref _splitBegin):F0} gpu_ms={Ms(ref _splitGpu):F0}"));
+    }
+
+    // [local] SHARPEMU_LABEL_POLL_SPLIT: on the GPU queue thread, before and after the begin of a measured download.
+    private bool _splitFlushed;
+
+    private void BeginSplit(Diagnostics.LabelPollSplit.Sample split)
+    {
+        split.Entered = System.Diagnostics.Stopwatch.GetTimestamp();
+        split.Current = _scheduler.CurrentTick;
+        split.CompletedTick = _scheduler.Timeline.CompletedTick;
+        _splitFlushed = false;
+    }
+
+    private void EndSplitBegin(Diagnostics.LabelPollSplit.Sample split, PendingDownload? pending, ulong address, ulong size)
+    {
+        split.Flushed = _splitFlushed;
+        if (pending is null)
+        {
+            return;
+        }
+
+        split.Pending = true;
+        split.Eager = pending.Eager;
+        split.WaitTick = pending.Ticket.WaitTick;
+        split.AheadCount = pending.Ticket.AheadCount;
+        split.AheadTick = pending.Ticket.AheadTick;
+        split.Pieces = pending.Copies.Count;
+        var page = address & ~(TrackerLayout.PageBytes - 1);
+        var log = Diagnostics.LabelPollSplit.LogPieces() ? new System.Text.StringBuilder() : null;
+        for (var index = 0; index < pending.Copies.Count; index++)
+        {
+            var copy = pending.Copies[index];
+            var tick = index < pending.WriteTicks.Length ? pending.WriteTicks[index] : copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size);
+            if (copy.Address < page + TrackerLayout.PageBytes && page < copy.Address + copy.Size)
+            {
+                split.PagePieces++;
+                split.PageTick = Math.Max(split.PageTick, tick);
+            }
+
+            if (copy.Address < address + size && address < copy.Address + copy.Size)
+            {
+                split.BytesPieces++;
+                split.BytesTick = Math.Max(split.BytesTick, tick);
+            }
+
+            log?.Append(FormattableString.Invariant($" {(long)copy.Address - (long)address:+#;-#;0}+0x{copy.Size:X}@{(long)split.Current - (long)tick}"));
+        }
+
+        if (log is not null)
+            Console.Error.WriteLine(FormattableString.Invariant($"[LABEL_POLL_PIECES] address=0x{address:X} window=0x{pending.WindowBegin:X}-0x{pending.WindowEnd:X} current={split.Current} completed={split.CompletedTick} flushed={split.Flushed} eager={pending.Eager} pieces(offset+size@lag):{log}"));
+        if (!pending.Eager)
+            pending.Ticket.Observe = split;
     }
 
     private static readonly bool GuestReadsAwaitOffQueue =
@@ -2601,9 +2675,19 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 published += current[index] ? 1 : 0;
             }
 
+            var splitSample = pending.Ticket.Observe; // [local] SHARPEMU_LABEL_POLL_SPLIT
             readback.Complete(pending.Ticket, published == 0 ? null : (index, bytes) =>
             {
                 if (current[index] && MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.ReadbackPieces, bytes.Length); // [local] SHARPEMU_MEMCOPY_PROBE
+                if (current[index] && splitSample is not null) // [local] SHARPEMU_LABEL_POLL_SPLIT: does the download change the backing?
+                {
+                    var before = new byte[bytes.Length];
+                    if (_backing.TryReadBacking(copies[index].Address, before))
+                    {
+                        if (bytes.SequenceEqual(before)) splitSample.SamePieces++;
+                        else splitSample.ChangedPieces++;
+                    }
+                }
                 if (current[index] && !_backing.TryWriteBacking(copies[index].Address, bytes))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
@@ -3119,6 +3203,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (waitTick >= _scheduler.CurrentTick)
         {
+            _splitFlushed = true; // [local] SHARPEMU_LABEL_POLL_SPLIT
             _scheduler.Flush();
         }
 

@@ -41,6 +41,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         public readonly CommandBuffer Command = command;
         public GpuBuffer? Staging;
         public bool Busy;
+        public ulong WaitTick, Value; // [local] SHARPEMU_LABEL_POLL_SPLIT
     }
 
     internal sealed class Ticket(Slot slot, ulong value, ulong waitTick, ulong[] offsets, ulong[] sizes)
@@ -50,6 +51,11 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         public ulong WaitTick { get; } = waitTick; // [local]
         public ulong[] Offsets { get; } = offsets;
         public ulong[] Sizes { get; } = sizes;
+        // [local] SHARPEMU_LABEL_POLL_SPLIT: copies submitted before this one and not signaled yet, and the latest
+        // main-queue tick they wait for; Observe makes Wait poll both timelines and stamp the sample.
+        public ulong AheadCount { get; init; }
+        public ulong AheadTick { get; init; }
+        public Diagnostics.LabelPollSplit.Sample? Observe { get; set; }
     }
 
     public VulkanAsyncReadback(GpuDeviceInfo device, SubmissionScheduler scheduler, Queue queue, uint queueFamilyIndex)
@@ -204,6 +210,12 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         try
         {
             var vk = _device.Vk;
+            if (ticket.Observe is { } sample) // [local] SHARPEMU_LABEL_POLL_SPLIT
+            {
+                Observe(ticket, sample);
+                return;
+            }
+
             var spinStart = VideoOut.Render2Probe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
             var spun = GpuWaitSpin.TrySpin(() =>
                 {
@@ -251,6 +263,33 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             {
                 _waiters--;
             }
+        }
+    }
+
+    // [local] SHARPEMU_LABEL_POLL_SPLIT: waits by polling the main timeline (writer done), this queue's timeline at the
+    // value before the ticket's (the copies ahead done) and at the ticket's (done).
+    private void Observe(Ticket ticket, Diagnostics.LabelPollSplit.Sample sample)
+    {
+        var vk = _device.Vk;
+        var main = new VkSemaphore(_scheduler.Timeline.Handle);
+        sample.WaitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        while (true)
+        {
+            ulong mainValue = 0, ownValue = 0;
+            _ = vk.GetSemaphoreCounterValue(_device.Device, main, &mainValue);
+            _ = vk.GetSemaphoreCounterValue(_device.Device, _timeline, &ownValue);
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (sample.WriterAt == 0 && mainValue >= ticket.WaitTick) sample.WriterAt = now;
+            if (sample.AheadAt == 0 && ownValue + 1 >= ticket.Value) sample.AheadAt = now;
+            if (ownValue >= ticket.Value)
+            {
+                if (sample.WriterAt == 0) sample.WriterAt = now;
+                if (sample.AheadAt == 0) sample.AheadAt = now;
+                sample.DoneAt = now;
+                return;
+            }
+
+            Thread.SpinWait(20);
         }
     }
 
@@ -351,6 +390,21 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         vk.CmdPipelineBarrier2(command, &dependency);
         Require(vk.EndCommandBuffer(command), "vkEndCommandBuffer(readback)");
 
+        ulong aheadCount = 0, aheadTick = 0;
+        if (Diagnostics.LabelPollSplit.Enabled) // [local]
+        {
+            ulong signaledNow = 0;
+            _ = vk.GetSemaphoreCounterValue(_device.Device, _timeline, &signaledNow);
+            foreach (var other in _slots)
+            {
+                if (other.Busy && other.Value > signaledNow)
+                {
+                    aheadCount++;
+                    aheadTick = Math.Max(aheadTick, other.WaitTick);
+                }
+            }
+        }
+
         var signalValue = ++_signaled;
         // The semaphore wait orders the copies after every write the main queue made
         // up to waitTick and makes those writes visible to them.
@@ -387,7 +441,9 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         // [local] PrepareMainQueueWait ran before the gate: with the guard, waitTick is already on the main queue.
         Require(vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback)");
         slot.Busy = true;
-        return new Ticket(slot, signalValue, waitTick, offsets, sizes);
+        slot.WaitTick = waitTick;
+        slot.Value = signalValue;
+        return new Ticket(slot, signalValue, waitTick, offsets, sizes) { AheadCount = aheadCount, AheadTick = aheadTick };
     }
 
     public delegate void ReadbackConsumer(int index, ReadOnlySpan<byte> bytes);
