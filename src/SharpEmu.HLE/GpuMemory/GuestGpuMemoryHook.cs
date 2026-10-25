@@ -160,6 +160,13 @@ public static class GuestGpuMemoryHook
     public static bool TryReadWithoutDownload(ulong address, Span<byte> data) =>
         _current?.TryReadWithoutDownload(address, data) ?? false;
 
+    public static bool TryReadWithoutDownloadParked(ulong address, Span<byte> data, long deadline) =>
+        _current?.TryReadWithoutDownloadParked(address, data, deadline) ?? false;
+
+    public static int BeginWriteWatch(ulong address, ulong size) => _current?.BeginWriteWatch(address, size) ?? -1;
+
+    public static int EndWriteWatch(int watch) => _current?.EndWriteWatch(watch) ?? -1;
+
     public static bool TryResolveFault(FaultKind kind, ulong address)
     {
         if (_current == null && Traces(address, 8))

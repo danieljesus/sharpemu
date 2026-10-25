@@ -137,6 +137,23 @@ public sealed class GuestGpuMemory : IDisposable
         return Buffers?.TryReadUnmodified(address, data) ?? false;
     }
 
+    // [local] SHARPEMU_FAULT_READ_EMULATE=1: see IGuestBufferStore.TryReadUnmodifiedParked.
+    public bool TryReadWithoutDownloadParked(ulong address, Span<byte> data, long deadline)
+    {
+        var size = (ulong)data.Length;
+        if (size == 0 || !Covers(address, size) || !GuestPermits(FaultKind.Read, address) ||
+            !GuestPermits(FaultKind.Read, address + size - 1))
+        {
+            return false;
+        }
+
+        return Buffers?.TryReadUnmodifiedParked(address, data, deadline) ?? false;
+    }
+
+    public int BeginWriteWatch(ulong address, ulong size) => Buffers?.BeginWriteWatch(address, size) ?? -1;
+
+    public int EndWriteWatch(int watch) => Buffers?.EndWriteWatch(watch) ?? -1;
+
     private bool TryRetryReleasedWrite(ulong address, ulong size)
     {
         var version = _pages.GetWriteRestorationVersion(address);

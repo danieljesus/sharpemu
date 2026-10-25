@@ -443,9 +443,18 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _ => throw SubmissionScheduler.Fatal("The utility buffer usage is invalid."),
     };
 
+    // [local] SHARPEMU_FAULT_READ_EMULATE: every backing write of the cache is noted for the watched fault reads.
+    private bool TryWriteBackingNoted(ulong address, ReadOnlySpan<byte> data)
+    {
+        var written = _backing.TryWriteBacking(address, data);
+        FaultReadWatch.Note(address, (ulong)data.Length);
+        return written;
+    }
+
     // A CPU write fault: true when the range is tracked and any GPU data reached guest memory.
     bool IGuestBufferStore.MarkCpuWrite(ulong address, ulong size)
     {
+        FaultReadWatch.Note(address, size); // [local] SHARPEMU_FAULT_READ_EMULATE
         if (TableWordMemo.Enabled) TableWordMemo.NoteOtherWrite(address, size); // [local]
         SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(address, size, SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidationSource.CpuFault); // [local]
         var tracked = _tracker.InvalidateRegion(address, size, out var needsGpuFlush);
@@ -578,6 +587,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         // [local] Under the gate the check and the read see one point of the render thread's sequence of GPU-modified
         // changes, as a relay to the queue would, without interrupting it: no range can turn GPU-modified (and be
         // downloaded into the backing) between the check and the read.
+        TlasHle.Instance?.NoteCpuRead(address, size, 0); // [local] as DownloadToCpuCore: a guest CPU read
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         bool served;
         long entered;
@@ -590,6 +600,75 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         FaultReadStats.NoteRelay(served, entered - started, System.Diagnostics.Stopwatch.GetTimestamp() - entered);
         return served;
+    }
+
+    // [local] SHARPEMU_FAULT_READ_EMULATE=1, a repeated poll: data holds the bytes this thread's previous emulated read
+    // of the range returned. While the range still holds them (and stays unmodified), the thread waits for a write to
+    // touch it or for the deadline (Stopwatch ticks), then reads again; the bytes returned are the backing's at the
+    // last read, as a read at that instant would see them. False (the ordinary download) once a byte is GPU-modified.
+    public bool TryReadUnmodifiedParked(ulong address, Span<byte> data, long deadline)
+    {
+        if (data.Length > 16)
+        {
+            return false;
+        }
+
+        Span<byte> previous = stackalloc byte[data.Length];
+        data.CopyTo(previous);
+        var slot = FaultReadWatch.Begin(address, (ulong)data.Length);
+        if (slot < 0)
+        {
+            return TryReadUnmodified(address, data);
+        }
+
+        try
+        {
+            var woken = 0;
+            var parked = System.Diagnostics.Stopwatch.GetTimestamp();
+            while (true)
+            {
+                var hits = FaultReadWatch.Hits(slot);
+                if (!TryReadUnmodified(address, data))
+                {
+                    FaultReadStats.NotePark(FaultReadStats.ParkOutcome.Declined, woken, System.Diagnostics.Stopwatch.GetTimestamp() - parked);
+                    return false;
+                }
+
+                if (!data.SequenceEqual(previous))
+                {
+                    FaultReadStats.NotePark(FaultReadStats.ParkOutcome.Changed, woken, System.Diagnostics.Stopwatch.GetTimestamp() - parked);
+                    return true;
+                }
+
+                if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline)
+                {
+                    FaultReadStats.NotePark(FaultReadStats.ParkOutcome.Deadline, woken, System.Diagnostics.Stopwatch.GetTimestamp() - parked);
+                    return true;
+                }
+
+                woken += FaultReadWatch.Wait(slot, hits, deadline) ? 1 : 0;
+            }
+        }
+        finally
+        {
+            FaultReadWatch.End(slot);
+        }
+    }
+
+    // [local] SHARPEMU_FAULT_READ_EMULATE=2: a watch over the range while the ordinary download runs; the end returns
+    // how many writes touched it (-1: no slot was free).
+    public int BeginWriteWatch(ulong address, ulong size) => FaultReadWatch.Begin(address, size);
+
+    public int EndWriteWatch(int watch)
+    {
+        if (watch < 0)
+        {
+            return -1;
+        }
+
+        var hits = FaultReadWatch.Hits(watch);
+        FaultReadWatch.End(watch);
+        return hits;
     }
 
     public bool DownloadToCpu(ulong address, ulong size)
@@ -841,6 +920,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (!_gpuModifiedRanges.Contains(guestAddress, size))
             {
                 lock (_gpuModifiedGate) _gpuModifiedRanges.Add(guestAddress, size); // [local] SHARPEMU_FAULT_READ_EMULATE
+                FaultReadWatch.Note(guestAddress, size); // [local]
                 Interlocked.Increment(ref _gpuModifiedVersion);
             }
 
@@ -997,7 +1077,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal("The host DMA write range is invalid.");
         }
 
-        if (!_backing.TryWriteBacking(guestAddress, data))
+        if (!TryWriteBackingNoted(guestAddress, data))
         {
             throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress:X16} size=0x{data.Length:X16}");
         }
@@ -1146,7 +1226,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     {
                         var offset = (ulong)piece * pieceBytes;
                         var chunk = (int)Math.Min(size - offset, pieceBytes);
-                        if (!_backing.TryWriteBacking(guestAddress + offset, MemoryMarshal.AsBytes(patternArray.AsSpan())[..chunk]))
+                        if (!TryWriteBackingNoted(guestAddress + offset, MemoryMarshal.AsBytes(patternArray.AsSpan())[..chunk]))
                             Interlocked.Exchange(ref failed, 1);
                     });
                     if (failed != 0)
@@ -1160,7 +1240,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     for (ulong offset = 0; offset < size;)
                     {
                         var chunk = (int)Math.Min(size - offset, (ulong)pattern.Length);
-                        if (!_backing.TryWriteBacking(guestAddress + offset, pattern[..chunk]))
+                        if (!TryWriteBackingNoted(guestAddress + offset, pattern[..chunk]))
                         {
                             throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress + offset:X16} size=0x{chunk:X}");
                         }
@@ -1266,7 +1346,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         for (ulong offset = 0; offset < size;)
         {
             var chunk = (int)Math.Min(size - offset, (ulong)bytes.Length);
-            if (!_backing.TryWriteBacking(guestAddress + offset, bytes[..chunk]))
+            if (!TryWriteBackingNoted(guestAddress + offset, bytes[..chunk]))
             {
                 return false;
             }
@@ -2739,7 +2819,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                         else splitSample.ChangedPieces++;
                     }
                 }
-                if (current[index] && !_backing.TryWriteBacking(copies[index].Address, bytes))
+                if (current[index] && !TryWriteBackingNoted(copies[index].Address, bytes))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
                 }
@@ -2875,7 +2955,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             readback.Complete(pending.Ticket, (index, bytes) =>
             {
                 if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.ReadbackPending, bytes.Length); // [local] SHARPEMU_MEMCOPY_PROBE
-                if (!_backing.TryWriteBacking(copies[index].Address, bytes))
+                if (!TryWriteBackingNoted(copies[index].Address, bytes))
                 {
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
                 }
@@ -3349,7 +3429,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             if (StoreTableVerify) VerifyExcludedBytes(copies[index].Address, bytes); // [local]
             if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.ReadbackAsync, bytes.Length); // [local] SHARPEMU_MEMCOPY_PROBE
-            if (!_backing.TryWriteBacking(copies[index].Address, bytes))
+            if (!TryWriteBackingNoted(copies[index].Address, bytes))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
             }
@@ -3385,7 +3465,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var offset = baseOffset + placement.DataOffset;
             _download.Invalidate(offset, placement.DataSize);
             if (MemCopyProbe.Enabled) MemCopyProbe.Add(MemCopyProbe.Site.ReadbackSync, (long)placement.DataSize); // [local] SHARPEMU_MEMCOPY_PROBE
-            if (!_backing.TryWriteBacking(copy.Address, _download.Mapped.Slice((int)offset, (int)placement.DataSize)))
+            if (!TryWriteBackingNoted(copy.Address, _download.Mapped.Slice((int)offset, (int)placement.DataSize)))
             {
                 throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copy.Address:X16} size=0x{placement.DataSize:X16}");
             }

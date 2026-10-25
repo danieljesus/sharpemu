@@ -668,20 +668,18 @@ public sealed partial class DirectExecutionBackend
 			8 => FaultKind.Execute,
 			_ => FaultKind.Unknown,
 		};
-		var verifyPending = false;
-		byte[] emulated = Array.Empty<byte>();
-		var emulatedSize = 0;
+		var verify = default(FaultReadVerify);
 		if (FaultReadEmulateMode != 0 && kind == FaultKind.Read && // [local] SHARPEMU_FAULT_READ_EMULATE
-			TryEmulateFaultingRead(contextRecord, rip, exceptionRecord->ExceptionInformation[1], out verifyPending, out emulated, out emulatedSize))
+			TryEmulateFaultingRead(contextRecord, rip, exceptionRecord->ExceptionInformation[1], out verify))
 		{
 			return true;
 		}
 
 		var resolved = kind != FaultKind.Unknown
 			&& GuestGpuMemoryHook.TryResolveFault(kind, exceptionRecord->ExceptionInformation[1]);
-		if (resolved && verifyPending)
+		if (verify.Pending)
 		{
-			VerifyFaultingRead(exceptionRecord->ExceptionInformation[1], emulated, emulatedSize);
+			VerifyFaultingRead(exceptionRecord->ExceptionInformation[1], verify, resolved);
 		}
 
 		return resolved;

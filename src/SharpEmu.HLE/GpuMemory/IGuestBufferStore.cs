@@ -16,4 +16,13 @@ public interface IGuestBufferStore
     // [local] SHARPEMU_FAULT_READ_EMULATE: the bytes of a faulting read when none of them is GPU-modified, so the backing
     // already holds what a download would leave there; false when a download is needed.
     bool TryReadUnmodified(ulong address, Span<byte> data) => false;
+
+    // [local] SHARPEMU_FAULT_READ_EMULATE=1: as TryReadUnmodified for a repeated poll whose previous bytes are in data:
+    // waits while the range still holds them, until a write touches it or the deadline (Stopwatch ticks).
+    bool TryReadUnmodifiedParked(ulong address, Span<byte> data, long deadline) => TryReadUnmodified(address, data);
+
+    // [local] SHARPEMU_FAULT_READ_EMULATE=2: counts the writes that touch the range between begin and end (-1: none).
+    int BeginWriteWatch(ulong address, ulong size) => -1;
+
+    int EndWriteWatch(int watch) => -1;
 }
