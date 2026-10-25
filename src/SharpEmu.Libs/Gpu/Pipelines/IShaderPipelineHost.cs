@@ -83,6 +83,10 @@ internal interface IShaderPipelineHost
     // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: GPU-owned ranges brought back in one readback; true when the first is.
     bool TrySynchronizeGuestRanges(ReadOnlySpan<(ulong Address, int Length)> ranges) => false;
 
+    // [local] SHARPEMU_STORE_TABLE_SYNC: the GPU-owned bytes of one store-table range brought back in one readback that
+    // waits for their writers only; true when the range is synchronized (or was not GPU-owned).
+    bool TrySynchronizeTableRange(ReadOnlySpan<(ulong Address, int Length)> ranges) => false;
+
     // Creates the host module of one compiled permutation and returns its handle.
     ulong CreateShaderModule(IGuestCompiledShader shader, ShaderStage stage, ulong hash, ulong programId);
 

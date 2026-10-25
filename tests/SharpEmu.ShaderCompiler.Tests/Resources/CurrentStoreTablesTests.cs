@@ -38,6 +38,108 @@ public sealed class CurrentStoreTablesTests
         }
     }
 
+    // [local] SHARPEMU_STORE_TABLE_SYNC: words the GPU may own. The resident reader refuses a range holding one; the word
+    // reader synchronizes the word it reads (its GPU value reaches the backing) and the range synchronizer the range.
+    private sealed class OwnedMemory
+    {
+        public readonly Memory Backing = new();
+        public readonly Dictionary<ulong, uint> Gpu = new();
+        public int WordSyncs, RangeSyncs;
+        public bool FailRangeSync;
+
+        public bool Read(ulong address, out uint word)
+        {
+            if (Gpu.Remove(address, out var value))
+            {
+                WordSyncs++;
+                Backing.Words[address] = value;
+            }
+
+            return Backing.Read(address, out word);
+        }
+
+        public bool ReadResident(ulong address, Span<byte> destination, bool clean)
+        {
+            foreach (var owned in Gpu.Keys)
+            {
+                if (owned >= address && owned < address + (ulong)destination.Length)
+                    return false;
+            }
+
+            return Backing.ReadResident(address, destination, clean);
+        }
+
+        public bool Synchronize(ReadOnlySpan<(ulong Address, int Length)> ranges)
+        {
+            RangeSyncs++;
+            if (FailRangeSync)
+                return false;
+            var (address, length) = ranges[0];
+            foreach (var owned in Gpu.Keys.Where(owned => owned >= address && owned < address + (ulong)length).ToArray())
+            {
+                Backing.Words[owned] = Gpu[owned];
+                Gpu.Remove(owned);
+            }
+
+            return true;
+        }
+    }
+
+    private static List<DeviceAddressRange> ScanOwned(ShaderResourcePlan plan, ulong table, int entries, bool synchronizer, bool failRangeSync, out OwnedMemory memory)
+    {
+        memory = new OwnedMemory { FailRangeSync = failRangeSync };
+        for (var entry = 0; entry < entries; entry++)
+            memory.Backing.SetEntry(table + (ulong)entry * 16, 0, 0);
+        memory.Backing.SetEntry(table, 0x10000, 0x100);
+        // The GPU wrote an entry of the second chunk: its new V# is only in GPU memory.
+        var second = table + 4100 * 16;
+        memory.Gpu[second] = 0x900000;
+        memory.Gpu[second + 8] = 0x80;
+        var inputs = new ResourceRuntimeInputs
+        {
+            UserData = [unchecked((uint)table), (uint)(table >> 32), (uint)entries * 16, 0],
+            ReadMemory = memory.Read,
+            ReadCleanMemory = memory.Read,
+            ReadResidentMemory = memory.ReadResident,
+            SynchronizeTableRange = synchronizer ? memory.Synchronize : null,
+        };
+        var ranges = new List<DeviceAddressRange>();
+        DeviceStoreTablePlanner.Evaluate(plan, inputs, ranges);
+        DeviceStoreTablePlanner.InvalidateTables(table, 8, DeviceStoreTablePlanner.InvalidationSource.CpuFault);
+        return ranges;
+    }
+
+    [Fact]
+    public void ARefusedChunkSynchronizedWholeDecodesWhatTheWordReaderDecodes()
+    {
+        if (DeviceStoreTablePlanner.TableSyncMode == 0)
+            return;
+        const int entries = 8192; // two chunks of the bulk read
+        var plan = Plan();
+        var previous = DeviceStoreTablePlanner.DiffMode;
+        try
+        {
+            foreach (var diff in new[] { 0, 1 })
+            {
+                DeviceStoreTablePlanner.DiffMode = diff;
+                var words = ScanOwned(plan, 0x7E4000000 + (ulong)diff * 0x100000, entries, synchronizer: false, failRangeSync: false, out var wordMemory);
+                var whole = ScanOwned(plan, 0x7E4800000 + (ulong)diff * 0x100000, entries, synchronizer: true, failRangeSync: false, out var wholeMemory);
+                var failed = ScanOwned(plan, 0x7E5000000 + (ulong)diff * 0x100000, entries, synchronizer: true, failRangeSync: true, out var failedMemory);
+
+                Assert.Contains(words, range => range.Base == 0x900000 && range.Size == 0x80);
+                Assert.Equal(words.Select(range => range with { Handle = 0 }), whole.Select(range => range with { Handle = 0 }));
+                Assert.Equal(words.Select(range => range with { Handle = 0 }), failed.Select(range => range with { Handle = 0 }));
+                Assert.Equal(2, wordMemory.WordSyncs);
+                Assert.Equal((0, 1), (wholeMemory.WordSyncs, wholeMemory.RangeSyncs));
+                Assert.Equal(2, failedMemory.WordSyncs);
+            }
+        }
+        finally
+        {
+            DeviceStoreTablePlanner.DiffMode = previous;
+        }
+    }
+
     // s[0:3] (user data) is the table's V#; the store's V# is loaded from it at a lane-dependent offset.
     private static ShaderResourcePlan Plan() => Extract(Program(
         ReadFirstLane(0, 16, 0),

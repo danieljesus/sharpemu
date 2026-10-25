@@ -795,6 +795,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
             if (DirtyWatch != 0 && guestAddress <= DirtyWatch && DirtyWatch < guestAddress + size && _dirtyWatchLogs++ < 400) // [local]
                 Console.Error.WriteLine($"[DIRTY_WATCH] range=0x{guestAddress:X}+0x{size:X} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16} stage={Diagnostics.GpuReadTrace.CurrentStage} tick={_scheduler.CurrentTick} caller={(_dirtyWatchLogs < 6 ? new System.Diagnostics.StackTrace(1, false).ToString().Replace(Environment.NewLine, " | ") : "")}");
+            if (Diagnostics.TableDirtyProbe.Overlaps(guestAddress, size)) Diagnostics.TableDirtyProbe.Note(conservativeWrite ? "obtain-conservative" : "obtain", guestAddress, size, _scheduler.CurrentTick); // [local]
             if (size < BroadWriteBytes) _preciseGpuModifiedRanges.Add(guestAddress, size); // [local]
             if (StoreTableVerify && !conservativeWrite) _exactGpuModifiedRanges.Add(guestAddress, size); // [local]
             NoteEverGpuWritten(guestAddress, size); // [local]
@@ -2122,7 +2123,21 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var readbackClass = ReadbackClassLog ? ClassifyReadback(guestAddress, size, source) : -1;
             var verify = !isWrite && GpuWriteHistory.Mode == 2 ? BeginPreciseTickCheck(copies[0].Buffer, guestAddress, size) : null; // [local]
             var narrowed = !isWrite && GpuWriteHistory.Narrows && NarrowReadbackWindow(copies, guestAddress, size); // [local]
+            byte[]? probeBefore = null; // [local] SHARPEMU_TABLE_DIRTY_PROBE: do the downloaded table bytes change?
+            var probeBegin = Math.Max(windowBegin, Diagnostics.TableDirtyProbe.Base);
+            if (Diagnostics.TableDirtyProbe.Overlaps(windowBegin, windowEnd - windowBegin))
+            {
+                probeBefore = new byte[Math.Min(windowEnd, Diagnostics.TableDirtyProbe.Base + Diagnostics.TableDirtyProbe.Bytes) - probeBegin];
+                if (!_backing.TryReadBacking(probeBegin, probeBefore)) probeBefore = null;
+            }
+
             DownloadBufferMemory(copies);
+            if (probeBefore is not null)
+            {
+                var probeAfter = new byte[probeBefore.Length];
+                if (_backing.TryReadBacking(probeBegin, probeAfter))
+                    Diagnostics.TableDirtyProbe.NoteDownload(probeBegin, probeBefore, probeAfter, copies.Count, _scheduler.CurrentTick, _scheduler.Timeline.CompletedTick);
+            }
             if (readbackClass >= 0) NoteReadbackClass(readbackClass, System.Diagnostics.Stopwatch.GetTimestamp() - classStarted);
             if (narrowed)
             {
@@ -2976,11 +2991,53 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     // for the batch being recorded (the queue runs its submissions in order).
     internal VulkanAsyncReadback? SyncReadback { get; set; }
 
+    // [local] SHARPEMU_STORE_TABLE_SYNC: the second readback queue when only store-table reads use it.
+    internal VulkanAsyncReadback? TableReadback { get; set; }
+    private bool _tableRead;
+
+    // [local] SHARPEMU_STORE_TABLE_SYNC: TrySynchronizeCpuRead whose download goes through the table readback queue
+    // (on the GPU queue thread). It still waits for the last writer tick of the pieces, as every readback does.
+    public bool TrySynchronizeTableRead(ulong address, ulong size, GuestMemoryProfile.ReadbackSource source)
+    {
+        _tableRead = TableReadback is not null && _relay.IsGpuQueueThread;
+        try
+        {
+            return TrySynchronizeCpuRead(address, size, source);
+        }
+        finally
+        {
+            _tableRead = false;
+        }
+    }
+
     private const ulong AsyncReadbackLimit = 64UL << 20;
 
     // Packs pieces into the download ring, waits for the copy, then writes each through the backing alias.
     private void DownloadBufferMemory(List<DownloadPiece> copies)
     {
+        if (Diagnostics.TableDirtyProbe.Enabled && copies.Exists(copy => Diagnostics.TableDirtyProbe.Overlaps(copy.Address, copy.Size))) // [local]
+        {
+            var reason = (SyncReadback ?? AsyncReadback) is null ? 1 : copies.Exists(copy => copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size) == 0) ? 2 : 0;
+            var waitTick = 0UL;
+            foreach (var copy in copies) waitTick = Math.Max(waitTick, copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size));
+            var current = _scheduler.CurrentTick;
+            var completed = _scheduler.Timeline.CompletedTick;
+            var probeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            var asyncDone = TryDownloadAsync(copies);
+            var asyncTicks = System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted;
+            if (asyncDone)
+            {
+                foreach (var copy in copies)
+                    RemoveGpuModified(copy.Address, copy.Size);
+                Diagnostics.TableDirtyProbe.NoteDownloadPath(true, reason, asyncTicks, waitTick, current, completed, copies.Count);
+                return;
+            }
+
+            DownloadBufferMemorySync(copies);
+            Diagnostics.TableDirtyProbe.NoteDownloadPath(false, reason, System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted, waitTick, current, completed, copies.Count);
+            return;
+        }
+
         if (TryDownloadAsync(copies))
         {
             foreach (var copy in copies)
@@ -2991,6 +3048,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return;
         }
 
+        DownloadBufferMemorySync(copies);
+    }
+
+    private void DownloadBufferMemorySync(List<DownloadPiece> copies)
+    {
         var batch = new List<PlannedDownload>();
         var planner = new BufferDownloadBatchPlanner(_download.Size);
         foreach (var piece in copies)
@@ -3085,7 +3147,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private bool TryDownloadAsync(List<DownloadPiece> copies)
     {
-        if ((SyncReadback ?? AsyncReadback) is not { } readback || copies.Count == 0)
+        if (((_tableRead ? TableReadback : null) ?? SyncReadback ?? AsyncReadback) is not { } readback || copies.Count == 0)
         {
             return false;
         }

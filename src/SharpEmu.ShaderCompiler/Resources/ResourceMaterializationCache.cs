@@ -327,6 +327,7 @@ public sealed class ResourceMaterializationCache
                 ReadMemory = recorder.Wrap(inputs.ReadMemory, clean: false),
                 ReadCleanMemory = recorder.Wrap(inputs.ReadCleanMemory, clean: true),
                 ReadResidentMemory = recorder.WrapResident(inputs.ReadResidentMemory),
+                SynchronizeTableRange = inputs.SynchronizeTableRange, // [local] SHARPEMU_STORE_TABLE_SYNC
                 ReadsClean = inputs.ReadsClean,
                 ComputeState = inputs.ComputeState,
                 TablePhase = recorder.TablePhase,
@@ -885,6 +886,7 @@ public sealed class ResourceMaterializationCache
                 ReadMemory = recorder.Wrap(inputs.ReadMemory, clean: false),
                 ReadCleanMemory = recorder.Wrap(inputs.ReadCleanMemory, clean: true),
                 ReadResidentMemory = recorder.WrapResident(inputs.ReadResidentMemory),
+                SynchronizeTableRange = inputs.SynchronizeTableRange, // [local] SHARPEMU_STORE_TABLE_SYNC
                 ReadsClean = inputs.ReadsClean,
                 ComputeState = inputs.ComputeState,
             };

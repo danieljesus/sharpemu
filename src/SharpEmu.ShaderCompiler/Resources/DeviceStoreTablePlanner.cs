@@ -46,7 +46,64 @@ public static class DeviceStoreTablePlanner
     // ms per rescan). Any chunk the resident reader refuses scans the table the old way. =2 decodes anyway and
     // counts the differences.
     internal static int DiffMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_DIFF"), out var diffMode) ? diffMode : 1;
+
+    // [local] SHARPEMU_STORE_TABLE_SYNC (=1 on, the default, =0 off, =2 verify): a chunk the resident reader refuses
+    // because the GPU may own some of its bytes is synchronized whole and read again through the resident reader,
+    // instead of word by word. The word reader synchronizes each GPU-dirty word before reading the backing, one
+    // readback per 64 KB window; this does it once for the chunk (the readback window covers it), and its download
+    // goes through the table readback queue, so it waits only for the writer ticks of the pieces and not behind the
+    // asynchronous copies queued for later ticks. GTA: 10CD and 6A53 bind written a V# of the 2 MB table that points
+    // inside the table (0x55F8C7820+~0x12000; they pick the V# with a waterfall, so no exact range), which makes one or
+    // two chunks GPU-dirty after every dispatch; ~11 ms per rescan, two ~5.7 ms readbacks of a writer done ~33 ticks
+    // before. A chunk still refused after the readback reads word by word as before. =2 also reads every word of each
+    // synchronized chunk through the word reader and counts the differences.
+    public static readonly int TableSyncMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_SYNC"), out var tableSyncMode) ? tableSyncMode : 1;
+    private static long _syncChunks, _syncFailed, _syncTicks, _syncVerifiedWords, _syncMismatches, _syncUnread;
+    private static int _syncMismatchLogs;
+
+    private static string TableSyncReport() => TableSyncMode == 0 ? string.Empty : System.FormattableString.Invariant(
+        $" table_sync=[chunks={Interlocked.Exchange(ref _syncChunks, 0)} failed={Interlocked.Exchange(ref _syncFailed, 0)} ms={Interlocked.Exchange(ref _syncTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} verified_words={Interlocked.Read(ref _syncVerifiedWords)} mismatches={Interlocked.Read(ref _syncMismatches)} unread={Interlocked.Read(ref _syncUnread)}]");
+
+    // [local] SHARPEMU_STORE_TABLE_SYNC: one chunk of a table through the resident reader; a refusal synchronizes the chunk
+    // in one readback and reads it again.
+    private static bool ReadTableChunk(ResourceRuntimeInputs inputs, ResidentGuestBytesReader bulk, GuestWordReader read, ulong address, Span<byte> bytes)
+    {
+        if (bulk(address, bytes, false))
+            return true;
+        if (TableSyncMode == 0 || inputs.SynchronizeTableRange is not { } synchronize)
+            return false;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var synchronized = synchronize([(address, bytes.Length)]) && bulk(address, bytes, false);
+        Interlocked.Add(ref _syncTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+        Interlocked.Increment(ref synchronized ? ref _syncChunks : ref _syncFailed);
+        if (synchronized && TableSyncMode == 2)
+        {
+            for (var offset = 0; offset + 4 <= bytes.Length; offset += 4)
+            {
+                var expected = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes[offset..]);
+                if (!read(address + (ulong)offset, out var word))
+                {
+                    Interlocked.Increment(ref _syncUnread);
+                    continue;
+                }
+
+                Interlocked.Increment(ref _syncVerifiedWords);
+                if (word == expected)
+                    continue;
+                Interlocked.Increment(ref _syncMismatches);
+                if (Interlocked.Increment(ref _syncMismatchLogs) <= 20)
+                    System.Console.Error.WriteLine($"[STORE_TABLE_SYNC_MISMATCH] address=0x{address + (ulong)offset:X} chunk=0x{address:X} synced=0x{expected:X8} word=0x{word:X8}");
+            }
+
+            var total = Interlocked.Read(ref _syncVerifiedWords);
+            if ((total >> 16) != ((total - bytes.Length / 4) >> 16))
+                System.Console.Error.WriteLine($"[STORE_TABLE_SYNC_VERIFY] verified_words={total} mismatches={Interlocked.Read(ref _syncMismatches)} unread={Interlocked.Read(ref _syncUnread)}");
+        }
+
+        return synchronized;
+    }
     private static long _diffReused, _diffDecoded, _diffRefused, _diffMismatches;
+    private static int _refusedLogs;
     private const int RawScansKept = 8;
 
     [System.ThreadStatic]
@@ -282,7 +339,7 @@ public static class DeviceStoreTablePlanner
             _scansByThread.TryRemove(name, out _);
         var byThread = string.Join(",", threads.Select(pair => System.FormattableString.Invariant($"{pair.Key}:{pair.Value.Scans}/{pair.Value.Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}ms")));
         return System.FormattableString.Invariant(
-            $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} bulk_races={Interlocked.Exchange(ref _bulkRaces, 0)} total_ms={Interlocked.Exchange(ref _totalScanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} diff_reused={Interlocked.Exchange(ref _diffReused, 0)} diff_decoded={Interlocked.Exchange(ref _diffDecoded, 0)} diff_refused={Interlocked.Exchange(ref _diffRefused, 0)} diff_mismatches={Interlocked.Read(ref _diffMismatches)} by_thread=[{byThread}] keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]") + FastReport();
+            $"[PERF][STORE_TABLES] evaluated={Interlocked.Exchange(ref _evaluated, 0)} hits={Interlocked.Exchange(ref _hits, 0)} scans={Interlocked.Exchange(ref _scans, 0)} scan_entries={Interlocked.Exchange(ref _scanEntries, 0)} scan_ms={Interlocked.Exchange(ref _scanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} bulk_chunks={Interlocked.Exchange(ref _bulkChunks, 0)} bulk_fallbacks={Interlocked.Exchange(ref _bulkFallbacks, 0)} bulk_mismatches={Interlocked.Exchange(ref _bulkMismatches, 0)} bulk_races={Interlocked.Exchange(ref _bulkRaces, 0)} total_ms={Interlocked.Exchange(ref _totalScanTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} diff_reused={Interlocked.Exchange(ref _diffReused, 0)} diff_decoded={Interlocked.Exchange(ref _diffDecoded, 0)} diff_refused={Interlocked.Exchange(ref _diffRefused, 0)} diff_mismatches={Interlocked.Read(ref _diffMismatches)} by_thread=[{byThread}] keys={keys.Length} drops(entries/calls/bytes)=[{drops}] top=[{top}]") + FastReport() + TableSyncReport();
     }
 
     // [local] SHARPEMU_STORE_TABLE_BULK (1 by default, =0 turns it off): a scan reads the table in 64 KB chunks through the
@@ -517,9 +574,11 @@ public static class DeviceStoreTablePlanner
                     {
                         var count = System.Math.Min(BulkChunkEntries, entries - first);
                         var bytes = probe.AsSpan(0, count * 16);
-                        if (!bulk(tableBase + (ulong)first * 16, bytes, false))
+                        if (!ReadTableChunk(inputs, bulk, read, tableBase + (ulong)first * 16, bytes))
                         {
                             refused = true;
+                            if (Profile && Interlocked.Increment(ref _refusedLogs) <= 400)
+                                System.Console.Error.WriteLine($"[STORE_TABLE_REFUSED] table=0x{tableBase:X} chunk=0x{tableBase + (ulong)first * 16:X} thread={System.Threading.Thread.CurrentThread.Name}");
                             break;
                         }
 
@@ -537,7 +596,7 @@ public static class DeviceStoreTablePlanner
                             var count = System.Math.Min(BulkChunkEntries, entries - first);
                             if (first == differs && probe is not null)
                                 probe.AsSpan(0, count * 16).CopyTo(whole.AsSpan(first * 16));
-                            else if (!bulk(tableBase + (ulong)first * 16, whole.AsSpan(first * 16, count * 16), false))
+                            else if (!ReadTableChunk(inputs, bulk, read, tableBase + (ulong)first * 16, whole.AsSpan(first * 16, count * 16)))
                             {
                                 refused = true;
                                 break;
@@ -577,7 +636,7 @@ public static class DeviceStoreTablePlanner
                 {
                     var count = System.Math.Min(BulkChunkEntries, entries - first);
                     var chunkBytes = whole is not null ? whole.AsSpan(first * 16, count * 16) : chunk is null ? default : chunk.AsSpan(0, count * 16);
-                    var bulkRead = whole is not null || (bulk is not null && bulk(tableBase + (ulong)first * 16, chunkBytes, false));
+                    var bulkRead = whole is not null || (bulk is not null && ReadTableChunk(inputs, bulk, read, tableBase + (ulong)first * 16, chunkBytes));
                     if (Profile && bulk is not null)
                         Interlocked.Increment(ref bulkRead ? ref _bulkChunks : ref _bulkFallbacks);
                     var piecesRead = false;

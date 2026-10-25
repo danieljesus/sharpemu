@@ -42,6 +42,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _bufferCache.AsyncReadback = null;
             _bufferCache.SyncReadback?.Dispose(); // [local]
             _bufferCache.SyncReadback = null;
+            _bufferCache.TableReadback?.Dispose(); // [local]
+            _bufferCache.TableReadback = null;
             _bufferCache.Dispose();
             PerfOverlay.SetGuestCacheStatistics(0, 0, _deviceInfo.LiveAllocations, _deviceInfo.PeakAllocations);
             _hostBufferPool.Dispose();

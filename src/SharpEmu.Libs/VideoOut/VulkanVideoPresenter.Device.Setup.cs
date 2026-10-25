@@ -681,6 +681,8 @@ internal static unsafe partial class VulkanVideoPresenter
         private Queue _readbackQueue;
         // [local] SHARPEMU_SYNC_READBACK_QUEUE=1: a second queue of the readback family for the render thread's synchronous reads.
         private static readonly bool SyncReadbackQueue = Environment.GetEnvironmentVariable("SHARPEMU_SYNC_READBACK_QUEUE") == "1";
+        // [local] SHARPEMU_STORE_TABLE_SYNC: the same second queue, for the store-table reads only.
+        private static readonly bool TableReadbackQueue = !SyncReadbackQueue && SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableSyncMode != 0;
         private uint _readbackQueueCount;
         private Queue _syncReadbackQueue;
 
@@ -753,7 +755,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     SType = StructureType.DeviceQueueCreateInfo,
                     QueueFamilyIndex = readbackFamily,
-                    QueueCount = SyncReadbackQueue && _readbackQueueCount >= 2 ? 2u : 1u,
+                    QueueCount = (SyncReadbackQueue || TableReadbackQueue) && _readbackQueueCount >= 2 ? 2u : 1u,
                     PQueuePriorities = readbackPriorities,
                 };
                 queueInfoCount = 2;
@@ -1305,7 +1307,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (_readbackQueueFamilyIndex is { } readbackQueueFamily)
             {
                 _vk.GetDeviceQueue(_device, readbackQueueFamily, 0, out _readbackQueue);
-                if (SyncReadbackQueue && _readbackQueueCount >= 2)
+                if ((SyncReadbackQueue || TableReadbackQueue) && _readbackQueueCount >= 2)
                 {
                     _vk.GetDeviceQueue(_device, readbackQueueFamily, 1, out _syncReadbackQueue);
                     Console.Error.WriteLine($"[LOADER][INFO] Vulkan synchronous readback queue: family={readbackQueueFamily} index=1");

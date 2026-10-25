@@ -992,6 +992,21 @@ internal static unsafe partial class VulkanVideoPresenter
         // synchronized as TryReadGuestWord would one word at a time, in one readback; the front never synchronizes.
         private readonly List<(ulong Address, ulong Size)> _syncRanges = new();
 
+        // [local] SHARPEMU_STORE_TABLE_SYNC: what TryReadGuestWord does for each GPU-dirty word of the range (synchronize,
+        // then read the backing), done once for the whole range; the readback waits for the range's writers on the
+        // table readback queue, not behind the asynchronous copies of the shared one. The front never synchronizes.
+        public bool TrySynchronizeTableRange(ReadOnlySpan<(ulong Address, int Length)> ranges)
+        {
+            if (OnFrontThread || ranges.Length != 1)
+                return false;
+            var (address, length) = ranges[0];
+            var size = (ulong)length;
+            if (!_guestMemory.CanRead(address, size))
+                return false;
+            return !_bufferCache.HasGpuDirtyBytes(address, size) ||
+                _bufferCache.TrySynchronizeTableRead(address, size, SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead);
+        }
+
         public bool TrySynchronizeGuestRanges(ReadOnlySpan<(ulong Address, int Length)> ranges)
         {
             if (OnFrontThread || ranges.Length == 0 || !_guestMemory.CanRead(ranges[0].Address, (ulong)ranges[0].Length))

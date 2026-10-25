@@ -33,6 +33,10 @@ public sealed class ResourceRuntimeInputs
 
     public GuestRangeSynchronizer? SynchronizeRanges { get; init; } // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE
 
+    // [local] SHARPEMU_STORE_TABLE_SYNC: brings one GPU-owned range of a store table back in one readback that waits only
+    // for the range's writers, so a refused chunk is read whole instead of one synchronizing word at a time.
+    public GuestRangeSynchronizer? SynchronizeTableRange { get; init; }
+
     public ResourceRuntimeInputs WithReader(GuestWordReader? reader) => new()
     {
         UserData = UserData,
@@ -44,6 +48,7 @@ public sealed class ResourceRuntimeInputs
         ReadResidentMemory = ReadResidentMemory,
         ReadsClean = ReadsClean || ReferenceEquals(reader, ReadCleanMemory),
         SynchronizeRanges = SynchronizeRanges,
+        SynchronizeTableRange = SynchronizeTableRange,
     };
 }
 

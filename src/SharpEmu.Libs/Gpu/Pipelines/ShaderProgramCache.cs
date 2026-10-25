@@ -240,6 +240,7 @@ internal sealed class ShaderProgramCache
             ReadCleanMemory = _readCleanGuestWord,
             ReadResidentMemory = _prefetchResidentGuestBytes,
             SynchronizeRanges = synchronizeRanges,
+            SynchronizeTableRange = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableSyncMode != 0 ? host.TrySynchronizeTableRange : null, // [local]
         }));
         _threadMaterializations = LockFree && _materializations is not null
             ? new ThreadLocal<ResourceMaterializationCache>(static () => new(stampStoreTables: StoreTableMode == 1, currentStoreTables: StoreTableMode == 3))
