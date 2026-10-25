@@ -56,13 +56,14 @@ public static class DeviceStoreTablePlanner
     // inside the table (0x55F8C7820+~0x12000; they pick the V# with a waterfall, so no exact range), which makes one or
     // two chunks GPU-dirty after every dispatch; ~11 ms per rescan, two ~5.7 ms readbacks of a writer done ~33 ticks
     // before. A chunk still refused after the readback reads word by word as before. =2 also reads every word of each
-    // synchronized chunk through the word reader and counts the differences.
+    // synchronized chunk through the word reader and counts the differences; a word the resident reader then reads as
+    // the word reader did changed in between (a guest write racing the scan, races), as STORE_TABLE_BULK=2 tells them.
     public static readonly int TableSyncMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_SYNC"), out var tableSyncMode) ? tableSyncMode : 1;
-    private static long _syncChunks, _syncFailed, _syncTicks, _syncVerifiedWords, _syncMismatches, _syncUnread;
+    private static long _syncChunks, _syncFailed, _syncTicks, _syncVerifiedWords, _syncMismatches, _syncUnread, _syncRaces;
     private static int _syncMismatchLogs;
 
     private static string TableSyncReport() => TableSyncMode == 0 ? string.Empty : System.FormattableString.Invariant(
-        $" table_sync=[chunks={Interlocked.Exchange(ref _syncChunks, 0)} failed={Interlocked.Exchange(ref _syncFailed, 0)} ms={Interlocked.Exchange(ref _syncTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} verified_words={Interlocked.Read(ref _syncVerifiedWords)} mismatches={Interlocked.Read(ref _syncMismatches)} unread={Interlocked.Read(ref _syncUnread)}]");
+        $" table_sync=[chunks={Interlocked.Exchange(ref _syncChunks, 0)} failed={Interlocked.Exchange(ref _syncFailed, 0)} ms={Interlocked.Exchange(ref _syncTicks, 0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} verified_words={Interlocked.Read(ref _syncVerifiedWords)} mismatches={Interlocked.Read(ref _syncMismatches)} races={Interlocked.Read(ref _syncRaces)} unread={Interlocked.Read(ref _syncUnread)}]");
 
     // [local] SHARPEMU_STORE_TABLE_SYNC: one chunk of a table through the resident reader; a refusal synchronizes the chunk
     // in one readback and reads it again.
@@ -90,6 +91,14 @@ public static class DeviceStoreTablePlanner
                 Interlocked.Increment(ref _syncVerifiedWords);
                 if (word == expected)
                     continue;
+                // A guest write between the two reads changed the word: the resident reader now agrees with the word reader.
+                Span<byte> again = stackalloc byte[4];
+                if (bulk(address + (ulong)offset, again, false) && System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(again) == word)
+                {
+                    Interlocked.Increment(ref _syncRaces);
+                    continue;
+                }
+
                 Interlocked.Increment(ref _syncMismatches);
                 if (Interlocked.Increment(ref _syncMismatchLogs) <= 20)
                     System.Console.Error.WriteLine($"[STORE_TABLE_SYNC_MISMATCH] address=0x{address + (ulong)offset:X} chunk=0x{address:X} synced=0x{expected:X8} word=0x{word:X8}");
@@ -97,7 +106,7 @@ public static class DeviceStoreTablePlanner
 
             var total = Interlocked.Read(ref _syncVerifiedWords);
             if ((total >> 16) != ((total - bytes.Length / 4) >> 16))
-                System.Console.Error.WriteLine($"[STORE_TABLE_SYNC_VERIFY] verified_words={total} mismatches={Interlocked.Read(ref _syncMismatches)} unread={Interlocked.Read(ref _syncUnread)}");
+                System.Console.Error.WriteLine($"[STORE_TABLE_SYNC_VERIFY] verified_words={total} mismatches={Interlocked.Read(ref _syncMismatches)} races={Interlocked.Read(ref _syncRaces)} unread={Interlocked.Read(ref _syncUnread)}");
         }
 
         return synchronized;
