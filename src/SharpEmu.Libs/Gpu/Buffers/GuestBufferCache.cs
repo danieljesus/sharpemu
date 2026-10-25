@@ -3455,9 +3455,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         profileScope.SwitchPhase(isWritten
             ? RenderPhaseProfile.Phase.BufferDirtySyncWritten
             : isTexelBuffer ? RenderPhaseProfile.Phase.BufferDirtySyncTexel : RenderPhaseProfile.Phase.BufferDirtySyncUpload);
-        // [local] SHARPEMU_TEXEL_CLEAN_SKIP (1 by default, =2 verify, =0 off): a texel read of a range without CPU-dirty
+        // [local] SHARPEMU_TEXEL_CLEAN_SKIP (opt-in =1, =2 verify, 0 by default): a texel read of a range without CPU-dirty
         // pages takes the same shortcut as any other read (first test above) for its upload, which has nothing to
         // copy, and still synchronizes from an image below. =2 runs the upload anyway and counts the ones that copied.
+        // Off by default: 0 mismatches in both scenes, but panning lost ~2 FPS with it on (pdX: 26.7 without it,
+        // 21.9 with it, the rest of the per-draw trims on in both); the skipped region visit is not free of effects.
         var texelClean = TexelCleanSkipMode != 0 && isTexelBuffer && !isWritten && !preserveCpuWriteHotPages &&
             !_tracker.MayHaveCpuDirtyPages(guestAddress, size);
         if (texelClean && TexelCleanSkipMode != 2)
@@ -3563,7 +3565,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     internal static readonly int TexelCleanSkipMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TEXEL_CLEAN_SKIP"), out var texelSkip) ? texelSkip : 1;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TEXEL_CLEAN_SKIP"), out var texelSkip) ? texelSkip : 0;
     private static long _texelCleanSkips, _texelCleanChecked, _texelCleanMismatches;
     private static int _texelCleanLogs;
 

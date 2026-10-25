@@ -39,7 +39,7 @@ public sealed class SpanSetTests
     public void AddAndRemove_MatchACoverageModel()
     {
         const int Units = 256;
-        var random = new Random(1234);
+        var random = new System.Random(1234);
         var set = new SpanSet();
         var covered = new bool[Units];
         for (var step = 0; step < 4000; step++)
