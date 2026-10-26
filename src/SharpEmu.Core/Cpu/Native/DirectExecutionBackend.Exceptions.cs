@@ -682,6 +682,11 @@ public sealed partial class DirectExecutionBackend
 			VerifyFaultingRead(exceptionRecord->ExceptionInformation[1], verify, resolved);
 		}
 
+		if (FaultReadEmulateMode != 0 && kind == FaultKind.Read)
+		{
+			NoteOrdinaryFaultRead();
+		}
+
 		return resolved;
 	}
 

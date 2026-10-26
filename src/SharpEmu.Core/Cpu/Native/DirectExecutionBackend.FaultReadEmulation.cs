@@ -26,7 +26,11 @@ namespace SharpEmu.Core.Cpu.Native;
 // bytes or SHARPEMU_FAULT_READ_PARK_US (2000; 0 never parks) passes, then reads them again. A delayed read is still
 // a read at the instant it returns.
 //
-// 0 (default) off; 1 emulates (and parks); 2 decodes and asks the store but still takes the ordinary path, then compares
+// 1 emulates only where the ordinary download would wait for a writer still in flight, or where the same load faults
+// again right after the ordinary path resolved it (the download left the page GPU-dirty); elsewhere the download is
+// cheap and leaves the page clean, and emulating it turned one fault per page into one per read; 3 emulates every
+// unmodified read (the 2026-10-22 behaviour, no parking).
+// 0 (default) off; 2 decodes and asks the store but still takes the ordinary path, then compares
 // the bytes the load reads after it with the emulated ones: equal is verified, different with a write noted on the
 // bytes in between is changed (the CP wrote the label meanwhile), different with none is a mismatch, and a page the
 // download left protected is pending (the load faults again). [FAULT_READ_EMU] every 5 s, per second.
@@ -57,6 +61,20 @@ public sealed partial class DirectExecutionBackend
 	[ThreadStatic] private static ulong t_faultReadValue;
 	[ThreadStatic] private static int t_faultReadSize;
 	[ThreadStatic] private static long t_faultReadAt;
+	// The last load the store declined to emulate, and when the ordinary path finished resolving it.
+	[ThreadStatic] private static ulong t_faultDeclinedAddress;
+	[ThreadStatic] private static long t_faultDeclinedAt;
+	[ThreadStatic] private static bool t_faultDeclinePending;
+
+	// After the ordinary path of a read fault: stamps a declined emulation, so an immediate refault is recognized.
+	private static void NoteOrdinaryFaultRead()
+	{
+		if (t_faultDeclinePending)
+		{
+			t_faultDeclinePending = false;
+			t_faultDeclinedAt = Stopwatch.GetTimestamp();
+		}
+	}
 
 	private const int CtxRax = 120;
 	private const int CtxRip = 248;
@@ -75,10 +93,23 @@ public sealed partial class DirectExecutionBackend
 		_ => BitConverter.ToUInt64(bytes),
 	};
 
+	// BZHI of a loaded operand of size bytes (4 or 8) by the index register's low byte, updating CF, ZF, SF and OF.
+	internal static ulong Bzhi(ulong source, ulong indexRegister, int size, ref uint flags)
+	{
+		var bits = size * 8;
+		var index = (int)(indexRegister & 0xFF);
+		var carry = index >= bits;
+		var result = carry ? source : index == 0 ? 0 : source & (ulong.MaxValue >> (64 - index));
+		flags &= ~(0x1u | 0x40u | 0x80u | 0x800u);
+		flags |= (carry ? 0x1u : 0) | (result == 0 ? 0x40u : 0) | (((result >> (bits - 1)) & 1) != 0 ? 0x80u : 0);
+		return result;
+	}
+
 	private unsafe static bool TryEmulateFaultingRead(void* contextRecord, ulong rip, ulong faultAddress, out FaultReadVerify verify)
 	{
 		verify = default;
 		var started = Stopwatch.GetTimestamp();
+		t_faultSiteText = null;
 		var code = new byte[15];
 		if (!TryReadExecutableBytes(rip, code))
 		{
@@ -88,8 +119,17 @@ public sealed partial class DirectExecutionBackend
 		var decoder = Iced.Intel.Decoder.Create(64, new ByteArrayCodeReader(code));
 		decoder.IP = rip;
 		decoder.Decode(out var instruction);
-		if (instruction.Code == Code.INVALID || instruction.OpCount != 2 ||
-			instruction.Mnemonic is not (Mnemonic.Mov or Mnemonic.Movzx or Mnemonic.Movsx or Mnemonic.Movsxd) ||
+		if (FaultReadSites)
+		{
+			t_faultSiteAddress = faultAddress;
+			t_faultSiteText = instruction.ToString();
+		}
+
+		// BZHI r, [m], r (GTA V also reads the label with it): its index register is read from the context.
+		var bzhi = instruction.Mnemonic == Mnemonic.Bzhi && instruction.OpCount == 3 && instruction.GetOpKind(2) == OpKind.Register &&
+			instruction.Op2Register.IsGPR() && GprOffset(instruction.Op2Register) >= 0;
+		if (instruction.Code == Code.INVALID || (instruction.OpCount != 2 && !bzhi) ||
+			(instruction.Mnemonic is not (Mnemonic.Mov or Mnemonic.Movzx or Mnemonic.Movsx or Mnemonic.Movsxd) && !bzhi) ||
 			instruction.GetOpKind(0) != OpKind.Register || instruction.GetOpKind(1) != OpKind.Memory ||
 			!instruction.Op0Register.IsGPR() || GprOffset(instruction.Op0Register) < 0 ||
 			instruction.Op0Register is Register.AH or Register.BH or Register.CH or Register.DH)
@@ -144,12 +184,24 @@ public sealed partial class DirectExecutionBackend
 
 		Span<byte> bytes = stackalloc byte[8];
 		var asked = bytes[..size];
+		// A repeat of this thread's previous emulated read: its page was rewritten by a writer in flight a moment ago.
+		var repeat = FaultReadEmulateMode == 1 && FaultReadParkTicks > 0 && t_faultReadAt != 0 && t_faultReadAddress == faultAddress &&
+			t_faultReadSize == size && started - t_faultReadAt <= FaultReadRepeatTicks;
+		// The same load faulting again right after the ordinary path resolved it: the download left the page GPU-dirty
+		// (a later tick rewrote a piece of it), so the next download would wait for that writer again.
+		var refault = t_faultDeclinedAt != 0 && t_faultDeclinedAddress == faultAddress && started - t_faultDeclinedAt <= FaultReadRepeatTicks;
+		t_faultDeclinedAt = 0;
 		// =2 watches the bytes from before the emulated read until the ordinary path's result is read.
 		var watch = FaultReadEmulateMode == 2 ? GuestGpuMemoryHook.BeginWriteWatch(faultAddress, (ulong)size) : -1;
-		if (!GuestGpuMemoryHook.TryReadWithoutDownload(faultAddress, asked))
+		var read = repeat || refault || FaultReadEmulateMode == 3
+			? GuestGpuMemoryHook.TryReadWithoutDownload(faultAddress, asked)
+			: GuestGpuMemoryHook.TryReadWithoutDownloadWhileWritten(faultAddress, asked);
+		if (!read)
 		{
 			if (watch >= 0) _ = GuestGpuMemoryHook.EndWriteWatch(watch);
 			t_faultReadAt = 0;
+			t_faultDeclinedAddress = faultAddress;
+			t_faultDeclinePending = true;
 			return NoteFaultRead(FaultReadOutcome.Store);
 		}
 
@@ -161,8 +213,7 @@ public sealed partial class DirectExecutionBackend
 
 		var raw = FaultReadValue(asked);
 		var outcome = FaultReadOutcome.Emulated;
-		if (FaultReadParkTicks > 0 && t_faultReadAt != 0 && t_faultReadAddress == faultAddress && t_faultReadSize == size &&
-			t_faultReadValue == raw && started - t_faultReadAt <= FaultReadRepeatTicks)
+		if (repeat && t_faultReadValue == raw)
 		{
 			if (!GuestGpuMemoryHook.TryReadWithoutDownloadParked(faultAddress, asked, started + FaultReadParkTicks))
 			{
@@ -190,6 +241,15 @@ public sealed partial class DirectExecutionBackend
 
 		var destination = instruction.Op0Register;
 		var destinationOffset = GprOffset(destination);
+		if (bzhi)
+		{
+			// dest = src with bits [n, size) cleared, n = index[7:0]; n >= size keeps src and sets CF. ZF and SF from the
+			// result, OF cleared, AF and PF undefined (kept). A 32-bit destination is zero-extended.
+			var flags = ReadCtxU32(contextRecord, CTX_EFLAGS);
+			raw = Bzhi(raw, ReadCtxU64(contextRecord, GprOffset(instruction.Op2Register)), size, ref flags);
+			WriteCtxU32(contextRecord, CTX_EFLAGS, flags);
+		}
+
 		var current = ReadCtxU64(contextRecord, destinationOffset);
 		var result = destination.GetSize() switch
 		{
@@ -216,7 +276,9 @@ public sealed partial class DirectExecutionBackend
 	private unsafe static void VerifyFaultingRead(ulong faultAddress, FaultReadVerify verify, bool resolved)
 	{
 		var actual = new byte[verify.Size];
-		var readable = resolved && TryReadHostBytes(faultAddress, actual);
+		// A page the download left GPU-dirty is still protected (the load faults again): its backing then holds what the
+		// load would read, the download having written only GPU-modified ranges.
+		var readable = resolved && (TryReadHostBytes(faultAddress, actual) || GuestGpuMemoryHook.TryReadBacking(faultAddress, actual));
 		var hits = GuestGpuMemoryHook.EndWriteWatch(verify.Watch);
 		if (!readable)
 		{
@@ -245,9 +307,24 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	// [local] SHARPEMU_FAULT_READ_SITES=1: the faulting reads by address, instruction and outcome, top 16 every 5 s.
+	private static readonly bool FaultReadSites = Environment.GetEnvironmentVariable("SHARPEMU_FAULT_READ_SITES") == "1";
+	private static readonly Dictionary<(ulong, string, FaultReadOutcome), long> _faultReadSites = new();
+	[ThreadStatic] private static ulong t_faultSiteAddress;
+	[ThreadStatic] private static string? t_faultSiteText;
+
 	private static bool NoteFaultRead(FaultReadOutcome outcome)
 	{
 		Interlocked.Increment(ref _faultReadOutcomes[(int)outcome]);
+		if (FaultReadSites && t_faultSiteText is { } siteText && outcome is not (FaultReadOutcome.Verified or FaultReadOutcome.Changed or FaultReadOutcome.Mismatch or FaultReadOutcome.Pending or FaultReadOutcome.Unwatched))
+		{
+			lock (_faultReadSites)
+			{
+				var key = (t_faultSiteAddress, siteText, outcome);
+				_faultReadSites[key] = _faultReadSites.GetValueOrDefault(key) + 1;
+			}
+		}
+
 		var now = Stopwatch.GetTimestamp();
 		var due = Volatile.Read(ref _faultReadReportAt);
 		if (due == 0)
@@ -278,6 +355,15 @@ public sealed partial class DirectExecutionBackend
 			}
 
 			Console.Error.WriteLine(text.ToString());
+			if (FaultReadSites)
+			{
+				lock (_faultReadSites)
+				{
+					foreach (var ((address, instructionText, siteOutcome), count) in _faultReadSites.OrderByDescending(pair => pair.Value).Take(16))
+						Console.Error.WriteLine($"[FAULT_READ_SITE] count={count} address=0x{address:X} outcome={siteOutcome} instruction={instructionText}");
+					_faultReadSites.Clear();
+				}
+			}
 		}
 
 		return false;

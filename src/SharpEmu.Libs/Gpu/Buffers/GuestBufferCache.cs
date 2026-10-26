@@ -602,6 +602,40 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         return served;
     }
 
+    // [local] SHARPEMU_FAULT_READ_EMULATE=1: the emulated read only where the ordinary download would wait for a writer
+    // in flight (GTA V's label page, rewritten every tick). Elsewhere the download is cheap and leaves the page clean,
+    // so later reads do not fault at all; emulating those turned one fault per page into one per read (0x57B67Dxxx,
+    // ~1,700/s). Decided on the GPU queue thread, where the ordinary path would decide too; the bytes are read there.
+    public bool TryReadUnmodifiedWhileWritten(ulong address, Span<byte> data)
+    {
+        var size = (ulong)data.Length;
+        if (size == 0 || size > 16 || _relay.IsGpuQueueThread || SubmissionScheduler.InDeferredOperation ||
+            !TryReadUnmodified(address, data))
+        {
+            return false;
+        }
+
+        var bytes = new byte[size];
+        var served = false;
+        if (!_relay.TryRunOnGpuQueue(() =>
+            {
+                if (!WriterCompleted(address, size))
+                {
+                    served = TryReadUnmodified(address, bytes);
+                }
+            }))
+        {
+            return false;
+        }
+
+        if (served)
+        {
+            bytes.CopyTo(data);
+        }
+
+        return served;
+    }
+
     // [local] SHARPEMU_FAULT_READ_EMULATE=1, a repeated poll: data holds the bytes this thread's previous emulated read
     // of the range returned. While the range still holds them (and stays unmodified), the thread waits for a write to
     // touch it or for the deadline (Stopwatch ticks), then reads again; the bytes returned are the backing's at the

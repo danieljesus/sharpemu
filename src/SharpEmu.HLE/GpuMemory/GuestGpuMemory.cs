@@ -137,6 +137,19 @@ public sealed class GuestGpuMemory : IDisposable
         return Buffers?.TryReadUnmodified(address, data) ?? false;
     }
 
+    // [local] SHARPEMU_FAULT_READ_EMULATE=1: see IGuestBufferStore.TryReadUnmodifiedWhileWritten.
+    public bool TryReadWithoutDownloadWhileWritten(ulong address, Span<byte> data)
+    {
+        var size = (ulong)data.Length;
+        if (size == 0 || !Covers(address, size) || !GuestPermits(FaultKind.Read, address) ||
+            !GuestPermits(FaultKind.Read, address + size - 1))
+        {
+            return false;
+        }
+
+        return Buffers?.TryReadUnmodifiedWhileWritten(address, data) ?? false;
+    }
+
     // [local] SHARPEMU_FAULT_READ_EMULATE=1: see IGuestBufferStore.TryReadUnmodifiedParked.
     public bool TryReadWithoutDownloadParked(ulong address, Span<byte> data, long deadline)
     {
@@ -151,6 +164,9 @@ public sealed class GuestGpuMemory : IDisposable
     }
 
     public int BeginWriteWatch(ulong address, ulong size) => Buffers?.BeginWriteWatch(address, size) ?? -1;
+
+    // [local] SHARPEMU_FAULT_READ_EMULATE=2: the backing bytes, for a page the ordinary path left protected.
+    public bool TryReadBacking(ulong address, Span<byte> data) => AddressSpace is IGuestBackedSpace backing && backing.TryReadBacking(address, data);
 
     public int EndWriteWatch(int watch) => Buffers?.EndWriteWatch(watch) ?? -1;
 
