@@ -82,11 +82,12 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
 
     public bool HasPendingCommands => Volatile.Read(ref _pendingCount) != 0 || Volatile.Read(ref _nestableCount) != 0;
 
-    // [local] SHARPEMU_RELAY_PUMP_IN_WAITS=1 (off by default): a guest download's completion, which records nothing, also
-    // runs while the GPU worker waits for the GPU (timeline and readback waits, which then wait in 0.2 ms slices),
-    // unless the wait is inside a relay command. The guest thread that faulted no longer waits for the worker to
-    // finish its own wait.
-    internal static readonly bool PumpInWaits = Environment.GetEnvironmentVariable("SHARPEMU_RELAY_PUMP_IN_WAITS") == "1";
+    // [local] SHARPEMU_RELAY_PUMP_IN_WAITS (on by default since 2026-10-26, =0 off): a guest download's completion, which
+    // records nothing, also runs while the GPU worker waits for the GPU (timeline and readback waits, which then wait in
+    // 0.2 ms slices), unless the wait is inside a relay command. The guest thread that faulted no longer waits for the
+    // worker to finish its own wait: the label poll's completing relay 0.67 -> 0.23 ms (p90 2.57 -> 0.84), static 28.74
+    // vs 28.36 FPS (5+5 alternating), pan 25.12 vs 23.58 (2+2).
+    internal static readonly bool PumpInWaits = Environment.GetEnvironmentVariable("SHARPEMU_RELAY_PUMP_IN_WAITS") != "0";
 
     internal static bool CanPumpInWait => PumpInWaits && _boundWorker is { _commandDepth: 0, _pumping: false };
 
