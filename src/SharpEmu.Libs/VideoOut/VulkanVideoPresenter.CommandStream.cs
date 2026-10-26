@@ -105,6 +105,26 @@ internal static unsafe partial class VulkanVideoPresenter
             : null;
     }
 
+    // [local] SHARPEMU_REWIND_PATCH_WAKE: the guest changed a REWIND packet's valid bit through
+    // sceAgcRewindPatchSetRewindState; the heads suspended on a REWIND re-evaluate it now. With onlyWhenGpuIdle, only
+    // while no submitted tick is still running on the GPU: a completing tick retries the heads anyway, and without one
+    // the next retry is the 100 ms all-blocked one.
+    internal static int RetryRewindHeadsAfterGuestPatch(bool onlyWhenGpuIdle)
+    {
+        if (Volatile.Read(ref _activePresenter) is not { } presenter || Volatile.Read(ref _closed))
+        {
+            return 0;
+        }
+
+        if (onlyWhenGpuIdle &&
+            (presenter.Scheduler is not { } scheduler || scheduler.SubmittedTick > scheduler.Timeline.CompletedTick))
+        {
+            return 0;
+        }
+
+        return presenter.CommandStream.RetryRewindHeads();
+    }
+
     private static bool TryGetActivePresenter([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Presenter? presenter)
     {
         lock (_gate)
@@ -270,6 +290,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.Log('Y', (ulong)((now - _lastCommandStreamProgressTicks) * 1000 / System.Diagnostics.Stopwatch.Frequency)); // [local]
+            if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.LogText('Z', _commandStream.DescribeHeads()); // [local]
             _commandStream.RetryBlocked();
             _lastCommandStreamProgressTicks = now;
         }

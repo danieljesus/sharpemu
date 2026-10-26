@@ -668,6 +668,11 @@ public sealed partial class DirectExecutionBackend
 			8 => FaultKind.Execute,
 			_ => FaultKind.Unknown,
 		};
+		if (_guestCallTimeline && kind == FaultKind.Read) // [local] SHARPEMU_GUEST_CALL_TIMELINE
+		{
+			NoteLabelReadFault(contextRecord, rip, exceptionRecord->ExceptionInformation[1]);
+		}
+
 		var verify = default(FaultReadVerify);
 		if (FaultReadEmulateMode != 0 && kind == FaultKind.Read && // [local] SHARPEMU_FAULT_READ_EMULATE
 			TryEmulateFaultingRead(contextRecord, rip, exceptionRecord->ExceptionInformation[1], out verify))

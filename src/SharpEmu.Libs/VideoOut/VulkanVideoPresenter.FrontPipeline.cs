@@ -1032,6 +1032,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // writes is seen late.
         private static readonly bool PollBlocked = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_POLL_BLOCKED") == "1";
         private int _traceFrontState = -1; // [local] SHARPEMU_LABEL_TRACE: the front state last noted
+        private int _timelineFrontState = -1; // [local] SHARPEMU_LABEL_TIMELINE
 
         // The front: the slices the render thread ran before, on their own thread.
         private void FrontLoop()
@@ -1073,6 +1074,16 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (result is SliceResult.Progressed or SliceResult.Completed)
                     {
                         Interlocked.Add(ref _frontWorkTicks, System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted);
+                    }
+
+                    if (Diagnostics.LabelTimeline.Enabled) // [local] SHARPEMU_LABEL_TIMELINE: X front state (0 ran, 1 all blocked, 2 no work), wait kind, address
+                    {
+                        var state = result is SliceResult.Progressed or SliceResult.Completed ? 0 : result == SliceResult.NoWork ? 2 : 1;
+                        if (state != _timelineFrontState)
+                        {
+                            Diagnostics.LabelTimeline.Log('X', (ulong)state, (ulong)_commandStream.LastRunBlockedKind, _commandStream.LastRunBlockedAddress);
+                            _timelineFrontState = state;
+                        }
                     }
 
                     if (LabelTrace.Enabled)

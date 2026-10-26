@@ -405,6 +405,27 @@ public sealed class CommandStreamQueue
         }
     }
 
+    // [local] SHARPEMU_REWIND_PATCH_WAKE: unblocks the heads suspended on a REWIND whose valid bit was clear (only those;
+    // every other head keeps waiting for its own trigger). Returns how many it unblocked.
+    public int RetryRewindHeads()
+    {
+        lock (_gate)
+        {
+            var woken = 0;
+            for (var queueId = 0; queueId < QueueCount; queueId++)
+            {
+                if (QueueMask && (_occupied & (1UL << queueId)) == 0) continue;
+                if (_queues[queueId].First is not { } head || !head.Value.Blocked ||
+                    head.Value.BlockedKind != SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Rewind) continue;
+                head.Value.Blocked = false;
+                woken++;
+            }
+
+            if (woken != 0) Monitor.PulseAll(_gate);
+            return woken;
+        }
+    }
+
     public void RetryBlocked()
     {
         lock (_gate)
@@ -931,6 +952,24 @@ public sealed class CommandStreamQueue
         var high = _occupied & (ulong.MaxValue << start);
         var low = start == 0 ? 0 : _occupied & ((1UL << start) - 1);
         return (high, low);
+    }
+
+    // [local] SHARPEMU_LABEL_TIMELINE: every queue head as queue:blocked:kind:wait address:packet address.
+    internal string DescribeHeads()
+    {
+        lock (_gate)
+        {
+            var text = new System.Text.StringBuilder();
+            for (var queueId = 0; queueId < QueueCount; queueId++)
+            {
+                if (_queues[queueId].First is not { } head) continue;
+                var submission = head.Value;
+                text.Append(System.Globalization.CultureInfo.InvariantCulture,
+                    $" {queueId}:{(submission.Blocked ? 1 : 0)}:{(int)submission.BlockedKind}:{submission.BlockedWaitAddress:X}:{submission.BlockedPacketAddress:X}");
+            }
+
+            return text.ToString();
+        }
     }
 
     private void UnblockHeadsLocked()

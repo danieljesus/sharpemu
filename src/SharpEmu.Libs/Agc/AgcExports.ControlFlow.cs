@@ -83,6 +83,13 @@ public static partial class AgcExports
         return ReturnPointer(ctx, cmd);
     }
 
+    // [local] SHARPEMU_REWIND_PATCH_WAKE=1: a patch that sets the valid bit retries, at once, the command-stream heads
+    // suspended on a REWIND (only those). Without it a head suspended on that REWIND only re-evaluates at the next completed slice, completed GPU tick
+    // or presentation, or after the 100 ms all-blocked retry when the GPU has nothing left in flight; GTA V's render
+    // thread waits for the front past that REWIND, so each such miss was a 100-145 ms stall.
+    // =2 wakes them only while the GPU has no submitted tick left to complete.
+    private static readonly int RewindPatchWake = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_REWIND_PATCH_WAKE"), out var wake) ? wake : 0;
+
     // Patches the REWIND body dword's valid bit and wakes any DCB suspended on it.
     // rdi is the packet pointer returned by sceAgcDcbRewind (header address).
     [SysAbiExport(
@@ -122,6 +129,9 @@ public static partial class AgcExports
         }
 
         TraceAgc($"agc.rewind_patch addr=0x{bodyAddress:X16} valid={valid} body=0x{patched:X8}");
+        var woken = RewindPatchWake != 0 && valid ? VideoOut.VulkanVideoPresenter.RetryRewindHeadsAfterGuestPatch(RewindPatchWake == 2) : 0;
+        if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.Log('U', bodyAddress, valid ? 1UL : 0UL, (ulong)woken); // [local]
+
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

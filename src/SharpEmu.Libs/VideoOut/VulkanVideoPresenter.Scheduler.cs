@@ -27,6 +27,7 @@ internal static unsafe partial class VulkanVideoPresenter
         internal GpuWorkerRelay Relay => _relay;
         private readonly SubmissionContext _submissionContext = new();
         private SubmissionScheduler _scheduler = null!;
+        internal SubmissionScheduler? Scheduler => _scheduler; // [local] SHARPEMU_REWIND_PATCH_WAKE=2
         private VulkanCommandProfile? _gpuCommandProfile;
         private GpuDeviceInfo _deviceInfo = null!;
         private GuestBufferCache _bufferCache = null!;

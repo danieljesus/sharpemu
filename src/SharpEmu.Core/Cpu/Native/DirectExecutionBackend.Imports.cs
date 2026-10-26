@@ -58,7 +58,9 @@ public sealed partial class DirectExecutionBackend
 				return r;
 			}
 
-			var result = directExecutionBackend.DispatchImport(importIndex, argPackPtr);
+			var result = _guestCallTimeline // [local] SHARPEMU_GUEST_CALL_TIMELINE
+				? directExecutionBackend.DispatchImportTimed(importIndex, argPackPtr)
+				: directExecutionBackend.DispatchImport(importIndex, argPackPtr);
 			directExecutionBackend.ClearActiveImportIndex();
 			return result;
 		}
