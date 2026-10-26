@@ -77,7 +77,7 @@ internal static class FaultReadStats
             var count = ParkMs.Count;
             ParkMs.Sort();
             Console.Error.WriteLine(FormattableString.Invariant(
-                $"[FAULT_READ_PARK] window_s={seconds:F1} parks_per_s={count / seconds:F0} changed_per_s={ParkOutcomes[0] / seconds:F0} deadline_per_s={ParkOutcomes[1] / seconds:F0} declined_per_s={ParkOutcomes[2] / seconds:F0} wakes_per_park={_parkWakes / (double)Math.Max(1, count):F2} park_ms_mean/p50/p90/max={ParkMs.Average():F3}/{ParkMs[count / 2]:F3}/{ParkMs[(int)(count * 0.9)]:F3}/{ParkMs[count - 1]:F3} parked_ms_per_s={ParkMs.Sum() / seconds:F0}"));
+                $"[FAULT_READ_PARK] window_s={seconds:F1} parks_per_s={count / seconds:F0} changed_per_s={ParkOutcomes[0] / seconds:F0} deadline_per_s={ParkOutcomes[1] / seconds:F0} declined_per_s={ParkOutcomes[2] / seconds:F0} wakes_per_park={_parkWakes / (double)Math.Max(1, count):F2} park_ms_mean/p50/p90/max={ParkMs.Average():F3}/{ParkMs[count / 2]:F3}/{ParkMs[(int)(count * 0.9)]:F3}/{ParkMs[count - 1]:F3} parked_ms_per_s={ParkMs.Sum() / seconds:F0} writer_flushes_per_s={GuestBufferCache.TakeFaultReadFlushes() / seconds:F0}"));
             Array.Clear(ParkOutcomes);
             ParkMs.Clear();
             _parkWakes = 0;

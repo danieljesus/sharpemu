@@ -11,6 +11,13 @@ public interface IGpuQueueRelay
 
     void Post(Action work);
 
+    // [local] SHARPEMU_FAULT_READ_FLUSH: false if the relay rejects the work (closed), instead of throwing.
+    bool TryPost(Action work)
+    {
+        Post(work);
+        return true;
+    }
+
     // Return after the work completes. Run it directly when called on the GPU worker.
     void RunOnGpuQueue(Action work);
 

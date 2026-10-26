@@ -622,6 +622,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 if (!WriterCompleted(address, size))
                 {
                     served = TryReadUnmodified(address, bytes);
+                    if (served && FaultReadFlush)
+                    {
+                        FlushWindowWriter(address, size);
+                    }
                 }
             }))
         {
@@ -634,6 +638,57 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         return served;
+    }
+
+    // [local] SHARPEMU_FAULT_READ_FLUSH (default 1, 0 off): an emulated read still submits the batch being recorded
+    // when it holds a writer of the page window, as the ordinary download does before it waits. That submission was
+    // the poll's side effect the guest relied on: without it the batch waits for the render thread's own submit while
+    // the front waits on a REWIND the guest patches only after its poll (FPS 19.8 with BZHI emulated, the label's
+    // chains gone).
+    // [local] SHARPEMU_FAULT_READ_PARK_MIN_US (default 0): a parked poll returns no sooner than this, even when its
+    // bytes changed earlier (the ordinary path answered ~10 ms late, with progress in large steps).
+    private static readonly long FaultReadParkMinTicks =
+        (long.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FAULT_READ_PARK_MIN_US"), out var parkMin) && parkMin > 0 ? parkMin : 0) *
+        System.Diagnostics.Stopwatch.Frequency / 1_000_000;
+
+    private static readonly bool FaultReadFlush = Environment.GetEnvironmentVariable("SHARPEMU_FAULT_READ_FLUSH") != "0";
+    private int _faultReadFlushPosted;
+
+    private void FlushWindowWriter(ulong address, ulong size)
+    {
+        var waitTick = 0UL;
+        foreach (var copy in CollectReadbackWindow(address, size, out _, out _))
+        {
+            waitTick = Math.Max(waitTick, copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size));
+        }
+
+        if (waitTick >= _scheduler.CurrentTick)
+        {
+            Interlocked.Increment(ref _faultReadFlushes);
+            _scheduler.Flush();
+        }
+    }
+
+    private static long _faultReadFlushes;
+
+    internal static long TakeFaultReadFlushes() => Interlocked.Exchange(ref _faultReadFlushes, 0);
+
+    // A repeated poll does not relay: the check is posted, one at a time, and runs between the queue's commands.
+    private void PostWindowWriterFlush(ulong address, ulong size)
+    {
+        if (!FaultReadFlush || Interlocked.CompareExchange(ref _faultReadFlushPosted, 1, 0) != 0)
+        {
+            return;
+        }
+
+        if (!_relay.TryPost(() =>
+            {
+                Volatile.Write(ref _faultReadFlushPosted, 0);
+                FlushWindowWriter(address, size);
+            }))
+        {
+            Volatile.Write(ref _faultReadFlushPosted, 0);
+        }
     }
 
     // [local] SHARPEMU_FAULT_READ_EMULATE=1, a repeated poll: data holds the bytes this thread's previous emulated read
@@ -649,6 +704,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         Span<byte> previous = stackalloc byte[data.Length];
         data.CopyTo(previous);
+        PostWindowWriterFlush(address, (ulong)data.Length);
         var slot = FaultReadWatch.Begin(address, (ulong)data.Length);
         if (slot < 0)
         {
@@ -666,6 +722,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 {
                     FaultReadStats.NotePark(FaultReadStats.ParkOutcome.Declined, woken, System.Diagnostics.Stopwatch.GetTimestamp() - parked);
                     return false;
+                }
+
+                var now = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (!data.SequenceEqual(previous) && now < parked + FaultReadParkMinTicks && now < deadline)
+                {
+                    // Changed before the floor: keep waiting (each write wakes the loop) and return the bytes then.
+                    woken += FaultReadWatch.Wait(slot, FaultReadWatch.Hits(slot), Math.Min(deadline, parked + FaultReadParkMinTicks)) ? 1 : 0;
+                    continue;
                 }
 
                 if (!data.SequenceEqual(previous))
