@@ -109,7 +109,7 @@ internal static class FrontPrepVerify
             Add(ref hash, resources.Samplers);
             foreach (var word in resources.FlattenedResourceTable) hash.Add(word);
             foreach (var word in resources.UserData) hash.Add(word);
-            foreach (var range in resources.DeviceAddressRanges) hash.Add(range);
+            foreach (var range in resources.DeviceAddressRanges) hash.Add(range with { Handle = 0 }); // [local] Handle is a positional id (logs only)
         }
 
         return (uint)hash.ToHashCode();

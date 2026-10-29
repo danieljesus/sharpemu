@@ -5,7 +5,7 @@ using System.Collections.Concurrent;
 
 namespace SharpEmu.Libs.VideoOut;
 
-// [local] SHARPEMU_FRONT_PREP_RANGES (0 off: the old rule; 1 on; 2 verify): a front preparation reads guest memory
+// [local] SHARPEMU_FRONT_PREP_RANGES (1 by default; 0 off: the old rule; 2 verify): a front preparation reads guest memory
 // directly only where no GPU write has been recorded, and SHARPEMU_FRONT_PREP_CHECK discards it when any range
 // became GPU-written before the render thread executes it. In pan streaming adds such ranges every frame, and each
 // one discarded every preparation in flight (~11 per frame, all prepared again on the render thread). With this
@@ -13,10 +13,11 @@ namespace SharpEmu.Libs.VideoOut;
 // the code of the programs it names), and the preparation is discarded only when a range first written since it
 // started overlaps one of them, or when the ranges since then are no longer known (ring wrapped, too many pages).
 // =2 keeps the preparations the old rule would have discarded only after preparing them again on the render thread
-// and comparing (FrontPrepVerify); the render thread's result is used on a mismatch.
+// and comparing (FrontPrepVerify); the render thread's result is used on a mismatch. Verify in pan (pnqV10): 0
+// mismatches in 125,544 checks; discarded preparations 11.4 -> 0 per frame, back materializations 178 -> 156.
 internal static class FrontPrepReads
 {
-    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_RANGES"), out var mode) ? mode : 0;
+    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_RANGES"), out var mode) ? mode : 1;
 
     private const int MaxRanges = 128;
 
