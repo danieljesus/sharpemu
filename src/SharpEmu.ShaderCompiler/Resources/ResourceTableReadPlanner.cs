@@ -13,8 +13,7 @@ public sealed class ResourceTableReadPlanner
     private readonly ScalarValueGraph _graph;
     private readonly ShaderStage _stage;
     private readonly ulong _hash;
-    private static readonly HashSet<ulong> DeviceTableHashes = new((System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_TABLE_HASHES") ?? "")
-        .Split(',', System.StringSplitOptions.RemoveEmptyEntries).Select(h => System.Convert.ToUInt64(h, 16))); // [local]
+    private static readonly HashSet<ulong> DeviceTableHashes = ParseHashes(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_TABLE_HASHES")); // [local] ',' or '/'
     private readonly List<ResourceTableRead> _reads = [];
     private readonly List<ScalarValue> _dynamicReads = [];
     private readonly List<(ScalarValue Read, uint Slot)> _patches = [];
