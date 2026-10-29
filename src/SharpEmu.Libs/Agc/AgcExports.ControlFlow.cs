@@ -88,6 +88,8 @@ public static partial class AgcExports
     // or presentation, or after the 100 ms all-blocked retry when the GPU has nothing left in flight; GTA V's render
     // thread waits for the front past that REWIND, so each such miss was a 100-145 ms stall.
     // =2 wakes them only while the GPU has no submitted tick left to complete.
+    // =3 leaves the patch alone: the front, when every head is blocked, retries the REWIND heads once a valid patch
+    // is SHARPEMU_REWIND_PATCH_WAKE_MS (default 2) old, instead of waiting for the 100 ms all-blocked retry.
     private static readonly int RewindPatchWake = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_REWIND_PATCH_WAKE"), out var wake) ? wake : 0;
 
     // Patches the REWIND body dword's valid bit and wakes any DCB suspended on it.
@@ -129,7 +131,8 @@ public static partial class AgcExports
         }
 
         TraceAgc($"agc.rewind_patch addr=0x{bodyAddress:X16} valid={valid} body=0x{patched:X8}");
-        var woken = RewindPatchWake != 0 && valid ? VideoOut.VulkanVideoPresenter.RetryRewindHeadsAfterGuestPatch(RewindPatchWake == 2) : 0;
+        var woken = RewindPatchWake is 1 or 2 && valid ? VideoOut.VulkanVideoPresenter.RetryRewindHeadsAfterGuestPatch(RewindPatchWake == 2) : 0;
+        if (RewindPatchWake == 3 && valid) VideoOut.VulkanVideoPresenter.NoteRewindPatch(); // [local]
         if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.Log('U', bodyAddress, valid ? 1UL : 0UL, (ulong)woken); // [local]
 
         ctx[CpuRegister.Rax] = 0;

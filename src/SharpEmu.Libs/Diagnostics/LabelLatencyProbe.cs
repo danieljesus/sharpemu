@@ -127,7 +127,7 @@ internal static class LabelLatencyProbe
         var slot = (int)(tick & (TickRing - 1));
         SubmittedAt[slot] = Stopwatch.GetTimestamp();
         Volatile.Write(ref SubmittedTick[slot], tick);
-        LabelTimeline.Log('S', tick);
+        LabelTimeline.Log('S', tick, (ulong)Interlocked.Exchange(ref LabelTimeline.Draws, 0), (ulong)Interlocked.Exchange(ref LabelTimeline.Dispatches, 0));
     }
 
     public static void NoteCompleted(ulong counter)

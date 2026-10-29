@@ -9,7 +9,7 @@ namespace SharpEmu.Libs.Diagnostics;
 // [local] SHARPEMU_LABEL_TIMELINE=<file> (off by default; needs SHARPEMU_LABEL_PROBE): one line per event of the label's
 // life and of what paces the game around it, with the time in ms since the first event, written to the file:
 // Q queue (a guest submission created), F (the front ran a label write: value), R (the render thread applied it in
-// tick), S (tick submitted), C (ticks complete up to), g (a guest poll of the label began: current, completed, size),
+// tick), S (tick submitted: tick, draws, dispatches recorded since the previous S, those of compute queues << 20), C (ticks complete up to), g (a guest poll of the label began: current, completed, size),
 // w (its readback ran on the GPU queue: block write tick, precise write tick with SHARPEMU_PRECISE_WRITE_TICKS, current
 // tick, pieces), a (its download finished: completed tick), b (its completion ran on the GPU queue: current tick), G (a guest poll of the label ended: value, current, completed, ms),
 // W (a GPU-queue-thread wait over 1 ms: tick, kind, site, ms), K (render loop: 0 start, 2 guest work flushed, 4 presentation taken, 6 presented), V (flip reserved by the front: request), P (flip presented: request).
@@ -47,6 +47,15 @@ internal static class LabelTimeline
     }
 
     private static readonly HashSet<int> Sites = new();
+    private static readonly int SiteFrames = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_LABEL_TIMELINE_SITE_FRAMES"), out var frames) ? frames : 8; // [local]
+
+    // [local] Draws and dispatches recorded since the last S line, which carries them.
+    public static long Draws, Dispatches;
+
+    // [local] The command-stream queue of the slice the front runs, and of the dispatch the render thread executes
+    // (a readback W line carries it as kind | (queue + 1) << 8).
+    public static int FrontQueue = -1;
+    [ThreadStatic] public static int RenderQueue;
 
     // A wait of more than 1 ms on the thread that owns the GPU queue: W (tick, kind 0 timeline / 1 readback, site, ms),
     // with the site's stack printed once to stderr as [LABEL_TIMELINE_SITE].
@@ -57,7 +66,7 @@ internal static class LabelTimeline
         if (ms < 1.0) return;
         var trace = new StackTrace(2, false);
         var text = new System.Text.StringBuilder();
-        for (var index = 0; index < Math.Min(trace.FrameCount, 8); index++)
+        for (var index = 0; index < Math.Min(trace.FrameCount, SiteFrames); index++)
         {
             var method = trace.GetFrame(index)?.GetMethod();
             text.Append(method?.DeclaringType?.Name).Append('.').Append(method?.Name).Append(" < ");
@@ -69,7 +78,7 @@ internal static class LabelTimeline
             if (Sites.Count < 64 && Sites.Add(site)) Console.Error.WriteLine($"[LABEL_TIMELINE_SITE] {site:X} {text}");
         }
 
-        Log('W', tick, (ulong)kind, (ulong)site, ms);
+        Log('W', tick, (ulong)kind | ((ulong)(uint)(RenderQueue + 1) << 8), (ulong)site, ms);
     }
 
     // A line with free text after the kind (SHARPEMU_GUEST_CALL_TIMELINE's T).

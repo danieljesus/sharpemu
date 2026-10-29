@@ -125,6 +125,22 @@ internal static unsafe partial class VulkanVideoPresenter
         return presenter.CommandStream.RetryRewindHeads();
     }
 
+    // [local] SHARPEMU_REWIND_PATCH_WAKE=3: the oldest valid REWIND patch not yet followed by a REWIND retry (0: none).
+    private static readonly long RewindPatchRetryTicks =
+        Environment.GetEnvironmentVariable("SHARPEMU_REWIND_PATCH_WAKE") == "3"
+            ? Math.Max(1, (long)((double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_REWIND_PATCH_WAKE_MS"),
+                System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var patchMs) ? patchMs : 2.0) *
+                System.Diagnostics.Stopwatch.Frequency / 1000))
+            : 0;
+
+    private static long _pendingRewindPatchTicks;
+
+    internal static void NoteRewindPatch()
+    {
+        if (Volatile.Read(ref _pendingRewindPatchTicks) == 0)
+            Interlocked.CompareExchange(ref _pendingRewindPatchTicks, System.Diagnostics.Stopwatch.GetTimestamp(), 0);
+    }
+
     private static bool TryGetActivePresenter([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Presenter? presenter)
     {
         lock (_gate)
@@ -285,6 +301,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void RetryBlockedCommandStreamIfDue()
         {
             var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (RewindPatchRetryTicks != 0) RetryRewindHeadsAfterPatchIfDue(now); // [local] SHARPEMU_REWIND_PATCH_WAKE=3
             if (now - _lastCommandStreamProgressTicks < _blockedRetryTicks)
             {
                 return;
@@ -294,6 +311,21 @@ internal static unsafe partial class VulkanVideoPresenter
             if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.LogText('Z', _commandStream.DescribeHeads()); // [local]
             _commandStream.RetryBlocked();
             _lastCommandStreamProgressTicks = now;
+        }
+
+        // [local] SHARPEMU_REWIND_PATCH_WAKE=3: every head is blocked and a valid REWIND patch is old enough: the heads
+        // suspended on a REWIND re-evaluate it (only those), as the 100 ms retry would.
+        private void RetryRewindHeadsAfterPatchIfDue(long now)
+        {
+            var patched = Volatile.Read(ref _pendingRewindPatchTicks);
+            if (patched == 0 || now - patched < RewindPatchRetryTicks ||
+                Interlocked.CompareExchange(ref _pendingRewindPatchTicks, 0, patched) != patched)
+            {
+                return;
+            }
+
+            var woken = _commandStream.RetryRewindHeads();
+            if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.Log('U', 0, 3, (ulong)woken); // [local]
         }
 
         // Milliseconds until the blocked heads are due for a retry; null when none is blocked.

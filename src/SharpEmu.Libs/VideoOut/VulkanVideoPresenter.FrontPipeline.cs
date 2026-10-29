@@ -747,6 +747,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             Func<ComputeProgram?> prepareOnFront = () => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator);
+            var timelineQueue = Diagnostics.LabelTimeline.FrontQueue; // [local] SHARPEMU_LABEL_TIMELINE
             var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
             var prepared = indirectArgumentsAddress == 0
                 ? presenter.TryPrepareComputeOnFront(snapshot.Shader.Compute.Address, prepareOnFront)
@@ -761,7 +762,9 @@ internal static unsafe partial class VulkanVideoPresenter
                         prepared = null;
                     if (prepared is not null && FrontPrepVerify.Enabled) // [local] SHARPEMU_FRONT_PREP_VERIFY
                         prepared = Presenter.VerifyCompute(prepared, prepareOnFront);
+                    Diagnostics.LabelTimeline.RenderQueue = timelineQueue; // [local]
                     presenter.ExecuteQueuedDispatch(submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, prepared);
+                    Diagnostics.LabelTimeline.RenderQueue = -1; // [local]
                 }
                 finally
                 {
@@ -1220,6 +1223,7 @@ internal static unsafe partial class VulkanVideoPresenter
             try
             {
                 _translation.ExecuteDraw(submitId, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs, drawRegisters);
+                if (Diagnostics.LabelTimeline.Enabled) Interlocked.Increment(ref Diagnostics.LabelTimeline.Draws); // [local]
             }
             finally
             {
@@ -1237,6 +1241,7 @@ internal static unsafe partial class VulkanVideoPresenter
             try
             {
                 _translation.ExecuteDispatch(submitId, banks, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, prepared);
+                if (Diagnostics.LabelTimeline.Enabled) Interlocked.Add(ref Diagnostics.LabelTimeline.Dispatches, Diagnostics.LabelTimeline.RenderQueue > 0 ? 1 << 20 : 1); // [local] compute-queue ones in the high bits
             }
             finally
             {

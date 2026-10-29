@@ -521,6 +521,7 @@ public sealed class CommandStreamQueue
         var writesBefore = Volatile.Read(ref _appliedWrites); // [local] SHARPEMU_FRONT_WAKE
         try
         {
+            if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.FrontQueue = submission!.QueueId; // [local]
             complete = RunSlice(submission!);
         }
         catch (Exception exception)
