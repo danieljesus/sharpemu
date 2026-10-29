@@ -289,12 +289,15 @@ public sealed class RuntimeValueEvaluator
         var previousBase = ExchangeReadBase(baseRegister);
         var previousNode = ExchangeReadNode(node);
         var previousBaseAddress = ExchangeReadBaseAddress(baseAddress);
+        var previousPlan = SrtReadProbe.CurrentPlan; // [local] SHARPEMU_SRT_READ_PROBE
+        if (SrtReadProbe.Enabled) SrtReadProbe.CurrentPlan = _plan;
         try
         {
             read = _inputs.ReadMemory is not null && _inputs.ReadMemory(address, out word);
         }
         finally
         {
+            if (SrtReadProbe.Enabled) SrtReadProbe.CurrentPlan = previousPlan;
             ExchangeReadBase(previousBase);
             ExchangeReadNode(previousNode);
             ExchangeReadBaseAddress(previousBaseAddress);

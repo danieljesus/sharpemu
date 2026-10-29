@@ -829,7 +829,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         earlyPre = _guestMemory.TryRead(address, pre) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(pre) : 0;
                     }
 
-                    if (census)
+                    var probe = Diagnostics.SrtReadProbeLog.Enabled; // [local] SHARPEMU_SRT_READ_PROBE
+                    if (probe || census)
                     {
                         Span<byte> pre = stackalloc byte[sizeof(uint)];
                         censusPre = _guestMemory.TryRead(address, pre) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(pre) : 0;
@@ -843,11 +844,15 @@ internal static unsafe partial class VulkanVideoPresenter
                         return false;
                     }
 
-                    if (census)
+                    if (probe || census)
                     {
                         var ms = System.Diagnostics.Stopwatch.GetElapsedTime(censusStarted).TotalMilliseconds;
                         Span<byte> post = stackalloc byte[sizeof(uint)];
                         var postWord = _guestMemory.TryRead(address, post) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(post) : censusPre;
+                        if (probe)
+                            Diagnostics.SrtReadProbeLog.Record(Diagnostics.GpuReadTrace.CurrentShader, address, ms, censusPre, postWord,
+                                Gpu.Buffers.TableWordMemo.Enabled ? Gpu.Buffers.TableWordMemo.ProbeReason(address, postWord) : "off");
+                        if (census)
                         Diagnostics.TableReadCensus.Record(address, postWord != censusPre, ms, censusTicks.Own, censusTicks.Window, censusTicks.Precise, censusTicks.Current, censusTicks.Completed);
                     }
 

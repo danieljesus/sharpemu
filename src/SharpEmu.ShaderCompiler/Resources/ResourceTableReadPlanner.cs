@@ -38,6 +38,22 @@ public sealed class ResourceTableReadPlanner
 
     public static bool IsDeviceTableHash(ulong hash) => DeviceTableHashes.Contains(hash); // [local]
 
+    // [local] SHARPEMU_DEVICE_DATA_READS=<hashes> ('/' or ',' separated; empty or 0 off): in the listed shaders an
+    // immediate-offset S_LOAD whose result is only shader data (no descriptor, handle or other read depends on it, and
+    // no other dword of the same load was flattened for one) is not flattened into the host table: the shader performs
+    // it through the device-address page table, as the hardware does, so its word is read when the dispatch runs and the
+    // host never reads it while recording. Only the loads' own address operands are still planned.
+    private static readonly HashSet<ulong> DeviceDataReadHashes = ParseHashes(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS"));
+
+    internal static HashSet<ulong> ParseHashes(string? value) =>
+        value is null or "0" ? [] : new(value.Split(['/', ','], System.StringSplitOptions.RemoveEmptyEntries).Select(h => System.Convert.ToUInt64(h, 16)));
+
+    public static bool IsDeviceDataReadHash(ulong hash) => DeviceDataReadHashes.Contains(hash);
+
+    private static long _deviceDataReads;
+
+    public static long DeviceDataReads => System.Threading.Interlocked.Read(ref _deviceDataReads);
+
     public static Result Plan(ScalarValueGraph graph, ShaderStage stage, ulong hash) =>
         new ResourceTableReadPlanner(graph, stage, hash).Run();
 
@@ -78,12 +94,29 @@ public sealed class ResourceTableReadPlanner
         }
 
         var validatorReadCount = _reads.Count;
+        var deviceData = DeviceDataReadHashes.Contains(_hash); // [local] SHARPEMU_DEVICE_DATA_READS
+        HashSet<int>? handleIndices = null;
+        if (deviceData)
+        {
+            handleIndices = [];
+            foreach (var (patched, _) in _patches)
+                handleIndices.Add(patched.MemoryIndex);
+        }
+
         foreach (var access in _graph.Accesses)
         {
             if (access?.Read is { Kind: ScalarValueKind.ScalarAddressWord } read &&
                 IsRawRead(read) && read.Operands[1].IsConstant &&
                 new RuntimeValueValidator(_graph, _graph.UserDataBase, _graph.UserDataCount, validatorReadCount).Validate(read))
             {
+                if (handleIndices is not null && !handleIndices.Contains(read.MemoryIndex))
+                {
+                    foreach (var operand in read.Operands[0].Operands)
+                        Collect(operand, _graph.Memory[read.MemoryIndex].Pc);
+                    System.Threading.Interlocked.Increment(ref _deviceDataReads);
+                    continue;
+                }
+
                 Collect(read, _graph.Memory[read.MemoryIndex].Pc);
             }
         }

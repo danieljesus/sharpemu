@@ -101,7 +101,7 @@ internal static class TableWordMemo
         if (Volatile.Read(ref _count) == 0 || Writers.Contains(CurrentProgram))
             return;
         lock (_lock)
-        if (Invalidate(address, size))
+        if (Invalidate(address, size, 'g', CurrentProgram))
         {
             _invalidGpu++;
             _invalidByWriter[CurrentProgram] = _invalidByWriter.GetValueOrDefault(CurrentProgram) + 1;
@@ -120,7 +120,9 @@ internal static class TableWordMemo
             return;
         if (!CommandUpdates)
         {
-            NoteOtherWrite(address, (ulong)data.Length);
+            lock (_lock)
+                if (Invalidate(address, (ulong)data.Length, 'w', 0))
+                    _invalidCp++;
             return;
         }
 
@@ -136,7 +138,7 @@ internal static class TableWordMemo
                     _values[word] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[(int)(word - address)..]);
                     _cpUpdates++;
                 }
-                else if (Invalidate(word, 4))
+                else if (Invalidate(word, 4, 'p', 0))
                 {
                     _invalidCp++;
                 }
@@ -162,13 +164,30 @@ internal static class TableWordMemo
         if (Volatile.Read(ref _count) == 0)
             return;
         lock (_lock)
-            if (Invalidate(address, size))
+            if (Invalidate(address, size, 'c', 0))
                 _invalidCp++;
     }
 
     private static int _count;
 
-    private static bool Invalidate(ulong address, ulong size)
+    // [local] SHARPEMU_SRT_READ_PROBE: why each dropped word was dropped, and the value it held.
+    private static readonly Dictionary<ulong, (char Kind, ulong Program, uint Value)> _dropped = new();
+
+    // "hit", "new" (never remembered) or the drop's kind ('g' GPU write of a program, 'w' CP write, 'p' partial CP write,
+    // 'c' CPU write fault or other host write), with whether the synchronized value equals the dropped one.
+    public static string ProbeReason(ulong address, uint synchronized)
+    {
+        lock (_lock)
+        {
+            if (_values.ContainsKey(address))
+                return "hit";
+            if (!_dropped.TryGetValue(address, out var drop))
+                return "new";
+            return $"{drop.Kind}{(drop.Program != 0 ? $":{drop.Program >> 48:X4}" : "")}:{(drop.Value == synchronized ? "same" : "diff")}";
+        }
+    }
+
+    private static bool Invalidate(ulong address, ulong size, char kind, ulong program)
     {
         if (_dirtySort)
         {
@@ -181,7 +200,11 @@ internal static class TableWordMemo
             index = ~index;
         var removed = false;
         for (; index < _sorted.Length && _sorted[index] < address + size; index++)
+        {
+            if (SharpEmu.ShaderCompiler.Resources.SrtReadProbe.Enabled && _values.TryGetValue(_sorted[index], out var old))
+                _dropped[_sorted[index]] = (kind, program, old);
             removed |= _values.Remove(_sorted[index]);
+        }
         if (removed)
         {
             _dirtySort = true;
