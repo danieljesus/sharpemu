@@ -206,8 +206,54 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _everGpuWrittenLock.ExitUpgradeableReadLock();
         }
 
-        Interlocked.Increment(ref _everGpuWrittenVersion);
+        if (VideoOut.FrontPrepReads.Mode != 0) // [local] SHARPEMU_FRONT_PREP_RANGES
+        {
+            lock (_firstWrites)
+            {
+                var version = Interlocked.Increment(ref _everGpuWrittenVersion);
+                _firstWrites[(int)(version & (FirstWriteRing - 1))] = (version, guestAddress, size);
+            }
+        }
+        else
+        {
+            Interlocked.Increment(ref _everGpuWrittenVersion);
+        }
+
         FirstGpuWrite?.Invoke(guestAddress, size);
+    }
+
+    // [local] SHARPEMU_FRONT_PREP_RANGES: the range added at each version, for the last FirstWriteRing versions.
+    private const int FirstWriteRing = 1024;
+    private readonly (long Version, ulong Address, ulong Size)[] _firstWrites = new (long, ulong, ulong)[FirstWriteRing];
+
+    // [local] SHARPEMU_FRONT_PREP_RANGES: 1 when a range first GPU-written after `version` overlaps the pages,
+    // 0 when none does, -1 when the ranges since `version` are no longer known.
+    internal int FirstWritesSinceOverlap(long version, VideoOut.FrontPrepReads.Pages pages)
+    {
+        lock (_firstWrites)
+        {
+            var current = Volatile.Read(ref _everGpuWrittenVersion);
+            if (current - version > FirstWriteRing - 1)
+            {
+                return -1;
+            }
+
+            for (var next = version + 1; next <= current; next++)
+            {
+                var entry = _firstWrites[(int)(next & (FirstWriteRing - 1))];
+                if (entry.Version != next)
+                {
+                    return -1;
+                }
+
+                if (VideoOut.FrontPrepReads.Overlaps(pages, entry.Address, entry.Size))
+                {
+                    return 1;
+                }
+            }
+
+            return 0;
+        }
     }
 
     // [local] Bumped after every range is added to the ever-GPU-written set (any thread may read it). A front

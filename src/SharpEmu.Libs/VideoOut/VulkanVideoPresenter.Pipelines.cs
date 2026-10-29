@@ -168,7 +168,10 @@ internal static unsafe partial class VulkanVideoPresenter
             // [local] A read of bytes a queued WriteGuestNow has not applied yet (overlay mode 2):
             // it runs on the render thread after the write, also while preparing (no deferral).
             _backReadForPendingWrite = PendingWriteOverlay.Mode >= 2 && FrontOverlay.Overlaps(address, size);
-            return _backReadForPendingWrite || _bufferCache.EverGpuWritten(address, size);
+            if (_backReadForPendingWrite || _bufferCache.EverGpuWritten(address, size))
+                return true;
+            if (_preparingOnFront) FrontPrepReads.Note(address, size); // [local] SHARPEMU_FRONT_PREP_RANGES: a direct read
+            return false;
         }
 
         [ThreadStatic] private static bool _backReadForPendingWrite; // [local] per thread: the front and the prep worker
@@ -191,6 +194,47 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             DiscardedFrontPreparations++;
             return false;
+        }
+
+        // [local] SHARPEMU_FRONT_PREP_RANGES: as above, but a version change discards the preparation only when a range
+        // first GPU-written since `version` overlaps a page it read directly. `verify` is set when the old rule would
+        // have discarded it (mode 2: the caller prepares again and compares). Releases `pages`.
+        internal bool FrontPreparationStillValid(long version, FrontPrepReads.Pages? pages, out bool verify)
+        {
+            verify = false;
+            if (pages is null || !FrontSyncedReads)
+                return FrontPreparationStillValid(version);
+            try
+            {
+                if (!FrontPrepCheck || _bufferCache.EverGpuWrittenVersion == version)
+                    return true;
+                var overlap = pages.Overflow ? -1 : _bufferCache.FirstWritesSinceOverlap(version, pages);
+                if (overlap != 0)
+                {
+                    if (overlap < 0) Interlocked.Increment(ref FrontPrepReads.Unknown);
+                    else Interlocked.Increment(ref FrontPrepReads.Discarded);
+                    DiscardedFrontPreparations++;
+                    return false;
+                }
+
+                Interlocked.Increment(ref FrontPrepReads.Kept);
+                verify = FrontPrepReads.Mode == 2;
+                return true;
+            }
+            finally
+            {
+                FrontPrepReads.Release(pages);
+            }
+        }
+
+        // [local] SHARPEMU_FRONT_PREP_RANGES: the pages the last front preparation of this thread read directly.
+        [ThreadStatic] private static FrontPrepReads.Pages? _lastPrepPages;
+
+        internal static FrontPrepReads.Pages? TakePrepPages()
+        {
+            var pages = _lastPrepPages;
+            _lastPrepPages = null;
+            return pages;
         }
 
         // [local] SHARPEMU_FRONT_STALE_CHECK=1 (diagnostic): the front notes each page it reads directly with the back
@@ -340,10 +384,11 @@ internal static unsafe partial class VulkanVideoPresenter
         // [local] SHARPEMU_FRONT_PREP_VERIFY: a preparation made ahead of the render thread (front or prep worker) is
         // prepared again here and compared; the render thread's result is used on a mismatch (and always with =2).
         internal static GraphicsPrograms? VerifyGraphics(GraphicsPrograms prepared, ref RenderExecutor.DrawProgramInputs inputs,
-            Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare)
+            Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare, bool force = false)
         {
-            if (!FrontPrepVerify.Enabled)
+            if (!FrontPrepVerify.Enabled && !force)
                 return prepared;
+            if (force) Interlocked.Increment(ref FrontPrepReads.Verified); // [local] SHARPEMU_FRONT_PREP_RANGES=2
             var (renderPrograms, renderInputs) = prepare();
             if (renderPrograms is null)
             {
@@ -369,10 +414,11 @@ internal static unsafe partial class VulkanVideoPresenter
             return renderPrograms;
         }
 
-        internal static ComputeProgram? VerifyCompute(ComputeProgram prepared, Func<ComputeProgram?> prepare)
+        internal static ComputeProgram? VerifyCompute(ComputeProgram prepared, Func<ComputeProgram?> prepare, bool force = false)
         {
-            if (!FrontPrepVerify.Enabled)
+            if (!FrontPrepVerify.Enabled && !force)
                 return prepared;
+            if (force) Interlocked.Increment(ref FrontPrepReads.Verified); // [local] SHARPEMU_FRONT_PREP_RANGES=2
             var renderProgram = prepare();
             if (renderProgram is null)
             {
@@ -479,6 +525,7 @@ internal static unsafe partial class VulkanVideoPresenter
         internal GraphicsPrograms? TryPrepareOnFront(Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare, out RenderExecutor.DrawProgramInputs inputs)
         {
             _preparingOnFront = true;
+            if (!_onPrepWorker) FrontPrepReads.Begin(); // [local] SHARPEMU_FRONT_PREP_RANGES
             var started = FrontProfile.LoopEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             try
             {
@@ -496,6 +543,8 @@ internal static unsafe partial class VulkanVideoPresenter
             finally
             {
                 _preparingOnFront = false;
+                FrontPrepReads.Release(_lastPrepPages); // [local] SHARPEMU_FRONT_PREP_RANGES: a previous one nobody took
+                _lastPrepPages = FrontPrepReads.End();
             }
         }
 
@@ -505,6 +554,7 @@ internal static unsafe partial class VulkanVideoPresenter
         internal ComputeProgram? TryPrepareComputeOnFront(Func<ComputeProgram?> prepare)
         {
             _preparingOnFront = true;
+            if (!_onPrepWorker) FrontPrepReads.Begin(); // [local] SHARPEMU_FRONT_PREP_RANGES
             var started = FrontProfile.LoopEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             try
             {
@@ -523,6 +573,8 @@ internal static unsafe partial class VulkanVideoPresenter
             finally
             {
                 _preparingOnFront = false;
+                FrontPrepReads.Release(_lastPrepPages); // [local] SHARPEMU_FRONT_PREP_RANGES: a previous one nobody took
+                _lastPrepPages = FrontPrepReads.End();
             }
         }
 

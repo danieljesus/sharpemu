@@ -126,6 +126,13 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         }
 
         identityScope.Dispose();
+        if (SharpEmu.Libs.VideoOut.FrontPrepReads.Mode != 0) // [local] SHARPEMU_FRONT_PREP_RANGES: the code a front preparation reads
+        {
+            SharpEmu.Libs.VideoOut.FrontPrepReads.Note(registered.CodeAddress, registered.CodeSizeBytes);
+            if (registered.IsFused)
+                SharpEmu.Libs.VideoOut.FrontPrepReads.Note(registered.ContinuationAddress, registered.ContinuationSizeBytes);
+        }
+
         using var userDataScope = SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.SourceUserData);
         var userData = UserData(registers, declaredCount, probeWrittenRegisters, codeAddress, label);
         return new ShaderSource(registered, hash, userData, userDataBase, stage);
