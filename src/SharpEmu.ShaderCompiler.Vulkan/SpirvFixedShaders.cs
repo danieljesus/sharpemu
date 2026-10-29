@@ -422,10 +422,14 @@ public static class SpirvFixedShaders
 
     // Read and clear binding 0. Write the count and 64-bit page addresses to binding 1.
     // Use 64 threads per group, with one thread per 32-page word.
-    // [local] baseWordPush: a push-constant word index is added to the invocation's, so one dispatch scans one run of
-    // the bitmap (SHARPEMU_BDA_SCAN_MAPPED).
-    public static byte[] CreateFaultBufferProcess(bool baseWordPush = false)
+    // [local] summaryWord != 0 (SHARPEMU_BDA_SCAN_MAPPED): two push-constant words, the base word index added to the
+    // invocation's and a flag. With the flag set, each workgroup (64 words = one 32 MiB granule) first reads its
+    // granule's bit in the summary bitmap at dword summaryWord, which every fault writer sets with the page's bit, and
+    // returns at once when it is clear. Otherwise the bit is cleared (after every invocation has read it) and set again
+    // by an invocation that keeps bits that did not fit, so the next scan visits the granule again.
+    public static byte[] CreateFaultBufferProcess(uint summaryWord = 0)
     {
+        var baseWordPush = summaryWord != 0;
         const uint cachingPageBits = 14;
         const uint maxPageFaults = 1024;
 
@@ -465,9 +469,10 @@ public static class SpirvFixedShaders
         var pushVar = 0u;
         if (baseWordPush)
         {
-            var pushStruct = module.TypeStruct(uintType);
+            var pushStruct = module.TypeStruct(uintType, uintType);
             module.AddDecoration(pushStruct, SpirvDecoration.Block);
             module.AddMemberDecoration(pushStruct, 0, SpirvDecoration.Offset, 0);
+            module.AddMemberDecoration(pushStruct, 1, SpirvDecoration.Offset, 4);
             pushVar = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.PushConstant, pushStruct), SpirvStorageClass.PushConstant);
             module.AddName(pushVar, "base_word");
         }
@@ -475,15 +480,60 @@ public static class SpirvFixedShaders
         var functionType = module.TypeFunction(voidType);
         var main = module.BeginFunction(voidType, functionType);
         module.AddName(main, "main");
-        var entry = module.AddLabel();
+        module.AddLabel();
         var gid = module.AddInstruction(SpirvOp.Load, uvec3Type, gidVar);
         var id = module.AddInstruction(SpirvOp.CompositeExtract, uintType, gid, 0);
+        var useSummary = 0u;
+        var summaryPtr = 0u;
+        var summaryBit = 0u;
         if (baseWordPush)
         {
-            var basePtr = module.AddInstruction(SpirvOp.AccessChain, module.TypePointer(SpirvStorageClass.PushConstant, uintType), pushVar, UInt(0));
-            var baseWord = module.AddInstruction(SpirvOp.Load, uintType, basePtr);
+            var pushUintPtr = module.TypePointer(SpirvStorageClass.PushConstant, uintType);
+            var baseWord = module.AddInstruction(SpirvOp.Load, uintType, module.AddInstruction(SpirvOp.AccessChain, pushUintPtr, pushVar, UInt(0)));
             id = module.AddInstruction(SpirvOp.IAdd, uintType, id, baseWord);
+            var flag = module.AddInstruction(SpirvOp.Load, uintType, module.AddInstruction(SpirvOp.AccessChain, pushUintPtr, pushVar, UInt(1)));
+            useSummary = module.AddInstruction(SpirvOp.INotEqual, boolType, flag, UInt(0));
+            var granule = module.AddInstruction(SpirvOp.ShiftRightLogical, uintType, id, UInt(6));
+            var summaryIndex = module.AddInstruction(SpirvOp.IAdd, uintType, UInt(summaryWord), module.AddInstruction(SpirvOp.ShiftRightLogical, uintType, granule, UInt(5)));
+            summaryPtr = module.AddInstruction(SpirvOp.AccessChain, uintStoragePtr, faultVar, UInt(0), summaryIndex);
+            summaryBit = module.AddInstruction(SpirvOp.ShiftLeftLogical, uintType, UInt(1), module.AddInstruction(SpirvOp.BitwiseAnd, uintType, granule, UInt(31)));
+
+            // if (useSummary) { if (!(summary & bit)) return; barrier; if (lane 0) summary &= ~bit; barrier; }
+            var summaryBody = module.AllocateId();
+            var summaryEmpty = module.AllocateId();
+            var summarySet = module.AllocateId();
+            var clearLane = module.AllocateId();
+            var afterClear = module.AllocateId();
+            var summaryMerge = module.AllocateId();
+            module.AddStatement(SpirvOp.SelectionMerge, summaryMerge, 0);
+            module.AddStatement(SpirvOp.BranchConditional, useSummary, summaryBody, summaryMerge);
+            module.AddLabel(summaryBody);
+            var summaryValue = module.AddInstruction(SpirvOp.Load, uintType, summaryPtr);
+            var marked = module.AddInstruction(SpirvOp.INotEqual, boolType, module.AddInstruction(SpirvOp.BitwiseAnd, uintType, summaryValue, summaryBit), UInt(0));
+            var innerMerge = module.AllocateId();
+            module.AddStatement(SpirvOp.SelectionMerge, innerMerge, 0);
+            module.AddStatement(SpirvOp.BranchConditional, marked, summarySet, summaryEmpty);
+            module.AddLabel(summaryEmpty);
+            module.AddStatement(SpirvOp.Return);
+            module.AddLabel(summarySet);
+            module.AddStatement(SpirvOp.ControlBarrier, UInt(2), UInt(2), UInt(0x48));
+            var lane = module.AddInstruction(SpirvOp.BitwiseAnd, uintType, module.AddInstruction(SpirvOp.CompositeExtract, uintType, gid, 0), UInt(63));
+            var isFirst = module.AddInstruction(SpirvOp.IEqual, boolType, lane, UInt(0));
+            module.AddStatement(SpirvOp.SelectionMerge, afterClear, 0);
+            module.AddStatement(SpirvOp.BranchConditional, isFirst, clearLane, afterClear);
+            module.AddLabel(clearLane);
+            module.AddInstruction(SpirvOp.AtomicAnd, uintType, summaryPtr, UInt(1), UInt(0), module.AddInstruction(SpirvOp.Not, uintType, summaryBit));
+            module.AddStatement(SpirvOp.Branch, afterClear);
+            module.AddLabel(afterClear);
+            module.AddStatement(SpirvOp.ControlBarrier, UInt(2), UInt(2), UInt(0x48));
+            module.AddStatement(SpirvOp.Branch, innerMerge);
+            module.AddLabel(innerMerge);
+            module.AddStatement(SpirvOp.Branch, summaryMerge);
+            module.AddLabel(summaryMerge);
         }
+        var entry = module.AllocateId();
+        module.AddStatement(SpirvOp.Branch, entry);
+        module.AddLabel(entry);
         var wordPtr = module.AddInstruction(SpirvOp.AccessChain, uintStoragePtr, faultVar, UInt(0), id);
         var firstWord = module.AddInstruction(SpirvOp.Load, uintType, wordPtr);
         module.AddStatement(SpirvOp.Store, wordPtr, UInt(0));
@@ -516,6 +566,17 @@ public static class SpirvFixedShaders
         module.AddLabel(exit);
         // Keep requests that did not fit for the next fault scan.
         module.AddStatement(SpirvOp.Store, wordPtr, word);
+        if (baseWordPush) // [local] and the granule's summary bit, so the next scan visits it (a no-op without the flag)
+        {
+            var keepBody = module.AllocateId();
+            var keepMerge = module.AllocateId();
+            module.AddStatement(SpirvOp.SelectionMerge, keepMerge, 0);
+            module.AddStatement(SpirvOp.BranchConditional, useSummary, keepBody, keepMerge);
+            module.AddLabel(keepBody);
+            module.AddInstruction(SpirvOp.AtomicOr, uintType, summaryPtr, UInt(1), UInt(0), summaryBit);
+            module.AddStatement(SpirvOp.Branch, keepMerge);
+            module.AddLabel(keepMerge);
+        }
         module.AddStatement(SpirvOp.Return);
 
         module.AddLabel(store);

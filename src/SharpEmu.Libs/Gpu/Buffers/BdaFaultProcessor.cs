@@ -89,26 +89,23 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private readonly DescriptorPool _pool;
     private uint _currentArea;
 
-    // [local] SHARPEMU_BDA_SCAN_MAPPED (on by default; =0 scans the whole bitmap, =2 verifies): the fault scan only
-    // dispatches over the 32 MiB granules (one 64-word workgroup each) that some GPU-registered span has ever covered,
-    // instead of the whole 1 TiB bitmap (32768 workgroups). The granule set only grows, so a span unregistered after a
-    // fault is still scanned, and a span registered after a scan was recorded is scanned by the next one: a scan never
-    // clears bits it did not cover. Bits outside every granule stay set (an address no span ever covered). =2 runs the
-    // whole-bitmap scan after the ranged one into its own lists, counts its pages inside the granules (lost, must be 0)
-    // and outside them, and serves them as the whole scan does. GTA V (2026-10-29): 3 scans/frame, 150 -> 3 us each
-    // (~0.46 ms GPU/frame saved), 0 lost; the few pages outside were all unreadable (never mapped).
-    internal static readonly int ScanMappedMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_SCAN_MAPPED"), out var scanMapped) ? scanMapped : 1;
-    private const int GranuleShift = 25; // 64 words x 32 pages x 16 KiB
-    private readonly ulong[]? _granules;
-    private readonly List<(uint First, uint Count)> _granuleRuns = new();
-    private long _granuleVersion = -1;
-    private object? _granuleMemory;
+    // [local] SHARPEMU_BDA_SCAN_MAPPED (on by default; =0 scans the whole bitmap, =2 verifies): every fault writer also
+    // sets its 32 MiB granule's bit in a 4 KB summary bitmap after the RT stack and zero-page areas
+    // (DeviceAddressPaging.FaultSummaryOffset), and each scan workgroup (64 words = one granule) returns at once when
+    // its granule's bit is clear, so the 8 MiB bitmap is read and cleared only where something faulted. The scan clears
+    // a visited granule's bit and sets it again when it keeps bits that did not fit. =2 runs the whole-bitmap scan after
+    // the summary one into its own lists: a page it finds is a lost fault (must be 0) and is served as the whole scan
+    // would serve it. GTA V (2026-10-29): 3 scans/frame, 150 -> 17 us of GPU each (0.47 -> 0.05 ms/frame), 0 lost in
+    // static and panning. A first version that scanned only granules of GPU-registered spans left faults on never
+    // mapped pages unserved: their invocations kept faulting and GTA V fell to 9 FPS.
+    internal static readonly int ScanMappedMode = DeviceAddressPaging.FaultSummaryEnabled
+        ? (Environment.GetEnvironmentVariable("SHARPEMU_BDA_SCAN_MAPPED") == "2" ? 2 : 1)
+        : 0;
     private readonly GpuBuffer? _verifyDownload;
     private readonly DescriptorSet[] _verifySets = new DescriptorSet[MaxPendingFaults];
     private readonly QueryPool _timestamps;
     private readonly double _timestampPeriod;
-    private static int _outsideReports;
+    private bool _summaryInitialized;
 
     public BdaFaultProcessor(GpuDeviceInfo device, SubmissionScheduler scheduler, GuestBufferCache cache, int pageBits, ulong pageCount)
     {
@@ -122,8 +119,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             throw new InvalidOperationException("The fault bitmap size does not match DeviceAddressPaging.FaultBitmapBytes.");
         if (DeviceAddressPaging.ZeroPageMode != 0 && _faultBufferSize != DeviceAddressPaging.FaultBitmapBytes)
             throw new InvalidOperationException("The fault bitmap size does not match DeviceAddressPaging.FaultBitmapBytes.");
-        // [local] RT stack area and SHARPEMU_DA_ZERO_PAGE area before the tail
-        _traceTailOffset = _faultBufferSize + DeviceAddressPaging.RtStackAreaBytes + DeviceAddressPaging.ZeroPageAreaBytes;
+        // [local] RT stack area, SHARPEMU_DA_ZERO_PAGE area and SHARPEMU_BDA_SCAN_MAPPED summary before the tail
+        _traceTailOffset = _faultBufferSize + DeviceAddressPaging.RtStackAreaBytes + DeviceAddressPaging.ZeroPageAreaBytes +
+            DeviceAddressPaging.FaultSummaryAreaBytes;
+        if (ScanMappedMode != 0 && _traceTailOffset - DeviceAddressPaging.FaultSummaryBytes != DeviceAddressPaging.FaultSummaryOffset)
+            throw new InvalidOperationException("The fault summary offset does not match DeviceAddressPaging.FaultSummaryOffset.");
         _faultBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags,
             _traceTailOffset + (GuestGpuMemoryHook.TraceEnabled ? TraceTailBytes : 0UL));
         if (GuestGpuMemoryHook.TraceEnabled)
@@ -133,8 +133,6 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             _counterDownload = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * DeviceAddressPaging.ZeroPageCounterBytes);
         if (DeviceAddressPaging.ZeroPageMode == 2)
             _shadowDownload = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
-        if (ScanMappedMode != 0) // [local] one bit per granule
-            _granules = new ulong[(int)Math.Max(1UL, ((pageCount << pageBits) >> GranuleShift) / 64)];
         if (ScanMappedMode == 2)
             _verifyDownload = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
 
@@ -159,7 +157,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         };
         RequireSuccess(vk.CreateDescriptorSetLayout(device.Device, &layoutInfo, null, out _layout), "Fault-buffer descriptor layout creation");
 
-        var spirv = SpirvFixedShaders.CreateFaultBufferProcess(baseWordPush: _granules is not null);
+        var spirv = SpirvFixedShaders.CreateFaultBufferProcess(ScanMappedMode != 0 ? (uint)(DeviceAddressPaging.FaultSummaryOffset / 4) : 0);
         ShaderModule module;
         fixed (byte* code = spirv)
         {
@@ -173,13 +171,13 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         }
 
         var setLayout = _layout;
-        var pushRange = new PushConstantRange(ShaderStageFlags.ComputeBit, 0, sizeof(uint)); // [local] the base word
+        var pushRange = new PushConstantRange(ShaderStageFlags.ComputeBit, 0, 2 * sizeof(uint)); // [local] base word, summary flag
         var pipelineLayoutInfo = new PipelineLayoutCreateInfo
         {
             SType = StructureType.PipelineLayoutCreateInfo,
             SetLayoutCount = 1,
             PSetLayouts = &setLayout,
-            PushConstantRangeCount = _granules is not null ? 1u : 0u,
+            PushConstantRangeCount = ScanMappedMode != 0 ? 1u : 0u,
             PPushConstantRanges = &pushRange,
         };
         RequireSuccess(vk.CreatePipelineLayout(device.Device, &pipelineLayoutInfo, null, out _pipelineLayout), "Fault-buffer pipeline layout creation");
@@ -238,7 +236,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         var writes = stackalloc WriteDescriptorSet[2 * MaxPendingFaults];
         for (var area = 0; area < MaxPendingFaults; area++)
         {
-            infos[2 * area] = new DescriptorBufferInfo(_faultBuffer.Handle, 0, _faultBufferSize);
+            infos[2 * area] = new DescriptorBufferInfo(_faultBuffer.Handle, 0, ScanMappedMode != 0 ? _traceTailOffset : _faultBufferSize); // [local] with the summary
             infos[2 * area + 1] = new DescriptorBufferInfo(_downloadBuffer.Handle, (ulong)area * PageFaultAreaSize, PageFaultAreaSize);
             for (uint binding = 0; binding < 2; binding++)
             {
@@ -306,104 +304,21 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         }
     }
 
-    // [local] SHARPEMU_BDA_SCAN_MAPPED: adds the granules of every span registered since the last scan and rebuilds the
-    // runs of consecutive granules. Granules are never removed.
-    private void UpdateGranules()
-    {
-        if (GuestGpuMemoryHook.Current is not { } memory)
-        {
-            return;
-        }
-
-        var version = memory.SpanVersion;
-        if (ReferenceEquals(memory, _granuleMemory) && version == _granuleVersion)
-        {
-            return;
-        }
-
-        var granules = _granules!;
-        var limit = (ulong)granules.Length * 64;
-        memory.ForEachSpan((address, size) =>
-        {
-            if (size == 0 || (address >> GranuleShift) >= limit)
-            {
-                return;
-            }
-
-            var first = address >> GranuleShift;
-            var last = Math.Min((address + size - 1) >> GranuleShift, limit - 1);
-            for (var granule = first; granule <= last; granule++)
-            {
-                granules[granule >> 6] |= 1UL << (int)(granule & 63);
-            }
-        });
-        _granuleMemory = memory;
-        _granuleVersion = version;
-        _granuleRuns.Clear();
-        var runStart = -1L;
-        for (var granule = 0L; granule <= (long)limit; granule++)
-        {
-            var set = granule < (long)limit && (granules[granule >> 6] & (1UL << (int)(granule & 63))) != 0;
-            if (set && runStart < 0)
-            {
-                runStart = granule;
-            }
-            else if (!set && runStart >= 0)
-            {
-                _granuleRuns.Add(((uint)runStart, (uint)(granule - runStart)));
-                runStart = -1;
-            }
-        }
-    }
-
-    private bool InGranules(ulong page)
-    {
-        if (_granules is not { } granules)
-        {
-            return true;
-        }
-
-        var granule = page >> GranuleShift;
-        return granule < (ulong)granules.Length * 64 && (granules[granule >> 6] & (1UL << (int)(granule & 63))) != 0;
-    }
-
-    // [local] One dispatch per granule run (the whole bitmap without SHARPEMU_BDA_SCAN_MAPPED or without a registry).
-    private void DispatchScan(CommandBuffer command, out long groups, out long dispatches)
+    // [local] SHARPEMU_BDA_SCAN_MAPPED: the whole bitmap, each workgroup skipping a granule whose summary bit is clear.
+    private void DispatchScan(CommandBuffer command, bool summary)
     {
         var wholeGroups = (uint)((_pageCount / 32 + 63) / 64);
-        if (_granules is null)
+        if (ScanMappedMode == 0)
         {
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(_device.Vk, command, wholeGroups, 1, 1);
-            groups = wholeGroups;
-            dispatches = 1;
             return;
         }
 
-        UpdateGranules();
-        if (_granuleMemory is null)
-        {
-            DispatchRun(command, 0, wholeGroups);
-            groups = wholeGroups;
-            dispatches = 1;
-            return;
-        }
-
-        groups = 0;
-        dispatches = 0;
-        foreach (var (first, count) in _granuleRuns)
-        {
-            DispatchRun(command, first, count);
-            groups += count;
-            dispatches++;
-        }
-    }
-
-    private void DispatchRun(CommandBuffer command, uint firstGroup, uint groupCount)
-    {
-        var vk = _device.Vk;
-        var baseWord = firstGroup * 64;
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPushConstants(vk, command, _pipelineLayout, ShaderStageFlags.ComputeBit, 0, sizeof(uint), &baseWord);
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(vk, command, groupCount, 1, 1);
+        var push = stackalloc uint[2];
+        push[0] = 0;
+        push[1] = summary ? 1u : 0u;
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPushConstants(_device.Vk, command, _pipelineLayout, ShaderStageFlags.ComputeBit, 0, 2 * sizeof(uint), push);
+        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatch(_device.Vk, command, wholeGroups, 1, 1);
     }
 
     public GpuBuffer FaultBuffer
@@ -419,6 +334,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             {
                 _faultBuffer.Fill(DeviceAddressPaging.ZeroPageCounterOffset, DeviceAddressPaging.ZeroPageAreaBytes, 0);
                 _zeroPageAreaInitialized = true;
+            }
+            if (ScanMappedMode != 0 && !_summaryInitialized) // [local] no granule marked
+            {
+                _faultBuffer.Fill(DeviceAddressPaging.FaultSummaryOffset, DeviceAddressPaging.FaultSummaryBytes, 0);
+                _summaryInitialized = true;
             }
             if (DeviceAddressPaging.RtStackAreaEnabled && !_rtStackAreaInitialized) // [local] every warp slot free
             {
@@ -481,16 +401,16 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         }
         var set = _sets[_currentArea];
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null); // [local]
-        DispatchScan(command, out var scanGroups, out var scanDispatches); // [local] SHARPEMU_BDA_SCAN_MAPPED
+        DispatchScan(command, summary: true); // [local] SHARPEMU_BDA_SCAN_MAPPED
         if (_shadowDownload is not null) // [local] SHARPEMU_DA_ZERO_PAGE=2
         {
             var shadowSet = _shadowSets[_currentArea];
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &shadowSet, 0, null);
-            DispatchScan(command, out _, out _);
+            DispatchScan(command, summary: false);
         }
         if (timed)
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdWriteTimestamp2(vk, command, PipelineStageFlags2.AllCommandsBit, _timestamps, 2 * _currentArea + 1);
-        if (Diagnostics.CheapProbe.Enabled) Diagnostics.CheapProbe.NoteBdaScan(scanGroups, scanDispatches);
+        if (Diagnostics.CheapProbe.Enabled) Diagnostics.CheapProbe.NoteBdaScan(0, 1);
         if (_verifyDownload is not null) // [local] SHARPEMU_BDA_SCAN_MAPPED=2: the whole bitmap after the ranged scan
         {
             var between = preBarrier;
@@ -501,7 +421,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                 0, null, 1, &between, 0, null);
             var verifySet = _verifySets[_currentArea];
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &verifySet, 0, null);
-            DispatchRun(command, 0, (uint)((_pageCount / 32 + 63) / 64));
+            DispatchScan(command, summary: false);
         }
         VulkanSynchronization.PipelineBarrier(vk,
             command, PipelineStageFlags.ComputeShaderBit, PipelineStageFlags.AllCommandsBit, DependencyFlags.ByRegionBit,
@@ -724,37 +644,22 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             Diagnostics.CheapProbe.NoteBdaGpu((long)((stamps[1] - stamps[0]) * _timestampPeriod));
     }
 
-    // [local] SHARPEMU_BDA_SCAN_MAPPED=2: the whole-bitmap scan found what the ranged one left set. A page inside the
-    // granules is a lost fault (unless the ranged lists overflowed and kept bits on purpose); one outside them is a
-    // fault on an address no span ever covered. Both are served, as the whole scan would.
-    private void VerifyScan(ulong offset, uint restrictedReported)
+    // [local] SHARPEMU_BDA_SCAN_MAPPED=2: what the whole-bitmap scan found after the summary scan is a lost fault (unless
+    // the summary scan's lists overflowed and kept bits on purpose). It is served, as the whole scan would serve it.
+    private void VerifyScan(ulong offset, uint summaryReported)
     {
         _verifyDownload!.Invalidate(offset, PageFaultAreaSize);
         var pages = MemoryMarshal.Cast<byte, ulong>(_verifyDownload.Mapped.Slice((int)offset, (int)PageFaultAreaSize));
         var count = Math.Min((uint)pages[0], MaxPageFaults - 1);
-        long lost = 0, outside = 0;
+        long lost = 0;
         for (var index = 1; index <= count; index++)
         {
-            if (InGranules(pages[index]))
-            {
-                if (restrictedReported < MaxPageFaults - 1)
-                {
-                    lost++;
-                    if (lost <= 4)
-                        Console.Error.WriteLine($"[GPU][BDA_SCAN_LOST] page=0x{pages[index]:X} restricted_reported={restrictedReported}");
-                }
-            }
-            else
-            {
-                outside++;
-                if (Interlocked.Increment(ref _outsideReports) <= 16)
-                    Console.Error.WriteLine($"[GPU][BDA_SCAN_OUTSIDE] page=0x{pages[index]:X} readable={_cache.CanReadGuest(pages[index], _pageSize)} registered_buffer={_cache.IsRegionRegistered(pages[index], _pageSize)} covered={GuestGpuMemoryHook.Current?.Covers(pages[index], _pageSize)} spans_version={GuestGpuMemoryHook.Current?.SpanVersion} granule_version={_granuleVersion}");
-            }
-
+            if (summaryReported < MaxPageFaults - 1 && ++lost <= 4)
+                Console.Error.WriteLine($"[GPU][BDA_SCAN_LOST] page=0x{pages[index]:X} summary_reported={summaryReported}");
             _faultRanges.Add(pages[index], _pageSize);
         }
 
-        Diagnostics.CheapProbe.NoteBdaVerify(lost, outside);
+        Diagnostics.CheapProbe.NoteBdaVerify(summaryReported < MaxPageFaults - 1 ? lost : 0, 0);
     }
 
     // [local] SHARPEMU_DA_ZERO_PAGE: this scan's counters and, with =2, the shadow bitmap's pages against the exact ones.

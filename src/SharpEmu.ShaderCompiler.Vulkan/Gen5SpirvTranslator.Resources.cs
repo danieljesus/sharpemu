@@ -738,6 +738,19 @@ public static partial class Gen5SpirvTranslator
             var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
             EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
                 _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bit));
+            MarkFaultSummary(pageIndex);
+        }
+
+        // [local] SHARPEMU_BDA_SCAN_MAPPED: the page's granule bit in the fault summary (DeviceAddressPaging.FaultSummaryOffset).
+        private void MarkFaultSummary(uint pageIndex)
+        {
+            if (!DeviceAddressPaging.FaultSummaryEnabled)
+                return;
+            var granule = ShiftRightLogical(pageIndex, UInt(DeviceAddressPaging.FaultSummaryGranulePageBits));
+            var word = IAdd(UInt((uint)(DeviceAddressPaging.FaultSummaryOffset / 4)), ShiftRightLogical(granule, UInt(5)));
+            var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(granule, UInt(31)));
+            EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
+                _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bit));
         }
 
         // Before the program ends: the unmapped page an invocation kept (SHARPEMU_DA_FAULT_MODE=2/3).
@@ -802,6 +815,8 @@ public static partial class Gen5SpirvTranslator
             var bit = ShiftLeftLogical(UInt(1), BitwiseAnd(pageIndex, UInt(31)));
             EmitConditional(IsBlockWordInRange(_faultBuffer, word), () =>
                 _module.AddInstruction(SpirvOp.AtomicOr, _uintType, BlockWordPointer(_faultBuffer, word), UInt(1), UInt(0), bit));
+            if (DeviceAddressPaging.ZeroPageMode != 2) // [local] the real bitmap (=2 writes the shadow one here)
+                MarkFaultSummary(pageIndex);
         }
 
         // Before the program ends: the unmapped pages the invocation hit (SHARPEMU_DA_ZERO_PAGE).

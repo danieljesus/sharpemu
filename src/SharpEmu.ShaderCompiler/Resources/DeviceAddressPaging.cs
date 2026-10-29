@@ -35,6 +35,15 @@ public static class DeviceAddressPaging
     public static ulong ZeroPageShadowOffset => ZeroPageCounterOffset + ZeroPageCounterBytes;
     public static ulong ZeroPageAreaBytes => ZeroPageMode == 0 ? 0 : ZeroPageCounterBytes + (ZeroPageMode == 2 ? FaultBitmapBytes : 0);
 
+    // [local] SHARPEMU_BDA_SCAN_MAPPED (on by default, =0 off): one bit per 32 MiB granule (2048 pages, 64 bitmap words)
+    // after the zero-page area, set by every writer of a fault bit; the fault scan reads and clears the bitmap only
+    // in the granules marked here.
+    public static readonly bool FaultSummaryEnabled = Environment.GetEnvironmentVariable("SHARPEMU_BDA_SCAN_MAPPED") != "0";
+    public const int FaultSummaryGranulePageBits = 11;
+    public const ulong FaultSummaryBytes = (1UL << (AddressSpaceBits - PageBits - FaultSummaryGranulePageBits)) / 8;
+    public static ulong FaultSummaryOffset => FaultBitmapBytes + RtStackAreaBytes + ZeroPageAreaBytes;
+    public static ulong FaultSummaryAreaBytes => FaultSummaryEnabled ? FaultSummaryBytes : 0;
+
     // [local] SHARPEMU_RT_STACK_SPLIT=<rows> (8 by default, 0 = off): the workgroup rows of the 0x8395
     // BLAS stack. An area after the fault bitmap holds the deeper entries: a bitmap of warp slots (each
     // 32-lane subgroup claims one for the dispatch and frees it at the end), then per slot

@@ -1196,6 +1196,31 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         harness.Shutdown();
     }
 
+    // [local] SHARPEMU_BDA_SCAN_MAPPED: what a shader's fault writer does besides the page bits, the granule bits of
+    // the fault summary for pages [firstPage, firstPage + pageCount).
+    private static void MarkFaultSummary(CacheHarness harness, ulong firstPage, int pageCount)
+    {
+        if (!SharpEmu.ShaderCompiler.Resources.DeviceAddressPaging.FaultSummaryEnabled)
+            return;
+        const int granuleBits = SharpEmu.ShaderCompiler.Resources.DeviceAddressPaging.FaultSummaryGranulePageBits;
+        var firstWord = (firstPage >> granuleBits) / 32;
+        var lastWord = ((firstPage + (ulong)pageCount - 1) >> granuleBits) / 32;
+        var words = new uint[lastWord - firstWord + 1];
+        for (var page = firstPage; page < firstPage + (ulong)pageCount; page++)
+        {
+            var granule = page >> granuleBits;
+            words[granule / 32 - firstWord] |= 1u << (int)(granule % 32);
+        }
+
+        var bytes = new byte[words.Length * 4];
+        System.Buffer.BlockCopy(words, 0, bytes, 0, bytes.Length);
+        var staging = harness.Cache.GetUtilityBuffer(GpuBufferUsage.Upload);
+        var offset = staging.Copy(bytes, 4);
+        harness.Cache.FaultBuffer.CopyFrom(harness.Scheduler.Current, staging, offset,
+            SharpEmu.ShaderCompiler.Resources.DeviceAddressPaging.FaultSummaryOffset + firstWord * 4, (ulong)bytes.Length,
+            Silk.NET.Vulkan.AccessFlags.HostWriteBit);
+    }
+
     [Fact]
     public void ProcessFaultBufferPreservesRequestsBeyondOutputCapacity()
     {
@@ -1211,6 +1236,7 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
             var offset = staging.Copy(bitmap, 4);
             harness.Cache.FaultBuffer.CopyFrom(harness.Scheduler.Current, staging, offset,
                 firstPage / 8, (ulong)bitmap.Length, Silk.NET.Vulkan.AccessFlags.HostWriteBit);
+            MarkFaultSummary(harness, firstPage, pageCount);
             harness.Cache.ProcessFaultBuffer();
             harness.Scheduler.Finish();
         });
@@ -1245,6 +1271,7 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
             var staging = harness.Cache.GetUtilityBuffer(GpuBufferUsage.Upload);
             var offset = staging.Copy(BitConverter.GetBytes(bits), 4);
             harness.Cache.FaultBuffer.CopyFrom(harness.Scheduler.Current, staging, offset, word * 4, 4, Silk.NET.Vulkan.AccessFlags.HostWriteBit);
+            MarkFaultSummary(harness, firstPage, 4);
             harness.Cache.ProcessFaultBuffer();
             harness.Scheduler.Finish();
         });
