@@ -17,7 +17,11 @@ public readonly record struct ReadbackPiece(GpuBuffer Source, ulong SourceOffset
 internal sealed unsafe class VulkanAsyncReadback : IDisposable
 {
     private const ulong Alignment = 16;
-    private const int SlotCount = 8;
+    // [local] SHARPEMU_READBACK_SLOTS (2..64, default 8): slot 0 is the synchronous one, the rest carry asynchronous
+    // copies. 32 is sharpemu/sharpemu PR #1128's count (TarkusR, 6d963114). Kept at 8: in GTA V (2026-10-29, static and
+    // panning, SHARPEMU_CHEAP_PROBE) no guest read ever found the 7 asynchronous slots busy.
+    internal static readonly int SlotCount =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_READBACK_SLOTS"), out var slots) && slots is >= 2 and <= 64 ? slots : 8;
 
     private readonly GpuDeviceInfo _device;
     private readonly SubmissionScheduler _scheduler;
@@ -76,7 +80,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             SType = StructureType.CommandBufferAllocateInfo,
             CommandPool = _pool,
             Level = CommandBufferLevel.Primary,
-            CommandBufferCount = SlotCount,
+            CommandBufferCount = (uint)SlotCount,
         };
         var commands = stackalloc CommandBuffer[SlotCount];
         Require(vk.AllocateCommandBuffers(device.Device, &allocateInfo, commands), "vkAllocateCommandBuffers(readback)");
@@ -121,9 +125,14 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         Complete(ticket, consume);
     }
 
-    public bool TryBegin(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick, out Ticket? ticket)
+    public bool TryBegin(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick, out Ticket? ticket) =>
+        TryBegin(pieces, waitTick, out ticket, out _);
+
+    // [local] slotsBusy: false only because every asynchronous slot was in use.
+    public bool TryBegin(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick, out Ticket? ticket, out bool slotsBusy)
     {
         ticket = null;
+        slotsBusy = false;
         if (!PrepareMainQueueWait(_scheduler, waitTick, SubmitGuard))
         {
             return false;
@@ -144,9 +153,29 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
                     return true;
                 }
             }
+
+            slotsBusy = true;
         }
 
         return false;
+    }
+
+    // [local] Adapted from 6d963114 by TarkusR: blocks the caller (not the GPU queue thread) until an asynchronous slot
+    // is free or the timeout passes; Complete pulses the gate when it frees a slot.
+    public void WaitForFreeSlot(int timeoutMilliseconds)
+    {
+        lock (_gate)
+        {
+            for (var index = 1; index < _slots.Length; index++)
+            {
+                if (_disposed || !_slots[index].Busy)
+                {
+                    return;
+                }
+            }
+
+            Monitor.Wait(_gate, timeoutMilliseconds);
+        }
     }
 
     private static int _unsealedReports; // [local]
@@ -354,6 +383,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             finally
             {
                 ticket.Slot.Busy = false;
+                Monitor.PulseAll(_gate); // [local] WaitForFreeSlot
             }
         }
     }

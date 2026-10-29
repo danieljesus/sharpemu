@@ -422,7 +422,9 @@ public static class SpirvFixedShaders
 
     // Read and clear binding 0. Write the count and 64-bit page addresses to binding 1.
     // Use 64 threads per group, with one thread per 32-page word.
-    public static byte[] CreateFaultBufferProcess()
+    // [local] baseWordPush: a push-constant word index is added to the invocation's, so one dispatch scans one run of
+    // the bitmap (SHARPEMU_BDA_SCAN_MAPPED).
+    public static byte[] CreateFaultBufferProcess(bool baseWordPush = false)
     {
         const uint cachingPageBits = 14;
         const uint maxPageFaults = 1024;
@@ -460,6 +462,15 @@ public static class SpirvFixedShaders
         module.AddDecoration(gidVar, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.GlobalInvocationId);
 
         uint UInt(uint value) => module.Constant(uintType, value);
+        var pushVar = 0u;
+        if (baseWordPush)
+        {
+            var pushStruct = module.TypeStruct(uintType);
+            module.AddDecoration(pushStruct, SpirvDecoration.Block);
+            module.AddMemberDecoration(pushStruct, 0, SpirvDecoration.Offset, 0);
+            pushVar = module.AddGlobalVariable(module.TypePointer(SpirvStorageClass.PushConstant, pushStruct), SpirvStorageClass.PushConstant);
+            module.AddName(pushVar, "base_word");
+        }
 
         var functionType = module.TypeFunction(voidType);
         var main = module.BeginFunction(voidType, functionType);
@@ -467,6 +478,12 @@ public static class SpirvFixedShaders
         var entry = module.AddLabel();
         var gid = module.AddInstruction(SpirvOp.Load, uvec3Type, gidVar);
         var id = module.AddInstruction(SpirvOp.CompositeExtract, uintType, gid, 0);
+        if (baseWordPush)
+        {
+            var basePtr = module.AddInstruction(SpirvOp.AccessChain, module.TypePointer(SpirvStorageClass.PushConstant, uintType), pushVar, UInt(0));
+            var baseWord = module.AddInstruction(SpirvOp.Load, uintType, basePtr);
+            id = module.AddInstruction(SpirvOp.IAdd, uintType, id, baseWord);
+        }
         var wordPtr = module.AddInstruction(SpirvOp.AccessChain, uintStoragePtr, faultVar, UInt(0), id);
         var firstWord = module.AddInstruction(SpirvOp.Load, uintType, wordPtr);
         module.AddStatement(SpirvOp.Store, wordPtr, UInt(0));
@@ -526,7 +543,7 @@ public static class SpirvFixedShaders
         module.EndFunction();
 
         module.AddExecutionMode(main, SpirvExecutionMode.LocalSize, 64, 1, 1);
-        module.AddEntryPoint(SpirvExecutionModel.GLCompute, main, "main", [gidVar, faultVar, downloadVar]);
+        module.AddEntryPoint(SpirvExecutionModel.GLCompute, main, "main", baseWordPush ? [gidVar, faultVar, downloadVar, pushVar] : [gidVar, faultVar, downloadVar]);
         return module.Build();
     }
 }

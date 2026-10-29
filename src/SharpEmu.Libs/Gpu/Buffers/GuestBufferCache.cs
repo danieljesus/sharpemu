@@ -1936,9 +1936,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             // [local] A download the GPU overwrote meanwhile is retried from this thread, so the
             // GPU queue thread does not block on the new copy; the last attempt retries there.
+            var slotWaits = 0;
             for (var attempt = 0; ; attempt++)
             {
                 PendingDownload? pending = null;
+                var slotsBusy = false;
+                var waitForSlot = ReadbackSlotWait && slotWaits < MaxReadbackSlotWaits;
                 var relayStarted = GuestReadSplit ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
                 long relayEntered = 0;
                 var split = source == GuestMemoryProfile.ReadbackSource.StoreDownload && Diagnostics.LabelPollSplit.Measures(guestAddress, size) // [local]
@@ -1948,11 +1951,24 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     {
                         if (GuestReadSplit) relayEntered = System.Diagnostics.Stopwatch.GetTimestamp();
                         if (split is not null) BeginSplit(split);
-                        pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true);
+                        pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true, markHot: false, waitForSlot);
+                        slotsBusy = _beginSlotsBusy;
                         if (split is not null) EndSplitBegin(split, pending, guestAddress, size);
                     }))
                 {
                     return AwaitShutdown();
+                }
+
+                if (slotsBusy)
+                {
+                    // [local] Adapted from 6d963114 by TarkusR: every asynchronous slot was busy. Wait here for one
+                    // instead of downloading synchronously on the GPU queue thread, then start over.
+                    var slotWaitStarted = Diagnostics.CheapProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                    slotWaits++;
+                    attempt--;
+                    readback.WaitForFreeSlot(1);
+                    if (slotWaitStarted != 0) Diagnostics.CheapProbe.NoteSlotWait(System.Diagnostics.Stopwatch.GetTimestamp() - slotWaitStarted);
+                    continue;
                 }
 
                 if (pending is null)
@@ -2156,7 +2172,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         var copies = CollectReadbackWindow(buffer, hot.Address, hot.Size, out var windowBegin, out var windowEnd);
-        if (copies.Count == 0 || !TryBeginDownloadAsync(copies, out var ticket, out var writeTicks))
+        if (copies.Count == 0 || !TryBeginDownloadAsync(copies, out var ticket, out var writeTicks, out _))
         {
             return;
         }
@@ -2319,6 +2335,15 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private static readonly bool GuestReadsAwaitOffQueue =
         Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_GUEST_READBACK") != "0";
 
+    // [local] SHARPEMU_READBACK_SLOT_WAIT=1 (off by default): a guest read that finds every readback slot busy waits
+    // off the GPU queue thread for a free one (up to MaxReadbackSlotWaits times 1 ms) instead of downloading
+    // synchronously there. Adapted from 6d963114 by TarkusR. Off: GTA V never found the slots busy (0 waits/frame).
+    internal static readonly bool ReadbackSlotWait = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_SLOT_WAIT") == "1";
+    private const int MaxReadbackSlotWaits = 64;
+    // Set by BeginReadMemoryOnGpu on the GPU queue thread: it returned null because every slot was busy and the
+    // caller asked to wait for one.
+    private bool _beginSlotsBusy;
+
     // [local] SHARPEMU_ASYNC_READBACK_RETRIES: stale guest readbacks retried off the GPU queue thread (0: old behaviour).
     private static readonly int AsyncReadbackRetries =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_READBACK_RETRIES"), out var retries) && retries >= 0 ? retries : 3;
@@ -2367,8 +2392,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     }
 
     private PendingDownload? BeginReadMemoryOnGpu(ulong guestAddress, ulong size, bool isWrite, GuestMemoryProfile.ReadbackSource source,
-        bool allowPending, bool markHot = false)
+        bool allowPending, bool markHot = false, bool waitForSlot = false)
     {
+        _beginSlotsBusy = false;
         using var readbackScope = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.BufferReadback);
         using var foreignRead = _device.Slabs.BeginForeignRead();
         var readbackStarted = GuestMemoryProfile.ReadbackDetailsEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -2398,7 +2424,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             NoteHotReadback(guestAddress, size);
         }
-        if (copies.Count != 0 && allowPending && TryBeginDownloadAsync(copies, out var ticket, out var writeTicks))
+        var slotsBusy = false;
+        if (copies.Count != 0 && allowPending && TryBeginDownloadAsync(copies, out var ticket, out var writeTicks, out slotsBusy))
         {
             foreach (var copy in copies)
             {
@@ -2420,6 +2447,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             };
         }
 
+        if (slotsBusy && waitForSlot)
+        {
+            // [local] Nothing was collected into a download yet: the caller waits for a slot and starts over.
+            _beginSlotsBusy = true;
+            return null;
+        }
+
+        var fallbackStarted = slotsBusy && Diagnostics.CheapProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
         if (copies.Count != 0)
         {
             var classStarted = ReadbackClassLog ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
@@ -2474,6 +2509,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _tracker.MarkCpuDirtyPages(guestAddress, size);
         }
 
+        if (fallbackStarted != 0) Diagnostics.CheapProbe.NoteSlotFallback(System.Diagnostics.Stopwatch.GetTimestamp() - fallbackStarted);
         RecordReadback(windowBegin, windowEnd, isWrite, copies, readbackStarted, source);
         return null;
     }
@@ -3400,10 +3436,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
     }
 
-    private bool TryBeginDownloadAsync(List<DownloadPiece> copies, out VulkanAsyncReadback.Ticket ticket, out ulong[] writeTicks)
+    private bool TryBeginDownloadAsync(List<DownloadPiece> copies, out VulkanAsyncReadback.Ticket ticket, out ulong[] writeTicks, out bool slotsBusy)
     {
         ticket = null!;
         writeTicks = [];
+        slotsBusy = false;
         if (AsyncReadback is not { } readback || copies.Count == 0)
         {
             return false;
@@ -3442,7 +3479,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             pieces[index] = new ReadbackPiece(copies[index].Buffer, copies[index].SourceOffset, copies[index].Size);
         }
 
-        if (!readback.TryBegin(pieces, waitTick, out var started) || started is null)
+        if (!readback.TryBegin(pieces, waitTick, out var started, out slotsBusy) || started is null)
         {
             return false;
         }

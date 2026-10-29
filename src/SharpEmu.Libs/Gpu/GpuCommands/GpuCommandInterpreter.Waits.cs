@@ -117,6 +117,7 @@ public sealed partial class GpuCommandInterpreter
             case 0:
                 // Clearing predication reads no memory, so no GPU result can be outstanding.
                 PredicateSkip = false;
+                if (Diagnostics.CheapProbe.Enabled) Diagnostics.CheapProbe.NotePredicationClear(); // [local]
                 break;
             case 3:
             {
@@ -130,11 +131,14 @@ public sealed partial class GpuCommandInterpreter
                     // The results are outstanding while work is queued behind this packet, and
                     // the game asked for the packets to run unpredicated in that case.
                     PredicateSkip = false;
+                    if (Diagnostics.CheapProbe.Enabled) Diagnostics.CheapProbe.NotePredicationZpass(false, 0); // [local]
                     break;
                 }
 
+                var probeStarted = Diagnostics.CheapProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
                 _host.FlushAndWait();
                 var value = ReadQword(address);
+                if (probeStarted != 0) Diagnostics.CheapProbe.NotePredicationZpass(true, System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted);
                 PredicateSkip = condition switch
                 {
                     0 => value != 0,
