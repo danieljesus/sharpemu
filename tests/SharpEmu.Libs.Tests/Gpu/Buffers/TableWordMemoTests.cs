@@ -73,6 +73,26 @@ public sealed class TableWordMemoTests
         }
     }
 
+    // [local] SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE=0: a command write drops what it touches and the probe names it.
+    [Fact]
+    public void WithoutCommandUpdatesACommandWriteDropsTheWord()
+    {
+        TableWordMemo.ResetForTests();
+        var updates = TableWordMemo.CommandUpdates;
+        TableWordMemo.CommandUpdates = false;
+        try
+        {
+            TableWordMemo.Store(Word, 7);
+            TableWordMemo.NoteCommandWrite(Word, [7, 0, 0, 0]);
+
+            Assert.False(TableWordMemo.TryGet(Word, out _));
+        }
+        finally
+        {
+            TableWordMemo.CommandUpdates = updates;
+        }
+    }
+
     [Fact]
     public void AGpuWriteAfterTheCommandWriteStillDrops()
     {

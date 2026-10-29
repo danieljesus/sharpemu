@@ -108,10 +108,13 @@ internal static class TableWordMemo
         }
     }
 
-    // [local] SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE=1 (off by default): a command-processor write carries its
+    // [local] SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE (on by default since 2026-10-30, =0 off): a command-processor write carries its
     // data, applied in stream order, so a remembered word it fully covers takes the new value instead of being dropped
     // (CP-written descriptors in GPU-dirty pages, re-written each frame with the same layout). Partly covered words drop.
-    internal static bool CommandUpdates = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE") == "1";
+    // In GTA V the BLAS build parameters F43B, F6F2 and 994A read (blob+0x48/0x4C/0x70, +0x30, +0x28) are re-written
+    // by the CP every frame with the same value; =2 of the memo with this on: 0 mismatches. Panning GpuCompletionWait
+    // 10.6 -> 7.7 ms/frame (probe sessions); FPS A/B 4+4 pan 25.87 -> 25.98, 2+2 static 29.20 -> 29.40.
+    internal static bool CommandUpdates = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE") != "0";
     private static long _cpUpdates, _hostStores;
 
     public static void NoteCommandWrite(ulong address, ReadOnlySpan<byte> data)
