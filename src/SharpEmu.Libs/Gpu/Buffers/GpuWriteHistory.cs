@@ -107,10 +107,14 @@ internal static class GpuWriteHistory
         return _evictedTick;
     }
 
+    // [local] Set by the scan-limited LastWriteTick when it stopped before finding a write over the range.
+    public static bool LastScanExhausted;
+
     // [local] As LastWriteTick, looking back at most `scan` entries: entries are in tick order, so a range with no
     // write among them was last written no later than the oldest one looked at.
     public static ulong LastWriteTick(ulong address, ulong size, int scan)
     {
+        LastScanExhausted = false;
         var end = address + size;
         var count = Math.Min(Math.Min(_count, Capacity), scan);
         for (long back = 1; back <= count; back++)
@@ -124,6 +128,7 @@ internal static class GpuWriteHistory
 
         if (count < Math.Min(_count, Capacity))
         {
+            LastScanExhausted = true;
             return Math.Max(_ring[(int)((_count - count) & (Capacity - 1))].Tick, _evictedTick);
         }
 

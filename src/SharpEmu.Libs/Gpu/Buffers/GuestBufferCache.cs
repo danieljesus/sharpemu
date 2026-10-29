@@ -2771,6 +2771,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     internal long PreciseWaitFallbacks { get; private set; }
 
     private const int PreciseWaitScan = 8192;
+
+    // [local] SHARPEMU_READBACK_PRECISE_WAIT_SCAN (default 8192): ring entries the requested range's lookup scans back.
+    private static readonly int PreciseWaitRequestScan =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_READBACK_PRECISE_WAIT_SCAN"), out var requestScan) && requestScan > 0 ? requestScan : PreciseWaitScan;
+    private long _preciseScanExhausted, _preciseNotSubmitted, _preciseInFlight;
     private long _preciseWaitReported, _preciseWaitReport = System.Diagnostics.Stopwatch.GetTimestamp();
 
     private bool TryPreciseRead(ulong guestAddress, ulong size, GuestMemoryProfile.ReadbackSource source, long started, bool captureOnly,
@@ -2786,9 +2791,12 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         ReportPreciseWait();
         var buffer = _registry.GetBuffer(FindBuffer(guestAddress, size));
-        var precise = GpuWriteHistory.Queryable ? GpuWriteHistory.LastWriteTick(guestAddress, size, PreciseWaitScan) : 0;
+        var precise = GpuWriteHistory.Queryable ? GpuWriteHistory.LastWriteTick(guestAddress, size, PreciseWaitRequestScan) : 0;
         if (!buffer.IsInBounds(guestAddress, size) || precise == 0 || precise >= _scheduler.CurrentTick || !_scheduler.IsTickComplete(precise))
         {
+            if (GpuWriteHistory.LastScanExhausted) _preciseScanExhausted++;
+            else if (precise >= _scheduler.CurrentTick) _preciseNotSubmitted++;
+            else if (precise != 0) _preciseInFlight++;
             PreciseWaitFallbacks++;
             return false;
         }
@@ -2888,7 +2896,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         }
 
         _preciseWaitReport = System.Diagnostics.Stopwatch.GetTimestamp();
-        Console.Error.WriteLine($"[READBACK_PRECISE_WAIT] reads={PreciseWaitReads} fallbacks={PreciseWaitFallbacks} since_last={PreciseWaitReads - _preciseWaitReported} verify_checks={PreciseVerifyChecks} verify_mismatches={PreciseVerifyMismatches}");
+        Console.Error.WriteLine($"[READBACK_PRECISE_WAIT] reads={PreciseWaitReads} fallbacks={PreciseWaitFallbacks} since_last={PreciseWaitReads - _preciseWaitReported} verify_checks={PreciseVerifyChecks} verify_mismatches={PreciseVerifyMismatches} scan_exhausted={_preciseScanExhausted} not_submitted={_preciseNotSubmitted} in_flight={_preciseInFlight}");
         _preciseWaitReported = PreciseWaitReads;
     }
 
