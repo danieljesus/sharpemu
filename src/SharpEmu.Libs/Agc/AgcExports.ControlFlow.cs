@@ -89,8 +89,9 @@ public static partial class AgcExports
     // thread waits for the front past that REWIND, so each such miss was a 100-145 ms stall.
     // =2 wakes them only while the GPU has no submitted tick left to complete.
     // =3 leaves the patch alone: the front, when every head is blocked, retries the REWIND heads once a valid patch
-    // is SHARPEMU_REWIND_PATCH_WAKE_MS (default 2) old, instead of waiting for the 100 ms all-blocked retry.
-    private static readonly int RewindPatchWake = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_REWIND_PATCH_WAKE"), out var wake) ? wake : 0;
+    // is SHARPEMU_REWIND_PATCH_WAKE_MS (default 2) old, instead of waiting for the 100 ms all-blocked retry. Default 3;
+    // =0 turns it off.
+    private static readonly int RewindPatchWake = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_REWIND_PATCH_WAKE"), out var wake) ? wake : 3;
 
     // Patches the REWIND body dword's valid bit and wakes any DCB suspended on it.
     // rdi is the packet pointer returned by sceAgcDcbRewind (header address).

@@ -127,7 +127,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
     // [local] SHARPEMU_REWIND_PATCH_WAKE=3: the oldest valid REWIND patch not yet followed by a REWIND retry (0: none).
     private static readonly long RewindPatchRetryTicks =
-        Environment.GetEnvironmentVariable("SHARPEMU_REWIND_PATCH_WAKE") == "3"
+        (Environment.GetEnvironmentVariable("SHARPEMU_REWIND_PATCH_WAKE") ?? "3") == "3"
             ? Math.Max(1, (long)((double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_REWIND_PATCH_WAKE_MS"),
                 System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var patchMs) ? patchMs : 2.0) *
                 System.Diagnostics.Stopwatch.Frequency / 1000))
