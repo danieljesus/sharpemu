@@ -640,6 +640,15 @@ public static partial class Gen5SpirvTranslator
             {
                 // Box: continue with the nearest child, push the others farthest first while
                 // there is room (one check per node, so the stack holds up to 69 entries).
+                if (RtProfileActive) // [local] SHARPEMU_8395_PROFILE: box tests, hit children, sorting T#
+                {
+                    var ray = (Gen5RayIntersectControl)plan.Instructions[0x10E4].Control!;
+                    CountRtProfile(RtProfileExtraBoxTests, UInt(1));
+                    for (var child = 0u; child < 4; child++)
+                        CountRtProfile(RtProfileExtraBoxHits, SelectU(_module.AddInstruction(SpirvOp.INotEqual, _boolType, LoadV(ray.VectorData + child), UInt(InvalidNode)), UInt(1), UInt(0)));
+                    CountRtProfile(RtProfileExtraSortedBoxes, SelectU(IsNotZero(BitwiseAnd(LoadS(ray.ScalarResource + 1), UInt(0x8000_0000))), UInt(1), UInt(0)));
+                }
+
                 EmitNativeGuest(plan, 0x110C);
                 var second = EmitNativeCompare(plan, 0x1114);
                 var room = _module.AddInstruction(SpirvOp.ULessThan, _boolType, Load(_uintType, _nativeStackPointer), UInt(NativeBlasPushRoom));
@@ -665,6 +674,8 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 var candidate = IsCurrentLaneSet(LoadS64(106));
+                CountRtProfile(RtProfileExtraTriangleTests, UInt(1)); // [local] SHARPEMU_8395_PROFILE
+                CountRtProfile(RtProfileExtraCandidates, SelectU(candidate, UInt(1), UInt(0)));
                 EmitConditional(candidate, () =>
                 {
                     foreach (var pc in new uint[] { 0x11F0, 0x11F4, 0x11F8, 0x11FC })
@@ -688,6 +699,7 @@ public static partial class Gen5SpirvTranslator
                         EndRtProfileRegion(RtProfileAlpha);
                     });
                     var accepted = EmitNativeCompare(plan, 0x1518);
+                    CountRtProfile(RtProfileExtraCommits, SelectU(accepted, UInt(1), UInt(0))); // [local]
                     EmitConditional(accepted, () =>
                     {
                         foreach (var pc in new uint[] { 0x1520, 0x1524, 0x1528, 0x152C, 0x1530, 0x1534, 0x1538 })

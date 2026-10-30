@@ -765,6 +765,11 @@ public static partial class Gen5SpirvTranslator
 
         private uint _faultMin, _faultMax, _faultMany, _faultMarkIndex;
 
+        // [local] SHARPEMU_DA_ZERO_PAGE_BRANCH=1 (off by default): the zero-page lookup keeps its fault bookkeeping (lowest,
+        // highest and a third distinct unmapped page) inside a branch on the fault instead of selects and stores on every
+        // lookup; the stored values are the same on every lane, so the bitmap set at the end is the same.
+        private readonly bool ZeroPageFaultBranch = System.Environment.GetEnvironmentVariable("SHARPEMU_DA_ZERO_PAGE_BRANCH") == "1";
+
         // SHARPEMU_DA_ZERO_PAGE: the lookup without branches (DeviceAddressPaging.ZeroPageMode).
         private (uint Pointer, uint Valid) ResolveDeviceAddressZeroPage(uint address64)
         {
@@ -783,6 +788,26 @@ public static partial class Gen5SpirvTranslator
             // fault record with the access's pc and address, which only the lookup itself knows.
             if (DeviceAddressPaging.ZeroPageMode == 2 || _request.TraceDeviceAddressFaults)
                 EmitConditional(faulted, () => RecordFault(address64, pageIndex));
+            if (ZeroPageFaultBranch)
+            {
+                // [local] SHARPEMU_DA_ZERO_PAGE_BRANCH=1: the same bookkeeping, only on the lanes that hit an unmapped page.
+                EmitConditional(faulted, () =>
+                {
+                    var faultMin = Load(_uintType, _faultMin);
+                    var faultMax = Load(_uintType, _faultMax);
+                    var known = _module.AddInstruction(SpirvOp.INotEqual, _boolType, faultMin, UInt(NoPendingFault));
+                    var other = LogicalAnd(known, LogicalAnd(
+                        _module.AddInstruction(SpirvOp.INotEqual, _boolType, pageIndex, faultMin),
+                        _module.AddInstruction(SpirvOp.INotEqual, _boolType, pageIndex, faultMax)));
+                    var many = LogicalAnd(other, _module.AddInstruction(SpirvOp.INotEqual, _boolType, faultMin, faultMax));
+                    Store(_faultMany, _module.AddInstruction(SpirvOp.Select, _uintType, many, UInt(1), Load(_uintType, _faultMany)));
+                    Store(_faultMin, _module.AddInstruction(SpirvOp.ExtInst, _uintType, _glsl, 38, faultMin, pageIndex));
+                    Store(_faultMax, _module.AddInstruction(SpirvOp.ExtInst, _uintType, _glsl, 41, faultMax, pageIndex));
+                });
+                var zeroBase = _module.AddInstruction(SpirvOp.Select, _ulongType, mapped, raw, zeroPage);
+                return (IAdd64(zeroBase, And64(masked, ULong(DeviceAddressPageSize - 1))), mapped);
+            }
+
             var min = Load(_uintType, _faultMin);
             var max = Load(_uintType, _faultMax);
             var seen = _module.AddInstruction(SpirvOp.INotEqual, _boolType, min, UInt(NoPendingFault));

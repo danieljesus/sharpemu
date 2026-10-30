@@ -622,6 +622,13 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        // [local] SHARPEMU_CONSERVATIVE_RECORDS: a descriptor sized by the sentinel record count spans the rest of the cache
+        // buffer holding its base.
+        private ulong ConservativeRequested(ulong hash, in BufferDescriptorWords descriptor, ulong requested) =>
+            descriptor.RecordCount == Gpu.Buffers.ConservativeRecords.SentinelRecords && Gpu.Buffers.ConservativeRecords.IsListedProgram(hash)
+                ? _bufferCache.ContainingBufferExtent(descriptor.Address, requested)
+                : requested;
+
         // The cache buffer each descriptor's range lives in; a null descriptor has none.
         private void FindBuffers(PreparedStageBindings prepared)
         {
@@ -647,6 +654,9 @@ internal static unsafe partial class VulkanVideoPresenter
                     continue;
                 }
 
+                if (Gpu.Buffers.ConservativeRecords.Mode == 2 && Gpu.Buffers.ConservativeRecords.IsVerifiedProgram(program.Hash)) // [local]
+                    Gpu.Buffers.ConservativeRecords.VerifyBinding(index, descriptor.RecordCount, requested, _bufferCache.ContainingBufferExtent(descriptor.Address, ulong.MaxValue, 0));
+                requested = ConservativeRequested(program.Hash, descriptor, requested); // [local] SHARPEMU_CONSERVATIVE_RECORDS
                 var size = ClampMappedSize(descriptor.Address, requested, prepared, index);
                 sources[index] = (descriptor, _bufferCache.FindBuffer(descriptor.Address, size), size);
                 ProbeBvhRefitBuffer(program.Hash, index, descriptor, requested, size, prepared);
@@ -1170,6 +1180,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 return NullStorageBuffer();
             }
+
+            requested = ConservativeRequested(program.Hash, descriptor, requested); // [local] SHARPEMU_CONSERVATIVE_RECORDS
 
             var size = ReuseClampedSize(address, requested, clampedSize);
             var alignment = _minStorageBufferOffsetAlignment;

@@ -703,12 +703,27 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
             using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.WordRead);
             FrontProfile.NoteSite(FrontProfile.Phase.WordRead);
+            var conservativeVerify = false; // [local] SHARPEMU_CONSERVATIVE_RECORDS
+            if (Gpu.Buffers.ConservativeRecords.Mode != 0 &&
+                Gpu.Buffers.ConservativeRecords.Matches(Gpu.Buffers.ConservativeRecords.CurrentReader, SharpEmu.ShaderCompiler.Resources.SrtReadProbe.CurrentBaseAddress, address))
+            {
+                if (Gpu.Buffers.ConservativeRecords.Mode == 1)
+                {
+                    word = Gpu.Buffers.ConservativeRecords.Sentinel;
+                    Gpu.Buffers.ConservativeRecords.NoteSentinel();
+                    return true;
+                }
+
+                conservativeVerify = true;
+            }
+
             if (OnFrontThread)
             {
                 if (NeedsBackRead(address, sizeof(uint)))
                 {
                     var (ok, value) = BackReadWord(address);
                     word = value;
+                    if (conservativeVerify && ok) Gpu.Buffers.ConservativeRecords.Verify(word); // [local]
                     return ok;
                 }
 
@@ -722,6 +737,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(patched);
                 }
 
+                if (conservativeVerify) Gpu.Buffers.ConservativeRecords.Verify(word); // [local]
                 return true;
             }
 
@@ -900,6 +916,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Diagnostics.GpuReadTrace.RecordValue(address, word);
             }
 
+            if (conservativeVerify) Gpu.Buffers.ConservativeRecords.Verify(word); // [local]
             return true;
         }
 

@@ -582,6 +582,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                         return $"{name}={(total == 0 ? 0 : 100.0 * cycles / total):F1}%";
                     }));
                     Console.Error.WriteLine($"[GPU][RT_PROFILE] scan_tick={scanTick} subgroups={words[0]} clock={(words[29] & 1) != 0} cycles_per_subgroup={(words[0] == 0 ? 0 : (double)total / words[0]):F0} {parts} alpha_tests={words[25]} blas_iterations={words[26]} tlas_node_visits={words[27]} instance_entries={words[28]}");
+                    if (nativeBlas[0] == 0) // [local] the extra counters share the verify record's words
+                    {
+                        var x = nativeBlas.Slice(8, 26).ToArray();
+                        Console.Error.WriteLine($"[GPU][RT_PROFILE2] scan_tick={scanTick} box_tests={x[0]} box_hits={x[1]} sorted_boxes={x[2]} tri_tests={x[3]} tri_candidates={x[4]} commits={x[5]} walks={x[6]} warp_iterations={x[7]} warp_walks={x[8]} walk_hist=[{string.Join(",", x[9..17])}] total_hist=[{string.Join(",", x[17..25])}] sum_subgroup_max_total={x[25]}");
+                    }
                 }
                 if (oob[0] != 0)
                     Console.Error.WriteLine($"[GPU][OOB_STORE] scan_tick={scanTick} hash=0x{((ulong)oob[2] << 32 | oob[1]):X16} pc=0x{oob[3]:X} binding={oob[4]} dword=0x{oob[5]:X} bound_dwords=0x{oob[6]:X} site={oob[7]}");

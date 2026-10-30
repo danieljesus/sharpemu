@@ -181,6 +181,8 @@ public enum SpirvOp : ushort
     GroupNonUniformShuffleXor = 346,
     GroupNonUniformShuffleUp = 347,
     GroupNonUniformShuffleDown = 348,
+    GroupNonUniformIAdd = 349, // [local] SHARPEMU_8395_PROFILE
+    GroupNonUniformUMax = 357, // [local]
     ReadClockKhr = 5056,
 }
 
@@ -214,6 +216,7 @@ public enum SpirvCapability : uint
     GroupNonUniformVote = 62,
     GroupNonUniformBallot = 64,
     GroupNonUniformShuffle = 65,
+    GroupNonUniformArithmetic = 63, // [local] SHARPEMU_8395_PROFILE
     ShaderLayer = 5253,
     ShaderViewportIndex = 5254,
     ShaderViewportIndexLayerExt = 5254,
@@ -849,7 +852,7 @@ public sealed class SpirvModuleBuilder
     private void RejectWaveOperation(SpirvOp opcode)
     {
         if (ForbidWaveOperations &&
-            (opcode == SpirvOp.ControlBarrier || opcode is >= SpirvOp.GroupNonUniformElect and <= SpirvOp.GroupNonUniformShuffleDown))
+            (opcode == SpirvOp.ControlBarrier || opcode is >= SpirvOp.GroupNonUniformElect and <= SpirvOp.GroupNonUniformUMax))
         {
             throw new InvalidOperationException($"{opcode} inside a lane-local region");
         }

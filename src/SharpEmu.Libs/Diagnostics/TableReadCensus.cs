@@ -21,15 +21,49 @@ internal static class TableReadCensus
         public readonly long[] Own = new long[3], Window = new long[3], Precise = new long[3];
         public ulong Writer, WriterAddress, WriterSize;
         public long WriterMisses;
+        // [local] The newest recorded write overlapping the word's 16 KB block (what moves the block tick).
+        public ulong BlockWriter, BlockWriterAddress, BlockWriterSize;
+        public long BlockTicks, BlockFound, BlockCovers;
+    }
+
+    [ThreadStatic] private static ulong _blockBegin, _blockSize;
+
+    // The word's 16 KB block, set by GuestBufferCache.CensusTicks before Record.
+    public static void NoteBlock(ulong begin, ulong size)
+    {
+        _blockBegin = begin;
+        _blockSize = size;
+    }
+
+    private static bool FindBlockWriter(ulong begin, ulong size, out (ulong Address, ulong Size, ulong Shader, ulong Tick, long Stamp) writer)
+    {
+        var count = Math.Min(_writerCount, WriterRing);
+        for (long back = 1; back <= count; back++)
+        {
+            var candidate = _writers[(_writerCount - back) & (WriterRing - 1)];
+            if (candidate.Address < begin + size && begin < candidate.Address + candidate.Size)
+            {
+                writer = candidate;
+                return true;
+            }
+        }
+
+        writer = default;
+        return false;
     }
 
     private static readonly Dictionary<(ulong Reader, ulong Address), Entry> _entries = new();
     private static long _windowStart = System.Diagnostics.Stopwatch.GetTimestamp();
 
-    public static void NoteWrite(ulong address, ulong size, ulong tick)
+    public static void NoteWrite(ulong address, ulong size, ulong tick) => NoteWrite(address, size, tick, GpuReadTrace.CurrentShader);
+
+    // [local] The writer id of a CPU-to-GPU upload (the copy moves the block tick as a shader write does).
+    public const ulong UploadWriter = 0x5550_4C4F_4144_0000;
+
+    public static void NoteWrite(ulong address, ulong size, ulong tick, ulong shader)
     {
         var index = _writerCount++ & (WriterRing - 1);
-        _writers[index] = (address, size, GpuReadTrace.CurrentShader, tick, System.Diagnostics.Stopwatch.GetTimestamp());
+        _writers[index] = (address, size, shader, tick, System.Diagnostics.Stopwatch.GetTimestamp());
     }
 
     private static bool FindWriter(ulong address, out (ulong Address, ulong Size, ulong Shader, ulong Tick, long Stamp) writer)
@@ -80,6 +114,18 @@ internal static class TableReadCensus
             entry.WriterMisses++;
         }
 
+        if (_blockSize != 0 && FindBlockWriter(_blockBegin, _blockSize, out var blockWriter)) // [local]
+        {
+            entry.BlockFound++;
+            entry.BlockWriter = blockWriter.Shader;
+            entry.BlockWriterAddress = blockWriter.Address;
+            entry.BlockWriterSize = blockWriter.Size;
+            entry.BlockTicks += (long)(current - Math.Min(blockWriter.Tick, current));
+            if (blockWriter.Address <= address && address < blockWriter.Address + blockWriter.Size) entry.BlockCovers++;
+        }
+
+        _blockSize = 0;
+
         var now = System.Diagnostics.Stopwatch.GetTimestamp();
         var seconds = (now - _windowStart) / (double)System.Diagnostics.Stopwatch.Frequency;
         if (seconds < 20)
@@ -93,7 +139,7 @@ internal static class TableReadCensus
         {
             var found = value.Reads - value.WriterMisses;
             Console.Error.WriteLine(FormattableString.Invariant(
-                $"[TABLE_CENSUS] reader=0x{readerHash:X16} addr=0x{wordAddress:X} reads={value.Reads} ms={value.Ms:F1} changed={value.Changed} own_cur={value.Own[0]} own_flight={value.Own[1]} own_done={value.Own[2]} win_cur={value.Window[0]} win_flight={value.Window[1]} win_done={value.Window[2]} pre_cur={value.Precise[0]} pre_flight={value.Precise[1]} pre_done={value.Precise[2]} writer=0x{value.Writer:X16} wrange=0x{value.WriterAddress:X}+0x{value.WriterSize:X} wmiss={value.WriterMisses} lag_ticks={(found == 0 ? 0 : value.Ticks / (double)found):F2} lag_ms={(found == 0 ? 0 : value.LagMs / found):F2}"));
+                $"[TABLE_CENSUS] reader=0x{readerHash:X16} addr=0x{wordAddress:X} reads={value.Reads} ms={value.Ms:F1} changed={value.Changed} own_cur={value.Own[0]} own_flight={value.Own[1]} own_done={value.Own[2]} win_cur={value.Window[0]} win_flight={value.Window[1]} win_done={value.Window[2]} pre_cur={value.Precise[0]} pre_flight={value.Precise[1]} pre_done={value.Precise[2]} writer=0x{value.Writer:X16} wrange=0x{value.WriterAddress:X}+0x{value.WriterSize:X} wmiss={value.WriterMisses} lag_ticks={(found == 0 ? 0 : value.Ticks / (double)found):F2} lag_ms={(found == 0 ? 0 : value.LagMs / found):F2} bwriter=0x{value.BlockWriter:X16} brange=0x{value.BlockWriterAddress:X}+0x{value.BlockWriterSize:X} blag_ticks={(value.BlockFound == 0 ? 0 : value.BlockTicks / (double)value.BlockFound):F2} bcovers={value.BlockCovers}/{value.BlockFound}"));
         }
 
         _entries.Clear();

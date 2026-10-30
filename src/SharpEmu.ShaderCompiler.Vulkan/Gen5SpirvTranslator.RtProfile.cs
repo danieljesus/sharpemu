@@ -45,8 +45,29 @@ public static partial class Gen5SpirvTranslator
         private uint[]? _rtProfileTimes;
         private uint[]? _rtProfileStarts;
         private uint _rtProfileProgramStart;
-        // Counters: alpha tests, native BLAS iterations, TLAS box-node visits, instance entries.
+        // Counters: alpha tests, native BLAS iterations, TLAS box-node visits, instance entries, then the
+        // RtProfileExtra* counters of the BLAS walks.
         private uint[]? _rtProfileCounters;
+
+        // [local] Extra counters (private per invocation, summed over the subgroup at the end and added by one lane):
+        // BLAS box tests, their hit children, the box tests whose T# sorts children, triangle tests, triangle
+        // candidates (t in range), commits, lane walks (active lanes entering a BLAS), warp iterations (the sum over
+        // walks of the subgroup's longest lane), warp walks, then a histogram of the iterations of one lane's walk.
+        public const int RtProfileExtraBoxTests = 4;
+        public const int RtProfileExtraBoxHits = 5;
+        public const int RtProfileExtraSortedBoxes = 6;
+        public const int RtProfileExtraTriangleTests = 7;
+        public const int RtProfileExtraCandidates = 8;
+        public const int RtProfileExtraCommits = 9;
+        public const int RtProfileExtraWalks = 10;
+        public const int RtProfileExtraWarpIterations = 11;
+        public const int RtProfileExtraWarpWalks = 12;
+        public const int RtProfileExtraWalkHistogram = 13;
+        private const int RtProfileHistogramBuckets = 8;
+        private const int RtProfileCounterCount = RtProfileExtraWalkHistogram + RtProfileHistogramBuckets;
+        // Bucket upper bounds: 0, 1-8, 9-16, ... 129-256, more (walks); 0, 1-16, ... 257-512, more (invocations).
+        private static readonly uint[] RtProfileWalkBounds = [0, 8, 16, 32, 64, 128, 256];
+        private static readonly uint[] RtProfileTotalBounds = [0, 16, 32, 64, 128, 256, 512];
 
         private bool RtProfileActive =>
             _rtProfileActive ??= _request.Hash == RtProfileHash &&
@@ -112,7 +133,7 @@ public static partial class Gen5SpirvTranslator
 
             _rtProfileTimes = RtProfileBlockRegions.Select(region => NativeVariable($"rtProfileTime_{region.Name}")).ToArray();
             _rtProfileStarts = RtProfileBlockRegions.Select(region => NativeVariable($"rtProfileStart_{region.Name}")).ToArray();
-            _rtProfileCounters = Enumerable.Range(0, 4).Select(index => NativeVariable($"rtProfileCounter{index}")).ToArray();
+            _rtProfileCounters = Enumerable.Range(0, RtProfileCounterCount).Select(index => NativeVariable($"rtProfileCounter{index}")).ToArray();
             _rtProfileProgramStart = NativeVariable("rtProfileProgramStart");
         }
 
@@ -152,6 +173,42 @@ public static partial class Gen5SpirvTranslator
 
             DeclareRtProfileState();
             Store(_rtProfileCounters![counter], IAdd(Load(_uintType, _rtProfileCounters[counter]), amount));
+        }
+
+        // [local] Whether `value` falls in histogram bucket `bucket` of `bounds` (inclusive upper bounds, the last open).
+        private uint InRtProfileBucket(uint value, uint[] bounds, int bucket) =>
+            bucket == 0 ? _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, value, UInt(bounds[0]))
+            : bucket < bounds.Length ? LogicalAnd(
+                _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, value, UInt(bounds[bucket])),
+                _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, value, UInt(bounds[bucket - 1])))
+            : _module.AddInstruction(SpirvOp.UGreaterThan, _boolType, value, UInt(bounds[^1]));
+
+        // [local] After a BLAS walk, where the subgroup has reconverged: the walk's iteration histogram per active
+        // lane, and the subgroup's longest walk (what the warp executes) added by one lane.
+        private void CountRtProfileWalk(uint active)
+        {
+            if (!RtProfileActive)
+            {
+                return;
+            }
+
+            DeclareRtProfileState();
+            var steps = SelectU(active, Load(_uintType, _nativeSteps), UInt(0));
+            CountRtProfile(RtProfileExtraWalks, SelectU(active, UInt(1), UInt(0)));
+            for (var bucket = 0; bucket < RtProfileHistogramBuckets; bucket++)
+                CountRtProfile(RtProfileExtraWalkHistogram + bucket,
+                    SelectU(LogicalAnd(active, InRtProfileBucket(steps, RtProfileWalkBounds, bucket)), UInt(1), UInt(0)));
+            if (_subgroupInvocationIdInput == 0)
+            {
+                return;
+            }
+
+            _module.AddCapability(SpirvCapability.GroupNonUniformArithmetic);
+            var longest = _module.AddInstruction(SpirvOp.GroupNonUniformUMax, _uintType, UInt(3), 0u, steps);
+            var elected = _module.AddInstruction(SpirvOp.GroupNonUniformElect, _boolType, UInt(3));
+            CountRtProfile(RtProfileExtraWarpIterations, SelectU(elected, longest, UInt(0)));
+            CountRtProfile(RtProfileExtraWarpWalks,
+                SelectU(LogicalAnd(elected, _module.AddInstruction(SpirvOp.INotEqual, _boolType, longest, UInt(0))), UInt(1), UInt(0)));
         }
 
         private void BeginRtProfileProgram()
@@ -228,6 +285,32 @@ public static partial class Gen5SpirvTranslator
             {
                 _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, NativeVerifyWord(59 + (uint)counter), UInt(1), UInt(0),
                     Load(_uintType, _rtProfileCounters![counter]));
+            }
+
+            // [local] The extra counters, words 8..24 of the native BLAS record (free unless its verify runs), the
+            // per-invocation histogram of BLAS iterations 25..32 and the sum of each subgroup's largest total 33.
+            if (_subgroupInvocationIdInput != 0)
+            {
+                _module.AddCapability(SpirvCapability.GroupNonUniformArithmetic);
+                var total = Load(_uintType, _rtProfileCounters![1]);
+                var sums = new uint[RtProfileCounterCount - RtProfileExtraBoxTests];
+                for (var counter = RtProfileExtraBoxTests; counter < RtProfileCounterCount; counter++)
+                    sums[counter - RtProfileExtraBoxTests] = _module.AddInstruction(SpirvOp.GroupNonUniformIAdd, _uintType, UInt(3), 0u,
+                        Load(_uintType, _rtProfileCounters[counter]));
+                var buckets = new uint[RtProfileHistogramBuckets];
+                for (var bucket = 0; bucket < RtProfileHistogramBuckets; bucket++)
+                    buckets[bucket] = _module.AddInstruction(SpirvOp.GroupNonUniformIAdd, _uintType, UInt(3), 0u,
+                        SelectU(InRtProfileBucket(total, RtProfileTotalBounds, bucket), UInt(1), UInt(0)));
+                var largest = _module.AddInstruction(SpirvOp.GroupNonUniformUMax, _uintType, UInt(3), 0u, total);
+                var elected = _module.AddInstruction(SpirvOp.GroupNonUniformElect, _boolType, UInt(3));
+                EmitConditional(elected, () =>
+                {
+                    for (var index = 0; index < sums.Length; index++)
+                        _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, NativeVerifyWord(8 + (uint)index), UInt(1), UInt(0), sums[index]);
+                    for (var bucket = 0; bucket < RtProfileHistogramBuckets; bucket++)
+                        _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, NativeVerifyWord(25 + (uint)bucket), UInt(1), UInt(0), buckets[bucket]);
+                    _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, NativeVerifyWord(33), UInt(1), UInt(0), largest);
+                });
             }
 
             if (!RtProfileClock || _subgroupInvocationIdInput == 0)

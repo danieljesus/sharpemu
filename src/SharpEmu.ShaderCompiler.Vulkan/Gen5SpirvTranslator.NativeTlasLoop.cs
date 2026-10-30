@@ -498,6 +498,7 @@ public static partial class Gen5SpirvTranslator
                     if (RtProfileActive)
                     {
                         CountRtProfile(1, Load(_uintType, _nativeSteps));
+                        CountRtProfileWalk(active); // [local]
                     }
 
                     BeginRtProfileRegion(RtProfileInstance);

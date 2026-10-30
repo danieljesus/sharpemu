@@ -516,6 +516,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     {
         var buffer = _registry.GetBuffer(FindBuffer(address, size));
         var own = buffer.BlockWriteTick(buffer.Offset(address), size);
+        // [local] the 16 KB block of the word in guest addresses, for the census's block writer
+        var blockOffset = buffer.Offset(address) & ~((1UL << 14) - 1);
+        Diagnostics.TableReadCensus.NoteBlock(buffer.CpuAddress + blockOffset, Math.Min(1UL << 14, buffer.Size - blockOffset));
         var window = 0UL;
         foreach (var copy in CollectReadbackWindow(buffer, address, size, out _, out _))
         {
@@ -863,6 +866,21 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         {
             throw SubmissionScheduler.Fatal($"Cannot download buffer data after a failed shutdown: addr=0x{guestAddress:X16} size=0x{size:X16}");
         }
+    }
+
+    // [local] SHARPEMU_CONSERVATIVE_RECORDS: the bytes from address to the end of the cache buffer that holds it, at most
+    // `limit`; without one, `fallback` (at most `limit`; the lookup then registers a buffer as for any other binding).
+    internal ulong ContainingBufferExtent(ulong address, ulong limit, ulong fallback = 1UL << 20)
+    {
+        var owner = _registry.FindContainingBuffer(address, sizeof(uint));
+        if (!owner.IsValid)
+        {
+            ConservativeRecords.NoteNoBuffer(fallback);
+            return Math.Min(limit, fallback);
+        }
+
+        var buffer = _registry.GetBuffer(owner);
+        return Math.Min(limit, buffer.CpuAddress + buffer.Size - address);
     }
 
     public ResourceSlotIdentifier FindBuffer(ulong guestAddress, ulong size)
@@ -4136,7 +4154,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                 _syncUploads++; // [local] written-obtain memo verification
                 if (Rendering.BatchSimulation.Enabled) Rendering.BatchSimulation.NoteUpload(); // [local]
                 foreach (var copy in copies)
+                {
                     buffer.NoteGpuWrite(copy.DstOffset, copy.Size);
+                    if (Diagnostics.TableReadCensus.Enabled) Diagnostics.TableReadCensus.NoteWrite(buffer.CpuAddress + copy.DstOffset, copy.Size, _scheduler.CurrentTick, Diagnostics.TableReadCensus.UploadWriter); // [local]
+                }
                 var command = _scheduler.Current;
                 command.EndRendering();
                 var native = new CommandBuffer(command.Handle);
