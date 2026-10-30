@@ -117,6 +117,54 @@ public sealed class IndirectImageDimensionTests
         });
     }
 
+    // The material table puts the 3D candidate at another position: the specialization is the same, and the key of
+    // the volume still selects the volume's descriptor.
+    [Fact]
+    public void CandidatesAreGroupedByClassSoTheirOrderDoesNotMakeAPermutation()
+    {
+        var plan = Extract(ResourceTrackerTests.IndirectImageProgram(false));
+        (ResourceSpecialization Specialization, ResourceSnapshot Snapshot) Specialize(int volumeIndex)
+        {
+            const int distinctCount = 4;
+            uint[] userData = [0x1000, 224 << 16, distinctCount, 0, 0x10000, 16 << 16, distinctCount * 2, 0, 7];
+            var memory = new TestWordMemory { Words = new uint[0x11000 / 4] };
+            for (var index = 0; index < distinctCount; index++)
+            {
+                memory.At(0x1000 + (ulong)index * 224 + 4) = (uint)index;
+                var descriptor = ResourceTrackerTests.ImageDescriptor();
+                descriptor[0] += (uint)index;
+                if (index == volumeIndex)
+                    descriptor[3] = (descriptor[3] & 0x0FFFFFFF) | (ImageType3D << 28);
+                ResourceTrackerTests.WriteImage(memory, 0x10000 + (ulong)index * 32, descriptor);
+            }
+
+            var snapshot = new ResourceSnapshot();
+            var specialization = new ResourceSpecialization();
+            Assert.True(ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read),
+                ref snapshot, ref specialization, out var failure), failure.ToString());
+            return (specialization, snapshot);
+        }
+
+        var (first, second) = WithMode(1, () => (Specialize(1), Specialize(3)));
+        Assert.Equal(first.Specialization, second.Specialization);
+        foreach (var (result, volumeKey) in new[] { (first, 1u), (second, 3u) })
+        {
+            var images = result.Specialization.Images;
+            var root = images.FindIndex(image => image.IndirectRoot != DescriptorConstants.NoIndex);
+            var table = result.Snapshot.FlattenedResourceTable;
+            var mapping = (int)images[root].IndirectMappingOffset;
+            var keys = table[mapping];
+            var members = Enumerable.Range(0, images.Count).Where(index => images[index].IndirectRoot == (uint)root).ToArray();
+            for (var entry = 0; entry < keys; entry++)
+            {
+                var key = table[mapping + 1 + entry * 2];
+                var image = members[(int)table[mapping + 2 + entry * 2]];
+                Assert.Equal(key == volumeKey ? ImageDimension.Dim3D : ImageDimension.Dim2D, images[image].Dimension);
+                Assert.Equal(0x20u + key, result.Snapshot.Images[image][0]);
+            }
+        }
+    }
+
     [Fact]
     public void On_ACubeCandidateIn2DTableStaysIncompatible()
     {

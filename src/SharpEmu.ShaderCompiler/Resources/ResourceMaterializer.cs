@@ -904,6 +904,36 @@ public static class ResourceMaterializer
         return baseLevel <= last ? last - baseLevel + 1 : 0;
     }
 
+    // [local] SHARPEMU_INDIRECT_IMAGE_DIM: candidates after the root ordered by what their specialization depends on
+    // (type, format, swizzle), keys remapped. The module then depends on how many candidates of each class the table
+    // holds, not on where the material table put them, so a table that mixes classes compiles a few permutations
+    // instead of one per arrangement (each a ~3 s pipeline wait for 0xD44E).
+    private static void GroupCandidatesByClass(IndirectImageTable table)
+    {
+        var count = table.Descriptors.Count;
+        if (count < 3)
+            return;
+        static ulong ClassKey(uint[] words) => words.Length < 4 ? 0 :
+            ((ulong)GuestImageFormat.ImageTypeOf(words) << 40) | ((ulong)GuestImageFormat.FormatOf(words) << 20) | (words[3] & 0xFFF);
+        var order = Enumerable.Range(1, count - 1).OrderBy(index => ClassKey(table.Descriptors[index].Dwords)).ToArray();
+        var sorted = true;
+        for (var position = 0; position < order.Length && sorted; position++)
+            sorted = order[position] == position + 1;
+        if (sorted)
+            return;
+        var remap = new uint[count];
+        var descriptors = new List<DescriptorWords>(count) { table.Descriptors[0] };
+        for (var position = 0; position < order.Length; position++)
+        {
+            remap[order[position]] = (uint)(position + 1);
+            descriptors.Add(table.Descriptors[order[position]]);
+        }
+
+        table.Descriptors = descriptors;
+        for (var index = 0; index < table.Candidates.Count; index++)
+            table.Candidates[index] = remap[table.Candidates[index]];
+    }
+
     private static bool Fail(string message)
     {
         SpecializationFailed(message);
@@ -962,6 +992,8 @@ public static class ResourceMaterializer
 
         foreach (var table in snapshot.IndirectImages)
         {
+            if (IndirectImageDimMode != 0)
+                GroupCandidatesByClass(table);
             var rootImage = images[(int)table.Resource];
             for (var candidate = 1; candidate < table.Descriptors.Count; candidate++)
             {
