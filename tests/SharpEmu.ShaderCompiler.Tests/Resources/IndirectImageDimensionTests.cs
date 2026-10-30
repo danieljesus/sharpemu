@@ -165,6 +165,29 @@ public sealed class IndirectImageDimensionTests
         }
     }
 
+    // Graphics stages keep refusing the mix unless the switch is 3.
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(2, false)]
+    [InlineData(3, true)]
+    public void APixelProgramMixesClassesOnlyWithMode3(int mode, bool accepted)
+    {
+        var plan = Extract(SpirvBindingDeclarationTests.IndirectImageAfterPlainImageProgram(indirectDimension: 1), stage: ShaderStage.Pixel);
+        var (userData, memory) = SpirvBindingDeclarationTests.IndirectImageAfterPlainImageInputs(
+            64, false, firstImageType: ImageType2D, secondImageType: ImageType3D);
+        var (success, failure) = WithMode(mode, () =>
+        {
+            var snapshot = new ResourceSnapshot();
+            var specialization = new ResourceSpecialization();
+            var ok = ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read),
+                ref snapshot, ref specialization, out var kind);
+            return (ok, kind);
+        });
+        Assert.Equal(accepted, success);
+        if (!accepted)
+            Assert.Equal(ResourceMaterializationFailure.IncompatibleImageCandidates, failure);
+    }
+
     [Fact]
     public void On_ACubeCandidateIn2DTableStaysIncompatible()
     {

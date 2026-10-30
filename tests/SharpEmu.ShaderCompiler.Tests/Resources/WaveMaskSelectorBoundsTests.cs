@@ -80,7 +80,7 @@ public sealed class WaveMaskSelectorBoundsTests
         memory.At(0x1000 + 5 * 224 + 4) = 1;
         var first = ResourceTrackerTests.ImageDescriptor();
         var second = first.ToArray();
-        second[3] = (second[3] & 0x0FFFFFFF) | (10u << 28);
+        second[3] = (second[3] & 0x0FFFFFFF) | (8u << 28);
         ResourceTrackerTests.WriteImage(memory, 0x2000, first);
         ResourceTrackerTests.WriteImage(memory, 0x2020, second);
         var inputs = new ResourceRuntimeInputs

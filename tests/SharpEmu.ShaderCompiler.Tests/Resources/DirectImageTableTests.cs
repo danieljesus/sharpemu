@@ -574,7 +574,7 @@ public sealed class DirectImageTableTests
             {
                 if (!incompatible) return false;
                 // A 3D descriptor; a cube one would now be dropped as unreachable from a 2D access.
-                word = (word & 0x0FFFFFFF) | (10u << 28);
+                word = (word & 0x0FFFFFFF) | (8u << 28);
             }
             return success;
         }
