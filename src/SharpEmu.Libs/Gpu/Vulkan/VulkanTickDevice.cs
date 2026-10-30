@@ -21,7 +21,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
     private long _recorded; // [local]
 
     public VulkanTickDevice(Vk vk, Device device, Queue queue, uint queueFamilyIndex, object queueGate, PhysicalDevice profilePhysicalDevice = default,
-        bool recordRing = false) // [local]
+        bool recordRing = false, bool dormantProfile = false) // [local] dormantProfile: SlowModeProbe
     {
         _vk = vk;
         _device = device;
@@ -47,7 +47,14 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         };
         RequireSuccess(_vk.CreateSemaphore(_device, &createInfo, null, out _timeline), "vkCreateSemaphore(scheduler timeline)");
         if (profilePhysicalDevice.Handle != 0)
-            CommandProfile = new VulkanCommandProfile(vk, profilePhysicalDevice, device, queueFamilyIndex);
+        {
+            CommandProfile = new VulkanCommandProfile(vk, profilePhysicalDevice, device, queueFamilyIndex)
+            {
+                Dormant = dormantProfile, // [local] SlowModeProbe
+            };
+            if (CommandProfile.Dormant)
+                CommandProfile.PerCommandMarkers = true;
+        }
         if (recordRing) // [local]
         {
             _ring = new CommandRing(vk);

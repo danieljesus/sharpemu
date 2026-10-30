@@ -24,6 +24,11 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
     private ulong _skippedMarkers;
     private ulong _unavailableBuffers;
     internal bool PerCommandMarkers { get; set; } = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_DRAWS") == "1" || PassesEnabled;
+
+    // [local] Created only for SlowModeProbe (no render profiler): records nothing until the probe arms it, then per-command
+    // markers, and its interval lines name the pipelines through DescribePipeline.
+    internal bool Dormant { get; init; }
+    internal static Func<ulong, string>? DescribePipeline { get; set; }
     private readonly List<(ulong Start, ulong End)> _spans = new();
     private ulong[]? _values;
 
@@ -140,7 +145,7 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
 
     public void BeginBuffer(CommandBuffer command)
     {
-        if (!Supported)
+        if (!Supported || Dormant && !SlowModeProbe.Armed) // [local] SlowModeProbe
             return;
         if (!_buffers.TryGetValue(command.Handle, out var queries))
         {
@@ -174,7 +179,7 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
 
     public void WriteMarker(CommandBuffer command, IntervalKind kind, ulong pipeline = 0, uint first = 0, uint second = 0, uint third = 0)
     {
-        if (!PerCommandMarkers && kind != IntervalKind.Tail)
+        if (!PerCommandMarkers && kind != IntervalKind.Tail || Dormant && !SlowModeProbe.Armed) // [local] SlowModeProbe
         {
             return;
         }
@@ -333,7 +338,8 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
         {
             _write($"[PERF][GPU_INTERVAL] completed_ms={_totals.Values.Sum(total => total.Milliseconds):F3} intervals={_totals.Values.Sum(total => (long)total.Count)} skipped_markers={_skippedMarkers} unavailable_buffers={_unavailableBuffers}");
             foreach (var (key, total) in _totals.OrderByDescending(pair => pair.Value.Milliseconds).Take(12))
-                _write($"[PERF][GPU_INTERVAL] kind={key.Kind} pipeline={key.Pipeline} count={total.Count} total_ms={total.Milliseconds:F3} max_ms={total.MaximumMilliseconds:F3} max_args={total.MaximumMarker.First},{total.MaximumMarker.Second},{total.MaximumMarker.Third}");
+                _write($"[PERF][GPU_INTERVAL] kind={key.Kind} pipeline={key.Pipeline} count={total.Count} total_ms={total.Milliseconds:F3} max_ms={total.MaximumMilliseconds:F3} max_args={total.MaximumMarker.First},{total.MaximumMarker.Second},{total.MaximumMarker.Third}" +
+                    (Dormant && DescribePipeline is { } describe && key.Pipeline != 0 ? $" {describe(key.Pipeline)}" : "")); // [local] SlowModeProbe
         }
         _totals.Clear();
         _skippedMarkers = 0;

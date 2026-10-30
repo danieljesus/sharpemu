@@ -1240,6 +1240,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private void ReportPipelineCreation(long elapsedMilliseconds, string kind, string stages, string spirv)
         {
             Interlocked.Add(ref _pipelineCreationMilliseconds, elapsedMilliseconds);
+            if (Gpu.Pipelines.CompileLog.Enabled) // [local] SHARPEMU_COMPILE_LOG: the async compile ran on a compiler worker
+                Gpu.Pipelines.CompileLog.Note(kind, elapsedMilliseconds, 0, $"{stages} spirv_bytes={spirv}".Replace(' ', ','),
+                    kind == "compute-async" ? "compile_worker" : null);
             if (elapsedMilliseconds < SlowPipelineCreationMilliseconds)
             {
                 return;
@@ -1505,7 +1508,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             entry.Id = ++_nextPipelineId;
             _pipelineEntries.Add(entry.Id, entry);
-            if (_gpuCommandProfile is not null)
+            if (_gpuCommandProfile is { Dormant: false })
                 Console.Error.WriteLine($"[PERF][GPU_PIPELINE] pipeline={entry.Id} vertex=0x{entry.ProfileVertexHash:X16} pixel=0x{entry.ProfilePixelHash:X16} compute=0x{entry.ProfileComputeHash:X16}{DescribeKeyForProfile(entry.Description)}");
             return new PipelineHandle(entry.Id, entry.Layout.Handle, entry.UsesPushDescriptors);
         }

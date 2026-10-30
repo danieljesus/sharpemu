@@ -209,7 +209,10 @@ public sealed unsafe class ColorToMultisampleDepthBlit : IDisposable
                 RenderPass = renderPass,
                 Subpass = 0,
             };
+            var compileStarted = Gpu.Pipelines.CompileLog.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_COMPILE_LOG
             created = _device.Vk.CreateGraphicsPipelines(_device.Device, default, 1, &create, null, out pipeline);
+            if (Gpu.Pipelines.CompileLog.Enabled)
+                Gpu.Pipelines.CompileLog.Note("emulator", System.Diagnostics.Stopwatch.GetElapsedTime(compileStarted).TotalMilliseconds, 0, "color_to_ms_depth");
         }
         finally
         {

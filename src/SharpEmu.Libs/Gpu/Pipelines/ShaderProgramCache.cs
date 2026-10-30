@@ -920,6 +920,35 @@ internal sealed class ShaderProgramCache
         return inputs.ToArray();
     }
 
+    // [local] SHARPEMU_COMPILE_LOG: the indirect candidates of a specialization by class, in order (class:run,...).
+    private static string IndirectSignature(ResourceSpecialization specialization)
+    {
+        var runs = new List<string>();
+        string? last = null;
+        var length = 0;
+        for (var index = 0; index < specialization.Images.Count; index++)
+        {
+            var image = specialization.Images[index];
+            if (image.IndirectRoot == DescriptorConstants.NoIndex || image.IndirectRoot == index)
+                continue;
+            var name = $"{image.NumericClass}/{image.Dimension}";
+            if (name == last)
+            {
+                length++;
+                continue;
+            }
+
+            if (last is not null)
+                runs.Add($"{last}:{length}");
+            last = name;
+            length = 1;
+        }
+
+        if (last is not null)
+            runs.Add($"{last}:{length}");
+        return runs.Count == 0 ? "-" : string.Join(',', runs);
+    }
+
     private ProgramPermutation CompilePermutation(
         ShaderSource source,
         StageCompileOptions options,
@@ -945,6 +974,7 @@ internal sealed class ShaderProgramCache
             throw SubmissionScheduler.Fatal($"The shader binding layout is invalid: stage={source.Label} hash=0x{source.Hash:X16} error={exception.Message}.");
         }
 
+        var compileStarted = CompileLog.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_COMPILE_LOG
         var request = BuildRequest(source, options, entry, resources, layout);
         var permutationDump = ShaderPermutationDump.WriteInputs(
             source, key, sourceWasCached, _programs.Keys, entry.Permutations,
@@ -981,6 +1011,9 @@ internal sealed class ShaderProgramCache
         CompiledShaderDump.Write(source.Label, source.Address, source.Hash, compiled, program);
         var id = ++_nextProgramId;
         var module = _host.CreateShaderModule(compiled, source.Stage, source.Hash, id);
+        if (CompileLog.Enabled) // [local]
+            CompileLog.Note("translate", System.Diagnostics.Stopwatch.GetElapsedTime(compileStarted).TotalMilliseconds, source.Hash,
+                $"stage={source.Stage} spirv_bytes={compiled.Payload.Length} images={specialization.Images.Count} indirect={IndirectSignature(specialization)}");
         var info = CreateProgramInfo(source, entry, resources, layout, request);
         if (source.Stage == ShaderStage.Compute &&
             _host.ShaderPrewarm is { } prewarm &&

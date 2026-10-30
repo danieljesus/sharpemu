@@ -230,10 +230,16 @@ public sealed partial class RenderExecutor
             // wait outside the pipeline cache's lock, so other queues can create their own
             // pipelines while this program compiles.
             PipelineHandle pipeline;
+            long waitStarted = 0; // [local] SHARPEMU_COMPILE_LOG
             while (!_pipelines.TryCreateComputePipeline(input, computeProgram.Program, out pipeline))
             {
+                if (waitStarted == 0)
+                    waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 Thread.Sleep(1);
             }
+
+            if (waitStarted != 0 && Gpu.Pipelines.CompileLog.Enabled)
+                Gpu.Pipelines.CompileLog.Note("dispatch-wait", System.Diagnostics.Stopwatch.GetElapsedTime(waitStarted).TotalMilliseconds, program.Hash);
 
             var bindings = PrepareBindings(input.Stage);
             if (program.UsesDeviceAddresses)
