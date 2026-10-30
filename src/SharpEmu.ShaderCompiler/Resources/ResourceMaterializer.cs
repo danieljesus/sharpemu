@@ -29,8 +29,8 @@ public static class ResourceMaterializer
 
     // [local] SHARPEMU_INDIRECT_IMAGE_PAD (=0 off by default): with a mixed table (SHARPEMU_INDIRECT_IMAGE_DIM), the
     // candidates after the root are ordered by the class their specialization takes (image type, numeric class,
-    // conversion) and every class run is padded to a fixed capacity (2 up to 2 candidates, 16 up to 16, then the next
-    // power of two) with copies of its first descriptor, and the key search takes at least PaddedSearchIterations steps.
+    // conversion...) and every class run is padded to a fixed capacity (4 up to 4 candidates, 16 up to 16, then the
+    // next power of two) with copies of its first descriptor, and the key search takes at least PaddedSearchIterations steps.
     // The key mapping only names real candidates, so a padding slot is never selected; the module then depends on which
     // classes the table holds, not on how many candidates or keys of each,
     // and 0xD44E stops compiling a new ~3 s permutation whenever its material table gains or loses a texture.
@@ -961,31 +961,42 @@ public static class ResourceMaterializer
 
     // [local] SHARPEMU_INDIRECT_IMAGE_PAD: the run capacity of a class with count real candidates.
     internal static int PaddedRunCapacity(int count) =>
-        count <= 2 ? 2 : count <= 16 ? 16 : (int)BitOperations.RoundUpToPowerOf2((uint)count);
+        count <= 4 ? 4 : count <= 16 ? 16 : (int)BitOperations.RoundUpToPowerOf2((uint)count);
 
-    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: what the specialization of a candidate depends on (see BuildSpecialization):
-    // its image type, the numeric class and conversion of its format; a null descriptor takes the exemplar's class.
-    private static ulong SpecializationClassKey(uint[] words)
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: the fields of the image specialization BuildSpecialization derives from one
+    // candidate's descriptor (numeric class, dimension, cube, conversion, swizzle, mips, emulated compare), so two
+    // candidates with the same class make the same record; a null descriptor takes the exemplar's class and an
+    // unsupported sampled format the nulled one.
+    private static string SpecializationClass(uint[] words, ImageResource baseImage, string? exemplar)
     {
+        var storage = baseImage.ResourceClass == ImageResourceClass.Storage;
         if (words.Length < 4 || NullImageDescriptor(words))
-            return 0;
+            return exemplar ?? "null";
         var format = GuestImageFormat.FormatOf(words);
-        return 1UL << 60 | (ulong)GuestImageFormat.ImageTypeOf(words) << 40 |
-            (ulong)(uint)GuestImageFormat.SampledNumericClass(format) << 20 | ImageConversionFormat(format);
+        var numeric = GuestImageFormat.SampledNumericClass(format);
+        if (!storage && numeric == ImageNumericClass.Unsupported)
+            return $"{ImageNumericClass.Float}/{ImageDimension.Dim2D}/cube0/conv{GuestImageFormat.Invalid}/sw-/mips{StorageMipCount(baseImage, words)}/cmp-";
+        var conversion = ImageConversionFormat(format);
+        var swizzle = storage || conversion != GuestImageFormat.Invalid ? $"{words[3] & 0xFFF:x}" : "-";
+        var compare = !storage && baseImage.DepthCompare && !GuestImageFormat.HasDepthEquivalent(format) ? "emu" : "-";
+        var cube = GuestImageFormat.ImageTypeOf(words) == GuestImageFormat.ImageTypeCube ? 1 : 0;
+        return $"{numeric}/{DescriptorDimension(words, baseImage.Dimension)}/cube{cube}/conv{conversion}/sw{swizzle}/mips{StorageMipCount(baseImage, words)}/cmp{compare}";
     }
 
     // [local] SHARPEMU_INDIRECT_IMAGE_PAD: orders the candidates after the root by specialization class and pads every
     // class run to PaddedRunCapacity; returns false (table unchanged) when the padded table would not fit in budget slots.
-    private static bool PadCandidatesByClass(IndirectImageTable table, int budget)
+    private static bool PadCandidatesByClass(IndirectImageTable table, ImageResource baseImage, int budget)
     {
         var count = table.Descriptors.Count;
         if (count < 2)
             return false;
-        var runs = Enumerable.Range(1, count - 1)
-            .GroupBy(index => SpecializationClassKey(table.Descriptors[index].Dwords))
-            .OrderBy(group => group.Key)
-            .Select(group => group.ToArray())
+        var exemplarWords = table.Descriptors.Select(words => words.Dwords).FirstOrDefault(words => words.Length >= 4 && !NullImageDescriptor(words));
+        var exemplar = exemplarWords is null ? null : SpecializationClass(exemplarWords, baseImage, null);
+        var classed = Enumerable.Range(1, count - 1)
+            .GroupBy(index => SpecializationClass(table.Descriptors[index].Dwords, baseImage, exemplar))
+            .OrderBy(group => group.Key, StringComparer.Ordinal)
             .ToArray();
+        var runs = classed.Select(group => group.ToArray()).ToArray();
         var padded = runs.Sum(run => PaddedRunCapacity(run.Length));
         if (padded > budget)
             return false;
@@ -1018,7 +1029,7 @@ public static class ResourceMaterializer
             Interlocked.Add(ref _padChecked, original.Length);
             Interlocked.Add(ref _padMismatches, mismatches);
             if (Interlocked.Increment(ref _padTables) % 256 == 0 || mismatches != 0)
-                Console.Error.WriteLine($"[GPU][INDIRECT_PAD] tables={Interlocked.Read(ref _padTables)} checked={Interlocked.Read(ref _padChecked)} mismatches={Interlocked.Read(ref _padMismatches)} skipped={Interlocked.Read(ref _padSkipped)} runs={string.Join(',', runs.Select(run => $"{run.Length}->{PaddedRunCapacity(run.Length)}"))}");
+                Console.Error.WriteLine($"[GPU][INDIRECT_PAD] tables={Interlocked.Read(ref _padTables)} checked={Interlocked.Read(ref _padChecked)} mismatches={Interlocked.Read(ref _padMismatches)} skipped={Interlocked.Read(ref _padSkipped)} runs={string.Join(' ', classed.Select(group => $"{group.Key}:{group.Count()}->{PaddedRunCapacity(group.Count())}"))}");
         }
         else
         {
@@ -1056,7 +1067,7 @@ public static class ResourceMaterializer
             foreach (var table in snapshot.IndirectImages)
             {
                 var own = Math.Max(0, table.Descriptors.Count - 1);
-                if (table.Resource < info.Images.Count && PadCandidatesByClass(table, budget + own))
+                if (table.Resource < info.Images.Count && PadCandidatesByClass(table, info.Images[(int)table.Resource], budget + own))
                     budget -= table.Descriptors.Count - 1 - own;
                 else
                     Interlocked.Increment(ref _padSkipped);

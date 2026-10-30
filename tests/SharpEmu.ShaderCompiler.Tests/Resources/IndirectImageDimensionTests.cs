@@ -165,7 +165,7 @@ public sealed class IndirectImageDimensionTests
         }
     }
 
-    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: tables with 3, 6 and 4 float candidates after the root plus one volume, the volume at different
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: tables with 5, 8 and 6 float candidates after the root plus one volume, the volume at different
     // places, give one specialization; every key still selects its own descriptor, never a padding slot.
     [Theory]
     [InlineData(1)]
@@ -199,7 +199,7 @@ public sealed class IndirectImageDimensionTests
         var mismatchesBefore = ResourceMaterializer.IndirectImagePadCounters.Mismatches;
         try
         {
-            var results = WithMode(1, () => new[] { (Specialize(5, 1), 1u), (Specialize(8, 7), 7u), (Specialize(6, 2), 2u) });
+            var results = WithMode(1, () => new[] { (Specialize(7, 1), 1u), (Specialize(10, 9), 9u), (Specialize(8, 2), 2u) });
             Assert.Equal(results[0].Item1.Specialization, results[1].Item1.Specialization);
             Assert.Equal(results[0].Item1.Specialization, results[2].Item1.Specialization);
             foreach (var (result, volumeKey) in results)
@@ -210,7 +210,7 @@ public sealed class IndirectImageDimensionTests
                 var mapping = (int)images[root].IndirectMappingOffset;
                 var keys = table[mapping];
                 var members = Enumerable.Range(0, images.Count).Where(index => images[index].IndirectRoot == (uint)root).ToArray();
-                Assert.Equal(1 + 16 + 2, members.Length);
+                Assert.Equal(1 + 16 + 4, members.Length);
                 for (var entry = 0; entry < keys; entry++)
                 {
                     var key = table[mapping + 1 + entry * 2];
@@ -237,9 +237,9 @@ public sealed class IndirectImageDimensionTests
     }
 
     [Theory]
-    [InlineData(1, 2)]
-    [InlineData(2, 2)]
-    [InlineData(3, 16)]
+    [InlineData(1, 4)]
+    [InlineData(4, 4)]
+    [InlineData(5, 16)]
     [InlineData(16, 16)]
     [InlineData(17, 32)]
     public void PaddedRunCapacityIsFixedPerBucket(int count, int capacity) =>

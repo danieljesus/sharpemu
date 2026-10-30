@@ -9,10 +9,11 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 
 // [local] SHARPEMU_COMPILE_LOG=1 (off): every shader translation and pipeline creation of the session, with its time and
 // the thread it ran on, and how long a dispatch waited for its asynchronous compute pipeline. One [PERF][COMPILE] line
-// per event of at least EventMilliseconds; one [PERF][COMPILES] line per 5 s window that had any (count and ms per kind
-// and thread). Kinds: translate (SPIR-V from the guest program plus its module), graphics (vkCreateGraphicsPipelines,
-// inline), compute (inline), compute-async (the worker's vkCreateComputePipelines), dispatch-wait (the command stream
-// spinning until that compile finishes), emulator (the emulator's own pipelines).
+// per event of at least EventMilliseconds and per translation of a program with indirect image candidates; one
+// [PERF][COMPILES] line per 5 s window that had any (count and ms per kind and thread). Kinds: translate (SPIR-V from
+// the guest program plus its module), graphics (vkCreateGraphicsPipelines, inline), compute (inline), compute-async (the
+// worker's vkCreateComputePipelines), dispatch-wait (the command stream spinning until that compile finishes),
+// emulator (the emulator's own pipelines).
 internal static class CompileLog
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_COMPILE_LOG") == "1";
@@ -28,14 +29,14 @@ internal static class CompileLog
         return string.IsNullOrEmpty(name) ? $"tid{Environment.CurrentManagedThreadId}" : name.Replace(' ', '_');
     }
 
-    internal static void Note(string kind, double milliseconds, ulong hash, string detail = "", string? thread = null)
+    internal static void Note(string kind, double milliseconds, ulong hash, string detail = "", string? thread = null, bool always = false)
     {
         if (!Enabled)
             return;
         thread ??= ThreadLabel();
         var now = Stopwatch.GetTimestamp();
         var seconds = (now - Started) / (double)Stopwatch.Frequency;
-        if (milliseconds >= EventMilliseconds)
+        if (milliseconds >= EventMilliseconds || always)
             Console.Error.WriteLine(string.Create(CultureInfo.InvariantCulture,
                 $"[PERF][COMPILE] t={seconds:F1} kind={kind} ms={milliseconds:F1} hash=0x{hash:X16} thread={thread} {detail}"));
         string? report = null;

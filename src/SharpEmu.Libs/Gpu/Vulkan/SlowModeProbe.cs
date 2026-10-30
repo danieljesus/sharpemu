@@ -7,22 +7,25 @@ using System.Globalization;
 namespace SharpEmu.Libs.Gpu.Vulkan;
 
 // [local] Dormant detector of the GTA V "1-4 FPS" mode (d4G3, d4dg2: GPU 96-100 %, CPU 4-9 %, from ~95 s to the end).
-// With SHARPEMU_FPS_LOG=1 and no render profiler, a 5 s window under MinimumFps after StartSeconds arms GPU timestamps
-// for ArmedWindows windows: the scheduler's command profile (created dormant, recording nothing until then) writes a
-// marker after every draw and dispatch and prints [PERF][GPU_BUSY] and the top [PERF][GPU_INTERVAL] lines with the
-// shader of each pipeline, which shows which pass holds the GPU. At most MaxArms per session.
+// With SHARPEMU_FPS_LOG=1 and no render profiler, two consecutive 5 s windows under MinimumFps after StartSeconds (past
+// the load and the player taking control, whose windows dip to ~6 FPS; a ~3.2 s pipeline compile makes one window of
+// ~2-3 FPS, so one alone does not arm) arm GPU timestamps for ArmedWindows windows: the scheduler's command profile
+// (created dormant, recording nothing until then) writes a marker after every draw and dispatch and prints
+// [PERF][GPU_BUSY] and the top [PERF][GPU_INTERVAL] lines with the shader of each pipeline, which shows which pass holds
+// the GPU. At most MaxArms per session.
 // SHARPEMU_SLOW_MODE_PROBE=0 turns it off (no profile object at all).
 internal static class SlowModeProbe
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_SLOW_MODE_PROBE") != "0";
-    private const double MinimumFps = 8;
-    private const double StartSeconds = 60;
+    private const double MinimumFps = 4;
+    private const double StartSeconds = 130;
     private const int ArmedWindows = 3;
     private const int MaxArms = 2;
     private static readonly DateTime Started = Process.GetCurrentProcess().StartTime;
     private static volatile bool _armed;
     private static int _armedWindows;
     private static int _arms;
+    private static int _slowWindows;
 
     internal static bool Armed => _armed;
 
@@ -41,7 +44,8 @@ internal static class SlowModeProbe
             return;
         }
 
-        if (uptime < StartSeconds || fps >= MinimumFps || _arms >= MaxArms)
+        _slowWindows = uptime >= StartSeconds && fps < MinimumFps ? _slowWindows + 1 : 0;
+        if (_slowWindows < 2 || _arms >= MaxArms)
             return;
         _arms++;
         _armedWindows = 0;

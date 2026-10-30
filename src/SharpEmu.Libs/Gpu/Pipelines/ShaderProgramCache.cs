@@ -1012,8 +1012,11 @@ internal sealed class ShaderProgramCache
         var id = ++_nextProgramId;
         var module = _host.CreateShaderModule(compiled, source.Stage, source.Hash, id);
         if (CompileLog.Enabled) // [local]
+        {
+            var indirect = IndirectSignature(specialization);
             CompileLog.Note("translate", System.Diagnostics.Stopwatch.GetElapsedTime(compileStarted).TotalMilliseconds, source.Hash,
-                $"stage={source.Stage} spirv_bytes={compiled.Payload.Length} images={specialization.Images.Count} indirect={IndirectSignature(specialization)}");
+                $"stage={source.Stage} spirv_bytes={compiled.Payload.Length} images={specialization.Images.Count} indirect={indirect}", always: indirect != "-");
+        }
         var info = CreateProgramInfo(source, entry, resources, layout, request);
         if (source.Stage == ShaderStage.Compute &&
             _host.ShaderPrewarm is { } prewarm &&
