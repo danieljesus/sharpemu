@@ -9,6 +9,7 @@ using static SharpEmu.ShaderCompiler.Tests.Resources.ResourceTestProgram;
 
 namespace SharpEmu.ShaderCompiler.Tests.Resources;
 
+[Collection(IndirectImageDimensionCollection.Name)] // [local] some tests pin SHARPEMU_INDIRECT_IMAGE_PAD
 public sealed class DirectImageTableTests
 {
     internal static Gen5ShaderProgram CreateWaveIndexedDescriptorProgram()
@@ -289,7 +290,11 @@ public sealed class DirectImageTableTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void MixedDimensionsRetainEveryCandidateAndUseSeparateBindings(bool arrayFirst)
+    public void MixedDimensionsRetainEveryCandidateAndUseSeparateBindings(bool arrayFirst) =>
+        // [local] The unpadded layout; SHARPEMU_INDIRECT_IMAGE_PAD would pad each class to 16.
+        IndirectImageDimensionCollection.WithPadMode(0, () => MixedDimensionsRetainEveryCandidateAndUseSeparateBindingsCore(arrayFirst));
+
+    private void MixedDimensionsRetainEveryCandidateAndUseSeparateBindingsCore(bool arrayFirst)
     {
         var (snapshot, request) = PrepareMixedDimensions(1, arrayFirst);
         Assert.Equal(3, snapshot.Images.Length);
@@ -328,7 +333,11 @@ public sealed class DirectImageTableTests
     [Theory]
     [InlineData(32)]
     [InlineData(33)]
-    public void DirectImageCapacityPreservesTheLimitAndPublishedState(int distinctCount)
+    public void DirectImageCapacityPreservesTheLimitAndPublishedState(int distinctCount) =>
+        // [local] The limit of the unpadded table; SHARPEMU_INDIRECT_IMAGE_PAD would pad 31 candidates to 32.
+        IndirectImageDimensionCollection.WithPadMode(0, () => DirectImageCapacityPreservesTheLimitAndPublishedStateCore(distinctCount));
+
+    private void DirectImageCapacityPreservesTheLimitAndPublishedStateCore(int distinctCount)
     {
         var (plan, snapshot, _) = PrepareDirect();
         var specialization = new ResourceSpecialization();

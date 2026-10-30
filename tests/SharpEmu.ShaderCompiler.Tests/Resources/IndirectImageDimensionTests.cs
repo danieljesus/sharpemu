@@ -13,6 +13,21 @@ namespace SharpEmu.ShaderCompiler.Tests.Resources;
 public sealed class IndirectImageDimensionCollection
 {
     public const string Name = "IndirectImageDimension";
+
+    // [local] Runs body with SHARPEMU_INDIRECT_IMAGE_PAD at mode, for tests of the unpadded table layout.
+    internal static void WithPadMode(int mode, Action body)
+    {
+        var previous = ResourceMaterializer.IndirectImagePadMode;
+        ResourceMaterializer.IndirectImagePadMode = mode;
+        try
+        {
+            body();
+        }
+        finally
+        {
+            ResourceMaterializer.IndirectImagePadMode = previous;
+        }
+    }
 }
 
 // [local] SHARPEMU_INDIRECT_IMAGE_DIM: a 3D candidate in a 2D sampled indirect table (GTA V's 0xD44E).

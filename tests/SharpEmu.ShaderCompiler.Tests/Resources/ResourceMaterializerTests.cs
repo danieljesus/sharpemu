@@ -8,6 +8,7 @@ using static SharpEmu.ShaderCompiler.Tests.Resources.ResourceTestProgram;
 
 namespace SharpEmu.ShaderCompiler.Tests.Resources;
 
+[Collection(IndirectImageDimensionCollection.Name)] // [local] some tests pin SHARPEMU_INDIRECT_IMAGE_PAD
 public sealed class ResourceMaterializerTests
 {
     private const uint Format32Float = 22;
@@ -21,7 +22,11 @@ public sealed class ResourceMaterializerTests
     [InlineData(33)]
     [InlineData(64)]
     [InlineData(65)]
-    public void MaterialImageCapacityPreservesTheLimitAndPublishedState(int distinctCount)
+    public void MaterialImageCapacityPreservesTheLimitAndPublishedState(int distinctCount) =>
+        // [local] The limit of the unpadded table; SHARPEMU_INDIRECT_IMAGE_PAD would pad 31 candidates to 32.
+        IndirectImageDimensionCollection.WithPadMode(0, () => MaterialImageCapacityPreservesTheLimitAndPublishedStateCore(distinctCount));
+
+    private static void MaterialImageCapacityPreservesTheLimitAndPublishedStateCore(int distinctCount)
     {
         var plan = Extract(ResourceTrackerTests.IndirectImageProgram(false));
         uint[] userData = [0x1000, 224 << 16, (uint)distinctCount, 0, 0x10000, 16 << 16, (uint)distinctCount * 2, 0, 7];

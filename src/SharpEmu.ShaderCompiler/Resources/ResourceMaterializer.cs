@@ -27,17 +27,18 @@ public static class ResourceMaterializer
     public static int IndirectImageDimMode { get; set; } =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_DIM"), out var dimMode) ? dimMode : 1;
 
-    // [local] SHARPEMU_INDIRECT_IMAGE_PAD (=0 off by default): with a mixed table (SHARPEMU_INDIRECT_IMAGE_DIM), the
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD (=1 by default, =0 off): with a mixed table (SHARPEMU_INDIRECT_IMAGE_DIM), the
     // candidates after the root are ordered by the class their specialization takes (image type, numeric class,
     // conversion...) and every class run is padded to a fixed capacity (16 up to 16 candidates, then the next power of
     // two) with copies of its first descriptor, and the key search takes at least PaddedSearchIterations steps.
     // The key mapping only names real candidates, so a padding slot is never selected; the module then depends on which
     // classes the table holds, not on how many candidates or keys of each,
-    // and 0xD44E stops compiling a new ~3 s permutation whenever its material table gains or loses a texture.
+    // and 0xD44E stops compiling a new ~3 s permutation whenever its material table gains or loses a texture. A table
+    // with one class and fewer than PaddedMinimumCandidates candidates is left as it was (grouped only).
     // =2 also checks, per key, that the padded mapping selects the same descriptor words as the unpadded one
     // ([GPU][INDIRECT_PAD] checked/mismatches, every 256 tables). Settable for tests.
     public static int IndirectImagePadMode { get; set; } =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_PAD"), out var padMode) ? padMode : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_PAD"), out var padMode) ? padMode : 1;
 
     private static long _padTables, _padChecked, _padMismatches, _padSkipped;
 
@@ -956,6 +957,10 @@ public static class ResourceMaterializer
             table.Candidates[index] = remap[table.Candidates[index]];
     }
 
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: a single-class table is padded only from this many candidates after the root
+    // (0xD44E's float-only tables hold 4-11).
+    internal const int PaddedMinimumCandidates = 4;
+
     // [local] SHARPEMU_INDIRECT_IMAGE_PAD: binary search steps of a padded table (up to 1023 keys; 0xD44E has ~410).
     internal const uint PaddedSearchIterations = 10;
 
@@ -999,6 +1004,10 @@ public static class ResourceMaterializer
             .OrderBy(group => group.Key, StringComparer.Ordinal)
             .ToArray();
         var runs = classed.Select(group => group.ToArray()).ToArray();
+        // Only tables that mix classes or hold at least PaddedMinimumCandidates: a small single-class table (most
+        // indirect tables) keeps its own size instead of 17 bindings.
+        if (runs.Length == 1 && count - 1 < PaddedMinimumCandidates)
+            return false;
         var padded = runs.Sum(run => PaddedRunCapacity(run.Length));
         if (padded > budget)
             return false;
@@ -1134,7 +1143,7 @@ public static class ResourceMaterializer
                 IndirectMappingOffset = mappingOffset,
                 // [local] SHARPEMU_INDIRECT_IMAGE_PAD: at least PaddedSearchIterations, so the key count does not make a
                 // permutation either; once low == high a step reads the slot the final compare reads and changes nothing.
-                IndirectSearchIterations = padded
+                IndirectSearchIterations = paddedTables?.Contains(table) == true
                     ? Math.Max(PaddedSearchIterations, (uint)BitOperations.Log2((uint)table.Keys.Count) + 1)
                     : (uint)BitOperations.Log2((uint)table.Keys.Count) + 1,
             };
