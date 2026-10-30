@@ -492,7 +492,8 @@ public static partial class Gen5SpirvTranslator
                     BeginRtProfileRegion(RtProfileBlas);
                     Store(_nativeSteps, UInt(0));
                     Store(_exec, active);
-                    EmitConditional(active, () => EmitNativeBlasLoop(_nativeBlas!));
+                    EmitRqMapProbe(); // [local] SHARPEMU_RQ_MAP
+                    EmitConditional(active, () => EmitBlasWalk(_nativeBlas!)); // [local] SHARPEMU_RT_RAYQUERY
                     Store(_exec, IsNotZero(Load(_uintType, _tlasExec)));
                     EndRtProfileRegion(RtProfileBlas);
                     if (RtProfileActive)

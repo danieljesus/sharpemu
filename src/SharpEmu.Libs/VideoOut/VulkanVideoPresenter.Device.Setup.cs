@@ -1048,9 +1048,18 @@ internal static unsafe partial class VulkanVideoPresenter
             var enablePipelineStats = Environment.GetEnvironmentVariable("SHARPEMU_PIPELINE_STATS") == "1" &&
                 IsDeviceExtensionAvailable("VK_KHR_pipeline_executable_properties");
             var pipelineStatsFeatures = default(PhysicalDevicePipelineExecutablePropertiesFeaturesKHR);
+            // [local] SHARPEMU_RT_RAYQUERY=1/2: acceleration structures and ray queries for the 0x8395 BLAS seam.
+            var accelerationExtension = (byte*)SilkMarshal.StringToPtr("VK_KHR_acceleration_structure");
+            var deferredExtension = (byte*)SilkMarshal.StringToPtr("VK_KHR_deferred_host_operations");
+            var rayQueryExtension = (byte*)SilkMarshal.StringToPtr("VK_KHR_ray_query");
+            var enableRayQuery = SharpEmu.ShaderCompiler.Resources.DeviceAddressPaging.RayQueryMode != 0 &&
+                IsDeviceExtensionAvailable("VK_KHR_acceleration_structure") && IsDeviceExtensionAvailable("VK_KHR_deferred_host_operations") &&
+                IsDeviceExtensionAvailable("VK_KHR_ray_query");
+            var accelerationFeatures = default(PhysicalDeviceAccelerationStructureFeaturesKHR);
+            var rayQueryFeatures = default(PhysicalDeviceRayQueryFeaturesKHR);
             try
             {
-                var extensions = stackalloc byte*[16];
+                var extensions = stackalloc byte*[24];
                 var extensionCount = 0u;
                 extensions[extensionCount++] = swapchainExtension;
                 extensions[extensionCount++] = pushDescriptorExtension;
@@ -1110,6 +1119,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (enablePipelineStats)
                 {
                     extensions[extensionCount++] = pipelineStatsExtension;
+                }
+
+                if (enableRayQuery) // [local] SHARPEMU_RT_RAYQUERY
+                {
+                    extensions[extensionCount++] = accelerationExtension;
+                    extensions[extensionCount++] = deferredExtension;
+                    extensions[extensionCount++] = rayQueryExtension;
                 }
 
                 if (IsDeviceExtensionAvailable(PortabilitySubsetExtensionName))
@@ -1230,6 +1246,24 @@ internal static unsafe partial class VulkanVideoPresenter
                     renderingChain = &colorWriteEnableFeatures;
                 }
 
+                if (enableRayQuery) // [local] SHARPEMU_RT_RAYQUERY
+                {
+                    accelerationFeatures = new PhysicalDeviceAccelerationStructureFeaturesKHR
+                    {
+                        SType = StructureType.PhysicalDeviceAccelerationStructureFeaturesKhr,
+                        AccelerationStructure = true,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &accelerationFeatures;
+                    rayQueryFeatures = new PhysicalDeviceRayQueryFeaturesKHR
+                    {
+                        SType = StructureType.PhysicalDeviceRayQueryFeaturesKhr,
+                        RayQuery = true,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &rayQueryFeatures;
+                }
+
                 if (enableShaderClock)
                 {
                     shaderClockFeatures = new PhysicalDeviceShaderClockFeaturesKHR
@@ -1279,6 +1313,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 Check(_vk.CreateDevice(_physicalDevice, &createInfo, null, out _device), "vkCreateDevice");
                 SharpEmu.ShaderCompiler.Vulkan.Gen5SpirvTranslator.ShaderClockEnabled = enableShaderClock; // [local]
                 PipelineStatsProbe.Enabled = enablePipelineStats; // [local]
+                if (enableRayQuery) RayQueryDevice.Initialize(_vk, _instance, _physicalDevice, _device); // [local] SHARPEMU_RT_RAYQUERY
+                SharpEmu.ShaderCompiler.Vulkan.Gen5SpirvTranslator.RayQueryEnabled = RayQueryDevice.Enabled; // [local]
+                if (SharpEmu.ShaderCompiler.Resources.DeviceAddressPaging.RayQueryMode != 0)
+                    Console.Error.WriteLine($"[LOADER][INFO] ray queries for 0x8395: {(RayQueryDevice.Enabled ? "enabled" : "unavailable")}");
                 PipelineStatsProbe.Initialize(_vk, _instance, _device);
                 if (Environment.GetEnvironmentVariable("SHARPEMU_8395_PROFILE") == "1")
                     Console.Error.WriteLine($"[LOADER][INFO] VK_KHR_shader_clock for the 0x8395 profile: {(enableShaderClock ? "enabled" : "unavailable, counters only")}");
@@ -1286,6 +1324,9 @@ internal static unsafe partial class VulkanVideoPresenter
             finally
             {
                 SilkMarshal.Free((nint)shaderClockExtension);
+                SilkMarshal.Free((nint)accelerationExtension);
+                SilkMarshal.Free((nint)deferredExtension);
+                SilkMarshal.Free((nint)rayQueryExtension);
                 SilkMarshal.Free((nint)pipelineStatsExtension);
                 SilkMarshal.Free((nint)swapchainExtension);
                 SilkMarshal.Free((nint)maintenance8Extension);

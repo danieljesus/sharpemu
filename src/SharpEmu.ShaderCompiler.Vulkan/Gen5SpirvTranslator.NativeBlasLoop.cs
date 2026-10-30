@@ -560,6 +560,7 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(SpirvOp.IEqual, _boolType, Load(_uintType, _programCounter), UInt((uint)plan.Header)));
             EmitConditional(enters, () =>
             {
+                EmitRqMapProbe(); // [local] SHARPEMU_RQ_MAP
                 if (verify)
                 {
                     SaveNativeBlasState(plan);
@@ -568,7 +569,7 @@ public static partial class Gen5SpirvTranslator
                 Store(_nativeCapped, UInt(0));
                 Store(_nativeSteps, UInt(0));
                 BeginRtProfileRegion(RtProfileBlas);
-                EmitConditional(Load(_boolType, _exec), () => EmitNativeBlasLoop(plan));
+                EmitConditional(Load(_boolType, _exec), () => EmitBlasWalk(plan)); // [local] SHARPEMU_RT_RAYQUERY
                 EndRtProfileRegion(RtProfileBlas);
                 if (RtProfileActive)
                 {
@@ -652,6 +653,7 @@ public static partial class Gen5SpirvTranslator
                 EmitNativeGuest(plan, 0x110C);
                 var second = EmitNativeCompare(plan, 0x1114);
                 var room = _module.AddInstruction(SpirvOp.ULessThan, _boolType, Load(_uintType, _nativeStackPointer), UInt(NativeBlasPushRoom));
+                NoteRqNativeDrop(LogicalAnd(second, LogicalNot(room))); // [local] SHARPEMU_RT_RAYQUERY=2
                 EmitConditional(LogicalAnd(second, room), () =>
                 {
                     var third = EmitNativeCompare(plan, 0x1128);
@@ -706,6 +708,8 @@ public static partial class Gen5SpirvTranslator
                         {
                             EmitNativeGuest(plan, pc);
                         }
+
+                        NoteRqNativeCommit(); // [local] SHARPEMU_RT_RAYQUERY=2
                     });
                 });
                 EmitNativeGuest(plan, 0x1540);

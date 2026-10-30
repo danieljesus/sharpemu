@@ -184,6 +184,18 @@ public enum SpirvOp : ushort
     GroupNonUniformIAdd = 349, // [local] SHARPEMU_8395_PROFILE
     GroupNonUniformUMax = 357, // [local]
     ReadClockKhr = 5056,
+    // [local] SHARPEMU_RT_RAYQUERY (SPV_KHR_ray_query)
+    ConvertUToAccelerationStructureKhr = 4447,
+    TypeRayQueryKhr = 4472,
+    RayQueryInitializeKhr = 4473,
+    RayQueryTerminateKhr = 4474,
+    RayQueryConfirmIntersectionKhr = 4476,
+    RayQueryProceedKhr = 4477,
+    RayQueryGetIntersectionTypeKhr = 4479,
+    TypeAccelerationStructureKhr = 5341,
+    RayQueryGetIntersectionTKhr = 6018,
+    RayQueryGetIntersectionPrimitiveIndexKhr = 6023,
+    RayQueryGetIntersectionBarycentricsKhr = 6024,
 }
 
 public enum SpirvCapability : uint
@@ -222,6 +234,7 @@ public enum SpirvCapability : uint
     ShaderViewportIndexLayerExt = 5254,
     RuntimeDescriptorArray = 5302,
     PhysicalStorageBufferAddresses = 5347,
+    RayQueryKhr = 4472, // [local] SHARPEMU_RT_RAYQUERY
 }
 
 public enum SpirvStorageClass : uint
@@ -429,6 +442,36 @@ public sealed class SpirvModuleBuilder
     // PhysicalStorageBuffer64 addressing with the GLSL450 memory model, for device-address loads.
     public void SetPhysicalStorageBuffer64MemoryModel() =>
         Emit(_memoryModel, SpirvOp.MemoryModel, 5348, 1);
+
+    // [local] SHARPEMU_RT_RAYQUERY
+    private uint? _rayQueryType;
+    private uint? _accelerationStructureType;
+
+    public uint TypeRayQuery()
+    {
+        if (_rayQueryType is { } existing)
+        {
+            return existing;
+        }
+
+        var id = AllocateId();
+        Emit(_typesConstantsGlobals, SpirvOp.TypeRayQueryKhr, id);
+        _rayQueryType = id;
+        return id;
+    }
+
+    public uint TypeAccelerationStructure()
+    {
+        if (_accelerationStructureType is { } existing)
+        {
+            return existing;
+        }
+
+        var id = AllocateId();
+        Emit(_typesConstantsGlobals, SpirvOp.TypeAccelerationStructureKhr, id);
+        _accelerationStructureType = id;
+        return id;
+    }
 
     public uint TypeSampler()
     {

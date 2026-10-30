@@ -129,6 +129,8 @@ public sealed partial class RenderExecutor
         var input = computeProgram.Input;
         var program = input.Stage.Program ?? throw _host.Fatal($"The compute program is missing: shader=0x{compute.Address:X16}.");
         Gpu.Buffers.TlasHle.Instance?.NoteProgram(compute.Address, program.Hash); // [local] SHARPEMU_TLAS_HLE
+        if (Gpu.Buffers.RayQueryHle.Instance?.NoteDispatch(program.Hash) == true) // [local] SHARPEMU_RT_RAYQUERY / SHARPEMU_RQ_MAP
+            _host.ResetBindings();
         if (Diagnostics.DccWriterTrace.Enabled)
         {
             Diagnostics.DccWriterTrace.CurrentProgram = program.Hash;

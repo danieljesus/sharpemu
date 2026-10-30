@@ -306,6 +306,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _tracker = new GuestPageTracker(pages);
         RangeDumpProbe.Cache = this; // [local]
         if (TlasHle.Enabled) TlasHle.Instance = new TlasHle(device, scheduler, this); // [local] SHARPEMU_TLAS_HLE
+        if (RayQueryHle.Enabled) RayQueryHle.Instance = new RayQueryHle(device, scheduler, this); // [local] SHARPEMU_RT_RAYQUERY / SHARPEMU_RQ_MAP
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
         _uploader = new GuestBufferUploader(device, scheduler, guest, _staging);
         if (ReadbackMirror.Mode != 0) // [local]
@@ -3917,7 +3918,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         var bufferIdentifier = _registry.AllocateBuffer(new GpuBuffer(
             _device, _scheduler, GpuBufferUsage.DeviceLocal, overlap.Begin,
-            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, overlap.End - overlap.Begin, allowSlab: true)
+            GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit | RayQueryDevice.GuestBufferUsage, overlap.End - overlap.Begin, allowSlab: true) // [local] SHARPEMU_RT_RAYQUERY: vertex input of AS builds
             { GpuWriteObserver = _mirror is { } mirror ? mirror.Invalidate : null }, overlap.Begin, overlap.End - overlap.Begin);
         foreach (var oldId in overlapping)
         {

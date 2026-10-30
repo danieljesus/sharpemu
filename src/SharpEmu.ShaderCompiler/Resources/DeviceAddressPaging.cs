@@ -44,6 +44,34 @@ public static class DeviceAddressPaging
     public static ulong FaultSummaryOffset => FaultBitmapBytes + RtStackAreaBytes + ZeroPageAreaBytes;
     public static ulong FaultSummaryAreaBytes => FaultSummaryEnabled ? FaultSummaryBytes : 0;
 
+    // [local] SHARPEMU_RT_RAYQUERY (=1 ray query, =2 verify) and SHARPEMU_RQ_MAP=1 (probe): an area after the fault summary.
+    //   table: RqTableSlots slots of 4 dwords the host writes (key = BLAS base >> 8, TLAS address low, high, first pair index);
+    //   map: RqMapSlots slots of 4 dwords the 0x8395 BLAS seam fills (key, lanes, subgroups, root node);
+    //   counters: RqCounterWords dwords (probe and verify statistics).
+    public static readonly int RayQueryMode = Environment.GetEnvironmentVariable("SHARPEMU_RT_RAYQUERY") switch
+    {
+        "1" or "on" => 1,
+        "2" or "verify" => 2,
+        _ => 0,
+    };
+    public static readonly bool RqMapProbe = Environment.GetEnvironmentVariable("SHARPEMU_RQ_MAP") == "1";
+    public static bool RqAreaEnabled => RayQueryMode != 0 || RqMapProbe;
+    public const uint RqTableSlots = 4096;
+    public const uint RqMapSlots = 4096;
+    public const uint RqCounterWords = 256;
+    public const uint RqSlotWords = 4;
+    public const uint RqProbeLimit = 32;
+    public static ulong RqAreaOffset => FaultBitmapBytes + RtStackAreaBytes + ZeroPageAreaBytes + FaultSummaryAreaBytes;
+    public static ulong RqTableBytes => (ulong)RqTableSlots * RqSlotWords * 4;
+    public static ulong RqMapOffset => RqAreaOffset + RqTableBytes;
+    public static ulong RqMapBytes => (ulong)RqMapSlots * RqSlotWords * 4;
+    public static ulong RqCounterOffset => RqMapOffset + RqMapBytes;
+    public static ulong RqStatsBytes => RqMapBytes + (ulong)RqCounterWords * 4;
+    public static ulong RqAreaBytes => RqAreaEnabled ? RqTableBytes + RqStatsBytes : 0;
+
+    // The first slot a key probes in the table or the map; the next ones follow, RqProbeLimit at most.
+    public static uint RqHashSlot(uint key) => ((key * 2654435761u) >> 20) & (RqTableSlots - 1);
+
     // [local] SHARPEMU_RT_STACK_SPLIT=<rows> (8 by default, 0 = off): the workgroup rows of the 0x8395
     // BLAS stack. An area after the fault bitmap holds the deeper entries: a bitmap of warp slots (each
     // 32-lane subgroup claims one for the dispatch and frees it at the end), then per slot

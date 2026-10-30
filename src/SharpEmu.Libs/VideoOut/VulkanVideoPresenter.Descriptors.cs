@@ -614,6 +614,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 _ = _bufferCache.FindBuffer(range.Base, ClampMappedSize(range.Base, range.Size));
+                if (range.Written) Gpu.Buffers.RayQueryHle.Instance?.NoteWrite(prepared.Program.Hash, range.Base, range.Size); // [local] SHARPEMU_RQ_MAP
                 if (BvhProbes && _bvhWriterCount < 400 && InBvhBlob(range.Base))
                 {
                     _bvhWriterCount++;
@@ -659,6 +660,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 requested = ConservativeRequested(program.Hash, descriptor, requested); // [local] SHARPEMU_CONSERVATIVE_RECORDS
                 var size = ClampMappedSize(descriptor.Address, requested, prepared, index);
                 sources[index] = (descriptor, _bufferCache.FindBuffer(descriptor.Address, size), size);
+                if (Gpu.Buffers.RayQueryHle.Instance is { } rayQuery && prepared.Resources.Info.Buffers[index].Written) // [local] SHARPEMU_RQ_MAP
+                    rayQuery.NoteWrite(program.Hash, descriptor.Address, size);
                 ProbeBvhRefitBuffer(program.Hash, index, descriptor, requested, size, prepared);
             }
 

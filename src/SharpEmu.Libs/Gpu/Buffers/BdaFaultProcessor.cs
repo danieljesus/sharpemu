@@ -106,6 +106,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private readonly QueryPool _timestamps;
     private readonly double _timestampPeriod;
     private bool _summaryInitialized;
+    private bool _rqAreaInitialized; // [local]
 
     public BdaFaultProcessor(GpuDeviceInfo device, SubmissionScheduler scheduler, GuestBufferCache cache, int pageBits, ulong pageCount)
     {
@@ -121,8 +122,8 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             throw new InvalidOperationException("The fault bitmap size does not match DeviceAddressPaging.FaultBitmapBytes.");
         // [local] RT stack area, SHARPEMU_DA_ZERO_PAGE area and SHARPEMU_BDA_SCAN_MAPPED summary before the tail
         _traceTailOffset = _faultBufferSize + DeviceAddressPaging.RtStackAreaBytes + DeviceAddressPaging.ZeroPageAreaBytes +
-            DeviceAddressPaging.FaultSummaryAreaBytes;
-        if (ScanMappedMode != 0 && _traceTailOffset - DeviceAddressPaging.FaultSummaryBytes != DeviceAddressPaging.FaultSummaryOffset)
+            DeviceAddressPaging.FaultSummaryAreaBytes + DeviceAddressPaging.RqAreaBytes; // [local] SHARPEMU_RT_RAYQUERY / SHARPEMU_RQ_MAP
+        if (ScanMappedMode != 0 && _traceTailOffset - DeviceAddressPaging.RqAreaBytes - DeviceAddressPaging.FaultSummaryBytes != DeviceAddressPaging.FaultSummaryOffset)
             throw new InvalidOperationException("The fault summary offset does not match DeviceAddressPaging.FaultSummaryOffset.");
         _faultBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags,
             _traceTailOffset + (GuestGpuMemoryHook.TraceEnabled ? TraceTailBytes : 0UL));
@@ -339,6 +340,11 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             {
                 _faultBuffer.Fill(DeviceAddressPaging.FaultSummaryOffset, DeviceAddressPaging.FaultSummaryBytes, 0);
                 _summaryInitialized = true;
+            }
+            if (DeviceAddressPaging.RqAreaEnabled && !_rqAreaInitialized) // [local] empty ray query table, map and counters
+            {
+                _faultBuffer.Fill(DeviceAddressPaging.RqAreaOffset, DeviceAddressPaging.RqAreaBytes, 0);
+                _rqAreaInitialized = true;
             }
             if (DeviceAddressPaging.RtStackAreaEnabled && !_rtStackAreaInitialized) // [local] every warp slot free
             {
