@@ -51,6 +51,15 @@ internal static unsafe class VkRecord
 
     private static bool Fits(int payload) => payload <= CommandRing.MaxPayload;
 
+    // [local] SHARPEMU_RT_RAYQUERY: the ring does not carry acceleration structure builds (arrays of pointers); it
+    // drains first, so the replay thread has issued every earlier record before this one goes to the driver.
+    public static void CmdBuildAccelerationStructures(KhrAccelerationStructure api, CommandBuffer command, uint count,
+        AccelerationStructureBuildGeometryInfoKHR* infos, AccelerationStructureBuildRangeInfoKHR** ranges)
+    {
+        Ring(command)?.Drain(RingDrainReason.Fallback);
+        api.CmdBuildAccelerationStructures(command, count, infos, ranges);
+    }
+
     public static void CmdPipelineBarrier2(Vk vk, CommandBuffer command, DependencyInfo* info)
     {
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Barrier); // [local] SHARPEMU_PROFILE_GPU_PASSES

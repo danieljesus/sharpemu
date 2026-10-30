@@ -227,14 +227,6 @@ internal sealed unsafe partial class RayQueryHle
         VulkanSynchronization.PipelineBarrier(_device.Vk, command, source, destination, 0, 1, &barrier, 0, null, 0, null);
     }
 
-    // vkCmd* calls that VkRecord does not carry go straight to the driver: the record ring's replay thread must have
-    // issued every earlier record first, or both threads record into the same command buffer.
-    private static void DrainRing(CommandBuffer command)
-    {
-        if (CommandRing.Active is { } ring && ring.ProducerBuffer == command.Handle)
-            ring.Drain(RingDrainReason.Fallback);
-    }
-
     private CommandBuffer DirectCommand() => new(_scheduler.Current.Handle);
 
     private void BuildAll(List<Blob> blobs)
@@ -348,8 +340,7 @@ internal sealed unsafe partial class RayQueryHle
                 rangePointers[index] = rangePointer + index;
             }
 
-            DrainRing(command); // the barrier above is a ring record: issue it before the direct call
-            Api.CmdBuildAccelerationStructures(command, (uint)built.Count, infoPointer, rangePointers);
+            VkRecord.CmdBuildAccelerationStructures(Api, command, (uint)built.Count, infoPointer, rangePointers);
         }
 
         Barrier(command, PipelineStageFlags.AccelerationStructureBuildBitKhr, AccessFlags2.AccelerationStructureWriteBitKhr,
@@ -448,10 +439,7 @@ internal sealed unsafe partial class RayQueryHle
             }
 
             if (count != 0)
-            {
-                DrainRing(command);
-                Api.CmdBuildAccelerationStructures(command, (uint)count, infoPointer, rangePointers);
-            }
+                VkRecord.CmdBuildAccelerationStructures(Api, command, (uint)count, infoPointer, rangePointers);
         }
 
         Barrier(command, PipelineStageFlags.AccelerationStructureBuildBitKhr, AccessFlags2.AccelerationStructureWriteBitKhr,
