@@ -54,6 +54,7 @@ internal sealed unsafe partial class RayQueryHle
     private long _queryLanes, _fallbackLanes, _counterDispatches;
     private readonly long[] _verify = new long[32];
     private int _sampleLogs;
+    private int _failDumps;
 
     private static KhrAccelerationStructure Api => RayQueryDevice.Api!;
 
@@ -101,10 +102,24 @@ internal sealed unsafe partial class RayQueryHle
                         return; // written meanwhile
                     if (geometry is null)
                     {
+                        if (DumpDirectory is { Length: > 0 } && _failDumps++ < DumpCount)
+                        {
+                            try
+                            {
+                                Directory.CreateDirectory(DumpDirectory);
+                                File.WriteAllBytes(Path.Combine(DumpDirectory, $"rqfail_{blob.Base:X}_{reason}.bin"), bytes.ToArray());
+                            }
+                            catch (Exception error)
+                            {
+                                Console.Error.WriteLine($"[GPU][RQ] dump failed: {error.Message}");
+                            }
+                        }
+
                         blob.State = AsState.Failed;
                         blob.FailReason = reason;
                         _failed++;
                         _failReasons[reason] = _failReasons.GetValueOrDefault(reason) + 1;
+                        Console.Error.WriteLine($"[GPU][RQ_FAIL] base=0x{blob.Base:X} size=0x{blob.Size:X} reason={reason} fallback_lanes={blob.Lanes} frames={blob.FirstFrame}-{blob.LastFrame}");
                         return;
                     }
 
@@ -516,7 +531,7 @@ internal sealed unsafe partial class RayQueryHle
         if (DeviceAddressPaging.RayQueryMode == 2)
         {
             var v = _verify;
-            Console.Error.WriteLine($"[GPU][RQ_VERIFY] frame={frame} compared={v[0]} both_miss={v[1]} both_hit={v[2]} query_only={v[3]} native_only={v[4]} same_prim={v[5]} other_prim={v[6]} other_prim_equal_t={v[7]} differ_with_drop={v[8]} native_capped={v[9]} dt_same=[0:{v[10]} <1e-7:{v[11]} <1e-6:{v[12]} <1e-5:{v[13]} <1e-4:{v[14]} more:{v[15]}] dij_same=[0:{v[16]} <1e-6:{v[17]} <1e-5:{v[18]} <1e-4:{v[19]} <1e-3:{v[20]} more:{v[21]}] dt_other=[<1e-6:{v[22]} <1e-4:{v[23]} more:{v[24]}] query_only_alpha={v[25]} native_only_alpha={v[26]} other_prim_alpha={v[27]} dropped_lanes={v[28]}");
+            Console.Error.WriteLine($"[GPU][RQ_VERIFY] frame={frame} compared={v[0]} both_miss={v[1]} both_hit={v[2]} query_only={v[3]} native_only={v[4]} same_prim={v[5]} other_prim={v[6]} other_prim_equal_t={v[7]} differ_with_drop={v[8]} native_capped={v[9]} dt_same=[0:{v[10]} <1e-7:{v[11]} <1e-6:{v[12]} <1e-5:{v[13]} <1e-4:{v[14]} more:{v[15]}] dij_same=[0:{v[16]} <1e-6:{v[17]} <1e-5:{v[18]} <1e-4:{v[19]} <1e-3:{v[20]} more:{v[21]}] dt_other=[<1e-6:{v[22]} <1e-4:{v[23]} more:{v[24]}] query_only_alpha={v[25]} native_only_alpha={v[26]} other_prim_alpha={v[27]} dropped_lanes={v[28]} native_nan_t={v[29]} query_nan_t={v[30]}");
             Array.Clear(_verify);
         }
 

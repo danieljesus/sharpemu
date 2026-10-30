@@ -399,7 +399,7 @@ public static partial class Gen5SpirvTranslator
         // children, 9 native lanes capped, 10-15 |dt|/t of the same primitive (0, <1e-7, <1e-6, <1e-5, <1e-4, more),
         // 16-21 max |di|,|dj| of the same primitive (0, <1e-6, <1e-5, <1e-4, <1e-3, more), 22-24 |dt|/t of another
         // primitive (<1e-6, <1e-4, more), 25 query-only hits on a non-opaque pair, 26 native-only on a non-opaque pair,
-        // 27 other primitive with either non-opaque, 28 lanes with a dropped child (all). Sample from RqCounterSample.
+        // 27 other primitive with either non-opaque, 28 lanes with a dropped child (all), 29/30 native/query t is NaN. Sample from RqCounterSample.
         private void EmitRqVerifyCompare(uint queryHit)
         {
             var nativeHit = Load(_uintType, _rqCommitted);
@@ -426,6 +426,8 @@ public static partial class Gen5SpirvTranslator
             });
             var tQuery = Bitcast(_floatType, Result(0));
             var tNative = RqFloat(23);
+            EmitConditional(_module.AddInstruction(SpirvOp.IsNan, _boolType, tNative), () => Count(29));
+            EmitConditional(_module.AddInstruction(SpirvOp.IsNan, _boolType, tQuery), () => Count(30));
             var relative = FDiv(Ext(4, _floatType, FSub(tQuery, tNative)), Ext(40, _floatType, Ext(4, _floatType, tNative), Float(1e-30f)));
             var samePrimitive = LogicalAnd(
                 _module.AddInstruction(SpirvOp.IEqual, _boolType, Result(1), LoadV(29)),

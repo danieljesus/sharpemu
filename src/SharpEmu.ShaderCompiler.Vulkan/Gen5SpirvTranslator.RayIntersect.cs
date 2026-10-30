@@ -36,6 +36,11 @@ public static partial class Gen5SpirvTranslator
         private static readonly bool LocalRayMiss = Environment.GetEnvironmentVariable("LOCAL_RAY_MISS") == "1";
         private static readonly bool TriangleRangeCheck = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRIANGLE_RANGE") != "0";
 
+        // [local] SHARPEMU_BVH_TRIANGLE23=1: triangle node types 2 (V2, V3, V4) and 3 (V2, V4, V0) are tested too (GFX10
+        // triangle nodes hold five vertices; GTA V's BLASes use all four triangle types). Off, they return four invalid
+        // dwords, which GTA V's 0x8395 loop takes as a candidate at t = NaN (counted by SHARPEMU_RT_RAYQUERY=2).
+        private static readonly bool Triangle23 = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRIANGLE23") == "1";
+
         private void EmitRayIntersect(Gen5RayIntersectControl ray, bool bvh64)
         {
             _rayResult ??= DeclareRayResult();
@@ -117,7 +122,7 @@ public static partial class Gen5SpirvTranslator
             // [local] experiment: GTA V derives the T# size from its node count, which leaves every triangle-pair
             // node beyond it; let triangle nodes through on page validity alone (SHARPEMU_BVH_TRIANGLE_RANGE=0).
             var triangleValid = TriangleRangeCheck ? valid : present;
-            var isTriangle = LogicalAnd(triangleValid, _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, nodeType, UInt(NodeTypeTriangle1)));
+            var isTriangle = LogicalAnd(triangleValid, _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, nodeType, UInt(Triangle23 ? 3u : NodeTypeTriangle1)));
             var isBox16 = LogicalAnd(valid, _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeBoxFloat16)));
             var isBox32 = LogicalAnd(LogicalAnd(present, wideInRange),
                 _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeBoxFloat32)));
@@ -411,6 +416,8 @@ public static partial class Gen5SpirvTranslator
             IReadOnlyList<uint> origin, IReadOnlyList<uint> direction)
         {
             var second = _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeTriangle1));
+            var third = _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(2));
+            var fourth = _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(3));
             var v1 = new uint[3];
             var v2 = new uint[3];
             var v3 = new uint[3];
@@ -423,6 +430,15 @@ public static partial class Gen5SpirvTranslator
                 v1[axis] = SelectF(second, vertex1, first);
                 v2[axis] = SelectF(second, vertex3, vertex1);
                 v3[axis] = vertex2;
+                if (Triangle23)
+                {
+                    // 2: (V2, V3, V4), 3: (V2, V4, V0).
+                    var vertex4 = LoadNodeFloat(node, 12 + axis);
+                    var later = LogicalOr(third, fourth);
+                    v1[axis] = SelectF(later, vertex2, v1[axis]);
+                    v2[axis] = SelectF(third, vertex3, SelectF(fourth, vertex4, v2[axis]));
+                    v3[axis] = SelectF(third, vertex4, SelectF(fourth, first, v3[axis]));
+                }
             }
 
             var e1 = Subtract(v2, v1);

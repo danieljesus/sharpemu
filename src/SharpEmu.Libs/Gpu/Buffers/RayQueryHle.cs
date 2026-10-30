@@ -200,7 +200,7 @@ internal sealed partial class RayQueryHle
         {
             var writers = string.Join(",", blob.Writers.OrderByDescending(pair => pair.Value.Frames).Take(8)
                 .Select(pair => $"{pair.Key >> 48:X4}:{pair.Value.Writes}/{pair.Value.Frames}f"));
-            Console.Error.WriteLine($"[GPU][RQ_BLOB] frame={frame} base=0x{blob.Base:X} size=0x{blob.Size:X} root=0x{blob.Root:X} frames={blob.FirstFrame}-{blob.LastFrame} dispatches={blob.Dispatches} lanes={blob.Lanes} subgroups={blob.Subgroups} checks={blob.Checks} changed_next_frame={blob.ChangedNextFrame} changed_since_last={blob.ChangedSinceLast} writers=[{writers}]");
+            Console.Error.WriteLine($"[GPU][RQ_BLOB] frame={frame} base=0x{blob.Base:X} size=0x{blob.Size:X} root=0x{blob.Root:X} frames={blob.FirstFrame}-{blob.LastFrame} dispatches={blob.Dispatches} lanes={blob.Lanes} subgroups={blob.Subgroups} state={blob.State}{(blob.FailReason is { } reason ? $"/{reason}" : "")} write_frames={blob.WriteFrames} checks={blob.Checks} changed_next_frame={blob.ChangedNextFrame} changed_since_last={blob.ChangedSinceLast} writers=[{writers}]");
         }
     }
 
