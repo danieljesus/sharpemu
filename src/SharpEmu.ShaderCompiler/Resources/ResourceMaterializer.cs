@@ -29,8 +29,8 @@ public static class ResourceMaterializer
 
     // [local] SHARPEMU_INDIRECT_IMAGE_PAD (=0 off by default): with a mixed table (SHARPEMU_INDIRECT_IMAGE_DIM), the
     // candidates after the root are ordered by the class their specialization takes (image type, numeric class,
-    // conversion...) and every class run is padded to a fixed capacity (4 up to 4 candidates, 16 up to 16, then the
-    // next power of two) with copies of its first descriptor, and the key search takes at least PaddedSearchIterations steps.
+    // conversion...) and every class run is padded to a fixed capacity (16 up to 16 candidates, then the next power of
+    // two) with copies of its first descriptor, and the key search takes at least PaddedSearchIterations steps.
     // The key mapping only names real candidates, so a padding slot is never selected; the module then depends on which
     // classes the table holds, not on how many candidates or keys of each,
     // and 0xD44E stops compiling a new ~3 s permutation whenever its material table gains or loses a texture.
@@ -959,9 +959,11 @@ public static class ResourceMaterializer
     // [local] SHARPEMU_INDIRECT_IMAGE_PAD: binary search steps of a padded table (up to 1023 keys; 0xD44E has ~410).
     internal const uint PaddedSearchIterations = 10;
 
-    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: the run capacity of a class with count real candidates.
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: the run capacity of a class with count real candidates. One bucket up to 16:
+    // 0xD44E's float 2D run moves between 4 and 14 and a 4/16 split was still a permutation (czVv); three classes of
+    // 16 and the root fit in MaxImages beside its 10 plan images.
     internal static int PaddedRunCapacity(int count) =>
-        count <= 4 ? 4 : count <= 16 ? 16 : (int)BitOperations.RoundUpToPowerOf2((uint)count);
+        count <= 16 ? 16 : (int)BitOperations.RoundUpToPowerOf2((uint)count);
 
     // [local] SHARPEMU_INDIRECT_IMAGE_PAD: the fields of the image specialization BuildSpecialization derives from one
     // candidate's descriptor (numeric class, dimension, cube, conversion, swizzle, mips, emulated compare), so two
