@@ -629,6 +629,7 @@ public static partial class Gen5SpirvTranslator
             _module.AddStatement(SpirvOp.BranchConditional, again, header, merge);
             _module.AddLabel(merge);
             Store(_nativeCapped, Load(_uintType, _nativeAlive));
+            FlushTriProbe(); // [local] SHARPEMU_BVH_TRI_PROBE
         }
 
         private void EmitNativeBlasIteration(NativeBlasPlan plan)
@@ -694,6 +695,8 @@ public static partial class Gen5SpirvTranslator
                         {
                             if (pc is >= NativeBlasAlphaFirst and <= NativeBlasAlphaLast && !NativeBlasAlphaSkipped.Contains(pc))
                             {
+                                if (pc == 0x133C)
+                                    EmitTriangleRecord(plan); // [local] SHARPEMU_BVH_TRI_PROBE
                                 EmitNativeGuest(plan, pc);
                             }
                         }

@@ -498,6 +498,7 @@ internal sealed unsafe partial class RayQueryHle
     // The counters of one dispatch (under _lock): query and fallback lanes, the verify record ([GPU][RQ_VERIFY]).
     private void NoteQueryCounters(ReadOnlySpan<uint> counters, long frame)
     {
+        NoteTriProbe(counters, frame);
         if (DeviceAddressPaging.RayQueryMode == 0)
             return;
         _counterDispatches++;

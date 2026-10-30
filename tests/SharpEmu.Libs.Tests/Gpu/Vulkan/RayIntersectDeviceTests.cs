@@ -188,6 +188,134 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
         }
     }
 
+    // [local] SHARPEMU_BVH_TRI_DEGENERATE: =1 turns exactly the triangle hits at t_denom == 0 into misses; =2 also
+    // those with a NaN in i, j or t. Every other output dword matches the reference.
+    [Theory]
+    [InlineData(false, "1")]
+    [InlineData(true, "1")]
+    [InlineData(false, "2")]
+    [InlineData(true, "2")]
+    public void DegenerateTriangleRejection_ChangesOnlyDegenerateHits(bool bvh64, string mode)
+    {
+        var vulkan = fixture.Vulkan;
+        if (!GatePrerequisites.Ready(vulkan, shaderInt64: true))
+        {
+            return;
+        }
+
+        var program = IntersectProgram(bvh64);
+        var compiled = new List<(ShaderCompileRequest Request, byte[] Spirv)>();
+        foreach (var value in new[] { "0", mode })
+        {
+            var (plan, resources, layout) = Prepare(program);
+            var request = new ShaderCompileRequest(plan, resources, layout)
+            {
+                LocalSizeX = Lanes,
+                ThreadCountX = Lanes,
+                ShaderSignedZeroInfNanPreserveFloat32Supported = true,
+            };
+            var previous = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRI_DEGENERATE");
+            try
+            {
+                Environment.SetEnvironmentVariable("SHARPEMU_BVH_TRI_DEGENERATE", value);
+                compiled.Add((request, Compile(request, "0", "0", "0")));
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("SHARPEMU_BVH_TRI_DEGENERATE", previous);
+            }
+        }
+
+        using var harness = new ImageTestHarness(vulkan);
+        var owner = new LayoutComputeRunner(harness, compiled[0].Request, compiled[0].Spirv);
+        LayoutComputeRunner[] runners = [];
+        int rejectedZero = 0, rejectedNan = 0, keptHits = 0;
+        try
+        {
+            var pages = new[] { owner.CreateBuffer(PageSize), owner.CreateBuffer(PageSize) };
+            var io = owner.CreateBuffer(InputBytes + OutputBytes);
+            var fault = owner.CreateBuffer(TableEntries / 8);
+            var table = owner.CreatePageTable(TableEntries, [(GuestBase, pages[0], 0ul), (GuestBase + PageSize, pages[1], 0ul)]);
+            var random = new System.Random(bvh64 ? 0xDE6E64 : 0xDE6E32);
+            for (var round = 0; round < Rounds; round++)
+            {
+                if (round % RoundsPerRunner == 0)
+                {
+                    foreach (var stale in runners)
+                        stale.Dispose();
+                    runners = compiled.Select(entry => new LayoutComputeRunner(harness, entry.Request, entry.Spirv)).ToArray();
+                }
+
+                var scene = Scene.Create(random, bvh64);
+                pages[0].Write(0, scene.Pages[0]);
+                pages[1].Write(0, scene.Pages[1]);
+                var results = new byte[2][];
+                for (var variant = 0; variant < 2; variant++)
+                {
+                    io.Write(0, scene.Input);
+                    io.Write(InputBytes, new byte[OutputBytes]);
+                    var registers = new uint[64];
+                    registers[0] = (uint)GuestBase;
+                    registers[1] = (uint)(GuestBase >> 32);
+                    registers[6] = InputBytes + OutputBytes;
+                    scene.TSharp.CopyTo(registers, (int)ScalarResource);
+                    var bound = new Dictionary<DescriptorBindingKind, GpuBuffer[]>
+                    {
+                        [DescriptorBindingKind.Buffers] = [io],
+                        [DescriptorBindingKind.DeviceAddressPageTable] = [table],
+                        [DescriptorBindingKind.FaultBuffer] = [fault],
+                    };
+                    var runner = runners[variant];
+                    harness.Run(() => runner.Dispatch(registers, bound, 1, flattenedTable: new uint[64]));
+                    results[variant] = runner.ReadBack(io, InputBytes, OutputBytes);
+                }
+
+                var barycentrics = (scene.TSharp[3] & (1u << 24)) != 0;
+                for (var lane = 0; lane < Lanes; lane++)
+                {
+                    uint Word(int variant, int component) =>
+                        BinaryPrimitives.ReadUInt32LittleEndian(results[variant].AsSpan((lane * 4 + component) * 4));
+                    var reference = Enumerable.Range(0, 4).Select(component => Word(0, component)).ToArray();
+                    var actual = Enumerable.Range(0, 4).Select(component => Word(1, component)).ToArray();
+                    var triangle = scene.Types[lane] <= 3 && !reference.All(word => word == uint.MaxValue);
+                    var referenceMiss = BitConverter.UInt32BitsToSingle(reference[0]) == float.PositiveInfinity && reference[1] == 0x3F80_0000;
+                    var denomZero = (reference[1] & 0x7FFF_FFFF) == 0;
+                    var nonFinite = reference.Take(barycentrics ? 4 : 2).Any(word => !float.IsFinite(BitConverter.UInt32BitsToSingle(word)))
+                        || float.IsNaN(BitConverter.UInt32BitsToSingle(reference[0]) / BitConverter.UInt32BitsToSingle(reference[1]));
+                    if (!reference.SequenceEqual(actual))
+                    {
+                        Assert.True(triangle && !referenceMiss, $"round {round} lane {lane} type {scene.Types[lane]}: changed a non-hit");
+                        Assert.True(BitConverter.UInt32BitsToSingle(actual[0]) == float.PositiveInfinity && actual[1] == 0x3F80_0000,
+                            $"round {round} lane {lane}: a changed hit must become a miss");
+                        Assert.True(denomZero || mode == "2" && nonFinite,
+                            $"round {round} lane {lane}: rejected a hit at t_num 0x{reference[0]:X8} / t_denom 0x{reference[1]:X8}");
+                        if (denomZero)
+                            rejectedZero++;
+                        else
+                            rejectedNan++;
+                    }
+                    else
+                    {
+                        // =2 keeps a non-finite hit only when the NaN is not in i, j or t (e.g. t = +inf over a finite i, j).
+                        Assert.False(triangle && !referenceMiss && denomZero, $"round {round} lane {lane}: kept a hit at t_denom 0");
+                        if (triangle && !referenceMiss)
+                            keptHits++;
+                    }
+                }
+            }
+
+            output.WriteLine($"bvh64={bvh64} mode={mode}: rejected at t_denom 0 {rejectedZero}, rejected with NaN {rejectedNan}, kept hits {keptHits}");
+            Assert.True(rejectedZero > 0 && keptHits > 0);
+            harness.AssertNoValidationMessages();
+        }
+        finally
+        {
+            foreach (var runner in runners)
+                runner.Dispose();
+            owner.Dispose();
+        }
+    }
+
     private static readonly string[] SwitchNames = ["SHARPEMU_BVH_UNIFIED_FETCH", "SHARPEMU_BVH_LEAN_SLABS", "SHARPEMU_BVH_PAGE_CACHE"];
 
     private static byte[] Compile(ShaderCompileRequest request, params string[] values)

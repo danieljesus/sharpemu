@@ -227,6 +227,7 @@ public static partial class Gen5SpirvTranslator
                 RestoreNativeBlasState();
                 Store(_rqCommitted, UInt(0));
                 Store(_rqDropped, UInt(0));
+                ResetTriProbeCommit();
                 EmitNativeBlasLoop(plan);
                 EmitRqVerifyCompare(queryHit);
             }, () => EmitNativeBlasLoop(plan));
@@ -380,6 +381,7 @@ public static partial class Gen5SpirvTranslator
         // Native loop hooks for verify: a commit, and a box node whose children are dropped with the stack full.
         private void NoteRqNativeCommit()
         {
+            NoteTriProbeCommit(); // [local] SHARPEMU_BVH_TRI_PROBE
             if (_rqMode == RqMode.Verify && _rqCommitted != 0)
             {
                 Store(_rqCommitted, UInt(1));
@@ -427,6 +429,7 @@ public static partial class Gen5SpirvTranslator
             var tQuery = Bitcast(_floatType, Result(0));
             var tNative = RqFloat(23);
             EmitConditional(_module.AddInstruction(SpirvOp.IsNan, _boolType, tNative), () => Count(29));
+            CountTriProbeVerify(LogicalAnd(native, _module.AddInstruction(SpirvOp.IsNan, _boolType, tNative)), LogicalAnd(native, LogicalNot(query)));
             EmitConditional(_module.AddInstruction(SpirvOp.IsNan, _boolType, tQuery), () => Count(30));
             var relative = FDiv(Ext(4, _floatType, FSub(tQuery, tNative)), Ext(40, _floatType, Ext(4, _floatType, tNative), Float(1e-30f)));
             var samePrimitive = LogicalAnd(

@@ -41,6 +41,19 @@ public static partial class Gen5SpirvTranslator
         // dwords, which GTA V's 0x8395 loop takes as a candidate at t = NaN (counted by SHARPEMU_RT_RAYQUERY=2).
         private static readonly bool Triangle23 = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRIANGLE23") != "0";
 
+        // [local] SHARPEMU_BVH_TRI_DEGENERATE (off by default): a triangle whose t_denom is 0 (zero area, or a ray in its
+        // plane) gives i = j = t = 0/0 = NaN, which none of the ordered compares rejects, so the test returned a hit at
+        // t_num = 0 over t_denom = 0 and GTA V's 0x8395 loop committed t = NaN (0.8 % of its hits; every later candidate then
+        // passes !(t > NaN)). The watertight test (Woop et al., JCGT 2013) misses on det == 0; =1 rejects t_denom == 0;
+        // =2 writes the range test unordered, so a NaN in i, j or t misses too (a NaN vertex, an inactive primitive in Vulkan).
+        // Read on every compile, so the translator tests can compare the lowerings in one process.
+        private static int TriDegenerate => Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRI_DEGENERATE") switch
+        {
+            "1" => 1,
+            "2" => 2,
+            _ => 0,
+        };
+
         private void EmitRayIntersect(Gen5RayIntersectControl ray, bool bvh64)
         {
             _rayResult ??= DeclareRayResult();
@@ -462,6 +475,20 @@ public static partial class Gen5SpirvTranslator
                 FCompare(SpirvOp.FOrdLessThan, v, zero),
                 FCompare(SpirvOp.FOrdGreaterThan, FAdd(u, v), one),
                 FCompare(SpirvOp.FOrdLessThan, t, zero));
+            var degenerateMode = TriDegenerate;
+            var reject = degenerateMode switch
+            {
+                1 => FCompare(SpirvOp.FOrdEqual, tDenom, zero),
+                2 => LogicalNot(LogicalAnd(LogicalAnd(
+                        LogicalAnd(FCompare(SpirvOp.FOrdGreaterThanEqual, u, zero), FCompare(SpirvOp.FOrdLessThanEqual, u, one)),
+                        LogicalAnd(FCompare(SpirvOp.FOrdGreaterThanEqual, v, zero), FCompare(SpirvOp.FOrdLessThanEqual, FAdd(u, v), one))),
+                    FCompare(SpirvOp.FOrdGreaterThanEqual, t, zero))),
+                _ => 0u,
+            };
+            if (TriProbeActive)
+                EmitTriangleProbe(nodeType, missed, reject, tNum, tDenom, iNum, jNum);
+            if (reject != 0)
+                missed = degenerateMode == 2 ? reject : LogicalOr(missed, reject);
             tNum = SelectF(missed, Float(float.PositiveInfinity), tNum);
             tDenom = SelectF(missed, one, tDenom);
 
