@@ -36,10 +36,10 @@ public static partial class Gen5SpirvTranslator
         private static readonly bool LocalRayMiss = Environment.GetEnvironmentVariable("LOCAL_RAY_MISS") == "1";
         private static readonly bool TriangleRangeCheck = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRIANGLE_RANGE") != "0";
 
-        // [local] SHARPEMU_BVH_TRIANGLE23=1: triangle node types 2 (V2, V3, V4) and 3 (V2, V4, V0) are tested too (GFX10
+        // [local] SHARPEMU_BVH_TRIANGLE23 (on by default, =0 off; rq8395 A/B: 0x8395 7.1 -> 4.5 ms, panning 25.9 -> 28.9 FPS): triangle node types 2 (V2, V3, V4) and 3 (V2, V4, V0) are tested too (GFX10
         // triangle nodes hold five vertices; GTA V's BLASes use all four triangle types). Off, they return four invalid
         // dwords, which GTA V's 0x8395 loop takes as a candidate at t = NaN (counted by SHARPEMU_RT_RAYQUERY=2).
-        private static readonly bool Triangle23 = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRIANGLE23") == "1";
+        private static readonly bool Triangle23 = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRIANGLE23") != "0";
 
         private void EmitRayIntersect(Gen5RayIntersectControl ray, bool bvh64)
         {
