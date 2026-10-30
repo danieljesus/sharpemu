@@ -626,7 +626,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // buffer holding its base.
         private ulong ConservativeRequested(ulong hash, in BufferDescriptorWords descriptor, ulong requested) =>
             descriptor.RecordCount == Gpu.Buffers.ConservativeRecords.SentinelRecords && Gpu.Buffers.ConservativeRecords.IsListedProgram(hash)
-                ? _bufferCache.ContainingBufferExtent(descriptor.Address, requested)
+                ? Gpu.Buffers.ConservativeRecords.NoteExtent(_bufferCache.ContainingBufferExtent(descriptor.Address, requested))
                 : requested;
 
         // The cache buffer each descriptor's range lives in; a null descriptor has none.

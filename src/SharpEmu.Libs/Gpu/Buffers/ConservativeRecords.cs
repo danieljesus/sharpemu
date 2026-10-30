@@ -3,7 +3,7 @@
 
 namespace SharpEmu.Libs.Gpu.Buffers;
 
-// [local] SHARPEMU_CONSERVATIVE_RECORDS (1 on by default, 0 off, 2 verify; r8v1/r8k1): a GPU-written table word that only sizes
+// [local] SHARPEMU_CONSERVATIVE_RECORDS (0 off by default, 1 on, 2 verify, 3 precise read, 4 its verify): a GPU-written table word that only sizes
 // a buffer descriptor (its num_records) is not read back synchronously; the materialization takes a sentinel and the
 // buffer is bound to the rest of the cache buffer that holds its base. Exact only for the listed words, each checked
 // against the shader: GTA V's BVH refit 0x5981037B07E391D5 loads [s4+0x60] at pc 0x1C into s6, whose only use is
@@ -12,10 +12,23 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // word is the dispatch's indirect thread count (initiator 0x61, thread dimensions, read by the GPU), so with the
 // count a multiple of 4 no lane reads at or past num_records and the wider binding reads the same bytes.
 // =2 reads the word as before and counts the counts that are not a multiple of 4 ([CONSERVATIVE_RECORDS]).
+// Off by default: the cache buffer holding the list is 21 MB on average (42 MB at most), and binding it on each of the
+// refit's dispatches cost more than the wait it saves (A/B 2026-10-30, r8A*/r8C* against r8B*).
 // SHARPEMU_CONSERVATIVE_RECORDS_WORDS=<hash>+<hex offset>[,...] (default 5981037B07E391D5+60).
 internal static class ConservativeRecords
 {
-    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_CONSERVATIVE_RECORDS"), out var mode) ? (mode is 1 or 2 ? mode : 0) : 1;
+    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_CONSERVATIVE_RECORDS"), out var mode) ? (mode is >= 1 and <= 4 ? mode : 0) : 0;
+
+    // =3: the listed words are still read, but each read waits only for the word's own last writer (the precise write
+    // tick, GuestBufferCache.TryPreciseRead) instead of its 16 KB block's tick; =4 captures that precise copy and checks
+    // it against the ordinary read. Needs the write-history ring, which this mode records.
+    private static long _precise, _preciseFallbacks, _preciseChecks, _preciseMismatches;
+
+    public static void NotePrecise(long reads, long fallbacks, long checks, long mismatches)
+    {
+        (_precise, _preciseFallbacks, _preciseChecks, _preciseMismatches) = (reads, fallbacks, checks, mismatches);
+        Report();
+    }
 
     // The sentinel word: num_records = 0x3FFFFFFF after the shader's shift, which no real record count reaches.
     public const uint Sentinel = 0xFFFF_FFFC;
@@ -65,6 +78,18 @@ internal static class ConservativeRecords
         }
     }
 
+    private static long _extents;
+    private static ulong _extentMax, _extentSum;
+
+    // The extents the sentinel bindings took (count, mean, largest in [CONSERVATIVE_RECORDS]).
+    public static ulong NoteExtent(ulong extent)
+    {
+        _extents++;
+        _extentSum += extent;
+        _extentMax = Math.Max(_extentMax, extent);
+        return extent;
+    }
+
     public static void NoteSentinel()
     {
         _sentinels++;
@@ -92,6 +117,6 @@ internal static class ConservativeRecords
         if (now - _lastReport < 20_000)
             return;
         _lastReport = now;
-        Console.Error.WriteLine($"[CONSERVATIVE_RECORDS] mode={Mode} sentinels={_sentinels} checked={_checked} not_multiple_of_4={_notMultiple} no_buffer={_noBuffer} bindings=[{string.Join(",", _bindings.TakeWhile((_, i) => i < 8))}] shorter=[{string.Join(",", _shorter.TakeWhile((_, i) => i < 8))}]");
+        Console.Error.WriteLine($"[CONSERVATIVE_RECORDS] mode={Mode} precise_reads={_precise} precise_fallbacks={_preciseFallbacks} precise_checks={_preciseChecks} precise_mismatches={_preciseMismatches} sentinels={_sentinels} checked={_checked} not_multiple_of_4={_notMultiple} no_buffer={_noBuffer} extents={_extents} extent_mean=0x{(_extents == 0 ? 0 : _extentSum / (ulong)_extents):X} extent_max=0x{_extentMax:X} bindings=[{string.Join(",", _bindings.TakeWhile((_, i) => i < 8))}] shorter=[{string.Join(",", _shorter.TakeWhile((_, i) => i < 8))}]");
     }
 }

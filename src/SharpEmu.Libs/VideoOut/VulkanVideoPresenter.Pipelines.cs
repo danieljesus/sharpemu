@@ -704,6 +704,7 @@ internal static unsafe partial class VulkanVideoPresenter
             using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.WordRead);
             FrontProfile.NoteSite(FrontProfile.Phase.WordRead);
             var conservativeVerify = false; // [local] SHARPEMU_CONSERVATIVE_RECORDS
+            var conservativePrecise = false;
             if (Gpu.Buffers.ConservativeRecords.Mode != 0 &&
                 Gpu.Buffers.ConservativeRecords.Matches(Gpu.Buffers.ConservativeRecords.CurrentReader, SharpEmu.ShaderCompiler.Resources.SrtReadProbe.CurrentBaseAddress, address))
             {
@@ -714,7 +715,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     return true;
                 }
 
-                conservativeVerify = true;
+                conservativeVerify = Gpu.Buffers.ConservativeRecords.Mode == 2;
+                conservativePrecise = Gpu.Buffers.ConservativeRecords.Mode >= 3;
             }
 
             if (OnFrontThread)
@@ -854,8 +856,29 @@ internal static unsafe partial class VulkanVideoPresenter
                         censusStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                     }
 
-                    if (!_bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
-                            SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead))
+                    if (conservativePrecise) // [local] SHARPEMU_CONSERVATIVE_RECORDS=3/4: this read alone after its precise writer tick
+                    {
+                        _bufferCache.ForcePreciseWait = true;
+                        _bufferCache.ForcePreciseVerify = Gpu.Buffers.ConservativeRecords.Mode == 4;
+                    }
+
+                    bool preciseSynced;
+                    try
+                    {
+                        preciseSynced = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
+                            SharpEmu.HLE.GuestMemory.GuestMemoryProfile.ReadbackSource.ShaderResourceRead);
+                    }
+                    finally
+                    {
+                        if (conservativePrecise)
+                        {
+                            _bufferCache.ForcePreciseWait = false;
+                            _bufferCache.ForcePreciseVerify = false;
+                            Gpu.Buffers.ConservativeRecords.NotePrecise(_bufferCache.PreciseWaitReads, _bufferCache.PreciseWaitFallbacks, _bufferCache.PreciseVerifyChecks, _bufferCache.PreciseVerifyMismatches);
+                        }
+                    }
+
+                    if (!preciseSynced)
                     {
                         return false;
                     }
