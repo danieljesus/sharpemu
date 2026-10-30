@@ -165,6 +165,86 @@ public sealed class IndirectImageDimensionTests
         }
     }
 
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: tables with 3, 6 and 4 float candidates after the root plus one volume, the volume at different
+    // places, give one specialization; every key still selects its own descriptor, never a padding slot.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void PaddedClassRunsMakeTheCandidateCountsOnePermutation(int padMode)
+    {
+        var plan = Extract(ResourceTrackerTests.IndirectImageProgram(false));
+        (ResourceSpecialization Specialization, ResourceSnapshot Snapshot) Specialize(int distinctCount, int volumeIndex)
+        {
+            uint[] userData = [0x1000, 224 << 16, (uint)distinctCount, 0, 0x10000, 16 << 16, (uint)distinctCount * 2, 0, 7];
+            var memory = new TestWordMemory { Words = new uint[0x11000 / 4] };
+            for (var index = 0; index < distinctCount; index++)
+            {
+                memory.At(0x1000 + (ulong)index * 224 + 4) = (uint)index;
+                var descriptor = ResourceTrackerTests.ImageDescriptor();
+                descriptor[0] += (uint)index;
+                if (index == volumeIndex)
+                    descriptor[3] = (descriptor[3] & 0x0FFFFFFF) | (ImageType3D << 28);
+                ResourceTrackerTests.WriteImage(memory, 0x10000 + (ulong)index * 32, descriptor);
+            }
+
+            var snapshot = new ResourceSnapshot();
+            var specialization = new ResourceSpecialization();
+            Assert.True(ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read),
+                ref snapshot, ref specialization, out var failure), failure.ToString());
+            return (specialization, snapshot);
+        }
+
+        var previous = ResourceMaterializer.IndirectImagePadMode;
+        ResourceMaterializer.IndirectImagePadMode = padMode;
+        var mismatchesBefore = ResourceMaterializer.IndirectImagePadCounters.Mismatches;
+        try
+        {
+            var results = WithMode(1, () => new[] { (Specialize(5, 1), 1u), (Specialize(8, 7), 7u), (Specialize(6, 2), 2u) });
+            Assert.Equal(results[0].Item1.Specialization, results[1].Item1.Specialization);
+            Assert.Equal(results[0].Item1.Specialization, results[2].Item1.Specialization);
+            foreach (var (result, volumeKey) in results)
+            {
+                var images = result.Specialization.Images;
+                var root = images.FindIndex(image => image.IndirectRoot != DescriptorConstants.NoIndex);
+                var table = result.Snapshot.FlattenedResourceTable;
+                var mapping = (int)images[root].IndirectMappingOffset;
+                var keys = table[mapping];
+                var members = Enumerable.Range(0, images.Count).Where(index => images[index].IndirectRoot == (uint)root).ToArray();
+                Assert.Equal(1 + 16 + 2, members.Length);
+                for (var entry = 0; entry < keys; entry++)
+                {
+                    var key = table[mapping + 1 + entry * 2];
+                    var image = members[(int)table[mapping + 2 + entry * 2]];
+                    Assert.Equal(key == volumeKey ? ImageDimension.Dim3D : ImageDimension.Dim2D, images[image].Dimension);
+                    Assert.Equal(0x20u + key, result.Snapshot.Images[image][0]);
+                }
+            }
+
+            var resources = ResourceMaterializer.ApplyTo(plan, results[0].Item1.Specialization);
+            var layout = BindingLayout.Allocate(
+                resources.Info,
+                BindingLayout.CollectUserDataRegisters(plan.Graph.Program, 0, 64),
+                false,
+                ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
+                false);
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(new ShaderCompileRequest(plan, resources, layout), out _, out var error), error);
+            Assert.Equal(mismatchesBefore, ResourceMaterializer.IndirectImagePadCounters.Mismatches);
+        }
+        finally
+        {
+            ResourceMaterializer.IndirectImagePadMode = previous;
+        }
+    }
+
+    [Theory]
+    [InlineData(1, 2)]
+    [InlineData(2, 2)]
+    [InlineData(3, 16)]
+    [InlineData(16, 16)]
+    [InlineData(17, 32)]
+    public void PaddedRunCapacityIsFixedPerBucket(int count, int capacity) =>
+        Assert.Equal(capacity, ResourceMaterializer.PaddedRunCapacity(count));
+
     // Graphics stages keep refusing the mix unless the switch is 3.
     [Theory]
     [InlineData(1, false)]

@@ -27,6 +27,23 @@ public static class ResourceMaterializer
     public static int IndirectImageDimMode { get; set; } =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_DIM"), out var dimMode) ? dimMode : 1;
 
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD (=0 off by default): with a mixed table (SHARPEMU_INDIRECT_IMAGE_DIM), the
+    // candidates after the root are ordered by the class their specialization takes (image type, numeric class,
+    // conversion) and every class run is padded to a fixed capacity (2 up to 2 candidates, 16 up to 16, then the next
+    // power of two) with copies of its first descriptor, and the key search takes at least PaddedSearchIterations steps.
+    // The key mapping only names real candidates, so a padding slot is never selected; the module then depends on which
+    // classes the table holds, not on how many candidates or keys of each,
+    // and 0xD44E stops compiling a new ~3 s permutation whenever its material table gains or loses a texture.
+    // =2 also checks, per key, that the padded mapping selects the same descriptor words as the unpadded one
+    // ([GPU][INDIRECT_PAD] checked/mismatches, every 256 tables). Settable for tests.
+    public static int IndirectImagePadMode { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_PAD"), out var padMode) ? padMode : 0;
+
+    private static long _padTables, _padChecked, _padMismatches, _padSkipped;
+
+    public static (long Tables, long Checked, long Mismatches, long Skipped) IndirectImagePadCounters =>
+        (Interlocked.Read(ref _padTables), Interlocked.Read(ref _padChecked), Interlocked.Read(ref _padMismatches), Interlocked.Read(ref _padSkipped));
+
     private static bool MixesImageClasses(ShaderResourcePlan plan) =>
         IndirectImageDimMode == 3 || IndirectImageDimMode is 1 or 2 && plan.Stage == ShaderStage.Compute;
 
@@ -939,6 +956,78 @@ public static class ResourceMaterializer
             table.Candidates[index] = remap[table.Candidates[index]];
     }
 
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: binary search steps of a padded table (up to 1023 keys; 0xD44E has ~410).
+    internal const uint PaddedSearchIterations = 10;
+
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: the run capacity of a class with count real candidates.
+    internal static int PaddedRunCapacity(int count) =>
+        count <= 2 ? 2 : count <= 16 ? 16 : (int)BitOperations.RoundUpToPowerOf2((uint)count);
+
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: what the specialization of a candidate depends on (see BuildSpecialization):
+    // its image type, the numeric class and conversion of its format; a null descriptor takes the exemplar's class.
+    private static ulong SpecializationClassKey(uint[] words)
+    {
+        if (words.Length < 4 || NullImageDescriptor(words))
+            return 0;
+        var format = GuestImageFormat.FormatOf(words);
+        return 1UL << 60 | (ulong)GuestImageFormat.ImageTypeOf(words) << 40 |
+            (ulong)(uint)GuestImageFormat.SampledNumericClass(format) << 20 | ImageConversionFormat(format);
+    }
+
+    // [local] SHARPEMU_INDIRECT_IMAGE_PAD: orders the candidates after the root by specialization class and pads every
+    // class run to PaddedRunCapacity; returns false (table unchanged) when the padded table would not fit in budget slots.
+    private static bool PadCandidatesByClass(IndirectImageTable table, int budget)
+    {
+        var count = table.Descriptors.Count;
+        if (count < 2)
+            return false;
+        var runs = Enumerable.Range(1, count - 1)
+            .GroupBy(index => SpecializationClassKey(table.Descriptors[index].Dwords))
+            .OrderBy(group => group.Key)
+            .Select(group => group.ToArray())
+            .ToArray();
+        var padded = runs.Sum(run => PaddedRunCapacity(run.Length));
+        if (padded > budget)
+            return false;
+        var original = IndirectImagePadMode == 2 ? table.Candidates.Select(candidate => table.Descriptors[(int)candidate].Dwords).ToArray() : null;
+        var remap = new uint[count];
+        var descriptors = new List<DescriptorWords>(padded + 1) { table.Descriptors[0] };
+        foreach (var run in runs)
+        {
+            foreach (var index in run)
+            {
+                remap[index] = (uint)descriptors.Count;
+                descriptors.Add(table.Descriptors[index]);
+            }
+
+            for (var slot = run.Length; slot < PaddedRunCapacity(run.Length); slot++)
+                descriptors.Add(new DescriptorWords([.. table.Descriptors[run[0]].Dwords]));
+        }
+
+        table.Descriptors = descriptors;
+        for (var index = 0; index < table.Candidates.Count; index++)
+            table.Candidates[index] = remap[table.Candidates[index]];
+        if (original is not null)
+        {
+            var mismatches = 0;
+            for (var index = 0; index < original.Length; index++)
+                if (!original[index].AsSpan().SequenceEqual(table.Descriptors[(int)table.Candidates[index]].Dwords))
+                    mismatches++;
+            var paddingSlots = Enumerable.Range(1, descriptors.Count - 1).Where(slot => !remap.Contains((uint)slot)).ToHashSet();
+            mismatches += table.Candidates.Count(candidate => paddingSlots.Contains((int)candidate));
+            Interlocked.Add(ref _padChecked, original.Length);
+            Interlocked.Add(ref _padMismatches, mismatches);
+            if (Interlocked.Increment(ref _padTables) % 256 == 0 || mismatches != 0)
+                Console.Error.WriteLine($"[GPU][INDIRECT_PAD] tables={Interlocked.Read(ref _padTables)} checked={Interlocked.Read(ref _padChecked)} mismatches={Interlocked.Read(ref _padMismatches)} skipped={Interlocked.Read(ref _padSkipped)} runs={string.Join(',', runs.Select(run => $"{run.Length}->{PaddedRunCapacity(run.Length)}"))}");
+        }
+        else
+        {
+            Interlocked.Increment(ref _padTables);
+        }
+
+        return true;
+    }
+
     private static bool Fail(string message)
     {
         SpecializationFailed(message);
@@ -960,6 +1049,20 @@ public static class ResourceMaterializer
         var info = plan.Info;
         var imageCount = info.Images.Count;
         var mappingWordCount = 0;
+        var padded = IndirectImagePadMode != 0 && MixesImageClasses(plan); // [local] SHARPEMU_INDIRECT_IMAGE_PAD
+        if (padded)
+        {
+            var budget = ShaderResourceInfo.MaxImages - imageCount - snapshot.IndirectImages.Sum(table => Math.Max(0, table.Descriptors.Count - 1));
+            foreach (var table in snapshot.IndirectImages)
+            {
+                var own = Math.Max(0, table.Descriptors.Count - 1);
+                if (table.Resource < info.Images.Count && PadCandidatesByClass(table, budget + own))
+                    budget -= table.Descriptors.Count - 1 - own;
+                else
+                    Interlocked.Increment(ref _padSkipped);
+            }
+        }
+
         foreach (var table in snapshot.IndirectImages)
         {
             if (table.Resource >= info.Images.Count || table.Descriptors.Count < 2)
@@ -997,7 +1100,7 @@ public static class ResourceMaterializer
 
         foreach (var table in snapshot.IndirectImages)
         {
-            if (MixesImageClasses(plan))
+            if (MixesImageClasses(plan) && !padded)
                 GroupCandidatesByClass(table);
             var rootImage = images[(int)table.Resource];
             for (var candidate = 1; candidate < table.Descriptors.Count; candidate++)
@@ -1011,7 +1114,11 @@ public static class ResourceMaterializer
             {
                 IndirectRoot = table.Resource,
                 IndirectMappingOffset = mappingOffset,
-                IndirectSearchIterations = (uint)BitOperations.Log2((uint)table.Keys.Count) + 1,
+                // [local] SHARPEMU_INDIRECT_IMAGE_PAD: at least PaddedSearchIterations, so the key count does not make a
+                // permutation either; once low == high a step reads the slot the final compare reads and changes nothing.
+                IndirectSearchIterations = padded
+                    ? Math.Max(PaddedSearchIterations, (uint)BitOperations.Log2((uint)table.Keys.Count) + 1)
+                    : (uint)BitOperations.Log2((uint)table.Keys.Count) + 1,
             };
             mappingCursor += 1 + table.Keys.Count * 2;
             var order = Enumerable.Range(0, table.Keys.Count).OrderBy(index => table.Keys[index]).ToArray();
