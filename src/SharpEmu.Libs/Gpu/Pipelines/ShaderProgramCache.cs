@@ -463,6 +463,18 @@ internal sealed class ShaderProgramCache
                 materialized = MaterializeWith(materializations, entry, inputs, ref snapshot, ref specialization, out materializationFailure, captureIndirectImageFailure);
             }
 
+            if (IndirectImageDiag.Hash != 0 && source.Hash == IndirectImageDiag.Hash) // [local] SHARPEMU_INDIRECT_IMAGE_DIAG
+            {
+                if (materialized)
+                    IndirectImageDiag.NoteSuccess(specialization, entry.Plan.Info.Images.Count);
+                else if (materializationFailure == ResourceMaterializationFailure.IncompatibleImageCandidates && IndirectImageDiag.ShouldCapture())
+                {
+                    var diagSnapshot = EmptySnapshot;
+                    var diagSpecialization = EmptySpecialization;
+                    ResourceMaterializer.Materialize(entry.Plan, inputs, ref diagSnapshot, ref diagSpecialization, out _, IndirectImageDiag.Write);
+                }
+            }
+
             if (resolveStarted != 0)
                 SharpEmu.Libs.VideoOut.ResolveProfile.NoteMaterialize(source.Hash, System.Diagnostics.Stopwatch.GetTimestamp() - resolveStarted,
                     materializations is { } hitCache && hitCache.Hits != hitsBefore,

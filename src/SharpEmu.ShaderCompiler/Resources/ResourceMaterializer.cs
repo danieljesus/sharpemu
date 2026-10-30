@@ -17,6 +17,14 @@ public static class ResourceMaterializer
     // Written to standard error like every specialization refusal; the host turns it
     // into its fatal.
     private static readonly bool DeviceStoreTableRanges = Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_STORE_TABLES") != "0"; // [local] on: CPU-memory ranges filtered and ranges merged (rt247merge)
+    // [local] SHARPEMU_INDIRECT_IMAGE_DIM=1: a sampled indirect table may mix 2D, 2D-array and 3D candidates, each with
+    // its own binding and coordinate width, as the hardware reads each T# by its own type (GTA V's 0xD44E: a 1x1x1
+    // placeholder volume among the 2D textures of its material table). =2 also counts, in the ray query area (needs
+    // SHARPEMU_RQ_MAP=1 or SHARPEMU_RT_RAYQUERY), the lanes that select a candidate of another dimension
+    // ([GPU][INDIRECT_DIM]). Settable for tests.
+    public static int IndirectImageDimMode { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_DIM"), out var dimMode) ? dimMode : 0;
+
     public static Action<string> SpecializationFailed { get; set; } = message => Console.Error.WriteLine($"shader resource specialization failed: {message}");
 
     private sealed class IndirectImageTable
@@ -1189,7 +1197,10 @@ public static class ResourceMaterializer
                 var compatibleDimensions = image.Dimension == imageClass.Dimension ||
                     separateSampledDimensions && !image.Cube && !imageClass.Cube &&
                     image.Dimension is ImageDimension.Dim2D or ImageDimension.Dim2DArray &&
-                    imageClass.Dimension is ImageDimension.Dim2D or ImageDimension.Dim2DArray;
+                    imageClass.Dimension is ImageDimension.Dim2D or ImageDimension.Dim2DArray ||
+                    IndirectImageDimMode != 0 && separateSampledDimensions && !image.Cube && !imageClass.Cube &&
+                    image.Dimension is ImageDimension.Dim2D or ImageDimension.Dim2DArray or ImageDimension.Dim3D &&
+                    imageClass.Dimension is ImageDimension.Dim2D or ImageDimension.Dim2DArray or ImageDimension.Dim3D;
                 if (image.NumericClass != imageClass.NumericClass || !compatibleDimensions ||
                     image.MipCount != imageClass.MipCount || image.ConversionFormat != imageClass.ConversionFormat ||
                     image.ShaderSwizzle != imageClass.ShaderSwizzle || image.Cube != imageClass.Cube)

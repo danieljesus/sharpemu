@@ -5700,11 +5700,20 @@ public static partial class Gen5SpirvTranslator
                     // One case per descriptor over a constant element, like a switch on the selector.
                     var emitted = true;
                     var caseError = string.Empty;
+                    var countDimensions = CountsIndirectDimensions(elements); // [local] SHARPEMU_INDIRECT_IMAGE_DIM=2
+                    if (countDimensions)
+                        CountIndirectDimensionLanes(IndirectDimTotalWord);
                     for (var index = 0; index < elements.Count && emitted; index++)
                     {
                         var elementCase = elements[index];
+                        var otherDimension = countDimensions &&
+                            _request.Resources.Info.Images[(int)elementCase.Resource].Dimension != _request.Resources.Info.Images[(int)elements[0].Resource].Dimension &&
+                            (_request.Resources.Info.Images[(int)elementCase.Resource].Dimension == ImageDimension.Dim3D ||
+                             _request.Resources.Info.Images[(int)elements[0].Resource].Dimension == ImageDimension.Dim3D);
                         EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, selector, UInt((uint)index)), () =>
                         {
+                            if (otherDimension)
+                                CountIndirectDimensionLanes(IndirectDimOtherWord);
                             if (!TryResolveLayoutImage(instruction, image, out var caseResource, out var caseImageObject, out var caseDstSelect, out caseError,
                                     elementCase))
                             {
