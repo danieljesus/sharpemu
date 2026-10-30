@@ -3,7 +3,7 @@
 
 namespace SharpEmu.Libs.Gpu.Buffers;
 
-// [local] SHARPEMU_CONSERVATIVE_RECORDS (0 off by default, 1 on, 2 verify): a GPU-written table word that only sizes
+// [local] SHARPEMU_CONSERVATIVE_RECORDS (1 on by default, 0 off, 2 verify; r8v1/r8k1): a GPU-written table word that only sizes
 // a buffer descriptor (its num_records) is not read back synchronously; the materialization takes a sentinel and the
 // buffer is bound to the rest of the cache buffer that holds its base. Exact only for the listed words, each checked
 // against the shader: GTA V's BVH refit 0x5981037B07E391D5 loads [s4+0x60] at pc 0x1C into s6, whose only use is
@@ -15,7 +15,7 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // SHARPEMU_CONSERVATIVE_RECORDS_WORDS=<hash>+<hex offset>[,...] (default 5981037B07E391D5+60).
 internal static class ConservativeRecords
 {
-    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_CONSERVATIVE_RECORDS"), out var mode) && mode is 1 or 2 ? mode : 0;
+    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_CONSERVATIVE_RECORDS"), out var mode) ? (mode is 1 or 2 ? mode : 0) : 1;
 
     // The sentinel word: num_records = 0x3FFFFFFF after the shader's shift, which no real record count reaches.
     public const uint Sentinel = 0xFFFF_FFFC;

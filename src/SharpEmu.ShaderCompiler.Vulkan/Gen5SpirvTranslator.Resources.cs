@@ -765,10 +765,10 @@ public static partial class Gen5SpirvTranslator
 
         private uint _faultMin, _faultMax, _faultMany, _faultMarkIndex;
 
-        // [local] SHARPEMU_DA_ZERO_PAGE_BRANCH=1 (off by default): the zero-page lookup keeps its fault bookkeeping (lowest,
+        // [local] SHARPEMU_DA_ZERO_PAGE_BRANCH (on by default, =0 off; r8z1/r8z0: 0x8395 6.86 -> 6.29 ms): the zero-page lookup keeps its fault bookkeeping (lowest,
         // highest and a third distinct unmapped page) inside a branch on the fault instead of selects and stores on every
         // lookup; the stored values are the same on every lane, so the bitmap set at the end is the same.
-        private readonly bool ZeroPageFaultBranch = System.Environment.GetEnvironmentVariable("SHARPEMU_DA_ZERO_PAGE_BRANCH") == "1";
+        private readonly bool ZeroPageFaultBranch = System.Environment.GetEnvironmentVariable("SHARPEMU_DA_ZERO_PAGE_BRANCH") != "0";
 
         // SHARPEMU_DA_ZERO_PAGE: the lookup without branches (DeviceAddressPaging.ZeroPageMode).
         private (uint Pointer, uint Valid) ResolveDeviceAddressZeroPage(uint address64)
@@ -790,7 +790,7 @@ public static partial class Gen5SpirvTranslator
                 EmitConditional(faulted, () => RecordFault(address64, pageIndex));
             if (ZeroPageFaultBranch)
             {
-                // [local] SHARPEMU_DA_ZERO_PAGE_BRANCH=1: the same bookkeeping, only on the lanes that hit an unmapped page.
+                // [local] SHARPEMU_DA_ZERO_PAGE_BRANCH: the same bookkeeping, only on the lanes that hit an unmapped page.
                 EmitConditional(faulted, () =>
                 {
                     var faultMin = Load(_uintType, _faultMin);
