@@ -16,6 +16,7 @@ internal sealed partial class RayQueryHle
     private const int MaxTriRecords = 200_000;
 
     private readonly long[] _triProbe = new long[TriProbeWords];
+    private long _leanCompared, _leanMismatches;
     private readonly HashSet<(uint Key, uint Node)> _triRecords = new();
     private long _triDispatches;
 
@@ -26,6 +27,8 @@ internal sealed partial class RayQueryHle
             return;
         for (var index = 0; index < TriProbeWords; index++)
             _triProbe[index] += counters[TriProbeFirst + index];
+        _leanCompared += counters[120];
+        _leanMismatches += counters[121];
         for (var slot = 0; slot < TriRecordSlots; slot++)
         {
             var record = counters.Slice(TriRecordFirst + slot * TriRecordWords, TriRecordWords);
@@ -37,7 +40,7 @@ internal sealed partial class RayQueryHle
         if (++_triDispatches % 64 != 0)
             return;
         var p = _triProbe;
-        Console.Error.WriteLine($"[GPU][TRI_PROBE] frame={frame} tests={p[0]} hits={p[1]} den0_num0={p[2]} den0_num={p[3]} nan_inf={p[4]} rejected={p[5]} den0_num0_by_type=[{p[6]},{p[7]},{p[8]},{p[9]}] den0_tests={p[10]} other_nan={p[11]} native_nan_by_class=[{p[12]},{p[13]},{p[14]},{p[15]}] native_only_by_class=[{p[16]},{p[17]},{p[18]},{p[19]}] records={_triRecords.Count}");
+        Console.Error.WriteLine($"[GPU][TRI_PROBE] frame={frame} tests={p[0]} hits={p[1]} den0_num0={p[2]} den0_num={p[3]} nan_inf={p[4]} rejected={p[5]} den0_num0_by_type=[{p[6]},{p[7]},{p[8]},{p[9]}] den0_tests={p[10]} other_nan={p[11]} native_nan_by_class=[{p[12]},{p[13]},{p[14]},{p[15]}] native_only_by_class=[{p[16]},{p[17]},{p[18]},{p[19]}] records={_triRecords.Count} lean_compared={_leanCompared} lean_mismatches={_leanMismatches}");
         Array.Clear(_triProbe);
     }
 }

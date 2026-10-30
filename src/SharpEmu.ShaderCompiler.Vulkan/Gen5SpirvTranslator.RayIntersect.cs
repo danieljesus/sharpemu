@@ -203,7 +203,14 @@ public static partial class Gen5SpirvTranslator
             "2" => 2,
             _ => 3,
         };
-        private readonly bool _bvhLeanSlabs = Environment.GetEnvironmentVariable("SHARPEMU_BVH_LEAN_SLABS") == "1";
+        // =2 (verify, with SHARPEMU_BVH_TRI_PROBE=1 in 0x8395): both slab tests run, the lean one is kept and the box
+        // nodes whose four (sorted) children differ are counted ([GPU][TRI_PROBE] lean_compared / lean_mismatches).
+        private readonly int _bvhLeanSlabsMode = Environment.GetEnvironmentVariable("SHARPEMU_BVH_LEAN_SLABS") switch
+        {
+            "1" => 1,
+            "2" => 2,
+            _ => 0,
+        };
         private uint _bvhSecondPointer, _bvhSecondMapped;
 
         // [local] SHARPEMU_BVH_UNIFIED_FETCH (3 by default, =0 off; adapted from the local hito4 experiment unified-fetch.diff):
@@ -518,6 +525,23 @@ public static partial class Gen5SpirvTranslator
         private uint[] EmitRayBoxes(NodeUnit first, NodeUnit second, bool fp16, uint boxGrow, uint boxSort, uint extent,
             IReadOnlyList<uint> origin, IReadOnlyList<uint> inverseDirection)
         {
+            if (_bvhLeanSlabsMode != 2)
+                return EmitRayBoxes(first, second, fp16, boxGrow, boxSort, extent, origin, inverseDirection, _bvhLeanSlabsMode == 1);
+            var reference = EmitRayBoxes(first, second, fp16, boxGrow, boxSort, extent, origin, inverseDirection, lean: false);
+            var lean = EmitRayBoxes(first, second, fp16, boxGrow, boxSort, extent, origin, inverseDirection, lean: true);
+            if (TriProbeActive)
+            {
+                var differs = Any(Enumerable.Range(0, 4).Select(child =>
+                    _module.AddInstruction(SpirvOp.INotEqual, _boolType, reference[child], lean[child])).ToArray());
+                CountLeanVerify(differs);
+            }
+
+            return lean;
+        }
+
+        private uint[] EmitRayBoxes(NodeUnit first, NodeUnit second, bool fp16, uint boxGrow, uint boxSort, uint extent,
+            IReadOnlyList<uint> origin, IReadOnlyList<uint> inverseDirection, bool lean)
+        {
             var zero = Float(0f);
             var growFactor = FAdd(Float(1f), FMul(
                 _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, boxGrow), Float(5.960464478e-8f)));
@@ -538,7 +562,7 @@ public static partial class Gen5SpirvTranslator
                     var positive = FCompare(SpirvOp.FOrdGreaterThanEqual, inverseDirection[(int)axis], zero);
                     var near = SelectF(positive, planeMin, planeMax);
                     var far = SelectF(positive, planeMax, planeMin);
-                    if (_bvhLeanSlabs)
+                    if (lean)
                     {
                         // [local] SHARPEMU_BVH_LEAN_SLABS=1 (off by default): as written, the max3/min3 below
                         // propagate NaN, so a NaN plane distance makes the child miss; otherwise they equal
@@ -562,7 +586,7 @@ public static partial class Gen5SpirvTranslator
                     leave = axis == 0 ? far : NanMin(leave, far);
                 }
 
-                var nan = _bvhLeanSlabs ? anyNan : _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
+                var nan = lean ? anyNan : _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
                     _module.AddInstruction(SpirvOp.IsNan, _boolType, enter),
                     _module.AddInstruction(SpirvOp.IsNan, _boolType, leave));
                 var minT = SelectF(nan, Float(float.PositiveInfinity), Ext(40, _floatType, enter, zero));

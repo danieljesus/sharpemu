@@ -25,6 +25,7 @@ public static partial class Gen5SpirvTranslator
     {
         internal const uint TriProbeFirstWord = 44;
         internal const uint TriRecordFirstWord = 128;
+        internal const uint LeanVerifyWord = 120;
         internal const uint TriRecordSlots = 16;
         internal const uint TriRecordWords = 8;
 
@@ -44,6 +45,7 @@ public static partial class Gen5SpirvTranslator
             _triTests = NativeVariable("triProbeTests");
             _triHits = NativeVariable("triProbeHits");
             _triDenomZero = NativeVariable("triProbeDenomZero");
+            _leanCompared = NativeVariable("leanVerifyCompared");
         }
 
         // The walk is lane-local (no subgroup operations): rare classes take an atomic each, the frequent ones are
@@ -54,17 +56,25 @@ public static partial class Gen5SpirvTranslator
         private void AddPrivateCount(uint variable, uint condition) =>
             Store(variable, IAdd(Load(_uintType, variable), SelectU(condition, UInt(1), UInt(0))));
 
-        private uint _triTests, _triHits, _triDenomZero;
+        private uint _triTests, _triHits, _triDenomZero, _leanCompared;
+
+        // SHARPEMU_BVH_LEAN_SLABS=2: word 120 box nodes compared (flushed after each BLAS walk), 121 nodes whose children differ.
+        private void CountLeanVerify(uint differs)
+        {
+            DeclareTriProbeState();
+            AddPrivateCount(_leanCompared, _module.ConstantBool(true));
+            AddLaneCount(LeanVerifyWord + 1, differs);
+        }
 
         // At the end of EmitNativeBlasLoop.
         private void FlushTriProbe()
         {
             if (!TriProbeActive || _triClass == 0)
                 return;
-            foreach (var (variable, word) in new[] { (_triTests, 0u), (_triHits, 1u), (_triDenomZero, 10u) })
+            foreach (var (variable, word) in new[] { (_triTests, TriProbeFirstWord), (_triHits, TriProbeFirstWord + 1), (_triDenomZero, TriProbeFirstWord + 10), (_leanCompared, LeanVerifyWord) })
             {
                 var value = Load(_uintType, variable);
-                EmitConditional(IsNotZero(value), () => AtomicAdd(RqCounter(TriProbeFirstWord + word), value));
+                EmitConditional(IsNotZero(value), () => AtomicAdd(RqCounter(word), value));
                 Store(variable, UInt(0));
             }
         }

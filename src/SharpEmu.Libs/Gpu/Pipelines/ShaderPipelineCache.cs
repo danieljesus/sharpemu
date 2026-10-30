@@ -503,10 +503,23 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         return TryPrepareProgram(source, computeOptions, ref pushDataCursor, out handle, out stage);
     }
 
+    private long _d44eAttempts, _d44eSkips; // [local]
+
     private bool TryPrepareProgram(ShaderSource source, StageCompileOptions options, ref uint pushDataCursor,
         out ShaderProgram program, out ShaderStageResources stage)
     {
-        if (_programs.TryGetProgram(source, options, _strictShaders && source.Hash != 0xD44EDA1B8D4FAA6B /* [local] GTA V Fidelity: heterogeneous image table, skip */, ref pushDataCursor, out program, out stage, out var rejection))
+        var prepared = _programs.TryGetProgram(source, options, _strictShaders && source.Hash != 0xD44EDA1B8D4FAA6B /* [local] GTA V Fidelity: heterogeneous image table, skip */, ref pushDataCursor, out program, out stage, out var rejection);
+        // [local] GTA V's 0xD44E pass runs in some sessions and not in others (skipped, or not dispatched), which moves the
+        // frame's GPU time by ~2 ms: every 256th preparation of it reports how many were skipped, for A/B stratification.
+        if (source.Hash == 0xD44EDA1B8D4FAA6B)
+        {
+            var attempts = Interlocked.Increment(ref _d44eAttempts);
+            var skipped = prepared ? Interlocked.Read(ref _d44eSkips) : Interlocked.Increment(ref _d44eSkips);
+            if (attempts % 256 == 0)
+                Console.Error.WriteLine($"[GPU][D44E_COUNT] prepared={attempts} skipped={skipped}");
+        }
+
+        if (prepared)
             return true;
 
         bool firstSkip;
