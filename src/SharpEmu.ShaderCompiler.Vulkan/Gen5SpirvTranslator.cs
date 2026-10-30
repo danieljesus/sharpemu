@@ -5706,10 +5706,7 @@ public static partial class Gen5SpirvTranslator
                     for (var index = 0; index < elements.Count && emitted; index++)
                     {
                         var elementCase = elements[index];
-                        var otherDimension = countDimensions &&
-                            _request.Resources.Info.Images[(int)elementCase.Resource].Dimension != _request.Resources.Info.Images[(int)elements[0].Resource].Dimension &&
-                            (_request.Resources.Info.Images[(int)elementCase.Resource].Dimension == ImageDimension.Dim3D ||
-                             _request.Resources.Info.Images[(int)elements[0].Resource].Dimension == ImageDimension.Dim3D);
+                        var otherDimension = countDimensions && OtherIndirectClass(elements[0], elementCase);
                         EmitConditional(_module.AddInstruction(SpirvOp.IEqual, _boolType, selector, UInt((uint)index)), () =>
                         {
                             if (otherDimension)

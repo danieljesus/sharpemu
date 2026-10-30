@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.ShaderCompiler;
 using SharpEmu.ShaderCompiler.Resources;
 using SharpEmu.ShaderCompiler.Vulkan;
 using Xunit;
@@ -75,6 +76,43 @@ public sealed class IndirectImageDimensionTests
             Assert.Equal(ImageDimension.Dim3D, candidate.Dimension);
             Assert.NotEqual(ImageDescriptorBinding.ForImage(root), ImageDescriptorBinding.ForImage(candidate));
             Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out _, out var error), error);
+            return 0;
+        });
+    }
+
+    // GTA V's other placeholder: a 1x1 8_8_8_8 UINT texture (unified format 60) among float ones.
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, true)]
+    public void AUintCandidateIn2DFloatTableNeedsTheSwitch(int mode, bool accepted)
+    {
+        var plan = Extract(SpirvBindingDeclarationTests.IndirectImageAfterPlainImageProgram(indirectDimension: 1));
+        var (userData, memory) = SpirvBindingDeclarationTests.IndirectImageAfterPlainImageInputs(
+            64, false, firstImageType: ImageType2D, secondImageType: ImageType2D);
+        memory.At(0x2024) = (memory.At(0x2024) & ~(0x1FFu << 20)) | (60u << 20);
+        WithMode(mode, () =>
+        {
+            var snapshot = new ResourceSnapshot();
+            var specialization = new ResourceSpecialization();
+            var success = ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read),
+                ref snapshot, ref specialization, out var failure);
+            Assert.Equal(accepted, success);
+            if (!accepted)
+            {
+                Assert.Equal(ResourceMaterializationFailure.IncompatibleImageCandidates, failure);
+                return 0;
+            }
+
+            Assert.Equal(ImageNumericClass.Float, specialization.Images[1].NumericClass);
+            Assert.Equal(ImageNumericClass.Uint, specialization.Images[2].NumericClass);
+            var resources = ResourceMaterializer.ApplyTo(plan, specialization);
+            var layout = BindingLayout.Allocate(
+                resources.Info,
+                BindingLayout.CollectUserDataRegisters(plan.Graph.Program, 0, 64),
+                false,
+                ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
+                false);
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(new ShaderCompileRequest(plan, resources, layout), out _, out var error), error);
             return 0;
         });
     }

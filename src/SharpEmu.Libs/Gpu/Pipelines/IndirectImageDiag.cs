@@ -13,6 +13,8 @@ internal static class IndirectImageDiag
 {
     internal static readonly ulong Hash = ParseHash(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_DIAG"));
     private static long _failures, _successes;
+    private static string? _lastSignature;
+    private static int _signatureChanges;
     private static readonly long Started = Environment.TickCount64;
 
     private static ulong ParseHash(string? value)
@@ -34,9 +36,17 @@ internal static class IndirectImageDiag
     internal static void NoteSuccess(ResourceSpecialization specialization, int baseImageCount)
     {
         var count = Interlocked.Increment(ref _successes);
-        if (count > 2 && count % 2048 != 0) return;
+        var signature = string.Join(",", specialization.Images.Where(image => image.IndirectRoot != DescriptorConstants.NoIndex)
+            .Select(Class).Distinct().OrderBy(text => text, StringComparer.Ordinal));
+        var changed = signature != _lastSignature && _signatureChanges < 64;
+        if (changed)
+        {
+            _lastSignature = signature;
+            _signatureChanges++;
+        }
+        else if (count > 2 && count % 2048 != 0) return;
         var builder = new StringBuilder();
-        builder.Append(FormattableString.Invariant($"[GPU][INDIRECT_DIAG] ok t={Uptime:F1}s n={count} images={specialization.Images.Count} base={baseImageCount}"));
+        builder.Append(FormattableString.Invariant($"[GPU][INDIRECT_DIAG] ok{(changed ? "*" : "")} t={Uptime:F1}s n={count} images={specialization.Images.Count} base={baseImageCount}"));
         foreach (var group in specialization.Images.Where(image => image.IndirectRoot != DescriptorConstants.NoIndex)
                      .GroupBy(image => image.IndirectRoot))
         {
