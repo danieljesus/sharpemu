@@ -13,10 +13,10 @@ namespace SharpEmu.Libs.Gpu.Vulkan;
 // (created dormant, recording nothing until then) writes a marker after every draw and dispatch and prints
 // [PERF][GPU_BUSY] and the top [PERF][GPU_INTERVAL] lines with the shader of each pipeline, which shows which pass holds
 // the GPU. At most MaxArms per session.
-// SHARPEMU_SLOW_MODE_PROBE=0 turns it off (no profile object at all).
+// Off by default; SHARPEMU_SLOW_MODE_PROBE=1 turns it on (without it there is no profile object at all).
 internal static class SlowModeProbe
 {
-    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_SLOW_MODE_PROBE") != "0";
+    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_SLOW_MODE_PROBE") == "1";
     private const double MinimumFps = 4;
     private const double StartSeconds = 130;
     private const int ArmedWindows = 3;

@@ -1063,14 +1063,19 @@ public static class ResourceMaterializer
         var imageCount = info.Images.Count;
         var mappingWordCount = 0;
         var padded = IndirectImagePadMode != 0 && MixesImageClasses(plan); // [local] SHARPEMU_INDIRECT_IMAGE_PAD
+        HashSet<IndirectImageTable>? paddedTables = null;
         if (padded)
         {
+            paddedTables = [];
             var budget = ShaderResourceInfo.MaxImages - imageCount - snapshot.IndirectImages.Sum(table => Math.Max(0, table.Descriptors.Count - 1));
             foreach (var table in snapshot.IndirectImages)
             {
                 var own = Math.Max(0, table.Descriptors.Count - 1);
                 if (table.Resource < info.Images.Count && PadCandidatesByClass(table, info.Images[(int)table.Resource], budget + own))
+                {
                     budget -= table.Descriptors.Count - 1 - own;
+                    paddedTables.Add(table);
+                }
                 else
                     Interlocked.Increment(ref _padSkipped);
             }
@@ -1113,7 +1118,7 @@ public static class ResourceMaterializer
 
         foreach (var table in snapshot.IndirectImages)
         {
-            if (MixesImageClasses(plan) && !padded)
+            if (MixesImageClasses(plan) && paddedTables?.Contains(table) != true) // a table too large to pad is still grouped
                 GroupCandidatesByClass(table);
             var rootImage = images[(int)table.Resource];
             for (var candidate = 1; candidate < table.Descriptors.Count; candidate++)
