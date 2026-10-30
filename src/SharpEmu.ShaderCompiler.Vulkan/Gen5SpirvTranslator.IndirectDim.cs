@@ -7,7 +7,8 @@ namespace SharpEmu.ShaderCompiler.Vulkan;
 
 // [local] SHARPEMU_INDIRECT_IMAGE_DIM=2 (verify; needs the ray query area): at every indirect image access whose
 // candidates differ in dimension or numeric class, ray query counter word 122 sums the lanes that select a candidate
-// of another class than the first case's, and word 123 the lanes of all such accesses. The host prints both
+// of another class than the first case's, and word 123 the lanes of all such accesses (124 and 125: see
+// CountIndirectProgramImage). The host prints them
 // ([GPU][INDIRECT_DIM]).
 public static partial class Gen5SpirvTranslator
 {
@@ -33,6 +34,21 @@ public static partial class Gen5SpirvTranslator
                 return false;
             Console.Error.WriteLine($"[GPU][INDIRECT_DIM] hash=0x{_request.Hash:X16} cases={elements.Count} other_class={other} counted={RqAreaUsable}");
             return RqAreaUsable;
+        }
+
+        internal const uint IndirectCaseWord = 124;
+        internal const uint IndirectProgramImageWord = 125;
+
+        // Words 124 (accesses over several descriptors) and 125 (every image access) of a program with an indirect
+        // image table: they show that the counters reach the host from this program at all.
+        private void CountIndirectProgramImage(bool hasCases)
+        {
+            if (ResourceMaterializer.IndirectImageDimMode != 2 || !RqAreaUsable ||
+                !_request.Resources.Info.Images.Any(image => image.IndirectRoot != DescriptorConstants.NoIndex))
+                return;
+            CountIndirectDimensionLanes(IndirectProgramImageWord);
+            if (hasCases)
+                CountIndirectDimensionLanes(IndirectCaseWord);
         }
 
         // One lane per subgroup adds the active lanes.

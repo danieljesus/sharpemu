@@ -23,7 +23,7 @@ internal sealed partial class RayQueryHle
     // Under _lock.
     // [local] SHARPEMU_INDIRECT_IMAGE_DIM=2: lanes that selected an indirect candidate of another dimension (word 122)
     // of the lanes of such mixed accesses (word 123), per 256 frames and since the start.
-    private long _dimOther, _dimTotal, _dimOtherAll, _dimTotalAll;
+    private long _dimOther, _dimTotal, _dimOtherAll, _dimTotalAll, _dimCases, _dimImages;
 
     private void NoteIndirectDim(ReadOnlySpan<uint> counters, long frame)
     {
@@ -31,12 +31,14 @@ internal sealed partial class RayQueryHle
             return;
         _dimOther += counters[122];
         _dimTotal += counters[123];
+        _dimCases += counters[124];
+        _dimImages += counters[125];
         if (frame % 256 != 0)
             return;
         _dimOtherAll += _dimOther;
         _dimTotalAll += _dimTotal;
-        Console.Error.WriteLine($"[GPU][INDIRECT_DIM] frame={frame} other_dimension_lanes={_dimOther} mixed_access_lanes={_dimTotal} total_other={_dimOtherAll} total_mixed={_dimTotalAll}");
-        _dimOther = _dimTotal = 0;
+        Console.Error.WriteLine($"[GPU][INDIRECT_DIM] frame={frame} other_dimension_lanes={_dimOther} mixed_access_lanes={_dimTotal} total_other={_dimOtherAll} total_mixed={_dimTotalAll} case_access_lanes={_dimCases} image_access_lanes={_dimImages}");
+        _dimOther = _dimTotal = _dimCases = _dimImages = 0;
     }
 
     private void NoteTriProbe(ReadOnlySpan<uint> counters, long frame)

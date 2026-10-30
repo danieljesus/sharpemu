@@ -5695,7 +5695,9 @@ public static partial class Gen5SpirvTranslator
             uint dstSelect;
             uint mipLevel;
             {
-                if (TryGetImageElementCases(instruction, image, out var selector, out var elements, out error))
+                var hasCases = TryGetImageElementCases(instruction, image, out var selector, out var elements, out error);
+                CountIndirectProgramImage(hasCases); // [local] SHARPEMU_INDIRECT_IMAGE_DIM=2
+                if (hasCases)
                 {
                     // One case per descriptor over a constant element, like a switch on the selector.
                     var emitted = true;
