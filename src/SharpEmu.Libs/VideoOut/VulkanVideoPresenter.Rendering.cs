@@ -33,12 +33,12 @@ internal static unsafe partial class VulkanVideoPresenter
     // The pass still ends at this cap so a long pass cannot hold the batch forever.
     private static readonly int DrawsPerBatchInRenderPass = int.Parse(Environment.GetEnvironmentVariable("SHARPEMU_DRAWS_PER_BATCH_PASS") ?? "512"); // [local] tunable
     private const uint SingleRectangleVertexCount = 4;
-    // [local] SHARPEMU_IDLE_FLUSH=<n> (off): a preparation that finds the GPU queue empty (every sealed tick handed to
+    // [local] SHARPEMU_IDLE_FLUSH=<n> (4 by default, =0 off): a preparation that finds the GPU queue empty (every sealed tick handed to
     // the queue and complete) submits the open batch once it holds at least n draws or dispatches, so the GPU starts
     // on it while the rest is recorded instead of after the next synchronizing read drains it. Outside a render pass
     // only, unless SHARPEMU_IDLE_FLUSH_PASS=1 (then the pass ends there). The boundary is the one a full batch already
     // places at any preparation: no command, barrier or order changes.
-    private static readonly int IdleFlushDraws = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IDLE_FLUSH"), out var idleDraws) && idleDraws > 0 ? idleDraws : 0;
+    private static readonly int IdleFlushDraws = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IDLE_FLUSH"), out var idleDraws) ? Math.Max(idleDraws, 0) : 4;
     private static readonly bool IdleFlushInPass = Environment.GetEnvironmentVariable("SHARPEMU_IDLE_FLUSH_PASS") == "1";
 
     private static void RequireRenderingFeature(bool supported, string feature, string deviceName)
