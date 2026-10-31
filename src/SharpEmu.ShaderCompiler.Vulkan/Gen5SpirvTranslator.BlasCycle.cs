@@ -37,7 +37,9 @@ public static partial class Gen5SpirvTranslator
         internal const uint BlasCycleTlasGuarded = 8;
         internal const uint BlasCycleTlasMax = 9;
         internal const uint BlasCycleSample = 10; // 10 claim, 11 key, 12 steps, 13 last node, 14 revisit step, 15 mark, 16-21 ray (v36-v41), 22 tmax (v23)
-        internal const uint BlasCycleLongSteps = 4096;
+        // SHARPEMU_BLAS_CYCLE_LONG: the steps above which a walk is long (4096; healthy walks stay under ~650).
+        internal static readonly uint BlasCycleLongSteps =
+            uint.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BLAS_CYCLE_LONG"), out var longSteps) && longSteps > 0 ? longSteps : 4096;
 
         private enum BlasCycleMode
         {
