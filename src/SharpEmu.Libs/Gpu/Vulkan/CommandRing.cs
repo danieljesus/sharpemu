@@ -42,7 +42,8 @@ internal sealed unsafe partial class CommandRing : IDisposable
     // SHARPEMU_RECORD_RING_WAKE: records appended before a parked replay thread is woken (sync points wake it at
     // once). SHARPEMU_RECORD_RING_SPIN_US: how long the replay thread spins on an empty ring before it parks.
     // [local] Defaults 256 and 0 (were 1 and 1000): parking at once frees ~37 ms/frame of a logical CPU in GTA V.
-    private static readonly int WakeEvery = Math.Max(1, EnvInt("SHARPEMU_RECORD_RING_WAKE", 256));
+    // [local] Wake default 64 (slow8395: less sealed work waiting on the replay with DEFERRED_PROTECT_WORKERS=2).
+    private static readonly int WakeEvery = Math.Max(1, EnvInt("SHARPEMU_RECORD_RING_WAKE", 64));
     private static readonly long SpinTicks = EnvInt("SHARPEMU_RECORD_RING_SPIN_US", 0) * Stopwatch.Frequency / 1_000_000;
     // [local] SHARPEMU_RECORD_RING_HYBRID=1: the replay thread spins only while the producer is appending (it found
     // records within the last SHARPEMU_RECORD_RING_ACTIVE_US, default 200 µs, and never longer than the spin above);

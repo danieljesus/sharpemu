@@ -42,8 +42,9 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
     // [local] The join is by job order: a job's number is taken with its place in the queue, and the completed count is
     // the longest prefix of finished jobs (with one worker, the order they finish in), so WaitIdle(target) returns
     // only once every job up to target has copied, also when jobs finish out of order.
+    // [local] Default 2 (was 1; slow8395 A/B with RECORD_RING_WAKE=64: panning +0.6-0.8 FPS).
     private static readonly int WorkerCount = Math.Clamp(
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_PROTECT_WORKERS"), out var count) ? count : 1, 1, 8);
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_PROTECT_WORKERS"), out var count) ? count : 2, 1, 8);
 
     // [local] SHARPEMU_DEFERRED_UPLOAD_WAIT_BLOCK (on by default, =0 turns it off): WaitIdle spins BlockSpins rounds of
     // Thread.SpinWait (16, 32, ... 512 iterations, some tens of microseconds in all) without yielding, then blocks on
