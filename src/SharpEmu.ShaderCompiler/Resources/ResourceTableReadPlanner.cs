@@ -49,6 +49,12 @@ public sealed class ResourceTableReadPlanner
 
     public static bool IsDeviceDataReadHash(ulong hash) => DeviceDataReadHashes.Contains(hash);
 
+    // [local] SHARPEMU_DEVICE_DATA_READS_VERIFY=1: the listed shaders' data reads are flattened and read by the host as
+    // before (its value is the one used), and the shader also performs each through the page table, as the device-read
+    // mode would, and counts the subgroups where the two differ ([GPU][DEVICE_DATA_VERIFY]). Their ranges are planned as
+    // in the device-read mode, so the host maps them the same way.
+    public static readonly bool DeviceDataVerify = System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS_VERIFY") == "1";
+
     private static long _deviceDataReads;
 
     public static long DeviceDataReads => System.Threading.Interlocked.Read(ref _deviceDataReads);
@@ -110,6 +116,14 @@ public sealed class ResourceTableReadPlanner
             {
                 if (handleIndices is not null && !handleIndices.Contains(read.MemoryIndex))
                 {
+                    if (DeviceDataVerify)
+                    {
+                        _graph.Memory[read.MemoryIndex].DeviceDataVerify = true;
+                        Collect(read, _graph.Memory[read.MemoryIndex].Pc);
+                        System.Threading.Interlocked.Increment(ref _deviceDataReads);
+                        continue;
+                    }
+
                     foreach (var operand in read.Operands[0].Operands)
                         Collect(operand, _graph.Memory[read.MemoryIndex].Pc);
                     System.Threading.Interlocked.Increment(ref _deviceDataReads);

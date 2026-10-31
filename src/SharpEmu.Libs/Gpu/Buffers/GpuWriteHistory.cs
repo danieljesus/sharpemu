@@ -21,7 +21,7 @@ internal static class GpuWriteHistory
     // [local] Lets the precise-read tests record the writes of one thread without the environment switches.
     internal static int ForceRecordingThread;
 
-    public static bool Recording => Mode != 0 || PreciseWaitRequested || ConservativeRecords.Mode >= 3; // [local] SHARPEMU_CONSERVATIVE_RECORDS=3/4
+    public static bool Recording => Mode != 0 || PreciseWaitRequested || ConservativeRecords.PreciseRecording; // [local] SHARPEMU_CONSERVATIVE_RECORDS=3/4, SHARPEMU_PRECISE_TABLE_READ
 
     public static bool Queryable => (Recording || ForceRecordingThread != 0) && !_poisoned;
 

@@ -65,7 +65,7 @@ public static class DeviceAddressPaging
         _ => 0,
     };
     public static readonly int BlasCycleMode = ReadBlasCycleMode();
-    public static bool RqAreaEnabled => RayQueryMode != 0 || RqMapProbe || BlasCycleMode != 0;
+    public static bool RqAreaEnabled => RayQueryMode != 0 || RqMapProbe || BlasCycleMode != 0 || ResourceTableReadPlanner.DeviceDataVerify;
     public const uint RqTableSlots = 4096;
     public const uint RqMapSlots = 4096;
     public const uint RqCounterWords = 256;

@@ -718,6 +718,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 conservativeVerify = Gpu.Buffers.ConservativeRecords.Mode == 2;
                 conservativePrecise = Gpu.Buffers.ConservativeRecords.Mode >= 3;
             }
+            else if (Gpu.Buffers.ConservativeRecords.PreciseTableMode != 0 &&
+                Gpu.Buffers.ConservativeRecords.MatchesPrecise(Gpu.Buffers.ConservativeRecords.CurrentReader, SharpEmu.ShaderCompiler.Resources.SrtReadProbe.CurrentBaseAddress, address))
+            {
+                conservativePrecise = true; // [local] SHARPEMU_PRECISE_TABLE_READ
+            }
 
             if (OnFrontThread)
             {
@@ -859,7 +864,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (conservativePrecise) // [local] SHARPEMU_CONSERVATIVE_RECORDS=3/4: this read alone after its precise writer tick
                     {
                         _bufferCache.ForcePreciseWait = true;
-                        _bufferCache.ForcePreciseVerify = Gpu.Buffers.ConservativeRecords.Mode == 4;
+                        _bufferCache.ForcePreciseVerify = Gpu.Buffers.ConservativeRecords.Mode == 4 || Gpu.Buffers.ConservativeRecords.PreciseTableMode == 2;
                     }
 
                     bool preciseSynced;

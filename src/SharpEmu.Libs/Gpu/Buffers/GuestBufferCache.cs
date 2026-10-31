@@ -2957,7 +2957,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private void ReportPreciseWait()
     {
-        if (!PreciseWait || System.Diagnostics.Stopwatch.GetElapsedTime(_preciseWaitReport).TotalSeconds < 20)
+        if ((!PreciseWait && !ConservativeRecords.PreciseRecording) || System.Diagnostics.Stopwatch.GetElapsedTime(_preciseWaitReport).TotalSeconds < 20) // [local] also the precise reads of SHARPEMU_CONSERVATIVE_RECORDS=3/4
         {
             return;
         }

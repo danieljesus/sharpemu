@@ -217,6 +217,7 @@ public sealed class ShaderResourcePlan
         }
 
         plan.WrittenRangeSlotByHandle = writtenSlots;
+        if (ResourceTableReadPlanner.DeviceDataVerify && plan.Memory.Entries.Any(memory => memory.DeviceDataVerify)) plan.Info.UsesDeviceAddresses = true; // [local] the verify loads go through the page table
         if (hash == 0x35B85620669D35A4) plan.Info.UsesDeviceAddresses = true; // [local] gives the scan shader a fault buffer for trace records
         if (hash == 0x220AB61E9C35767C && Environment.GetEnvironmentVariable("SHARPEMU_LOOKBACK_PROBE") == "1") plan.Info.UsesDeviceAddresses = true; // [local] fault buffer for the look-back probe
         return plan;

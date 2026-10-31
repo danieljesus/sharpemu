@@ -496,11 +496,31 @@ internal sealed unsafe partial class RayQueryHle
     }
 
     // The counters of one dispatch (under _lock): query and fallback lanes, the verify record ([GPU][RQ_VERIFY]).
+    // [local] SHARPEMU_DEVICE_DATA_READS_VERIFY: words 110-117 (Gen5SpirvTranslator.DeviceDataVerify.cs).
+    private long _ddvChecks, _ddvMismatches, _ddvChecksAll, _ddvMismatchesAll, _ddvSamples;
+
+    private void NoteDeviceDataVerify(ReadOnlySpan<uint> counters, long frame)
+    {
+        if (!SharpEmu.ShaderCompiler.Resources.ResourceTableReadPlanner.DeviceDataVerify)
+            return;
+        _ddvChecks += counters[110];
+        _ddvMismatches += counters[111];
+        if (counters[112] != 0 && _ddvSamples++ < 16)
+            Console.Error.WriteLine($"[GPU][DEVICE_DATA_VERIFY_SAMPLE] frame={frame} host=0x{counters[113]:X8} device=0x{counters[114]:X8} address=0x{((ulong)counters[116] << 32) | counters[115]:X} pc=0x{counters[117] >> 8:X} component={counters[117] & 0xFF}");
+        if (frame % 256 != 0)
+            return;
+        _ddvChecksAll += _ddvChecks;
+        _ddvMismatchesAll += _ddvMismatches;
+        Console.Error.WriteLine($"[GPU][DEVICE_DATA_VERIFY] frame={frame} checks={_ddvChecks} mismatches={_ddvMismatches} total_checks={_ddvChecksAll} total_mismatches={_ddvMismatchesAll}");
+        _ddvChecks = _ddvMismatches = 0;
+    }
+
     private void NoteQueryCounters(ReadOnlySpan<uint> counters, long frame)
     {
         NoteTriProbe(counters, frame);
         NoteBlasCycle(counters, frame);
         NoteIndirectDim(counters, frame);
+        NoteDeviceDataVerify(counters, frame);
         if (DeviceAddressPaging.RayQueryMode == 0)
             return;
         _counterDispatches++;

@@ -1216,6 +1216,15 @@ public static partial class Gen5SpirvTranslator
                     }
 
                     value = LoadFlattenedSlot(slot);
+                    if (entry.DeviceDataVerify && entry.Kind == MemoryResourceKind.ScalarAddress && RqAreaUsable &&
+                        instruction.Sources.Count != 0 && instruction.Sources[0].Kind == Gen5OperandKind.ScalarRegister)
+                    {
+                        var verifyRegister = instruction.Sources[0].Value;
+                        var verifyAddress = And64(IAdd64(
+                            Pair64(LoadS(verifyRegister), LoadS(verifyRegister + 1)),
+                            IAdd64(Widen(dynamicOffset), SignedOffset64(control.ImmediateOffsetBytes + component * sizeof(uint)))), ULong(DeviceAddressMask & ~3ul));
+                        EmitDeviceDataVerify(verifyAddress, value, instruction.Pc, (uint)component);
+                    }
                 }
                 else if (entry.Kind == MemoryResourceKind.ScalarBuffer && entry.DeviceDescriptor)
                 {

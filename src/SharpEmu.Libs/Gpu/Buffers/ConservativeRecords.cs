@@ -42,6 +42,31 @@ internal static class ConservativeRecords
 
     private static readonly HashSet<ulong> Hashes = Words.Select(word => word.Hash).ToHashSet();
 
+    // [local] SHARPEMU_PRECISE_TABLE_READ (0 off by default, 1 on, 2 verify) with SHARPEMU_PRECISE_TABLE_WORDS=<hash>+<hex offset>[,...]
+    // (default F5EB +0x50/+0x54 and 4481 +0xD8..+0xE4): the =3/=4 precise read of the listed table words, without the num_records lists above.
+    // A listed word's synchronizing read waits only for its own last writer tick (GuestBufferCache.TryPreciseRead), not
+    // for its 16 KB block's tick, and copies only the bytes whose own writer finished; exact by construction (a byte is
+    // copied only once its last recorded GPU writer has completed), =2 also copies after the block tick and compares
+    // ([READBACK_PRECISE_WAIT] verify_mismatches). Meant for GTA V's TLAS-chain reader 0xF5EB at struct+0x50: the CPU copy
+    // is already right (census changed=0), its exact writer finished ~4 ticks earlier, but 0x5981's refit writes 0x18 B
+    // at struct+0x0 of the same block in the tick being recorded, so with SHARPEMU_DEVICE_DATA_READS=B198 its read is the
+    // one that flushes the open batch. 0x4481's V# at +0xD8 is the same pattern (writer 0x10CD's wide binding, changed=0).
+    public static readonly int PreciseTableMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_TABLE_READ"), out var preciseMode) ? (preciseMode is 1 or 2 ? preciseMode : 0) : 0;
+
+    private static readonly HashSet<(ulong Hash, ulong Offset)> PreciseWords = (Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_TABLE_WORDS") ?? "F5EBBA997605508B+50,F5EBBA997605508B+54,4481C2A89BEA7646+D8,4481C2A89BEA7646+DC,4481C2A89BEA7646+E0,4481C2A89BEA7646+E4")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries)
+        .Select(item => item.Split('+'))
+        .Select(parts => (Convert.ToUInt64(parts[0], 16), Convert.ToUInt64(parts[1], 16)))
+        .ToHashSet();
+
+    // Whether the reads are tracked at all (the reader hash and the write-history ring).
+    public static bool Tracking => Mode != 0 || PreciseTableMode != 0;
+
+    public static bool PreciseRecording => Mode >= 3 || PreciseTableMode != 0;
+
+    public static bool MatchesPrecise(ulong reader, ulong baseAddress, ulong address) =>
+        PreciseTableMode != 0 && baseAddress != 0 && address >= baseAddress && PreciseWords.Contains((reader, address - baseAddress));
+
     // The program whose resources are being materialized (set by ShaderProgramCache while the switch is on).
     [ThreadStatic] internal static ulong CurrentReader;
 

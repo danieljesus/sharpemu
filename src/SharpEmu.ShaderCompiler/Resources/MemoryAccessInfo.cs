@@ -111,6 +111,8 @@ public sealed class MemoryAccessInfo
     // A scalar buffer load whose descriptor only exists on the device: the shader reads
     // through the descriptor in its registers instead of a host-bound buffer.
     public bool DeviceDescriptor { get; set; }
+    // [local] SHARPEMU_DEVICE_DATA_READS_VERIFY: a flattened data read the shader also performs through the page table.
+    public bool DeviceDataVerify { get; set; }
 
     // The guest V# behind a buffer access, filled in by the resource tracker.
     // Null until then. Its provenance tells the backend which lowering

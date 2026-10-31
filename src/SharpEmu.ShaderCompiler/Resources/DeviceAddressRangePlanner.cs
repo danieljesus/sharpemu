@@ -36,7 +36,7 @@ public static class DeviceAddressRangePlanner
         for (var index = 0; index < plan.Memory.Count; index++)
         {
             var memory = plan.Memory[index];
-            if (memory.Kind is not (MemoryResourceKind.Flat or MemoryResourceKind.Global or MemoryResourceKind.ScalarAddress) || memory.PlanningOnly)
+            if (memory.Kind is not (MemoryResourceKind.Flat or MemoryResourceKind.Global or MemoryResourceKind.ScalarAddress) || (memory.PlanningOnly && !memory.DeviceDataVerify))
             {
                 continue;
             }
