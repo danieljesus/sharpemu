@@ -77,9 +77,21 @@ internal static class TableDirtyProbe
 
     private static string Ms(int slot) => (_pathCounts[slot] == 0 ? 0 : _pathTicks[slot] * 1000.0 / System.Diagnostics.Stopwatch.Frequency / _pathCounts[slot]).ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
 
+    // [local] SHARPEMU_TABLE_DIRTY_TIMELINE=<skip>+<count>: also logs every event over the watched range in order (writes,
+    // marks and the synchronous table reads), after skipping the first <skip>, for <count> events.
+    private static readonly (long Skip, long Count) Timeline = System.Environment.GetEnvironmentVariable("SHARPEMU_TABLE_DIRTY_TIMELINE")?.Split('+') is [var skip, var count]
+        ? (long.Parse(skip), long.Parse(count)) : (0, 0);
+    private static long _events;
+
     public static void Note(string what, ulong address, ulong size, ulong tick)
     {
         var hits = System.Threading.Interlocked.Increment(ref _hits);
+        if (Timeline.Count != 0)
+        {
+            var events = System.Threading.Interlocked.Increment(ref _events);
+            if (events > Timeline.Skip && events <= Timeline.Skip + Timeline.Count)
+                System.Console.Error.WriteLine($"[TABLE_DIRTY_TL] {events} tick={tick} {what} range=0x{address:X}+0x{size:X} thread={System.Environment.CurrentManagedThreadId}");
+        }
         var key = $"{what} range=0x{address:X}+0x{size:X}";
         var count = Seen.AddOrUpdate(key, 1, static (_, value) => value + 1);
         if (count == 1 && Seen.Count <= 200)

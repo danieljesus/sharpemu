@@ -892,6 +892,15 @@ internal static unsafe partial class VulkanVideoPresenter
                         return false;
                     }
 
+                    if (Gpu.Buffers.WriteDiffProbe.Enabled) Gpu.Buffers.WriteDiffProbe.NoteRead(Diagnostics.GpuReadTrace.CurrentShader, address); // [local] SHARPEMU_WRITE_DIFF
+                    if (Gpu.Buffers.GuestBufferCache.TableReadVerify > 0) // [local] SHARPEMU_TABLE_READ_VERIFY
+                    {
+                        Span<byte> answer = stackalloc byte[sizeof(uint)];
+                        if (_guestMemory.TryRead(address, answer))
+                            _bufferCache.VerifyTableRead(address, sizeof(uint), System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(answer));
+                    }
+                    if (Diagnostics.TableDirtyProbe.Overlaps(address, sizeof(uint))) Diagnostics.TableDirtyProbe.Note($"read reader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16}", address, sizeof(uint), _scheduler.CurrentTick); // [local]
+
                     if (probe || census)
                     {
                         var ms = System.Diagnostics.Stopwatch.GetElapsedTime(censusStarted).TotalMilliseconds;

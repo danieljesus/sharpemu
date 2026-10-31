@@ -241,6 +241,7 @@ public sealed partial class RenderExecutor
             if (waitStarted != 0 && Gpu.Pipelines.CompileLog.Enabled)
                 Gpu.Pipelines.CompileLog.Note("dispatch-wait", System.Diagnostics.Stopwatch.GetElapsedTime(waitStarted).TotalMilliseconds, program.Hash);
 
+            if (Gpu.Buffers.WriteDiffProbe.Enabled) Gpu.Buffers.WriteDiffProbe.Arm(program.Hash); // [local] SHARPEMU_WRITE_DIFF
             var bindings = PrepareBindings(input.Stage);
             if (program.UsesDeviceAddresses)
             {
@@ -288,6 +289,7 @@ public sealed partial class RenderExecutor
             }
 
             if (DispatchExecLog && physicalGroups[0] == 1 && physicalGroups[1] == 1 && physicalGroups[2] == 1 && _hdrDispatchLogs++ < 600) Console.Error.WriteLine($"[DISPATCH_EXEC] shader=0x{compute.Address:X} groups=1,1,1 indirect=0x{indirectArgumentsAddress:X}"); // [local]
+            if (Gpu.Buffers.WriteDiffProbe.Enabled) Gpu.Buffers.WriteDiffProbe.BeforeDispatch(); // [local]
             if (gpuThreadIndirect)
             {
                 if (!_host.TryDispatchIndirectThreads(indirectArgumentsAddress, bindings))
@@ -302,6 +304,7 @@ public sealed partial class RenderExecutor
             if (DispatchBarriers)
                 _host.ShaderAccessBarrier();
             if (Gpu.Buffers.RangeDumpProbe.Enabled) Gpu.Buffers.RangeDumpProbe.AfterDispatch(program.Hash, input.Stage.Resources.UserData, input.Stage.Resources.Buffers); // [local] SHARPEMU_RANGE_DUMP
+            if (Gpu.Buffers.WriteDiffProbe.Enabled) Gpu.Buffers.WriteDiffProbe.AfterDispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2], indirectArgumentsAddress, input.Stage.Resources.UserData); // [local]
             if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0 || (useThreadDimensions && _dimsLogs++ < 3000)) Console.Error.WriteLine($"[DISPATCH_DIMS] shader=0x{compute.Address:X} thread_dims={useThreadDimensions} dims={dimsX}x{dimsY}x{dimsZ} local={compute.ThreadsX}x{compute.ThreadsY}x{compute.ThreadsZ} indirect=0x{dimsIndirect:X} initiator=0x{dispatchInitiator:X} groups={physicalGroups[0]}x{physicalGroups[1]}x{physicalGroups[2]}"); // [local]
             var hook = Gpu.Buffers.GuestBufferCache.PostDispatchHook; // [local]
             if (hook != null) { Gpu.Buffers.GuestBufferCache.PostDispatchHook = null; hook(); }

@@ -307,6 +307,9 @@ public static class DeviceStoreTablePlanner
     }
 
     private static readonly bool TableLog = System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_LOG") == "1"; // [local]
+    // [local] SHARPEMU_STORE_TABLE_COVER=<hex address>: logs every scanned table V# (before the merge) that covers the address.
+    private static readonly ulong CoverWatch = System.Convert.ToUInt64(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_COVER") ?? "0", 16);
+    private static int _coverLogs;
     private static int _tableLogs;
 
     private static string Describe(List<DeviceAddressRange> ranges) =>
@@ -722,6 +725,8 @@ public static class DeviceStoreTablePlanner
                         if (readable && TryDecode(words, out var entryBase, out var entryBytes) && entryBytes <= MaxEntryBytes && (FilterGpuWritable ? SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.IsGpuWritable(entryBase, entryBytes) : entryBase + entryBytes <= TableMaxAddress))
                         {
                             ranges.Add(new DeviceAddressRange(uint.MaxValue - (uint)ranges.Count, entryBase, entryBytes, Planned: true, Written: MarksWritten(entryBytes))); // [local]
+                            if (CoverWatch != 0 && CoverWatch >= entryBase && CoverWatch - entryBase < entryBytes && Interlocked.Increment(ref _coverLogs) <= 400) // [local] SHARPEMU_STORE_TABLE_COVER
+                                System.Console.Error.WriteLine($"[STORE_TABLE_COVER] hash=0x{plan.Hash:X16} table=0x{tableBase:X} entry={entry} vsharp=0x{entryBase:X}+0x{entryBytes:X} words={words[0]:X8} {words[1]:X8} {words[2]:X8} {words[3]:X8}");
                         }
                     }
                 }

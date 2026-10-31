@@ -87,6 +87,112 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private long _gpuModifiedRemovals; // [local]
 
+    // [local] SHARPEMU_CP_WRITE_CLEAN=1 (off by default): a command-processor write (WRITE_DATA, DMA from host data) puts
+    // the same bytes in the backing and, in stream order, in the device buffer, so after it neither copy is newer than
+    // the other: the bytes leave the GPU-modified set. Before, a word the CP rewrote every frame stayed GPU-modified
+    // through the conservative marks of earlier dispatches, and its next synchronous read downloaded it again, waiting
+    // for whatever was recorded since. A download already queued over those bytes is no longer current (the copy moved
+    // its write tick and the bytes left the set), so it is not applied; a later dispatch that writes them marks them again.
+    internal static readonly bool CpWriteClean = Environment.GetEnvironmentVariable("SHARPEMU_CP_WRITE_CLEAN") == "1";
+    private long _cpCleanedWrites, _cpCleanedBytes;
+
+    private void CleanCpWritten(ulong address, ulong size)
+    {
+        if (!_gpuModifiedRanges.Overlaps(address, size))
+            return;
+        _cpCleanedWrites++;
+        _cpCleanedBytes += (long)size;
+        RemoveGpuModified(address, size);
+        ClearPagesOfPublishedPiece(address, size,
+            page => _gpuModifiedRanges.Overlaps(page, TrackerLayout.PageBytes),
+            (begin, bytes) => _tracker.ClearGpuDirtyPages(begin, bytes));
+    }
+
+    // [local] SHARPEMU_CLEAN_BYTE_READS=1 (off by default; =2 verify): a synchronous shader-table read whose own bytes are
+    // not GPU-modified needs nothing from the GPU (the backing holds them), even when other bytes of its page or readback
+    // window are; it no longer downloads the window and waits for their writers. =2 reads as before and also copies the
+    // requested bytes from the device buffer at that point of the stream and, at completion, compares them with the
+    // backing as it was when the read was answered ([CLEAN_BYTE_READS] mismatches=, has to stay 0).
+    internal static readonly int CleanByteReads = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_CLEAN_BYTE_READS"), out var cleanByteReads) ? cleanByteReads : 0;
+    private long _cleanReads, _cleanChecks, _cleanMismatches, _cleanUnchecked;
+    private GpuBuffer? _cleanVerify;
+    private int _cleanVerifySlot;
+    private int _cleanMismatchLogs;
+    private long _cleanReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private bool TryCleanByteRead(ulong guestAddress, ulong size, GuestMemoryProfile.ReadbackSource source)
+    {
+        if (CleanByteReads == 0 || source != GuestMemoryProfile.ReadbackSource.ShaderResourceRead || size == 0 || size > 16)
+            return false;
+        ReportCleanByteReads();
+        if (_gpuModifiedRanges.Overlaps(guestAddress, size))
+            return false;
+        _cleanReads++;
+        if (CleanByteReads == 1)
+            return true;
+        VerifyHostBytes(guestAddress, size, null);
+        return false;
+    }
+
+    // [local] SHARPEMU_TABLE_READ_VERIFY=<n> (off by default): one synchronous shader-table read in n, once answered, also
+    // copies its bytes from the device buffer at that point of the stream and compares them at completion with the bytes
+    // the host answered ([CLEAN_BYTE_READS] checks=/mismatches=). Checks every way a read can be answered without the GPU
+    // (SHARPEMU_CP_WRITE_CLEAN, SHARPEMU_CLEAN_BYTE_READS). Only reads made on the GPU queue thread, outside CPU-dirty pages
+    // (the device copy is legitimately older there), are checked.
+    internal static readonly int TableReadVerify = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_READ_VERIFY"), out var tableReadVerify) ? tableReadVerify : 0;
+    private long _tableReadVerifySeen, _tableReadVerifyOffQueue;
+
+    internal void VerifyTableRead(ulong guestAddress, ulong size, uint answered)
+    {
+        if (_tableReadVerifySeen++ % TableReadVerify != 0)
+            return;
+        ReportCleanByteReads();
+        if (!_relay.IsGpuQueueThread)
+        {
+            _tableReadVerifyOffQueue++;
+            return;
+        }
+
+        var expected = new byte[size];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(expected, answered);
+        VerifyHostBytes(guestAddress, size, expected);
+    }
+
+    private void VerifyHostBytes(ulong guestAddress, ulong size, byte[]? answered)
+    {
+        var expected = answered ?? new byte[size];
+        var owner = FindOwner(guestAddress, size);
+        if (owner is null || !owner.IsInBounds(guestAddress, size) || _tracker.HasCpuDirtyPages(guestAddress, size) || (answered is null && !_backing.TryReadBacking(guestAddress, expected)))
+        {
+            _cleanUnchecked++;
+            return;
+        }
+
+        _cleanVerify ??= new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, 4096 * 16);
+        var verify = _cleanVerify;
+        var offset = (ulong)(_cleanVerifySlot++ % 4096) * 16;
+        verify.CopyFrom(_scheduler.Current, owner, owner.Offset(guestAddress), offset, size, destinationAfter: AccessFlags.HostReadBit);
+        _scheduler.QueueCompletionAction(() =>
+        {
+            verify.Invalidate(offset, size);
+            var actual = verify.Mapped.Slice((int)offset, (int)size);
+            _cleanChecks++;
+            if (actual.SequenceEqual(expected))
+                return;
+            _cleanMismatches++;
+            if (_cleanMismatchLogs++ < 20)
+                Console.Error.WriteLine($"[CLEAN_BYTE_READS_MISMATCH] address=0x{guestAddress:X} size={size} backing={Convert.ToHexString(expected)} device={Convert.ToHexString(actual)} shader=0x{Diagnostics.GpuReadTrace.CurrentShader:X16}");
+        });
+    }
+
+    private void ReportCleanByteReads()
+    {
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_cleanReport).TotalSeconds < 20)
+            return;
+        _cleanReport = System.Diagnostics.Stopwatch.GetTimestamp();
+        Console.Error.WriteLine($"[CLEAN_BYTE_READS] mode={CleanByteReads} verify={TableReadVerify} clean_reads={_cleanReads} checks={_cleanChecks} mismatches={_cleanMismatches} unchecked={_cleanUnchecked} off_queue={_tableReadVerifyOffQueue} cp_cleaned={_cpCleanedWrites}/{_cpCleanedBytes}B");
+    }
+
     // [local] experiment: writes through bindings of 16 MB or more are tracked as "broad";
     // a word dirty only through broad bindings may be read speculatively by table reads.
     private readonly SpanSet _preciseGpuModifiedRanges = new();
@@ -305,6 +411,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             _zeroPage = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags | BufferUsageFlags.ShaderDeviceAddressBit, CachingPageSize);
         _tracker = new GuestPageTracker(pages);
         RangeDumpProbe.Cache = this; // [local]
+        WriteDiffProbe.Cache = this; // [local] SHARPEMU_WRITE_DIFF
         if (TlasHle.Enabled) TlasHle.Instance = new TlasHle(device, scheduler, this); // [local] SHARPEMU_TLAS_HLE
         if (RayQueryHle.Enabled) RayQueryHle.Instance = new RayQueryHle(device, scheduler, this); // [local] SHARPEMU_RT_RAYQUERY / SHARPEMU_RQ_MAP
         _staging = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Upload, 512 * MiB);
@@ -469,6 +576,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     // [local] SHARPEMU_TLAS_HLE: bytes for a binding, in the stream ring.
     internal (GpuBuffer Buffer, ulong Offset) UploadStream(ReadOnlySpan<byte> source, ulong alignment) => (_stream, _stream.Copy(source, alignment));
+
+    // [local] SHARPEMU_WRITE_DIFF
+    internal SubmissionScheduler ProbeScheduler => _scheduler;
+    internal GpuDeviceInfo ProbeDevice => _device;
 
     public void DumpDeviceRange(ulong guestAddress, ulong size, string path)
     {
@@ -1065,6 +1176,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (isWritten)
         {
             buffer.NoteGpuWrite(buffer.Offset(guestAddress), size);
+            if (WriteDiffProbe.Enabled) WriteDiffProbe.NoteWritten(buffer, buffer.Offset(guestAddress), guestAddress, size, conservativeWrite); // [local]
             if (Diagnostics.DccWriterTrace.Enabled)
             {
                 Diagnostics.DccWriterTrace.Record(RequireImageCache(), guestAddress, size);
@@ -1247,6 +1359,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{guestAddress:X16} size=0x{data.Length:X16}");
         }
 
+        if (Diagnostics.TableDirtyProbe.Overlaps(guestAddress, (ulong)data.Length)) Diagnostics.TableDirtyProbe.Note("cp-write", guestAddress, (ulong)data.Length, _scheduler.CurrentTick); // [local]
+
         // Registered buffers are ordered and disjoint: walk only the ones the write overlaps.
         var end = guestAddress + (ulong)data.Length;
         ulong covered = 0; // [local]
@@ -1267,6 +1381,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             WriteDataBuffer(buffer, begin, data.Slice((int)(begin - guestAddress), (int)(rangeEnd - begin)));
             TouchBuffer(bufferIdentifier);
             covered += rangeEnd - begin;
+            if (CpWriteClean) CleanCpWritten(begin, rangeEnd - begin); // [local] SHARPEMU_CP_WRITE_CLEAN
         }
         if (covered < (ulong)data.Length) // [local] bytes only the guest copy received
         {
@@ -2466,6 +2581,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         using var foreignRead = _device.Slabs.BeginForeignRead();
         var readbackStarted = GuestMemoryProfile.ReadbackDetailsEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (isWrite && !IsRegionRegistered(guestAddress, size))
+        {
+            return null;
+        }
+
+        if (!isWrite && TryCleanByteRead(guestAddress, size, source)) // [local] SHARPEMU_CLEAN_BYTE_READS
         {
             return null;
         }
