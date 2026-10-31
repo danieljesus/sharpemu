@@ -72,6 +72,8 @@ public sealed class ResourceTableReadPlanner
 
     private HashSet<ScalarValue>? _deviceDescriptorReads;
 
+    public static bool IsDeviceDescriptorRead(ulong hash, uint pc) => DeviceDescriptorReads.Count != 0 && !DeviceDataVerify && DeviceDescriptorReads.Contains((hash, pc));
+
     private static long _deviceDataReads;
 
     public static long DeviceDataReads => System.Threading.Interlocked.Read(ref _deviceDataReads);

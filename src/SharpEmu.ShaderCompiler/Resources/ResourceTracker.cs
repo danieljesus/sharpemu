@@ -433,6 +433,25 @@ public sealed partial class ResourceTracker
     // read on the device too (ResourceTableReadPlanner leaves those reads unflattened).
     private bool DeviceTables => ResourceTableReadPlanner.IsDeviceTableHash(_plan.Hash);
 
+    private bool DependsOnDeviceDescriptorRead(ScalarValue value)
+    {
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(value);
+        while (pending.TryPop(out var current))
+        {
+            if (!visited.Add(current))
+                continue;
+            if (current.Kind == ScalarValueKind.ScalarAddressWord && current.MemoryIndex >= 0 && current.MemoryIndex < _plan.Memory.Count &&
+                ResourceTableReadPlanner.IsDeviceDescriptorRead(_plan.Hash, _plan.Memory[current.MemoryIndex].Pc))
+                return true;
+            foreach (var operand in current.Operands)
+                pending.Push(operand);
+        }
+
+        return false;
+    }
+
     private bool DependsOnScalarBufferWord(ScalarValue value)
     {
         var pending = new Stack<ScalarValue>();
@@ -916,6 +935,16 @@ public sealed partial class ResourceTracker
 
         if (isBuffer)
         {
+            // [local] SHARPEMU_DEVICE_DESCRIPTOR_READS: a read through a V# built from a listed, unflattened S_LOAD reads
+            // its descriptor from its SGPRs on the device; the host neither binds nor reads it.
+            if (memory.Access == MemoryAccess.Read && access.Handle is { Kind: ScalarValueKind.BufferHandle } deviceHandle &&
+                deviceHandle.Operands.Any(DependsOnDeviceDescriptorRead))
+            {
+                memory.DeviceDescriptor = true;
+                _info.UsesDeviceAddresses = true;
+                return;
+            }
+
             // A front GS/HS shader can carry a second code object after
             // S_SETPC_B64. Until AGC supplies its continuation descriptor,
             // linear decoding sees that unreachable tail with undefined SGPRs.

@@ -30,11 +30,15 @@ public sealed class LocalDeviceDescriptorReadTests(ITestOutputHelper output)
         try
         {
             ResourceTableReadPlanner.DeviceDescriptorReads = [];
-            var before = Offsets(Plan(out _));
+            var basePlan = Plan(out _);
+            var before = Offsets(basePlan);
             ResourceTableReadPlanner.DeviceDescriptorReads = [(Hash, 0x1C), (Hash, 0xC)];
             var plan = Plan(out var program);
             var after = Offsets(plan);
-            output.WriteLine($"before=[{string.Join(",", before)}] after=[{string.Join(",", after)}] uses_device_addresses={plan.Info.UsesDeviceAddresses}");
+            output.WriteLine($"before=[{string.Join(",", before)}] after=[{string.Join(",", after)}] buffers={basePlan.Info.Buffers.Count}->{plan.Info.Buffers.Count} uses_device_addresses={plan.Info.UsesDeviceAddresses}");
+            Assert.True(plan.Info.UsesDeviceAddresses);
+            Assert.True(plan.Info.Buffers.Count < basePlan.Info.Buffers.Count);
+            Assert.Contains(plan.Memory.Entries, memory => memory.DeviceDescriptor && memory.Opcode.StartsWith("BufferLoad", StringComparison.Ordinal));
             Assert.Contains((0x1Cu, 0u), before);
             Assert.Contains((0x1Cu, 1u), before);
             Assert.DoesNotContain((0x1Cu, 0u), after);
