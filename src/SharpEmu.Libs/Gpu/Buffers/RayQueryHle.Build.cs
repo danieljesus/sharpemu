@@ -499,6 +499,7 @@ internal sealed unsafe partial class RayQueryHle
     private void NoteQueryCounters(ReadOnlySpan<uint> counters, long frame)
     {
         NoteTriProbe(counters, frame);
+        NoteBlasCycle(counters, frame);
         NoteIndirectDim(counters, frame);
         if (DeviceAddressPaging.RayQueryMode == 0)
             return;

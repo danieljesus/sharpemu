@@ -101,6 +101,42 @@ public sealed class LocalNativeBlasLoopTests(ITestOutputHelper output)
         }
     }
 
+    // [local] SHARPEMU_BLAS_CYCLE: box revisit detection in the native BLAS loop, stop and verify, with and without tracing.
+    [Fact]
+    public void TranslatesWithTheCycleSwitch()
+    {
+        if (!File.Exists(Binary))
+        {
+            return;
+        }
+
+        var previous = Environment.GetEnvironmentVariable("SHARPEMU_BLAS_CYCLE");
+        try
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_BLAS_CYCLE", "0");
+            var baseline = Compile(trace: false).Length;
+            foreach (var trace in new[] { false, true })
+            {
+                foreach (var mode in new[] { "1", "2" })
+                {
+                    Environment.SetEnvironmentVariable("SHARPEMU_BLAS_CYCLE", mode);
+                    var spirv = Compile(trace);
+                    output.WriteLine($"cycle trace={trace} mode={mode} bytes={spirv.Length} baseline={baseline}");
+                    Assert.True(spirv.Length > baseline);
+                    if (Environment.GetEnvironmentVariable("LOCAL_SPV_OUT") is { Length: > 0 } directory)
+                    {
+                        Directory.CreateDirectory(directory);
+                        File.WriteAllBytes(Path.Combine(directory, $"8395_cycle_trace{(trace ? 1 : 0)}_mode{mode}.spv"), spirv);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_BLAS_CYCLE", previous);
+        }
+    }
+
     // [local] The BVH node-test switches on the pass as the game runs it (native BLAS and TLAS loops).
     [Fact]
     public void TranslatesWithTheBvhNodeTestSwitches()

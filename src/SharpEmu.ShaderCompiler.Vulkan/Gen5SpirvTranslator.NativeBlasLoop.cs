@@ -606,6 +606,7 @@ public static partial class Gen5SpirvTranslator
         {
             Store(_nativeAlive, UInt(1));
             Store(_nativeStackPointer, UInt(0));
+            BeginBlasCycleWalk(); // [local] SHARPEMU_BLAS_CYCLE
             var header = _module.AllocateId();
             var body = _module.AllocateId();
             var next = _module.AllocateId();
@@ -626,14 +627,17 @@ public static partial class Gen5SpirvTranslator
                 again = LogicalAnd(again, _module.AddInstruction(SpirvOp.ULessThan, _boolType, steps, UInt((uint)_maxDispatcherSteps)));
             }
 
+            again = BlasCycleContinue(again); // [local] SHARPEMU_BLAS_CYCLE
             _module.AddStatement(SpirvOp.BranchConditional, again, header, merge);
             _module.AddLabel(merge);
+            EndBlasCycleWalk(); // [local] SHARPEMU_BLAS_CYCLE
             Store(_nativeCapped, Load(_uintType, _nativeAlive));
             FlushTriProbe(); // [local] SHARPEMU_BVH_TRI_PROBE
         }
 
         private void EmitNativeBlasIteration(NativeBlasPlan plan)
         {
+            EmitBlasCycleCheck(); // [local] SHARPEMU_BLAS_CYCLE
             // Node test and type (0x10E4-0x10F8).
             EmitNativeGuest(plan, 0x10E4);
             EmitNativeGuest(plan, 0x10F8);

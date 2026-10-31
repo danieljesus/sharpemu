@@ -662,15 +662,21 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     private bool SubmitSealed(in SealedSubmit item, out string failure)
     {
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
+        GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitReplay); // [local] SHARPEMU_GPU_STARVE_PROBE
         _device.WaitRecorded(item.Recorded); // [local]
         var replayed = GpuStarveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_GPU_STARVE_PROBE
+        GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitUploads);
         WaitSubmitTarget?.Invoke(item.Target);
         var joined = System.Diagnostics.Stopwatch.GetTimestamp();
         bool submitted;
+        GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitGate);
         lock (_device.QueueGate)
         {
+            GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitCall);
             submitted = _device.TrySubmit(item.Buffer, item.Bundle, out failure);
         }
+
+        GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitOther);
 
         if (submitted && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(item.Tick); // [local]
         if (submitted && Diagnostics.LabelLatencyProbe.Enabled) Diagnostics.LabelLatencyProbe.NoteSubmitted(item.Tick); // [local]

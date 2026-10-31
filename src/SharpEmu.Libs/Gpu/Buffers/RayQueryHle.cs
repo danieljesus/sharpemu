@@ -56,6 +56,9 @@ internal sealed partial class RayQueryHle
         public RayQueryBlas.Geometry? Geometry;
         public long ReadWriteSeq, LastWriteSeq, WriteFrames, LastWriteFrame;
         public BuiltAs? Built;
+        // SHARPEMU_BLAS_CYCLE
+        public long MaxSteps;
+        public long GraphChecks, LastGraphFrame;
     }
 
     private readonly Dictionary<ulong, Blob> _blobs = new();
@@ -134,9 +137,10 @@ internal sealed partial class RayQueryHle
             ParseStats(MemoryMarshal.Cast<byte, uint>(_statsDownload.Mapped.Slice((int)offset, (int)DeviceAddressPaging.RqStatsBytes)), frame);
         });
         RequestHeaders();
+        RequestGraphChecks(frame);
         if (DeviceAddressPaging.RayQueryMode != 0)
             RequestBlobReads();
-        else
+        else if (!CycleOnly)
             RequestChangeCheck(frame);
     }
 
@@ -161,7 +165,10 @@ internal sealed partial class RayQueryHle
                 }
 
                 blob.Lanes += entry[1];
-                blob.Subgroups += entry[2];
+                if (CycleOnly)
+                    blob.MaxSteps = Math.Max(blob.MaxSteps, entry[2]);
+                else
+                    blob.Subgroups += entry[2];
                 blob.Root = entry[3];
                 blob.Dispatches++;
                 blob.LastFrame = frame;
@@ -177,13 +184,17 @@ internal sealed partial class RayQueryHle
             _windowMaxBlobs = Math.Max(_windowMaxBlobs, distinct);
             if (added)
                 Resort();
-            if (_windowDispatches == 64)
+            if (_windowDispatches == 64 && CycleOnly)
+            {
+                _windowDispatches = _windowBlobs = _windowMaxBlobs = _subgroups = _lanes = _nonBoxRoots = _overflows = 0;
+            }
+            else if (_windowDispatches == 64)
             {
                 Console.Error.WriteLine($"[GPU][RQ_MAP] frame={frame} dispatches={_windowDispatches} blas_per_dispatch={(double)_windowBlobs / _windowDispatches:F1} max={_windowMaxBlobs} known={_blobs.Count} subgroups_per_dispatch={_subgroups / _windowDispatches} lanes_per_dispatch={_lanes / _windowDispatches} nonbox_root_subgroups={_nonBoxRoots} overflows={_overflows}");
                 _windowDispatches = _windowBlobs = _windowMaxBlobs = _subgroups = _lanes = _nonBoxRoots = _overflows = 0;
             }
 
-            if (frame % 1024 == 0)
+            if (frame % 1024 == 0 && _blobs.Count != 0)
                 Report(frame);
         }
     }
@@ -200,7 +211,7 @@ internal sealed partial class RayQueryHle
         {
             var writers = string.Join(",", blob.Writers.OrderByDescending(pair => pair.Value.Frames).Take(8)
                 .Select(pair => $"{pair.Key >> 48:X4}:{pair.Value.Writes}/{pair.Value.Frames}f"));
-            Console.Error.WriteLine($"[GPU][RQ_BLOB] frame={frame} base=0x{blob.Base:X} size=0x{blob.Size:X} root=0x{blob.Root:X} frames={blob.FirstFrame}-{blob.LastFrame} dispatches={blob.Dispatches} lanes={blob.Lanes} subgroups={blob.Subgroups} state={blob.State}{(blob.FailReason is { } reason ? $"/{reason}" : "")} write_frames={blob.WriteFrames} checks={blob.Checks} changed_next_frame={blob.ChangedNextFrame} changed_since_last={blob.ChangedSinceLast} writers=[{writers}]");
+            Console.Error.WriteLine($"[GPU][RQ_BLOB] frame={frame} base=0x{blob.Base:X} size=0x{blob.Size:X} root=0x{blob.Root:X} frames={blob.FirstFrame}-{blob.LastFrame} dispatches={blob.Dispatches} lanes={blob.Lanes} subgroups={blob.Subgroups} max_steps={blob.MaxSteps} state={blob.State}{(blob.FailReason is { } reason ? $"/{reason}" : "")} write_frames={blob.WriteFrames} checks={blob.Checks} changed_next_frame={blob.ChangedNextFrame} changed_since_last={blob.ChangedSinceLast} writers=[{writers}]");
         }
     }
 
@@ -223,6 +234,8 @@ internal sealed partial class RayQueryHle
                 }
 
                 Console.Error.WriteLine($"[GPU][RQ_BLAS] base=0x{blob.Base:X} size=0x{blob.Size:X} root=0x{blob.Root:X} header=[{string.Join(" ", header.Take(48).Select(word => word.ToString("X8")))}]");
+                if (DeviceAddressPaging.BlasCycleMode != 0)
+                    RequestGraphCheck(blob);
             });
         }
     }

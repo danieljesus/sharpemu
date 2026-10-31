@@ -29,6 +29,18 @@ internal static class GpuStarveProbe
 
     private static long _submits, _replayTicks, _targetTicks, _submitTicks;
 
+    // What the submit thread is doing, sampled while sealed work waits (queued): between items (parked or waking),
+    // waiting for the ring replay, joining the uploads, waiting for the queue gate, in vkQueueSubmit2.
+    public const int SubmitOther = 0, SubmitReplay = 1, SubmitUploads = 2, SubmitGate = 3, SubmitCall = 4;
+    private static readonly string[] SubmitNames = ["other", "replay", "uploads", "gate", "call"];
+    private static int _submitState;
+
+    public static void SetSubmitState(int state)
+    {
+        if (Enabled)
+            Volatile.Write(ref _submitState, state);
+    }
+
     // The submit thread's time per sealed buffer: record-ring replay, deferred-upload join, vkQueueSubmit2.
     public static void NoteSubmit(long replay, long target, long submit)
     {
@@ -86,6 +98,7 @@ internal static class GpuStarveProbe
     private static void Run(SubmissionScheduler scheduler, IGpuTickDevice device)
     {
         var bins = new long[GpuNames.Length * RenderStates];
+        var queuedBySubmit = new long[SubmitNames.Length];
         var phases = new long[512];
         var spanCount = new long[RenderStates];
         var spanTicks = new long[RenderStates];
@@ -123,6 +136,8 @@ internal static class GpuStarveProbe
             var render = waitTick != 0 ? (waitTick >= sealedTick ? RenderWaitDrain : RenderWaitPartial)
                 : Volatile.Read(ref _idle) != 0 ? RenderIdle : RenderRunning;
             bins[gpu * RenderStates + render] += dt;
+            if (gpu == 1)
+                queuedBySubmit[Volatile.Read(ref _submitState)] += dt;
             if (gpu != 0 && render == RenderRunning)
             {
                 var phase = Volatile.Read(ref _phase);
@@ -163,6 +178,9 @@ internal static class GpuStarveProbe
                     spans.Add(FormattableString.Invariant($"after_{RenderNames[r]}={spanCount[r] / (double)count:F2}x{spanTicks[r] * 1000.0 / frequency / spanCount[r]:F2}ms"));
             Console.Error.WriteLine(FormattableString.Invariant(
                 $"[GPU_STARVE] window_s={seconds:F1} frames={count} ms_per_frame: {string.Join(" ", parts)} | idle_spans {string.Join(" ", spans)} hist(<.5,<1,<2,<4,<8,>=8)={string.Join("/", spanHist.Select(value => (value / (double)count).ToString("F2", System.Globalization.CultureInfo.InvariantCulture)))} | submits={Interlocked.Exchange(ref _submits, 0) / (double)count:F1} replay={Interlocked.Exchange(ref _replayTicks, 0) * perFrame:F2} uploads={Interlocked.Exchange(ref _targetTicks, 0) * perFrame:F2} vksubmit={Interlocked.Exchange(ref _submitTicks, 0) * perFrame:F2}"));
+            Console.Error.WriteLine(FormattableString.Invariant(
+                $"[GPU_STARVE] queued_by_submit_state: {string.Join(" ", SubmitNames.Select((name, index) => FormattableString.Invariant($"{name}={queuedBySubmit[index] * perFrame:F2}")))}"));
+            Array.Clear(queuedBySubmit);
             if (phases.Any(value => value != 0))
             {
                 var top = phases.Select((value, index) => (value, index)).Where(pair => pair.value != 0).OrderByDescending(pair => pair.value).Take(12)

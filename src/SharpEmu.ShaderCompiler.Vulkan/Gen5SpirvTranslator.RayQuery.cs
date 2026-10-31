@@ -111,9 +111,11 @@ public static partial class Gen5SpirvTranslator
         }
 
         // One lane per subgroup adds the lanes for which `entering` holds to the map entry of the BLAS.
-        private void EmitRqMapInsert(uint entering, bool countRoots)
+        // maxValue (SHARPEMU_BLAS_CYCLE): word 2 keeps the largest value among the lanes instead of counting subgroups.
+        private void EmitRqMapInsert(uint entering, bool countRoots, uint maxValue = 0)
         {
             var lanes = SubgroupCount(entering);
+            var largest = maxValue == 0 ? 0u : _module.AddInstruction(SpirvOp.GroupNonUniformUMax, _uintType, UInt(3), 0u, SelectU(entering, maxValue, UInt(0)));
             var root = LoadV(8);
             var elected = _module.AddInstruction(SpirvOp.GroupNonUniformElect, _boolType, UInt(3));
             EmitConditional(LogicalAnd(elected, IsNotZero(lanes)), () =>
@@ -144,7 +146,10 @@ public static partial class Gen5SpirvTranslator
                     EmitConditional(mine, () =>
                     {
                         AtomicAdd(RqWord(DeviceAddressPaging.RqMapOffset, current, 1), lanes);
-                        AtomicAdd(RqWord(DeviceAddressPaging.RqMapOffset, current, 2), UInt(1));
+                        if (largest == 0)
+                            AtomicAdd(RqWord(DeviceAddressPaging.RqMapOffset, current, 2), UInt(1));
+                        else
+                            _module.AddInstruction(SpirvOp.AtomicUMax, _uintType, RqWord(DeviceAddressPaging.RqMapOffset, current, 2), UInt(1), UInt(0), largest);
                         _module.AddInstruction(SpirvOp.AtomicExchange, _uintType, RqWord(DeviceAddressPaging.RqMapOffset, current, 3), UInt(1), UInt(0), root);
                         Store(placed, UInt(1));
                     }, () => Store(slot, BitwiseAnd(IAdd(current, UInt(1)), UInt(DeviceAddressPaging.RqMapSlots - 1))));

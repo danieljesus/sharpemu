@@ -460,6 +460,7 @@ public static partial class Gen5SpirvTranslator
 
             _module.AddStatement(SpirvOp.BranchConditional, again, header, merge);
             _module.AddLabel(merge);
+            EndBlasCycleTlas(); // [local] SHARPEMU_BLAS_CYCLE
             Store(_exec, IsNotZero(Load(_uintType, _tlasExec)));
         }
 
