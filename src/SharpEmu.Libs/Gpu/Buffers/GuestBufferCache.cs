@@ -317,11 +317,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
         if (DeferredUploadWorker.Enabled) // [local]
         {
-            _deferredUploads = new DeferredUploadWorker();
+            _deferredUploads = new DeferredUploadWorker(device.Vk, device.Device);
             // The capture runs on the recording thread; the join, before the submit, on whichever thread submits.
             var deferred = _deferredUploads;
             scheduler.CaptureSubmitTarget = () => deferred.Enqueued;
             scheduler.WaitSubmitTarget = deferred.WaitIdle;
+            if (DeferredUploadWorker.GpuWait) // [local] SHARPEMU_UPLOAD_GPU_WAIT
+                scheduler.GpuWaitSubmitTarget = deferred.GpuWaitFor;
         }
         _guestMemory = guest; // [local]
         _stream = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Stream, 64 * MiB);

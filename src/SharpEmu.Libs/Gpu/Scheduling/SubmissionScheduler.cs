@@ -520,6 +520,10 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     public Action<long>? WaitSubmitTarget { get; set; }
 
+    // [local] SHARPEMU_UPLOAD_GPU_WAIT: on the submit thread, instead of WaitSubmitTarget, the semaphore wait that
+    // joins the target on the GPU ((0, 0): already joined).
+    public Func<long, (ulong Semaphore, ulong Value)>? GpuWaitSubmitTarget { get; set; }
+
     public ulong Submit(SubmitBundle? bundle = null)
     {
         if (SubmitProbe) RecordSubmit(); // [local]
@@ -666,7 +670,17 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _device.WaitRecorded(item.Recorded); // [local]
         var replayed = GpuStarveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_GPU_STARVE_PROBE
         GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitUploads);
-        WaitSubmitTarget?.Invoke(item.Target);
+        if (GpuWaitSubmitTarget is { } gpuWait && item.Bundle.WaitCount < SubmitBundle.MaxSemaphores) // [local] SHARPEMU_UPLOAD_GPU_WAIT
+        {
+            var (semaphore, value) = gpuWait(item.Target);
+            if (semaphore != 0)
+                item.Bundle.AddWait(semaphore, value);
+        }
+        else
+        {
+            WaitSubmitTarget?.Invoke(item.Target);
+        }
+
         var joined = System.Diagnostics.Stopwatch.GetTimestamp();
         bool submitted;
         GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitGate);

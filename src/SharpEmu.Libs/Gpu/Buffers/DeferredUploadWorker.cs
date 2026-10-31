@@ -4,6 +4,8 @@
 using System.Collections.Concurrent;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.VideoOut;
+using Silk.NET.Vulkan;
+using VkSemaphore = Silk.NET.Vulkan.Semaphore;
 
 namespace SharpEmu.Libs.Gpu.Buffers;
 
@@ -11,8 +13,25 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // protects the cleared pages again and then copies their bytes into the reserved staging. A guest write before the
 // protection lands in the copy; one after it faults and dirties the page for the next upload. The scheduler joins
 // before every submit, so the GPU never reads staging that is still being written.
-internal sealed class DeferredUploadWorker : IDisposable
+//
+// [local] SHARPEMU_UPLOAD_GPU_WAIT=1 (off by default): the submit thread does not join the uploads on the CPU. A buffer
+// whose jobs are not all done waits for them on the GPU: a timeline semaphore whose value is the completed count,
+// signaled from the host (vkSignalSemaphore) by the worker that completes jobs while a submission waits for more. The
+// buffer then starts when its staging is written, as before, but its vkQueueSubmit2 and the submit thread's wake-up
+// overlap the last copies. The commands, their order and the bytes the GPU reads are the same.
+internal sealed unsafe class DeferredUploadWorker : IDisposable
 {
+    public static readonly bool GpuWait = Environment.GetEnvironmentVariable("SHARPEMU_UPLOAD_GPU_WAIT") == "1";
+    internal static DeferredUploadWorker? Instance;
+
+    private Vk? _vk;
+    private Device _device;
+    private VkSemaphore _timeline;
+    private long _requested;
+    private long _signaled;
+    private long _gpuWaits, _cpuDone, _signals, _gpuWaitCalls;
+    private readonly object _signalGate = new();
+
     internal sealed record Job(List<TrackedRegion> Regions, GuestBufferUploader Uploader, GpuRingBuffer Source,
         List<(ulong Address, ulong Offset, int Size)> Reads);
 
@@ -20,6 +39,9 @@ internal sealed class DeferredUploadWorker : IDisposable
 
     // SHARPEMU_DEFERRED_PROTECT_WORKERS: threads taking jobs. Jobs may then finish out of order, which is safe: each
     // protects under its regions' locks before it copies, and a write after any protection faults and dirties.
+    // [local] The join is by job order: a job's number is taken with its place in the queue, and the completed count is
+    // the longest prefix of finished jobs (with one worker, the order they finish in), so WaitIdle(target) returns
+    // only once every job up to target has copied, also when jobs finish out of order.
     private static readonly int WorkerCount = Math.Clamp(
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_PROTECT_WORKERS"), out var count) ? count : 1, 1, 8);
 
@@ -30,15 +52,38 @@ internal sealed class DeferredUploadWorker : IDisposable
     internal static readonly bool BlockWait = Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_UPLOAD_WAIT_BLOCK") != "0";
     private const int BlockSpins = 6;
 
-    private readonly BlockingCollection<Job> _queue = new();
+    private readonly BlockingCollection<(Job Job, long Number)> _queue = new();
+    private readonly object _enqueueGate = new();
+    private readonly object _orderGate = new();
+    private readonly HashSet<long> _finishedOutOfOrder = new();
     private readonly object _idleGate = new();
     private long _enqueued;
     private long _completed;
     private int _blockedWaiters;
     private Exception? _failure;
 
-    public DeferredUploadWorker()
+    public DeferredUploadWorker(Vk? vk = null, Device device = default)
     {
+        Instance = this;
+        if (GpuWait && vk != null)
+        {
+            var typeInfo = new SemaphoreTypeCreateInfo
+            {
+                SType = StructureType.SemaphoreTypeCreateInfo,
+                SemaphoreType = SemaphoreType.Timeline,
+                InitialValue = 0,
+            };
+            var createInfo = new SemaphoreCreateInfo { SType = StructureType.SemaphoreCreateInfo, PNext = &typeInfo };
+            if (vk.CreateSemaphore(device, &createInfo, null, out var timeline) == Result.Success)
+            {
+                _vk = vk;
+                _device = device;
+                _timeline = timeline;
+            }
+
+            Console.Error.WriteLine($"[GPU][UPLOAD_GPU_WAIT] timeline={(_vk != null ? "created" : "failed")}");
+        }
+
         for (var index = 0; index < WorkerCount; index++)
         {
             new Thread(Run) { IsBackground = true, Name = $"SharpEmu deferred uploads {index}" }.Start();
@@ -47,8 +92,99 @@ internal sealed class DeferredUploadWorker : IDisposable
 
     public void Enqueue(Job job)
     {
-        Interlocked.Increment(ref _enqueued);
-        _queue.Add(job);
+        lock (_enqueueGate)
+        {
+            _queue.Add((job, Interlocked.Increment(ref _enqueued)));
+        }
+    }
+
+    // [local] SHARPEMU_UPLOAD_GPU_WAIT: the wait a buffer that needs the first target jobs submits with, or (0, 0)
+    // when they are done. The request is published before the completed count is read again, and a worker publishes
+    // the count before it reads the requests (both interlocked), so either this sees the jobs done or the worker
+    // that completes them sees the request and signals.
+    public (ulong Semaphore, ulong Value) GpuWaitFor(long target)
+    {
+        if ((++_gpuWaitCalls & 8191) == 0)
+            Console.Error.WriteLine(TakeGpuWaitReport());
+        if (_vk == null || Volatile.Read(ref _completed) >= target)
+        {
+            Interlocked.Increment(ref _cpuDone);
+            return (0, 0);
+        }
+
+        var seen = Volatile.Read(ref _requested);
+        while (seen < target)
+        {
+            var previous = Interlocked.CompareExchange(ref _requested, target, seen);
+            if (previous == seen)
+                break;
+            seen = previous;
+        }
+
+        Interlocked.MemoryBarrier();
+        if (Volatile.Read(ref _completed) >= target)
+        {
+            Interlocked.Increment(ref _cpuDone);
+            return (0, 0);
+        }
+
+        Interlocked.Increment(ref _gpuWaits);
+        return (_timeline.Handle, (ulong)target);
+    }
+
+    // True while a submitted buffer waits on the GPU for jobs not yet done (the starve probe's state).
+    public bool GpuWaitPending => _vk != null && Volatile.Read(ref _requested) > Volatile.Read(ref _completed);
+
+    public string TakeGpuWaitReport() =>
+        $"[GPU][UPLOAD_GPU_WAIT] gpu_waits={Interlocked.Exchange(ref _gpuWaits, 0)} already_done={Interlocked.Exchange(ref _cpuDone, 0)} signals={Interlocked.Exchange(ref _signals, 0)} signaled={Volatile.Read(ref _signaled)} requested={Volatile.Read(ref _requested)} completed={Volatile.Read(ref _completed)}";
+
+    private void SignalWaitingSubmissions()
+    {
+        if (_vk == null || Volatile.Read(ref _requested) <= Volatile.Read(ref _signaled))
+            return;
+        lock (_signalGate)
+        {
+            var completed = Volatile.Read(ref _completed);
+            if (completed <= _signaled)
+                return;
+            var signal = new SemaphoreSignalInfo
+            {
+                SType = StructureType.SemaphoreSignalInfo,
+                Semaphore = _timeline,
+                Value = (ulong)completed,
+            };
+            var result = _vk.SignalSemaphore(_device, &signal);
+            if (result != Result.Success)
+                Console.Error.WriteLine($"[GPU][ERROR] vkSignalSemaphore(upload timeline, {completed}) failed: {result}");
+            Volatile.Write(ref _signaled, completed);
+            Interlocked.Increment(ref _signals);
+        }
+    }
+
+    private void Finished(long number)
+    {
+        if (WorkerCount == 1)
+        {
+            Interlocked.Increment(ref _completed);
+            SignalWaitingSubmissions();
+            return;
+        }
+
+        lock (_orderGate)
+        {
+            if (number != Volatile.Read(ref _completed) + 1)
+            {
+                _finishedOutOfOrder.Add(number);
+                return;
+            }
+
+            var completed = number;
+            while (_finishedOutOfOrder.Remove(completed + 1))
+                completed++;
+            Interlocked.Exchange(ref _completed, completed);
+        }
+
+        SignalWaitingSubmissions();
     }
 
     // [local] The jobs enqueued so far: a submit captures this when its buffer is sealed and joins it before the submit.
@@ -117,7 +253,7 @@ internal sealed class DeferredUploadWorker : IDisposable
     private void Run()
     {
         SharpEmu.HLE.Host.HostLaneReservation.ApplyToHelperThread();
-        foreach (var job in _queue.GetConsumingEnumerable())
+        foreach (var (job, number) in _queue.GetConsumingEnumerable())
         {
             try
             {
@@ -130,7 +266,7 @@ internal sealed class DeferredUploadWorker : IDisposable
                 Console.Error.WriteLine($"[GPU][ERROR] A deferred upload failed. {exception}");
             }
 
-            Interlocked.Increment(ref _completed);
+            Finished(number);
             if (Volatile.Read(ref _blockedWaiters) != 0)
             {
                 lock (_idleGate)
