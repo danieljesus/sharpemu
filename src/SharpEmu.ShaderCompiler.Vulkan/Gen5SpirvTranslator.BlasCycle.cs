@@ -17,8 +17,9 @@ namespace SharpEmu.ShaderCompiler.Vulkan;
 //   as the step guard would end it later.
 // 2 (verify): the same detection without stopping.
 // 3 (trap): no detection in the loop, only what a walk leaves at its end (long and guarded walks, the map, the sample);
-//   the host's graph walk of the blob then tells a cycle. Measured with the profile (s8qV): =2 costs 8395 ~1.4 ms per
-//   dispatch (6.32 against ~4.9 in the same scene mode), so neither mode rides SHARPEMU_SLOW_MODE_PROBE.
+//   the host's graph walk of the blob then tells a cycle. Measured with the profile, against 9FBC in the same session to
+//   take out the scene: =2 makes 8395 ~15 % slower (s8qV 8395/9FBC 5.96 against 5.08-5.26 without), =3 costs nothing
+//   seen (5.23, s8rT). Neither rides SHARPEMU_SLOW_MODE_PROBE.
 // Both count in the fault buffer's ray query area (DeviceAddressPaging.RqCounterOffset, words BlasCycleFirstWord..):
 // walks checked, revisits, revisits that then reached the guard, revisits that ended by themselves, stops, long walks,
 // guarded lanes, the longest walk, guarded TLAS waves, and one sample (key, steps, node, revisit step, ray, tmax). Lanes with a
