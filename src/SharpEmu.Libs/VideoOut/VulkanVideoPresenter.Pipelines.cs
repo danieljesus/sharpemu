@@ -705,6 +705,7 @@ internal static unsafe partial class VulkanVideoPresenter
             FrontProfile.NoteSite(FrontProfile.Phase.WordRead);
             var conservativeVerify = false; // [local] SHARPEMU_CONSERVATIVE_RECORDS
             var conservativePrecise = false;
+            var preciseInFlight = false;
             if (Gpu.Buffers.ConservativeRecords.Mode != 0 &&
                 Gpu.Buffers.ConservativeRecords.Matches(Gpu.Buffers.ConservativeRecords.CurrentReader, SharpEmu.ShaderCompiler.Resources.SrtReadProbe.CurrentBaseAddress, address))
             {
@@ -722,6 +723,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Gpu.Buffers.ConservativeRecords.MatchesPrecise(Gpu.Buffers.ConservativeRecords.CurrentReader, SharpEmu.ShaderCompiler.Resources.SrtReadProbe.CurrentBaseAddress, address))
             {
                 conservativePrecise = true; // [local] SHARPEMU_PRECISE_TABLE_READ
+                preciseInFlight = true;
             }
 
             if (OnFrontThread)
@@ -865,6 +867,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     {
                         _bufferCache.ForcePreciseWait = true;
                         _bufferCache.ForcePreciseVerify = Gpu.Buffers.ConservativeRecords.Mode == 4 || Gpu.Buffers.ConservativeRecords.PreciseTableMode == 2;
+                        _bufferCache.AllowInFlightPrecise = preciseInFlight;
                     }
 
                     bool preciseSynced;
@@ -879,6 +882,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         {
                             _bufferCache.ForcePreciseWait = false;
                             _bufferCache.ForcePreciseVerify = false;
+                            _bufferCache.AllowInFlightPrecise = false;
                             Gpu.Buffers.ConservativeRecords.NotePrecise(_bufferCache.PreciseWaitReads, _bufferCache.PreciseWaitFallbacks, _bufferCache.PreciseVerifyChecks, _bufferCache.PreciseVerifyMismatches);
                         }
                     }

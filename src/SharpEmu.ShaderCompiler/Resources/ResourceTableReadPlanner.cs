@@ -55,6 +55,23 @@ public sealed class ResourceTableReadPlanner
     // in the device-read mode, so the host maps them the same way.
     public static readonly bool DeviceDataVerify = System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS_VERIFY") == "1";
 
+    // [local] SHARPEMU_DEVICE_DESCRIPTOR_READS=<hash>@<hex pc>[/...] (off by default): in the listed shader, the S_LOADs
+    // at the listed pcs (immediate offset, host-evaluable address) are not flattened when they only feed the descriptors
+    // of read accesses: the V# they build is a runtime descriptor the shader reads through the page table, so the host
+    // never waits for their words while recording. A listed load that feeds the handle of a write or an atomic is
+    // flattened as before ([DEVICE_DESCRIPTOR_READS] kept=...). With SHARPEMU_DEVICE_DATA_READS_VERIFY=1 the loads stay
+    // flattened and are compared on the device as the data reads are. For GTA V's 0xF5EB (TLAS chain): pc 0x1C loads the
+    // base of the read-only V# s[16:19] (struct+0x50) and pc 0xC its records (struct+0x90); its stores go through V#s
+    // loaded at 0x3D4 and 0x408, which stay on the host.
+    internal static HashSet<(ulong Hash, uint Pc)> DeviceDescriptorReads = ParseHashPcs(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DESCRIPTOR_READS"));
+
+    internal static HashSet<(ulong Hash, uint Pc)> ParseHashPcs(string? value) =>
+        value is null or "0" ? [] : new(value.Split(['/', ','], System.StringSplitOptions.RemoveEmptyEntries)
+            .Select(item => item.Split('@'))
+            .Select(parts => (System.Convert.ToUInt64(parts[0], 16), System.Convert.ToUInt32(parts[1], 16))));
+
+    private HashSet<ScalarValue>? _deviceDescriptorReads;
+
     private static long _deviceDataReads;
 
     public static long DeviceDataReads => System.Threading.Interlocked.Read(ref _deviceDataReads);
@@ -64,6 +81,7 @@ public sealed class ResourceTableReadPlanner
 
     private Result Run()
     {
+        _deviceDescriptorReads = PlanDeviceDescriptorReads(); // [local] SHARPEMU_DEVICE_DESCRIPTOR_READS
         foreach (var value in _graph.Values)
         {
             if (value.Kind is ScalarValueKind.ScalarAddressWord or ScalarValueKind.ScalarBufferWord &&
@@ -138,6 +156,61 @@ public sealed class ResourceTableReadPlanner
         return new Result(_reads, _dynamicReads, _replacements, _flattenedSlotByMemoryIndex);
     }
 
+    // [local] The listed raw reads of this shader whose every dependent access handle belongs to a read.
+    private HashSet<ScalarValue>? PlanDeviceDescriptorReads()
+    {
+        if (DeviceDescriptorReads.Count == 0)
+            return null;
+        var listed = new HashSet<ScalarValue>();
+        foreach (var value in _graph.Values)
+        {
+            if (value.Kind == ScalarValueKind.ScalarAddressWord && value.MemoryIndex < _graph.Memory.Count &&
+                DeviceDescriptorReads.Contains((_hash, _graph.Memory[value.MemoryIndex].Pc)) &&
+                IsRawRead(value) && value.Operands.Length > 1 && value.Operands[1].IsConstant)
+                listed.Add(value);
+        }
+
+        if (listed.Count == 0)
+            return null;
+        var kept = new HashSet<ScalarValue>();
+        var reached = 0;
+        for (var index = 0; index < _graph.Accesses.Length; index++)
+        {
+            if (_graph.Accesses[index]?.Handle is not { } handle || index >= _graph.Memory.Count)
+                continue;
+            var used = DependsOn(handle, listed);
+            if (used.Count == 0)
+                continue;
+            reached++;
+            if (_graph.Memory[index].Access != MemoryAccess.Read)
+                kept.UnionWith(used);
+        }
+
+        listed.ExceptWith(kept);
+        string Words(IEnumerable<ScalarValue> values) => string.Join(",", values.Select(value => $"0x{_graph.Memory[value.MemoryIndex].Pc:X}+{value.Operands[1].ConstantU32:X}"));
+        System.Console.Error.WriteLine($"[DEVICE_DESCRIPTOR_READS] hash=0x{_hash:X16} device=[{Words(listed)}] kept=[{Words(kept)}] accesses={reached} verify={DeviceDataVerify}");
+        return listed.Count == 0 ? null : listed;
+    }
+
+    private static HashSet<ScalarValue> DependsOn(ScalarValue root, HashSet<ScalarValue> targets)
+    {
+        var found = new HashSet<ScalarValue>();
+        var pending = new Stack<ScalarValue>();
+        var visited = new HashSet<ScalarValue>();
+        pending.Push(root);
+        while (pending.TryPop(out var current))
+        {
+            if (!visited.Add(current))
+                continue;
+            if (targets.Contains(current))
+                found.Add(current);
+            foreach (var operand in current.Operands)
+                pending.Push(operand);
+        }
+
+        return found;
+    }
+
     private void Fail(uint pc, string message) =>
         throw new ResourcePlanException(
             $"shader resource-table planning failed: hash=0x{_hash:X16} stage={_stage} pc=0x{pc:X8} {message}");
@@ -178,6 +251,16 @@ public sealed class ResourceTableReadPlanner
         if (!IsRawRead(value) || DeviceTableHashes.Contains(_hash)) // [local] experiment: listed shaders read their tables on the device
         {
             return;
+        }
+
+        if (_deviceDescriptorReads is not null && _deviceDescriptorReads.Contains(value)) // [local] SHARPEMU_DEVICE_DESCRIPTOR_READS
+        {
+            if (!DeviceDataVerify)
+            {
+                return;
+            }
+
+            _graph.Memory[value.MemoryIndex].DeviceDataVerify = true;
         }
 
         var offset = value.Operands[1];

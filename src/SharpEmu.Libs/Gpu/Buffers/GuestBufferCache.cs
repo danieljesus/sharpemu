@@ -2815,6 +2815,10 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     internal bool ForcePreciseVerify { get; set; }
 
+    // [local] SHARPEMU_PRECISE_TABLE_READ: the precise read also takes a writer tick that is submitted but not complete
+    // (the readback waits for it on the GPU timeline), instead of falling back to the block tick.
+    internal bool AllowInFlightPrecise { get; set; }
+
     internal long PreciseVerifyChecks { get; private set; }
 
     internal long PreciseVerifyMismatches { get; private set; }
@@ -2859,7 +2863,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         ReportPreciseWait();
         var buffer = _registry.GetBuffer(FindBuffer(guestAddress, size));
         var precise = GpuWriteHistory.Queryable ? GpuWriteHistory.LastWriteTick(guestAddress, size, PreciseWaitRequestScan) : 0;
-        if (!buffer.IsInBounds(guestAddress, size) || precise == 0 || precise >= _scheduler.CurrentTick || !_scheduler.IsTickComplete(precise))
+        var inFlightOk = AllowInFlightPrecise; // [local] SHARPEMU_PRECISE_TABLE_READ: a submitted writer is waited for, not the open batch
+        if (!buffer.IsInBounds(guestAddress, size) || precise == 0 || precise >= _scheduler.CurrentTick || (!inFlightOk && !_scheduler.IsTickComplete(precise)))
         {
             if (GpuWriteHistory.LastScanExhausted) _preciseScanExhausted++;
             else if (precise >= _scheduler.CurrentTick) _preciseNotSubmitted++;
@@ -2877,7 +2882,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         foreach (var piece in window)
         {
             var tick = GpuWriteHistory.LastWriteTick(piece.Address, piece.Size, PreciseWaitScan);
-            if (tick != 0 && tick < _scheduler.CurrentTick && _scheduler.IsTickComplete(tick))
+            if (tick != 0 && tick < _scheduler.CurrentTick && (inFlightOk || _scheduler.IsTickComplete(tick)))
             {
                 copies.Add(piece);
                 waitTick = Math.Max(waitTick, tick);
