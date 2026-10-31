@@ -59,6 +59,8 @@ internal static class GpuWriteHistory
             Console.Error.WriteLine($"[PRECISE_WRITE_TICKS] write recorded from a second thread ({thread}, owner {_owner}); precise ticks off");
         }
 
+        if (Diagnostics.TableDirtyProbe.Overlaps(address, size)) // [local] SHARPEMU_TABLE_DIRTY_PROBE: who stamps a watched word's precise tick
+            Diagnostics.TableDirtyProbe.Note($"history program={TableWordMemo.CurrentProgram:X16}", address, size, tick);
         var index = (int)(_count & (Capacity - 1));
         if (_count >= Capacity && _ring[index].Tick > _evictedTick)
         {
