@@ -15,7 +15,10 @@ namespace SharpEmu.ShaderCompiler.Vulkan;
 //
 // 1 (stop): a lane that revisits ends its walk after that iteration (a box iteration commits nothing), keeping its hit,
 //   as the step guard would end it later.
-// 2 (verify, also on with SHARPEMU_SLOW_MODE_PROBE=1): the same detection without stopping.
+// 2 (verify): the same detection without stopping.
+// 3 (trap): no detection in the loop, only what a walk leaves at its end (long and guarded walks, the map, the sample);
+//   the host's graph walk of the blob then tells a cycle. Measured with the profile (s8qV): =2 costs 8395 ~1.4 ms per
+//   dispatch (6.32 against ~4.9 in the same scene mode), so neither mode rides SHARPEMU_SLOW_MODE_PROBE.
 // Both count in the fault buffer's ray query area (DeviceAddressPaging.RqCounterOffset, words BlasCycleFirstWord..):
 // walks checked, revisits, revisits that then reached the guard, revisits that ended by themselves, stops, long walks,
 // guarded lanes, the longest walk, guarded TLAS waves, and one sample (key, steps, node, revisit step, ray, tmax). Lanes with a
@@ -46,6 +49,7 @@ public static partial class Gen5SpirvTranslator
             Off,
             Stop,
             Verify,
+            Trap,
         }
 
         private static readonly uint BlasCycleFrom =
@@ -62,6 +66,7 @@ public static partial class Gen5SpirvTranslator
             {
                 1 => BlasCycleMode.Stop,
                 2 => BlasCycleMode.Verify,
+                3 => BlasCycleMode.Trap,
                 _ => BlasCycleMode.Off,
             };
 
@@ -72,7 +77,7 @@ public static partial class Gen5SpirvTranslator
         // At the start of each walk.
         private void BeginBlasCycleWalk()
         {
-            if (CycleMode == BlasCycleMode.Off)
+            if (CycleMode is BlasCycleMode.Off or BlasCycleMode.Trap)
             {
                 return;
             }
@@ -92,7 +97,7 @@ public static partial class Gen5SpirvTranslator
         // At the start of each iteration, before the node test (v8 = the node this iteration enters).
         private void EmitBlasCycleCheck()
         {
-            if (CycleMode == BlasCycleMode.Off)
+            if (CycleMode is BlasCycleMode.Off or BlasCycleMode.Trap)
             {
                 return;
             }
@@ -127,7 +132,8 @@ public static partial class Gen5SpirvTranslator
 
             var steps = Load(_uintType, _nativeSteps);
             var alive = IsNotZero(Load(_uintType, _nativeAlive));
-            var seen = Load(_uintType, _cycleSeen);
+            var trap = CycleMode == BlasCycleMode.Trap;
+            var seen = trap ? UInt(0) : Load(_uintType, _cycleSeen);
             var revisited = IsNotZero(seen);
             var guarded = _maxDispatcherSteps > 0
                 ? _module.AddInstruction(SpirvOp.UGreaterThanEqual, _boolType, steps, UInt((uint)_maxDispatcherSteps))
@@ -162,7 +168,7 @@ public static partial class Gen5SpirvTranslator
                         Store(CycleCounter(BlasCycleSample + 2), steps);
                         Store(CycleCounter(BlasCycleSample + 3), LoadV(8));
                         Store(CycleCounter(BlasCycleSample + 4), seen);
-                        Store(CycleCounter(BlasCycleSample + 5), Load(_uintType, _cycleMark));
+                        Store(CycleCounter(BlasCycleSample + 5), trap ? UInt(0) : Load(_uintType, _cycleMark));
                         for (var register = 0u; register < 6; register++)
                         {
                             Store(CycleCounter(BlasCycleSample + 6 + register), LoadV(36 + register));

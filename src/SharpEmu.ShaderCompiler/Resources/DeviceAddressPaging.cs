@@ -55,14 +55,14 @@ public static class DeviceAddressPaging
         _ => 0,
     };
     public static readonly bool RqMapProbe = Environment.GetEnvironmentVariable("SHARPEMU_RQ_MAP") == "1";
-    // [local] SHARPEMU_BLAS_CYCLE (=1 stop, =2 verify; SHARPEMU_SLOW_MODE_PROBE=1 alone gives 2): box revisits in the 0x8395
+    // [local] SHARPEMU_BLAS_CYCLE (=1 stop, =2 verify, =3 trap; off by default): box revisits and long walks in the 0x8395
     // BLAS loop, counted in the area (Gen5SpirvTranslator.BlasCycle.cs). Read on every call: the translator tests switch it.
     public static int ReadBlasCycleMode() => Environment.GetEnvironmentVariable("SHARPEMU_BLAS_CYCLE") switch
     {
         "1" or "stop" => 1,
         "2" or "verify" => 2,
-        "0" or "off" => 0,
-        _ => Environment.GetEnvironmentVariable("SHARPEMU_SLOW_MODE_PROBE") == "1" ? 2 : 0,
+        "3" or "trap" => 3,
+        _ => 0,
     };
     public static readonly int BlasCycleMode = ReadBlasCycleMode();
     public static bool RqAreaEnabled => RayQueryMode != 0 || RqMapProbe || BlasCycleMode != 0;

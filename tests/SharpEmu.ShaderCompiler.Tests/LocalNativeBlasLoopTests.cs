@@ -117,12 +117,12 @@ public sealed class LocalNativeBlasLoopTests(ITestOutputHelper output)
             var baseline = Compile(trace: false).Length;
             foreach (var trace in new[] { false, true })
             {
-                foreach (var mode in new[] { "1", "2" })
+                foreach (var mode in new[] { "1", "2", "3" })
                 {
                     Environment.SetEnvironmentVariable("SHARPEMU_BLAS_CYCLE", mode);
                     var spirv = Compile(trace);
                     output.WriteLine($"cycle trace={trace} mode={mode} bytes={spirv.Length} baseline={baseline}");
-                    Assert.True(spirv.Length > baseline);
+                    Assert.True(mode == "3" ? spirv.Length >= baseline : spirv.Length > baseline);
                     if (Environment.GetEnvironmentVariable("LOCAL_SPV_OUT") is { Length: > 0 } directory)
                     {
                         Directory.CreateDirectory(directory);
