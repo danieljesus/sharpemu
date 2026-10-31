@@ -33,6 +33,13 @@ internal static unsafe partial class VulkanVideoPresenter
     // The pass still ends at this cap so a long pass cannot hold the batch forever.
     private static readonly int DrawsPerBatchInRenderPass = int.Parse(Environment.GetEnvironmentVariable("SHARPEMU_DRAWS_PER_BATCH_PASS") ?? "512"); // [local] tunable
     private const uint SingleRectangleVertexCount = 4;
+    // [local] SHARPEMU_IDLE_FLUSH=<n> (off): a preparation that finds the GPU queue empty (every sealed tick handed to
+    // the queue and complete) submits the open batch once it holds at least n draws or dispatches, so the GPU starts
+    // on it while the rest is recorded instead of after the next synchronizing read drains it. Outside a render pass
+    // only, unless SHARPEMU_IDLE_FLUSH_PASS=1 (then the pass ends there). The boundary is the one a full batch already
+    // places at any preparation: no command, barrier or order changes.
+    private static readonly int IdleFlushDraws = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IDLE_FLUSH"), out var idleDraws) && idleDraws > 0 ? idleDraws : 0;
+    private static readonly bool IdleFlushInPass = Environment.GetEnvironmentVariable("SHARPEMU_IDLE_FLUSH_PASS") == "1";
 
     private static void RequireRenderingFeature(bool supported, string feature, string deviceName)
     {
@@ -617,6 +624,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 EndRendering();
                 FlushBatchedGuestCommands();
             }
+            else if (IdleFlushDraws != 0 && _batchOpen && _batchDrawCount >= IdleFlushDraws && ((_batchDrawCount - IdleFlushDraws) & 3) == 0 && (IdleFlushInPass || !_renderingActive) &&
+                _scheduler.IsQueueIdle()) // [local] SHARPEMU_IDLE_FLUSH
+            {
+                _idleFlushes++;
+                EndRendering();
+                FlushBatchedGuestCommands();
+                ReportIdleFlushes();
+            }
 
             EnsureGuestSubmissionCapacity();
             _ = BeginBatchedGuestCommands();
@@ -633,6 +648,17 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             return _preparation;
+        }
+
+        private long _idleFlushes, _idleFlushesReported, _idleFlushReport = System.Diagnostics.Stopwatch.GetTimestamp(); // [local] SHARPEMU_IDLE_FLUSH
+
+        private void ReportIdleFlushes()
+        {
+            if (System.Diagnostics.Stopwatch.GetElapsedTime(_idleFlushReport).TotalSeconds < 20)
+                return;
+            _idleFlushReport = System.Diagnostics.Stopwatch.GetTimestamp();
+            Console.Error.WriteLine($"[IDLE_FLUSH] flushes={_idleFlushes} since_last={_idleFlushes - _idleFlushesReported} min_draws={IdleFlushDraws} in_pass={IdleFlushInPass}");
+            _idleFlushesReported = _idleFlushes;
         }
 
         private RenderPreparation RequirePreparation() =>

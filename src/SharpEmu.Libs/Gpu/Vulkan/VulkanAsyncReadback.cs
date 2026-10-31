@@ -236,6 +236,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         }
 
         if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.GpuWait, Environment.CurrentManagedThreadId, 1, ticket.WaitTick, ticket.Value); // [local]
+        var starveEntered = Scheduling.GpuStarveProbe.EnterGpuWait(ticket.WaitTick); // [local] SHARPEMU_GPU_STARVE_PROBE
         try
         {
             var vk = _device.Vk;
@@ -306,6 +307,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         finally
         {
             if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.GpuWaitEnd, Environment.CurrentManagedThreadId, 1, ticket.WaitTick, ticket.Value); // [local]
+            Scheduling.GpuStarveProbe.ExitGpuWait(starveEntered);
             lock (_gate)
             {
                 _waiters--;

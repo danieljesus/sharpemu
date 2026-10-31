@@ -91,6 +91,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             _submitThread = new Thread(RunSubmitWorker) { IsBackground = true, Name = "SharpEmu GPU submit" };
             _submitThread.Start();
         }
+
+        GpuStarveProbe.Start(this, device); // [local] SHARPEMU_GPU_STARVE_PROBE
     }
 
     // [local]
@@ -133,6 +135,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     // Release the device once after shutdown. A callback leaves final disposal to the shutdown owner.
     public void Dispose()
     {
+        GpuStarveProbe.Stop(); // [local]
         Volatile.Write(ref _disposeRequested, true);
         Shutdown();
         DisposeDeviceOnceClosed();
@@ -449,6 +452,13 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
     }
 
+    // [local] SHARPEMU_IDLE_FLUSH: every sealed tick has been handed to the queue and has completed.
+    public bool IsQueueIdle()
+    {
+        var sealedTick = CurrentTick - 1;
+        return SubmittedTick >= sealedTick && IsTickComplete(sealedTick);
+    }
+
     public bool IsTickComplete(ulong tick)
     {
         if (_timeline.IsTickComplete(tick))
@@ -653,6 +663,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     {
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
         _device.WaitRecorded(item.Recorded); // [local]
+        var replayed = GpuStarveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_GPU_STARVE_PROBE
         WaitSubmitTarget?.Invoke(item.Target);
         var joined = System.Diagnostics.Stopwatch.GetTimestamp();
         bool submitted;
@@ -665,6 +676,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         if (submitted && Diagnostics.LabelLatencyProbe.Enabled) Diagnostics.LabelLatencyProbe.NoteSubmitted(item.Tick); // [local]
 
         SubmitThreadStats.Submitted(joined - start, System.Diagnostics.Stopwatch.GetTimestamp() - joined);
+        if (replayed != 0) GpuStarveProbe.NoteSubmit(replayed - start, joined - replayed, System.Diagnostics.Stopwatch.GetTimestamp() - joined); // [local]
         if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Submitted, -1, 0, item.Tick); // [local]
         return submitted;
     }

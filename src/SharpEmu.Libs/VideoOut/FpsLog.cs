@@ -18,6 +18,7 @@ internal static class FpsLog
     public static void FramePresented()
     {
         IdleProbe.NoteFrame(); // [local]
+        Gpu.Scheduling.GpuStarveProbe.NoteFrame(); // [local]
         if (!Enabled)
         {
             return;

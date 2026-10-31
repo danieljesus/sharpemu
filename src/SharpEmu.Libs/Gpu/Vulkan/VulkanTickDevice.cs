@@ -232,6 +232,24 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public bool TryWaitTimeline(ulong tick, out string failure)
     {
+        if (GpuStarveProbe.Enabled) // [local] SHARPEMU_GPU_STARVE_PROBE
+        {
+            var entered = GpuStarveProbe.EnterGpuWait(tick);
+            try
+            {
+                return TryWaitTimelineTraced(tick, out failure);
+            }
+            finally
+            {
+                GpuStarveProbe.ExitGpuWait(entered);
+            }
+        }
+
+        return TryWaitTimelineTraced(tick, out failure);
+    }
+
+    private bool TryWaitTimelineTraced(ulong tick, out string failure)
+    {
         if (!LabelTrace.Enabled)
         {
             return TryWaitTimelineCore(tick, out failure);

@@ -505,6 +505,7 @@ internal static class RenderPhaseProfile
         _lastTimestamp = now;
         _lastAllocated = allocated;
         _current = next;
+        if (Gpu.Scheduling.GpuStarveProbe.Enabled) Gpu.Scheduling.GpuStarveProbe.NotePhase((int)next); // [local]
         return previous;
     }
 

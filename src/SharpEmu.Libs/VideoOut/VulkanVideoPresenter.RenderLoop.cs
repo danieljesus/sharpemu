@@ -76,7 +76,9 @@ internal static unsafe partial class VulkanVideoPresenter
                     detail: waitMilliseconds);
                 if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.RenderIdle, -1, 0, (ulong)waitPhase); // [local]
                 var idleStarted = IdleProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+                Gpu.Scheduling.GpuStarveProbe.SetRenderIdle(true); // [local] SHARPEMU_GPU_STARVE_PROBE
                 var signaled = System.Threading.Monitor.Wait(_gate, waitMilliseconds);
+                Gpu.Scheduling.GpuStarveProbe.SetRenderIdle(false);
                 if (idleStarted != 0)
                     IdleProbe.Note(waitPhase, gpuWorkInFlight, signaled, System.Diagnostics.Stopwatch.GetTimestamp() - idleStarted);
                 if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.RenderIdleEnd, -1, 0, (ulong)waitPhase); // [local]

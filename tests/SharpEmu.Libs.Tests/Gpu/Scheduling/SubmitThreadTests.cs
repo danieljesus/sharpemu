@@ -47,6 +47,27 @@ public sealed class SubmitThreadTests
         Assert.DoesNotContain(Environment.CurrentManagedThreadId, _device.SubmitThreads);
     }
 
+    // [local] SHARPEMU_IDLE_FLUSH: the queue is idle only once every sealed tick is submitted and complete.
+    [Fact]
+    public async Task TheQueueIsIdleOnlyWhenEverySealedTickIsSubmittedAndComplete()
+    {
+        using var gate = new ManualResetEventSlim(false);
+        _device.SubmitGate = gate;
+        using var scheduler = NewScheduler(submitThread: true);
+        Assert.True(scheduler.IsQueueIdle());
+
+        var tick = scheduler.Flush();
+        Assert.False(scheduler.IsQueueIdle());
+
+        gate.Set();
+        Assert.True(await CompletesWithin(Task.Run(() => scheduler.WaitSubmitted(tick)), 5000));
+        Assert.False(scheduler.IsQueueIdle());
+
+        _device.Complete(tick);
+        Assert.True(scheduler.IsQueueIdle());
+        _device.CompleteOnSubmit = true; // the shutdown drain submits and waits for the open buffer
+    }
+
     [Fact]
     public void TheQueuePartJoinsTheTargetCapturedWhenTheBufferWasSealed()
     {
