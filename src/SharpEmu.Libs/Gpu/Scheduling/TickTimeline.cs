@@ -45,8 +45,51 @@ public sealed class TickTimeline
 
     public ulong ReserveTick() => Interlocked.Increment(ref _currentTick) - 1;
 
+    // [local] SHARPEMU_TIMELINE_POLL_US=<n> (off by default; 0 off): RefreshCompletedTick skips the device read
+    // (vkGetSemaphoreCounterValue, a driver escape of ~2 us on Windows) when any thread read the timeline less than n
+    // us ago, so the known completed tick is at most n us old. The priority worker refreshes it after each tick it
+    // waits for. Only polls are throttled: Wait and RefreshCompletedTickNow always read. A tick seen complete later
+    // only delays reuse and callbacks; it never makes an incomplete tick look complete. Tests set PollTicks.
+    internal static readonly long PollTicksDefault =
+        long.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TIMELINE_POLL_US"), out var pollUs) && pollUs > 0
+            ? pollUs * System.Diagnostics.Stopwatch.Frequency / 1_000_000 : 0;
+
+    internal long PollTicks { get; set; } = PollTicksDefault;
+
+    private long _lastRead;
+    private static long _polls, _pollsSkipped, _pollReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
     public void RefreshCompletedTick()
     {
+        var poll = PollTicks;
+        if (poll != 0)
+        {
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            _polls++;
+            if (now - Volatile.Read(ref _lastRead) < poll)
+            {
+                _pollsSkipped++;
+                return;
+            }
+
+            if (now - _pollReport >= 20 * System.Diagnostics.Stopwatch.Frequency)
+            {
+                _pollReport = now;
+                Console.Error.WriteLine($"[GPU][TIMELINE_POLL] polls={_polls} skipped={_pollsSkipped}");
+                _polls = _pollsSkipped = 0;
+            }
+        }
+
+        RefreshCompletedTickNow();
+    }
+
+    public void RefreshCompletedTickNow()
+    {
+        if (PollTicks != 0)
+        {
+            Volatile.Write(ref _lastRead, System.Diagnostics.Stopwatch.GetTimestamp());
+        }
+
         var counter = _device.ReadTimeline();
         var known = Volatile.Read(ref _gpuTick);
         while (known < counter)
@@ -86,6 +129,6 @@ public sealed class TickTimeline
             throw SubmissionScheduler.Fatal($"vkWaitSemaphores failed: {failure}, tick={tick}");
         }
 
-        RefreshCompletedTick();
+        RefreshCompletedTickNow();
     }
 }

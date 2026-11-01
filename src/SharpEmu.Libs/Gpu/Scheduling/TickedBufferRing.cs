@@ -28,7 +28,7 @@ public sealed class TickedBufferRing
         var found = FindReusableBuffer(_hint, _ticks.Count, gpuTick);
         if (found < 0)
         {
-            _timeline.RefreshCompletedTick();
+            _timeline.RefreshCompletedTickNow(); // [local] SHARPEMU_TIMELINE_POLL_US: a miss allocates more buffers
             gpuTick = _timeline.CompletedTick;
             found = FindReusableBuffer(_hint, _ticks.Count, gpuTick);
         }

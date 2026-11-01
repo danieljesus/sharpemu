@@ -93,4 +93,32 @@ public sealed class TickTimelineTests
         Assert.Throws<SchedulerFatalException>(() => timeline.Wait(1));
         Assert.Equal("vkWaitSemaphores failed: VK_ERROR_DEVICE_LOST, tick=1", fatal.Messages.Single());
     }
+
+    // [local] SHARPEMU_TIMELINE_POLL_US: a poll within the window keeps the known tick; Now and Wait always read.
+    [Fact]
+    public void ThrottledPollsKeepTheKnownTickUntilAFreshRead()
+    {
+        var timeline = new TickTimeline(_device) { PollTicks = long.MaxValue / 2 };
+        _device.Complete(2);
+        timeline.RefreshCompletedTickNow();
+        Assert.Equal(2UL, timeline.CompletedTick);
+
+        _device.Complete(4);
+        timeline.RefreshCompletedTick();
+        Assert.Equal(2UL, timeline.CompletedTick);
+        Assert.False(timeline.IsTickComplete(4));
+
+        timeline.Wait(4);
+        Assert.Equal(4UL, timeline.CompletedTick);
+
+        _device.Complete(6);
+        timeline.RefreshCompletedTick();
+        Assert.Equal(4UL, timeline.CompletedTick);
+        timeline.RefreshCompletedTickNow();
+        Assert.Equal(6UL, timeline.CompletedTick);
+
+        var unthrottled = new TickTimeline(_device) { PollTicks = 0 };
+        unthrottled.RefreshCompletedTick();
+        Assert.Equal(6UL, unthrottled.CompletedTick);
+    }
 }

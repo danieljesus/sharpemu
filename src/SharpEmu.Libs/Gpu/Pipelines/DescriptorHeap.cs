@@ -100,7 +100,7 @@ public sealed unsafe class DescriptorHeap : IDisposable
 
         _pendingPools.Enqueue((_currentPool, _scheduler.CurrentTick));
         var (oldest, tick) = _pendingPools.Peek();
-        _scheduler.Timeline.RefreshCompletedTick();
+        _scheduler.Timeline.RefreshCompletedTickNow(); // [local] SHARPEMU_TIMELINE_POLL_US: a miss allocates a pool
         if (_scheduler.Timeline.IsTickComplete(tick))
         {
             _pendingPools.Dequeue();
