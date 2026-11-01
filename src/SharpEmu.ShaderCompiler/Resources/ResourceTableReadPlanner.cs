@@ -38,16 +38,27 @@ public sealed class ResourceTableReadPlanner
     public static bool IsDeviceTableHash(ulong hash) => DeviceTableHashes.Contains(hash); // [local]
 
     // [local] SHARPEMU_DEVICE_DATA_READS=<hashes> ('/' or ',' separated; empty or 0 off): in the listed shaders an
-    // immediate-offset S_LOAD whose result is only shader data (no descriptor, handle or other read depends on it, and
-    // no other dword of the same load was flattened for one) is not flattened into the host table: the shader performs
-    // it through the device-address page table, as the hardware does, so its word is read when the dispatch runs and the
-    // host never reads it while recording. Only the loads' own address operands are still planned.
-    private static readonly HashSet<ulong> DeviceDataReadHashes = ParseHashes(System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS"));
+    // immediate-offset S_LOAD dword whose result is only shader data (no descriptor, sampler or address handle and no
+    // flattened read depends on it; decided per component, so the other dwords of the same load can stay flattened)
+    // is not flattened into the host table: the shader performs it through the device-address page table, as the
+    // hardware does, so its word is read when the dispatch runs and the host never reads it while recording. Only the
+    // loads' own address operands are still planned (DeviceAddressRangePlanner maps and uploads the loaded range).
+    // =auto: the same per-site rule in every compute shader, without a list (no hashes); =auto-all also in the graphics
+    // stages. Off by default. SHARPEMU_DEVICE_DATA_READS_VERIFY=1 checks every such site on the device.
+    private static readonly string? DeviceDataReadsValue = System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS");
+
+    private static readonly HashSet<ulong> DeviceDataReadHashes = DeviceDataReadsValue is "auto" or "auto-all" ? [] : ParseHashes(DeviceDataReadsValue);
+
+    // [local] 0 off, 1 compute shaders, 2 every stage (SHARPEMU_DEVICE_DATA_READS=auto / auto-all). Tests set it.
+    internal static int DeviceDataReadsAuto = DeviceDataReadsValue switch { "auto" => 1, "auto-all" => 2, _ => 0 };
 
     internal static HashSet<ulong> ParseHashes(string? value) =>
         value is null or "0" ? [] : new(value.Split(['/', ','], System.StringSplitOptions.RemoveEmptyEntries).Select(h => System.Convert.ToUInt64(h, 16)));
 
     public static bool IsDeviceDataReadHash(ulong hash) => DeviceDataReadHashes.Contains(hash);
+
+    private bool DeviceDataReadsHere => DeviceDataReadHashes.Contains(_hash) || DeviceDataReadsAuto == 2 ||
+        (DeviceDataReadsAuto == 1 && _stage == ShaderStage.Compute);
 
     // [local] SHARPEMU_DEVICE_DATA_READS_VERIFY=1: the listed shaders' data reads are flattened and read by the host as
     // before (its value is the one used), and the shader also performs each through the page table, as the device-read
@@ -119,7 +130,7 @@ public sealed class ResourceTableReadPlanner
         }
 
         var validatorReadCount = _reads.Count;
-        var deviceData = DeviceDataReadHashes.Contains(_hash); // [local] SHARPEMU_DEVICE_DATA_READS
+        var deviceData = DeviceDataReadsHere; // [local] SHARPEMU_DEVICE_DATA_READS
         HashSet<int>? handleIndices = null;
         if (deviceData)
         {
