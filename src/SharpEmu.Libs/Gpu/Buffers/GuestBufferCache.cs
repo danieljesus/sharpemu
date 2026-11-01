@@ -425,6 +425,11 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         _device = device;
         _scheduler = scheduler;
         if (EarlyWriterSubmit) EarlySubmit = () => { _earlySubmits++; _scheduler.Flush(); }; // [local]
+        if (CutPolicy.Words || CutPolicy.GuestWindows) CutPolicy.DispatchCut = () => // [local] SHARPEMU_CUT_POLICY
+        {
+            Diagnostics.ReadbackOriginProbe.NoteCutReason(Diagnostics.ReadbackOriginProbe.CutReason.Policy);
+            _scheduler.Flush();
+        };
         _relay = relay;
         _backing = backing;
         _faults = new BdaFaultProcessor(device, scheduler, this, CachingPageBits, CachingPageCount);
@@ -809,6 +814,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             {
                 if (!WriterCompleted(address, size))
                 {
+                    if (CutPolicy.GuestWindows) _cut.NoteWindow(address, _batchSerial); // [local] SHARPEMU_CUT_POLICY
                     served = TryReadUnmodified(address, bytes);
                     if (served && FaultReadFlush)
                     {
@@ -859,6 +865,21 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private static long _faultReadFlushes;
 
+    // [local] SHARPEMU_CUT_POLICY: the per-cache state of the cut policy (hot words and guest windows).
+    private readonly CutPolicy _cut = new(CutPolicy.WordMaxBytes, CutPolicy.WindowMaxBytes);
+
+    // [local] SHARPEMU_CUT_POLICY=1: a render table word read while its writer is in the open batch becomes hot.
+    internal void NoteCutWord(ulong address)
+    {
+        if (CutPolicy.Words && FindOwner(address, sizeof(uint)) is { } owner &&
+            owner.GpuWriteTick(owner.Offset(address), sizeof(uint)) >= _scheduler.CurrentTick)
+        {
+            _cut.NoteWord(address);
+        }
+    }
+
+    internal void NoteDurationCut() => _cut.DurationCuts++; // [local] SHARPEMU_CUT_POLICY=4
+
     // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN_FLUSH: as the synchronizing read of [address, address + size) would, submits the
     // open batch when the readback window's writer is in it; nothing is waited for. True when it flushed.
     internal bool FlushOpenWriter(ulong address, ulong size)
@@ -874,6 +895,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return false;
         }
 
+        Diagnostics.ReadbackOriginProbe.NoteCutReason(Diagnostics.ReadbackOriginProbe.CutReason.Learn); // [local]
         _scheduler.Flush();
         return true;
     }
@@ -1235,6 +1257,9 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             if (TableWordMemo.Enabled) TableWordMemo.NoteGpuWrite(guestAddress, size); // [local]
             if (Diagnostics.TableReadCensus.Enabled) Diagnostics.TableReadCensus.NoteWrite(guestAddress, size, _scheduler.CurrentTick); // [local]
             if (EarlyWriterSubmit && !EarlySubmitPending) NoteHotWordWrite(guestAddress, size); // [local]
+            if ((CutPolicy.Words || CutPolicy.GuestWindows) && !CutPolicy.DispatchCutPending && // [local] SHARPEMU_CUT_POLICY
+                _cut.NoteWrite(guestAddress, size, _batchSerial, CutPolicy.Words, CutPolicy.GuestWindows))
+                CutPolicy.DispatchCutPending = true;
             if (ReadbackTickLog) // [local] diagnostic: last writer tick per 4 KB page
                 for (var page = guestAddress >> 12; page <= (guestAddress + size - 1) >> 12; page++)
                     _pageWriteTicks[page] = _scheduler.CurrentTick;
@@ -2178,6 +2203,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                         if (GuestReadSplit) relayEntered = System.Diagnostics.Stopwatch.GetTimestamp();
                         if (split is not null) BeginSplit(split);
                         pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true, markHot: false, waitForSlot);
+                        if (CutPolicy.GuestWindows && pending is not null && !_scheduler.IsTickComplete(pending.Ticket.WaitTick)) // [local] SHARPEMU_CUT_POLICY
+                            _cut.NoteWindow(guestAddress, _batchSerial);
                         slotsBusy = _beginSlotsBusy;
                         if (split is not null) EndSplitBegin(split, pending, guestAddress, size);
                     }))
@@ -2325,6 +2352,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     public void OnBatchSubmitted()
     {
         _batchSerial++;
+        if (CutPolicy.Enabled) _cut.Report(); // [local] SHARPEMU_CUT_POLICY
         HotWritePending = false;
         _mirror?.OnBatchSubmitted(); // [local]
         if (AsyncReadback is not { } readback)

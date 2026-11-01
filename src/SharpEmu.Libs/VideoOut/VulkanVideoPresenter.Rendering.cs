@@ -619,8 +619,10 @@ internal static unsafe partial class VulkanVideoPresenter
             // Acquire the decoded frame before any stage selects its movie texture planes.
             PumpHostMovieFrame();
 
+            Gpu.Buffers.CutPolicy.DispatchCutPending = false; // [local] SHARPEMU_CUT_POLICY: only a compute writer's own dispatch cuts
             if (_batchDrawCount >= (_renderingActive ? DrawsPerBatchInRenderPass : DrawsPerBatch))
             {
+                Diagnostics.ReadbackOriginProbe.NoteCutReason(Diagnostics.ReadbackOriginProbe.CutReason.Cap); // [local]
                 EndRendering();
                 FlushBatchedGuestCommands();
             }
@@ -628,9 +630,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 _scheduler.IsQueueIdle()) // [local] SHARPEMU_IDLE_FLUSH
             {
                 _idleFlushes++;
+                Diagnostics.ReadbackOriginProbe.NoteCutReason(Diagnostics.ReadbackOriginProbe.CutReason.Idle); // [local]
                 EndRendering();
                 FlushBatchedGuestCommands();
                 ReportIdleFlushes();
+            }
+            else if (Gpu.Buffers.CutPolicy.Duration && _batchOpen && _batchDrawCount != 0 && !_renderingActive &&
+                System.Diagnostics.Stopwatch.GetTimestamp() - _batchOpenedAt >= Gpu.Buffers.CutPolicy.MaxOpenTicks) // [local] SHARPEMU_CUT_POLICY=4
+            {
+                Diagnostics.ReadbackOriginProbe.NoteCutReason(Diagnostics.ReadbackOriginProbe.CutReason.Policy);
+                FlushBatchedGuestCommands();
+                _bufferCache?.NoteDurationCut();
             }
 
             EnsureGuestSubmissionCapacity();

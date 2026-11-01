@@ -41,6 +41,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // submitted once per drained work batch (one vkQueueSubmit per batch).
         private bool _batchOpen;
         private int _batchDrawCount;
+        private long _batchOpenedAt; // [local] SHARPEMU_CUT_POLICY=4 and SHARPEMU_READBACK_ORIGIN_PROBE
         private readonly List<SubmissionUploadResources> _batchResources = new();
         // [local] The debug name of the batch's first committed draw or dispatch; a draw with nothing to retire
         // adds no resource entry, so the name is kept apart.
@@ -56,6 +57,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 _batchOpen = true;
                 _batchDrawCount = 0;
+                if (Gpu.Buffers.CutPolicy.Duration || Diagnostics.ReadbackOriginProbe.Enabled) _batchOpenedAt = System.Diagnostics.Stopwatch.GetTimestamp(); // [local]
             }
 
             return commandBuffer;
@@ -105,6 +107,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _batchOpen = false;
+            if (Diagnostics.ReadbackOriginProbe.Enabled) Diagnostics.ReadbackOriginProbe.NoteBatch(_batchDrawCount, System.Diagnostics.Stopwatch.GetTimestamp() - _batchOpenedAt); // [local]
             var resources = _batchResources.ToArray();
             var retireBuffers = _batchRetireBuffers.Count > 0 ? _batchRetireBuffers.ToArray() : [];
             _batchResources.Clear();

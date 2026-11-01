@@ -816,6 +816,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         {
                             if (Gpu.Buffers.TableWordMemo.NoteAnsweredHit(address, out var speculated)) // [local] SHARPEMU_TABLE_WORD_MEMO_AUDIT
                                 _bufferCache.AuditMemoWord(address, memoValue, speculated);
+                            if (speculated && Gpu.Buffers.CutPolicy.Words) // [local] SHARPEMU_CUT_POLICY=1
+                                _bufferCache.NoteCutWord(address);
                             if (speculated && Gpu.Buffers.TableWordMemo.LearnFlush) // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN_FLUSH
                                 Gpu.Buffers.TableWordMemo.NoteLearnFlush(_bufferCache.FlushOpenWriter(address, sizeof(uint)));
                             word = memoValue;
@@ -847,6 +849,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     // [local experiment] the pending command buffer may hold the writes this word depends on
                     if (FlushBeforeTableReads) { _flushedTableReads++; _scheduler.FlushAndWait(); }
                     _bufferCache.NoteSyncTableRead(address, sizeof(uint)); // [local] SHARPEMU_EARLY_WRITER_SUBMIT
+                    if (Gpu.Buffers.CutPolicy.Words) _bufferCache.NoteCutWord(address); // [local] SHARPEMU_CUT_POLICY=1
                     var census = Diagnostics.TableReadCensus.Enabled; // [local]
                     var censusTicks = default((ulong Own, ulong Window, ulong Precise, ulong Current, ulong Completed));
                     var censusPre = 0u;
