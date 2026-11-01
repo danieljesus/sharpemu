@@ -269,6 +269,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public int Count => Volatile.Read(ref _count); // [local] GpuStallReport
 
+        // [local] SHARPEMU_RUNAHEAD_TICKS: run on the render thread after each item.
+        public Action? AfterItem { get; set; }
+
         // [local] SHARPEMU_FRONT_STALE_CHECK: items queued so far, and items the render thread has finished.
         internal long Enqueued;
         internal long Executed;
@@ -425,6 +428,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 ran++;
                 Volatile.Write(ref Executed, Executed + 1);
+                AfterItem?.Invoke();
                 if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline)
                 {
                     return ran;
@@ -985,6 +989,10 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _back = new BackQueue(WakeRenderThread, BackQueueCapacity);
+            if (Gpu.Scheduling.RunaheadBound.Enabled) // [local] SHARPEMU_RUNAHEAD_TICKS
+            {
+                _back.AfterItem = () => Gpu.Scheduling.RunaheadBound.Hold(_scheduler.Timeline, () => _scheduler.CurrentTick - 1, RunPendingCommands);
+            }
             _front = new FrontCommandStreamHost(this, _back);
             RenderPhaseProfile.FrontReport = TakeFrontReport;
             ShaderPipelineCache.BeforeGuestWrite = _front.Drain;
@@ -1048,6 +1056,9 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool PollBlocked = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_POLL_BLOCKED") == "1";
         private int _traceFrontState = -1; // [local] SHARPEMU_LABEL_TRACE: the front state last noted
         private int _timelineFrontState = -1; // [local] SHARPEMU_LABEL_TIMELINE
+        private int _originFrontState; // [local] SHARPEMU_READBACK_ORIGIN_PROBE: 0 ran, 1 blocked or without work since _originBlockedSince
+        private long _originBlockedSince;
+        private ulong _originDepth, _originUnsubmitted;
 
         // The front: the slices the render thread ran before, on their own thread.
         private void FrontLoop()
@@ -1098,6 +1109,26 @@ internal static unsafe partial class VulkanVideoPresenter
                         {
                             Diagnostics.LabelTimeline.Log('X', (ulong)state, (ulong)_commandStream.LastRunBlockedKind, _commandStream.LastRunBlockedAddress);
                             _timelineFrontState = state;
+                        }
+                    }
+
+                    if (Diagnostics.ReadbackOriginProbe.Enabled) // [local] the front's blocked spans, with the GPU queue depth when they began
+                    {
+                        var ran = result is SliceResult.Progressed or SliceResult.Completed;
+                        if (!ran && _originFrontState == 0)
+                        {
+                            _originFrontState = 1;
+                            _originBlockedSince = sliceStarted;
+                            var completed = _scheduler.Timeline.CompletedTick;
+                            var submitted = _scheduler.SubmittedTick;
+                            _originDepth = submitted > completed ? submitted - completed : 0;
+                            _originUnsubmitted = _scheduler.CurrentTick > submitted ? _scheduler.CurrentTick - submitted : 0;
+                        }
+                        else if (ran && _originFrontState != 0)
+                        {
+                            _originFrontState = 0;
+                            Diagnostics.ReadbackOriginProbe.NoteFrontBlocked((byte)_commandStream.LastRunBlockedKind, _commandStream.LastRunBlockedAddress,
+                                sliceStarted - _originBlockedSince, _originDepth, _originUnsubmitted);
                         }
                     }
 

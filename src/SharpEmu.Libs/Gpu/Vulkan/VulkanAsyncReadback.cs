@@ -60,6 +60,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         public ulong AheadCount { get; init; }
         public ulong AheadTick { get; init; }
         public Diagnostics.LabelPollSplit.Sample? Observe { get; set; }
+        // [local] SHARPEMU_READBACK_ORIGIN_PROBE: what started the copy.
+        public Diagnostics.ReadbackOriginProbe.Origin Origin { get; init; }
     }
 
     public VulkanAsyncReadback(GpuDeviceInfo device, SubmissionScheduler scheduler, Queue queue, uint queueFamilyIndex)
@@ -237,6 +239,18 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
 
         if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.GpuWait, Environment.CurrentManagedThreadId, 1, ticket.WaitTick, ticket.Value); // [local]
         var starveEntered = Scheduling.GpuStarveProbe.EnterGpuWait(ticket.WaitTick); // [local] SHARPEMU_GPU_STARVE_PROBE
+        var guestWait = Scheduling.RunaheadBound.Enabled && !Scheduling.GpuWorkerRelay.OnAnyGpuQueueThread; // [local] SHARPEMU_RUNAHEAD_TICKS
+        if (guestWait) Scheduling.RunaheadBound.EnterGuestWait();
+        ulong originCompleted = 0, originSubmitted = 0, originCurrent = 0; // [local] SHARPEMU_READBACK_ORIGIN_PROBE
+        var originStarted = 0L;
+        if (Diagnostics.ReadbackOriginProbe.Enabled)
+        {
+            originCompleted = _scheduler.Timeline.CompletedTick;
+            originSubmitted = _scheduler.SubmittedTick;
+            originCurrent = _scheduler.CurrentTick;
+            originStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+
         try
         {
             var vk = _device.Vk;
@@ -308,6 +322,10 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         {
             if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.GpuWaitEnd, Environment.CurrentManagedThreadId, 1, ticket.WaitTick, ticket.Value); // [local]
             Scheduling.GpuStarveProbe.ExitGpuWait(starveEntered);
+            if (guestWait) Scheduling.RunaheadBound.ExitGuestWait();
+            if (originStarted != 0)
+                Diagnostics.ReadbackOriginProbe.NoteWait(ticket.Origin, ticket.WaitTick, originCompleted, originSubmitted, originCurrent,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - originStarted);
             lock (_gate)
             {
                 _waiters--;
@@ -493,7 +511,12 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         slot.Busy = true;
         slot.WaitTick = waitTick;
         slot.Value = signalValue;
-        return new Ticket(slot, signalValue, waitTick, offsets, sizes) { AheadCount = aheadCount, AheadTick = aheadTick };
+        return new Ticket(slot, signalValue, waitTick, offsets, sizes)
+        {
+            AheadCount = aheadCount,
+            AheadTick = aheadTick,
+            Origin = Diagnostics.ReadbackOriginProbe.Enabled ? Diagnostics.ReadbackOriginProbe.Current : default,
+        };
     }
 
     public delegate void ReadbackConsumer(int index, ReadOnlySpan<byte> bytes);

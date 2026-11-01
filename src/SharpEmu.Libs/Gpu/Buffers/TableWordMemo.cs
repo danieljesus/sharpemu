@@ -140,6 +140,21 @@ internal static class TableWordMemo
     // ([TABLE_WORD_MEMO_LEARN] audits=/audit_mismatches=, has to stay 0). =1 audits every hit. A mismatch bans the word.
     internal static int AuditRate = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_AUDIT"), out var audit) ? audit : 0;
 
+    // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN_FLUSH=1 (off by default): a hit that learning kept (the synchronizing read it
+    // replaces would have flushed the open batch when the word's writer was in it, then waited) still flushes the batch,
+    // without the wait. It only moves a batch boundary to where the read put it before, so it is exact by construction.
+    // With LEARN=8 alone the open batch holding 5981's refit and what follows it reaches the GPU later (2026-11-02,
+    // gta/runahead).
+    internal static readonly bool LearnFlush = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_LEARN_FLUSH") == "1";
+    private static long _learnFlushes, _learnFlushChecks;
+
+    public static void NoteLearnFlush(bool flushed)
+    {
+        Interlocked.Increment(ref _learnFlushChecks);
+        if (flushed)
+            Interlocked.Increment(ref _learnFlushes);
+    }
+
     private static readonly Dictionary<(ulong Word, ulong Program), int> _survivals = new();
     private static readonly Dictionary<ulong, (ulong Program, uint Value)> _pendingDrops = new();
     private static readonly HashSet<ulong> _banned = new();
@@ -259,7 +274,7 @@ internal static class TableWordMemo
             return;
         _learnReport = System.Diagnostics.Stopwatch.GetTimestamp();
         var trusted = _survivals.Count(pair => pair.Value >= LearnThreshold && LearnThreshold > 0);
-        Console.Error.WriteLine($"[TABLE_WORD_MEMO_LEARN] k={LearnThreshold} audit={AuditRate} words={_values.Count} trusted_pairs={trusted} learned={_learnedPairs} resets={_learnResets} banned={_banned.Count} skips={_learnSkips} learned_hits={_learnHits} audits={_audits} audit_mismatches={_auditMismatches} audit_unchecked={_auditUnchecked}");
+        Console.Error.WriteLine($"[TABLE_WORD_MEMO_LEARN] k={LearnThreshold} audit={AuditRate} words={_values.Count} trusted_pairs={trusted} learned={_learnedPairs} resets={_learnResets} banned={_banned.Count} skips={_learnSkips} learned_hits={_learnHits} learn_flushes={_learnFlushes}/{_learnFlushChecks} audits={_audits} audit_mismatches={_auditMismatches} audit_unchecked={_auditUnchecked}");
     }
 
     // [local] SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE (on by default since 2026-10-30, =0 off): a command-processor write carries its

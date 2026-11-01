@@ -859,6 +859,25 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private static long _faultReadFlushes;
 
+    // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN_FLUSH: as the synchronizing read of [address, address + size) would, submits the
+    // open batch when the readback window's writer is in it; nothing is waited for. True when it flushed.
+    internal bool FlushOpenWriter(ulong address, ulong size)
+    {
+        var waitTick = 0UL;
+        foreach (var copy in CollectReadbackWindow(address, size, out _, out _))
+        {
+            waitTick = Math.Max(waitTick, copy.Buffer.GpuWriteTick(copy.SourceOffset, copy.Size));
+        }
+
+        if (waitTick < _scheduler.CurrentTick)
+        {
+            return false;
+        }
+
+        _scheduler.Flush();
+        return true;
+    }
+
     internal static long TakeFaultReadFlushes() => Interlocked.Exchange(ref _faultReadFlushes, 0);
 
     // A repeated poll does not relay: the check is posted, one at a time, and runs between the queue's commands.
@@ -2601,6 +2620,28 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     private PendingDownload? BeginReadMemoryOnGpu(ulong guestAddress, ulong size, bool isWrite, GuestMemoryProfile.ReadbackSource source,
         bool allowPending, bool markHot = false, bool waitForSlot = false)
     {
+        if (!Diagnostics.ReadbackOriginProbe.Enabled)
+        {
+            return BeginReadMemoryOnGpuCore(guestAddress, size, isWrite, source, allowPending, markHot, waitForSlot);
+        }
+
+        // [local] SHARPEMU_READBACK_ORIGIN_PROBE: the tickets started here carry their origin.
+        var precise = GpuWriteHistory.Queryable ? GpuWriteHistory.LastWriteTick(guestAddress, Math.Max(size, 1), PreciseWaitScan) : 0;
+        var previous = Diagnostics.ReadbackOriginProbe.Enter(_tableRead ? Diagnostics.ReadbackOriginProbe.Site.Table : Diagnostics.ReadbackOriginProbe.Site.Ordinary,
+            source, guestAddress, size, precise);
+        try
+        {
+            return BeginReadMemoryOnGpuCore(guestAddress, size, isWrite, source, allowPending, markHot, waitForSlot);
+        }
+        finally
+        {
+            Diagnostics.ReadbackOriginProbe.Restore(previous);
+        }
+    }
+
+    private PendingDownload? BeginReadMemoryOnGpuCore(ulong guestAddress, ulong size, bool isWrite, GuestMemoryProfile.ReadbackSource source,
+        bool allowPending, bool markHot, bool waitForSlot)
+    {
         _beginSlotsBusy = false;
         using var readbackScope = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.BufferReadback);
         using var foreignRead = _device.Slabs.BeginForeignRead();
@@ -3063,6 +3104,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             return true;
         }
 
+        if (Diagnostics.ReadbackOriginProbe.Enabled) Diagnostics.ReadbackOriginProbe.SetSite(Diagnostics.ReadbackOriginProbe.Site.Precise); // [local]
         readback.Read(pieces, waitTick, (index, bytes) =>
         {
             if (!_backing.TryWriteBacking(copies[index].Address, bytes))
@@ -3874,6 +3916,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (waitTick >= _scheduler.CurrentTick)
         {
             _splitFlushed = true; // [local] SHARPEMU_LABEL_POLL_SPLIT
+            Diagnostics.ReadbackOriginProbe.NoteFlush(); // [local]
             _scheduler.Flush();
         }
 
@@ -3953,6 +3996,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         // waiting) so the readback queue has a signal to wait for.
         if (waitTick >= _scheduler.CurrentTick)
         {
+            Diagnostics.ReadbackOriginProbe.NoteFlush(); // [local]
             _scheduler.Flush();
         }
 
