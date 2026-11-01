@@ -191,6 +191,9 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
     // [local] The jobs enqueued so far: a submit captures this when its buffer is sealed and joins it before the submit.
     public long Enqueued => Volatile.Read(ref _enqueued);
 
+    // [local] SHARPEMU_SUBMIT_BATCH: the first target jobs have protected and copied (never blocks).
+    public bool IsDone(long target) => Volatile.Read(ref _completed) >= target && Volatile.Read(ref _failure) is null;
+
     // Every job enqueued so far has protected and copied.
     public void WaitIdle() => WaitIdle(Volatile.Read(ref _enqueued));
 

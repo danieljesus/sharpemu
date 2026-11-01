@@ -524,6 +524,25 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     // joins the target on the GPU ((0, 0): already joined).
     public Func<long, (ulong Semaphore, ulong Value)>? GpuWaitSubmitTarget { get; set; }
 
+    // [local] SHARPEMU_SUBMIT_BATCH: whether a target is already joined (never blocks). Without it a batch holds only
+    // buffers whose targets need no join.
+    public Func<long, bool>? SubmitTargetDone { get; set; }
+
+    // [local] SHARPEMU_SUBMIT_BATCH=<n> (off by default; 0 or 1 off): once the submit thread has joined the oldest
+    // sealed buffer (ring replay and deferred uploads), it also takes the following sealed buffers whose replay and
+    // uploads are already done, up to n in all, stopping at the first that is not, and submits them with one
+    // vkQueueSubmit2 (one VkSubmitInfo2 each, own waits and signals). Same buffers, same order, same semaphores: only
+    // the number of queue calls changes. Off with SHARPEMU_UPLOAD_GPU_WAIT (its waits are added per buffer). Tests set
+    // SubmitBatchLimit on their own scheduler.
+    internal static readonly int SubmitBatchDefault =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SUBMIT_BATCH"), out var submitBatch) ? Math.Clamp(submitBatch, 0, 32) : 0;
+
+    internal int SubmitBatchLimit { get; set; } = SubmitBatchDefault;
+
+    private readonly List<SealedSubmit> _batch = new();
+    private nint[] _batchBuffers = [];
+    private SubmitBundle[] _batchBundles = [];
+
     public ulong Submit(SubmitBundle? bundle = null)
     {
         if (SubmitProbe) RecordSubmit(); // [local]
@@ -701,6 +720,84 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         return submitted;
     }
 
+    // [local] SHARPEMU_SUBMIT_BATCH: the queue part for the oldest sealed buffer and the ready ones behind it.
+    private bool SubmitSealedBatch(in SealedSubmit head, out int taken, out ulong lastTick, out string failure)
+    {
+        var start = System.Diagnostics.Stopwatch.GetTimestamp();
+        GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitReplay); // [local] SHARPEMU_GPU_STARVE_PROBE
+        _device.WaitRecorded(head.Recorded);
+        var replayed = GpuStarveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitUploads);
+        WaitSubmitTarget?.Invoke(head.Target);
+        var joined = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        _batch.Clear();
+        _batch.Add(head);
+        var limit = SubmitBatchLimit;
+        var targetDone = SubmitTargetDone;
+        var joinsTargets = WaitSubmitTarget != null;
+        lock (_submitLock)
+        {
+            var first = true;
+            foreach (var next in _sealed)
+            {
+                if (first)
+                {
+                    first = false;
+                    continue;
+                }
+
+                if (_batch.Count >= limit || !_device.IsRecorded(next.Recorded) ||
+                    (joinsTargets && (targetDone == null || !targetDone(next.Target))))
+                {
+                    break;
+                }
+
+                _batch.Add(next);
+            }
+        }
+
+        var count = _batch.Count;
+        if (_batchBuffers.Length < count)
+        {
+            _batchBuffers = new nint[limit];
+            _batchBundles = new SubmitBundle[limit];
+        }
+
+        for (var index = 0; index < count; index++)
+        {
+            _batchBuffers[index] = _batch[index].Buffer;
+            _batchBundles[index] = _batch[index].Bundle;
+        }
+
+        bool submitted;
+        GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitGate);
+        lock (_device.QueueGate)
+        {
+            GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitCall);
+            submitted = _device.TrySubmitBatch(_batchBuffers.AsSpan(0, count), _batchBundles.AsSpan(0, count), out failure);
+        }
+
+        GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitOther);
+        Array.Clear(_batchBundles, 0, count);
+        var end = System.Diagnostics.Stopwatch.GetTimestamp();
+        SubmitThreadStats.Batched(count);
+        for (var index = 0; index < count; index++)
+        {
+            var tick = _batch[index].Tick;
+            if (submitted && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(tick);
+            if (submitted && Diagnostics.LabelLatencyProbe.Enabled) Diagnostics.LabelLatencyProbe.NoteSubmitted(tick);
+            SubmitThreadStats.Submitted(index == 0 ? joined - start : 0, index == 0 ? end - joined : 0);
+            if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Submitted, -1, 0, tick);
+        }
+
+        if (replayed != 0) GpuStarveProbe.NoteSubmit(replayed - start, joined - replayed, end - joined);
+        taken = count;
+        lastTick = _batch[count - 1].Tick;
+        _batch.Clear();
+        return submitted;
+    }
+
     private static string FormatSubmitFailure(in SealedSubmit item, string failure)
     {
         var trace = item.Trace;
@@ -733,9 +830,18 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             }
 
             string? message = null;
+            var taken = 1; // [local] SHARPEMU_SUBMIT_BATCH
+            var lastTick = item.Tick;
             try
             {
-                if (!SubmitSealed(item, out var failure))
+                if (SubmitBatchLimit > 1 && GpuWaitSubmitTarget == null)
+                {
+                    if (!SubmitSealedBatch(item, out taken, out lastTick, out var batchFailure))
+                    {
+                        message = FormatSubmitFailure(item, batchFailure);
+                    }
+                }
+                else if (!SubmitSealed(item, out var failure))
                 {
                     message = FormatSubmitFailure(item, failure);
                 }
@@ -763,10 +869,14 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
             lock (_submitLock)
             {
-                _sealed.Dequeue();
+                for (var index = 0; index < taken; index++)
+                {
+                    _sealed.Dequeue();
+                }
+
                 if (message == null)
                 {
-                    Volatile.Write(ref _submittedTick, item.Tick);
+                    Volatile.Write(ref _submittedTick, lastTick);
                 }
                 else
                 {

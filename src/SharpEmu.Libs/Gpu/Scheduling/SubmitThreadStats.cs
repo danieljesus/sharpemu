@@ -39,6 +39,24 @@ internal static class SubmitThreadStats
         Interlocked.Add(ref _submitTicks, submitTicks);
     }
 
+    // [local] SHARPEMU_SUBMIT_BATCH: queue calls and the buffers they carried, reported every 4096 calls.
+    private static long _batchCalls, _batchItems, _batchMulti, _batchMax;
+
+    public static void Batched(int items)
+    {
+        _batchItems += items;
+        if (items > 1) _batchMulti++;
+        if (items > _batchMax) _batchMax = items;
+        if ((++_batchCalls & 4095) != 0)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(string.Create(CultureInfo.InvariantCulture,
+            $"[GPU][SUBMIT_BATCH] calls={_batchCalls} buffers={_batchItems} multi_calls={_batchMulti} buffers_per_call={_batchItems / (double)_batchCalls:F3} max={_batchMax}"));
+        _batchCalls = _batchItems = _batchMulti = _batchMax = 0;
+    }
+
     public static void Waited(long ticks)
     {
         Interlocked.Increment(ref _waits);

@@ -180,6 +180,50 @@ internal sealed class FakeTickDevice : IGpuTickDevice
         return true;
     }
 
+    // [local] SHARPEMU_SUBMIT_BATCH: the buffers each queue call carried, and the replay positions not yet replayed.
+    public List<int> BatchSizes { get; } = new();
+
+    public HashSet<long> UnreplayedPositions { get; } = new();
+
+    public long NextRecordedPosition { get; set; }
+
+    public long RecordedPosition => NextRecordedPosition;
+
+    public bool IsRecorded(long position)
+    {
+        lock (UnreplayedPositions)
+        {
+            return !UnreplayedPositions.Contains(position);
+        }
+    }
+
+    public void WaitRecorded(long position)
+    {
+        while (!IsRecorded(position))
+        {
+            Thread.Sleep(1);
+        }
+    }
+
+    public bool TrySubmitBatch(ReadOnlySpan<nint> buffers, ReadOnlySpan<SubmitBundle> bundles, out string failure)
+    {
+        lock (BatchSizes)
+        {
+            BatchSizes.Add(buffers.Length);
+        }
+
+        failure = "";
+        for (var index = 0; index < buffers.Length; index++)
+        {
+            if (!TrySubmit(buffers[index], bundles[index], out failure))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     public void Complete(ulong tick)
     {
         lock (_gate)

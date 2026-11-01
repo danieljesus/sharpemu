@@ -272,6 +272,9 @@ internal sealed unsafe partial class CommandRing : IDisposable
     // call this before they destroy objects the open buffer may reference.
     public static void DrainActive(RingDrainReason reason) => Active?.Drain(reason);
 
+    // [local] SHARPEMU_SUBMIT_BATCH: the replay thread has issued records up to this position (never blocks).
+    public bool IsReplayed(long position) => Volatile.Read(ref _consumed) >= position;
+
     // Any thread: wait until the replay thread has issued records up to this position.
     public void WaitReplayed(long position)
     {

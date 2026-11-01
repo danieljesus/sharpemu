@@ -36,6 +36,25 @@ public interface IGpuTickDevice : IDisposable
     {
     }
 
+    // [local] SHARPEMU_SUBMIT_BATCH: whether the ring has already replayed up to a position (never blocks).
+    bool IsRecorded(long position) => true;
+
+    // [local] SHARPEMU_SUBMIT_BATCH: submit several sealed buffers in order with one queue call. Each keeps its own
+    // waits and signals; the default submits them one by one, which is the same work in the same order.
+    bool TrySubmitBatch(ReadOnlySpan<nint> buffers, ReadOnlySpan<SubmitBundle> bundles, out string failure)
+    {
+        failure = "";
+        for (var index = 0; index < buffers.Length; index++)
+        {
+            if (!TrySubmit(buffers[index], bundles[index], out failure))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // [local] For GpuStallReport: the raw timeline value and the record ring's positions.
     string DescribeStall() => "";
 }

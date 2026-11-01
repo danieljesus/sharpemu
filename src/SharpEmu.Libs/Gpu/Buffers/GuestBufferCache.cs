@@ -429,6 +429,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
             var deferred = _deferredUploads;
             scheduler.CaptureSubmitTarget = () => deferred.Enqueued;
             scheduler.WaitSubmitTarget = deferred.WaitIdle;
+            scheduler.SubmitTargetDone = deferred.IsDone; // [local] SHARPEMU_SUBMIT_BATCH
             if (DeferredUploadWorker.GpuWait) // [local] SHARPEMU_UPLOAD_GPU_WAIT
                 scheduler.GpuWaitSubmitTarget = deferred.GpuWaitFor;
         }

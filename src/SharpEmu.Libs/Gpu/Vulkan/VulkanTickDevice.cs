@@ -66,6 +66,8 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public void WaitRecorded(long position) => _ring?.WaitReplayed(position); // [local]
 
+    public bool IsRecorded(long position) => _ring == null || _ring.IsReplayed(position); // [local] SHARPEMU_SUBMIT_BATCH
+
     // [local] GpuStallReport: the raw main timeline (its result too, a lost device shows here) and the ring.
     public string DescribeStall()
     {
@@ -477,6 +479,92 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
             failure = result.ToString();
             return result == Result.Success;
         }
+    }
+
+    // [local] SHARPEMU_SUBMIT_BATCH: one vkQueueSubmit2 with one VkSubmitInfo2 per sealed buffer, in tick order. The
+    // spec orders the submissions of one call as it orders separate calls, so this is the same work as submitting
+    // them one by one. The fence retirement path (one fence per submit) keeps the one-by-one submits.
+    public bool TrySubmitBatch(ReadOnlySpan<nint> buffers, ReadOnlySpan<SubmitBundle> bundles, out string failure)
+    {
+        if (buffers.Length == 1 || FenceRetirement)
+        {
+            failure = "";
+            for (var index = 0; index < buffers.Length; index++)
+            {
+                if (!TrySubmit(buffers[index], bundles[index], out failure))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        var count = buffers.Length;
+        var waitTotal = 0;
+        var signalTotal = 0;
+        for (var index = 0; index < count; index++)
+        {
+            waitTotal += bundles[index].WaitCount;
+            signalTotal += bundles[index].SignalCount;
+        }
+
+        var waitInfos = stackalloc SemaphoreSubmitInfo[Math.Max(waitTotal, 1)];
+        var signalInfos = stackalloc SemaphoreSubmitInfo[Math.Max(signalTotal, 1)];
+        var commandInfos = stackalloc CommandBufferSubmitInfo[count];
+        var submitInfos = stackalloc SubmitInfo2[count];
+        var waitNext = 0;
+        var signalNext = 0;
+        for (var index = 0; index < count; index++)
+        {
+            var bundle = bundles[index];
+            var waitFirst = waitNext;
+            for (var wait = 0; wait < bundle.WaitCount; wait++)
+            {
+                waitInfos[waitNext++] = new SemaphoreSubmitInfo
+                {
+                    SType = StructureType.SemaphoreSubmitInfo,
+                    Semaphore = new VkSemaphore(bundle.WaitSemaphores[wait]),
+                    Value = bundle.WaitTicks[wait],
+                    StageMask = (PipelineStageFlags2)bundle.WaitStages[wait],
+                };
+            }
+
+            var signalFirst = signalNext;
+            for (var signal = 0; signal < bundle.SignalCount; signal++)
+            {
+                signalInfos[signalNext++] = new SemaphoreSubmitInfo
+                {
+                    SType = StructureType.SemaphoreSubmitInfo,
+                    Semaphore = new VkSemaphore(bundle.SignalSemaphores[signal]),
+                    Value = bundle.SignalTicks[signal],
+                    StageMask = PipelineStageFlags2.AllCommandsBit,
+                };
+            }
+
+            commandInfos[index] = new CommandBufferSubmitInfo
+            {
+                SType = StructureType.CommandBufferSubmitInfo,
+                CommandBuffer = new CommandBuffer(buffers[index]),
+                DeviceMask = 1,
+            };
+            submitInfos[index] = new SubmitInfo2
+            {
+                SType = StructureType.SubmitInfo2,
+                WaitSemaphoreInfoCount = (uint)bundle.WaitCount,
+                PWaitSemaphoreInfos = waitInfos + waitFirst,
+                CommandBufferInfoCount = 1,
+                PCommandBufferInfos = commandInfos + index,
+                SignalSemaphoreInfoCount = (uint)bundle.SignalCount,
+                PSignalSemaphoreInfos = signalInfos + signalFirst,
+            };
+        }
+
+        var vkProbe = VkCallProbe.Start();
+        var result = _vk.QueueSubmit2(_queue, (uint)count, submitInfos, default);
+        VkCallProbe.Stop(VkCallProbe.Kind.Submit, vkProbe);
+        failure = result.ToString();
+        return result == Result.Success;
     }
 
     public void Dispose()
