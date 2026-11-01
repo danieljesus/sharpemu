@@ -44,6 +44,11 @@ internal static class TableWordMemo
             _sorted = [];
             _dirtySort = false;
             Volatile.Write(ref _count, 0);
+            _survivals.Clear();
+            _pendingDrops.Clear();
+            _banned.Clear();
+            _speculated.Clear();
+            _auditSeen = 0;
         }
     }
 
@@ -64,7 +69,14 @@ internal static class TableWordMemo
     public static void Store(ulong address, uint value)
     {
         lock (_lock)
+        {
+            if (LearnThreshold > 0) // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN
+            {
+                LearnLocked(address, value);
+                MaybeReportLocked();
+            }
             StoreLocked(address, value);
+        }
     }
 
     private static void StoreLocked(ulong address, uint value)
@@ -91,8 +103,14 @@ internal static class TableWordMemo
         if (memo == synchronized)
             return;
         _mismatches++;
+        if (LearnThreshold > 0) // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN: =2 found the memo wrong
+        {
+            _banned.Add(address);
+            _pendingDrops.Remove(address);
+            _auditMismatches++;
+        }
         if (_mismatchLogs++ < 40)
-            Console.Error.WriteLine($"[TABLE_WORD_MEMO] mismatch address=0x{address:X} memo=0x{memo:X8} synchronized=0x{synchronized:X8}");
+            Console.Error.WriteLine($"[TABLE_WORD_MEMO] mismatch address=0x{address:X} memo=0x{memo:X8} synchronized=0x{synchronized:X8} speculated={_speculated.Contains(address)}");
     }
 
     // A GPU write marked over [address, address+size) by the current program.
@@ -101,11 +119,147 @@ internal static class TableWordMemo
         if (Volatile.Read(ref _count) == 0 || Writers.Contains(CurrentProgram))
             return;
         lock (_lock)
-        if (Invalidate(address, size, 'g', CurrentProgram))
+        if (LearnThreshold > 0 ? InvalidateUntrusted(address, size, CurrentProgram) : Invalidate(address, size, 'g', CurrentProgram))
         {
             _invalidGpu++;
             _invalidByWriter[CurrentProgram] = _invalidByWriter.GetValueOrDefault(CurrentProgram) + 1;
         }
+    }
+
+    // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN=<k> (0 off by default): the writer allowlist learned per (word, program) instead
+    // of given by hash. When a program's written binding drops a remembered word, the program and the value are kept; if
+    // the next synchronizing read of the word gets the same value, that (word, program) pair survived once. After k
+    // survivals in a row the program's marks no longer drop that word (a different value resets the run). In GTA V the
+    // memo for 994A +0x28/+0x2C/+0x74 (the TLAS header: offset and record count of the V# 994A writes through) was dropped
+    // every frame by 5F74's binding, and the read then waited for the open batch behind 5981's refit (~1.5-1.9 ms/frame).
+    // A word whose memo turns out wrong (SHARPEMU_TABLE_WORD_MEMO_AUDIT, or =2) is banned from learning for the session.
+    internal static int LearnThreshold = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_LEARN"), out var learn) ? learn : 0;
+
+    // [local] SHARPEMU_TABLE_WORD_MEMO_AUDIT=<n> (0 off by default): one memo hit in n, answered without waiting, also copies
+    // the word from the device buffer at that point of the stream and compares it at completion with the value given
+    // ([TABLE_WORD_MEMO_LEARN] audits=/audit_mismatches=, has to stay 0). =1 audits every hit. A mismatch bans the word.
+    internal static int AuditRate = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_AUDIT"), out var audit) ? audit : 0;
+
+    private static readonly Dictionary<(ulong Word, ulong Program), int> _survivals = new();
+    private static readonly Dictionary<ulong, (ulong Program, uint Value)> _pendingDrops = new();
+    private static readonly HashSet<ulong> _banned = new();
+    private static readonly HashSet<ulong> _speculated = new();
+    private static long _learnSkips, _learnedPairs, _learnResets, _learnHits, _auditSeen, _audits, _auditMismatches, _auditUnchecked;
+    private static long _learnReport = System.Diagnostics.Stopwatch.GetTimestamp();
+    private static int _auditMismatchLogs;
+
+    internal static bool IsTrusted(ulong word, ulong program) =>
+        !_banned.Contains(word) && _survivals.GetValueOrDefault((word, program)) >= LearnThreshold;
+
+    private static bool InvalidateUntrusted(ulong address, ulong size, ulong program)
+    {
+        if (_dirtySort)
+        {
+            _sorted = _values.Keys.Order().ToArray();
+            _dirtySort = false;
+        }
+
+        var index = Array.BinarySearch(_sorted, address & ~3UL);
+        if (index < 0)
+            index = ~index;
+        var removed = false;
+        for (; index < _sorted.Length && _sorted[index] < address + size; index++)
+        {
+            var word = _sorted[index];
+            if (!_values.TryGetValue(word, out var old))
+                continue;
+            if (program != 0 && IsTrusted(word, program))
+            {
+                _learnSkips++;
+                _speculated.Add(word);
+                continue;
+            }
+
+            if (program != 0 && !_banned.Contains(word))
+                _pendingDrops[word] = (program, old);
+            if (SharpEmu.ShaderCompiler.Resources.SrtReadProbe.Enabled)
+                _dropped[word] = ('g', program, old);
+            _values.Remove(word);
+            _speculated.Remove(word);
+            removed = true;
+        }
+        if (removed)
+        {
+            _dirtySort = true;
+            Volatile.Write(ref _count, _values.Count);
+        }
+
+        return removed;
+    }
+
+    // The value a synchronizing read got: one survival sample for the program that dropped the word since it was stored.
+    private static void LearnLocked(ulong address, uint value)
+    {
+        _speculated.Remove(address);
+        if (!_pendingDrops.Remove(address, out var drop))
+            return;
+        var key = (address, drop.Program);
+        if (drop.Value != value)
+        {
+            if (_survivals.Remove(key))
+                _learnResets++;
+            return;
+        }
+
+        var survivals = _survivals.GetValueOrDefault(key) + 1;
+        _survivals[key] = survivals;
+        if (survivals == LearnThreshold)
+            _learnedPairs++;
+    }
+
+    // A memo hit answered without waiting: whether to audit it against the device copy, and whether learning kept it.
+    public static bool NoteAnsweredHit(ulong address, out bool speculated)
+    {
+        speculated = false;
+        if (LearnThreshold == 0 && AuditRate == 0)
+            return false;
+        lock (_lock)
+        {
+            speculated = _speculated.Contains(address);
+            if (speculated)
+                _learnHits++;
+            MaybeReportLocked();
+            return AuditRate > 0 && _auditSeen++ % AuditRate == 0;
+        }
+    }
+
+    public static void NoteAudit(ulong address, uint memo, uint device, bool speculated, bool checkedOnDevice)
+    {
+        lock (_lock)
+        {
+            if (!checkedOnDevice)
+            {
+                _auditUnchecked++;
+                return;
+            }
+
+            _audits++;
+            if (memo == device)
+                return;
+            _auditMismatches++;
+            _banned.Add(address);
+            _pendingDrops.Remove(address);
+            if (_values.ContainsKey(address))
+                Invalidate(address, 4, 'a', 0);
+            if (_auditMismatchLogs++ < 40)
+                Console.Error.WriteLine($"[TABLE_WORD_MEMO_LEARN] audit_mismatch address=0x{address:X} memo=0x{memo:X8} device=0x{device:X8} speculated={speculated}");
+        }
+    }
+
+    private static void MaybeReportLocked()
+    {
+        if (LearnThreshold == 0 && AuditRate == 0)
+            return;
+        if (System.Diagnostics.Stopwatch.GetElapsedTime(_learnReport).TotalSeconds < 20)
+            return;
+        _learnReport = System.Diagnostics.Stopwatch.GetTimestamp();
+        var trusted = _survivals.Count(pair => pair.Value >= LearnThreshold && LearnThreshold > 0);
+        Console.Error.WriteLine($"[TABLE_WORD_MEMO_LEARN] k={LearnThreshold} audit={AuditRate} words={_values.Count} trusted_pairs={trusted} learned={_learnedPairs} resets={_learnResets} banned={_banned.Count} skips={_learnSkips} learned_hits={_learnHits} audits={_audits} audit_mismatches={_auditMismatches} audit_unchecked={_auditUnchecked}");
     }
 
     // [local] SHARPEMU_TABLE_WORD_MEMO_CP_UPDATE (on by default since 2026-10-30, =0 off): a command-processor write carries its
@@ -207,6 +361,7 @@ internal static class TableWordMemo
             if (SharpEmu.ShaderCompiler.Resources.SrtReadProbe.Enabled && _values.TryGetValue(_sorted[index], out var old))
                 _dropped[_sorted[index]] = (kind, program, old);
             removed |= _values.Remove(_sorted[index]);
+            _speculated.Remove(_sorted[index]);
         }
         if (removed)
         {

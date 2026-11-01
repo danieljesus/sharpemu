@@ -185,6 +185,30 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         });
     }
 
+    // [local] SHARPEMU_TABLE_WORD_MEMO_AUDIT: the remembered word given without waiting, against the device copy at this point
+    // of the stream (what the GPU program being recorded will read). Unchecked off the GPU queue thread, outside a
+    // registered buffer or in CPU-dirty pages (the device copy is legitimately older there).
+    internal void AuditMemoWord(ulong guestAddress, uint memo, bool speculated)
+    {
+        var owner = _relay.IsGpuQueueThread ? FindOwner(guestAddress, sizeof(uint)) : null;
+        if (owner is null || !owner.IsInBounds(guestAddress, sizeof(uint)) || _tracker.HasCpuDirtyPages(guestAddress, sizeof(uint)))
+        {
+            TableWordMemo.NoteAudit(guestAddress, memo, memo, speculated, false);
+            return;
+        }
+
+        _cleanVerify ??= new GpuBuffer(_device, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, 4096 * 16);
+        var verify = _cleanVerify;
+        var offset = (ulong)(_cleanVerifySlot++ % 4096) * 16;
+        verify.CopyFrom(_scheduler.Current, owner, owner.Offset(guestAddress), offset, sizeof(uint), destinationAfter: AccessFlags.HostReadBit);
+        _scheduler.QueueCompletionAction(() =>
+        {
+            verify.Invalidate(offset, sizeof(uint));
+            var device = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(verify.Mapped.Slice((int)offset, sizeof(uint)));
+            TableWordMemo.NoteAudit(guestAddress, memo, device, speculated, true);
+        });
+    }
+
     private void ReportCleanByteReads()
     {
         if (System.Diagnostics.Stopwatch.GetElapsedTime(_cleanReport).TotalSeconds < 20)

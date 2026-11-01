@@ -113,4 +113,99 @@ public sealed class TableWordMemoTests
             TableWordMemo.CommandUpdates = updates;
         }
     }
+
+    // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN: a program whose binding dropped the word k times in a row while the next
+    // synchronized read found the same value stops dropping it; a different value restarts the run.
+    private const ulong Builder = 0x5F7405747C3FE001;
+
+    private static void DropAndResync(uint synchronized)
+    {
+        using (TableWordMemo.BeginProgram(Builder))
+            TableWordMemo.NoteGpuWrite(Word - 0x28, 0x100);
+        if (!TableWordMemo.TryGet(Word, out _))
+            TableWordMemo.Store(Word, synchronized);
+    }
+
+    private static void WithLearning(int threshold, Action body)
+    {
+        var learn = TableWordMemo.LearnThreshold;
+        TableWordMemo.LearnThreshold = threshold;
+        TableWordMemo.ResetForTests();
+        try
+        {
+            body();
+        }
+        finally
+        {
+            TableWordMemo.LearnThreshold = learn;
+            TableWordMemo.ResetForTests();
+        }
+    }
+
+    [Fact]
+    public void ALearnedWriterKeepsTheWordAfterKSurvivals() => WithLearning(3, () =>
+    {
+        TableWordMemo.Store(Word, 7);
+        DropAndResync(7);
+        DropAndResync(7);
+        Assert.False(TableWordMemo.IsTrusted(Word, Builder));
+        DropAndResync(7);
+
+        Assert.True(TableWordMemo.IsTrusted(Word, Builder));
+        using (TableWordMemo.BeginProgram(Builder))
+            TableWordMemo.NoteGpuWrite(Word - 0x28, 0x100);
+        Assert.True(TableWordMemo.TryGet(Word, out var value));
+        Assert.Equal(7u, value);
+        TableWordMemo.NoteAnsweredHit(Word, out var speculated);
+        Assert.True(speculated);
+    });
+
+    [Fact]
+    public void ADifferentValueRestartsTheRun() => WithLearning(2, () =>
+    {
+        TableWordMemo.Store(Word, 7);
+        DropAndResync(7);
+        DropAndResync(8);
+        DropAndResync(8);
+        Assert.False(TableWordMemo.IsTrusted(Word, Builder));
+        DropAndResync(8);
+        Assert.True(TableWordMemo.IsTrusted(Word, Builder));
+    });
+
+    [Fact]
+    public void LearningIsPerProgramAndPerWord() => WithLearning(1, () =>
+    {
+        TableWordMemo.Store(Word, 7);
+        DropAndResync(7);
+        Assert.True(TableWordMemo.IsTrusted(Word, Builder));
+        Assert.False(TableWordMemo.IsTrusted(Word + 4, Builder));
+        using (TableWordMemo.BeginProgram(0x4481C2A89BEA7646))
+            TableWordMemo.NoteGpuWrite(Word, 4);
+        Assert.False(TableWordMemo.TryGet(Word, out _));
+    });
+
+    [Fact]
+    public void AnAuditMismatchBansTheWord() => WithLearning(1, () =>
+    {
+        TableWordMemo.Store(Word, 7);
+        DropAndResync(7);
+        Assert.True(TableWordMemo.IsTrusted(Word, Builder));
+        TableWordMemo.NoteAudit(Word, 7, 9, speculated: true, checkedOnDevice: true);
+        Assert.False(TableWordMemo.TryGet(Word, out _));
+        Assert.False(TableWordMemo.IsTrusted(Word, Builder));
+        TableWordMemo.Store(Word, 9);
+        DropAndResync(9);
+        Assert.False(TableWordMemo.IsTrusted(Word, Builder));
+    });
+
+    [Fact]
+    public void WithoutLearningTheBindingStillDrops() => WithLearning(0, () =>
+    {
+        TableWordMemo.Store(Word, 7);
+        for (var i = 0; i < 4; i++)
+            DropAndResync(7);
+        using (TableWordMemo.BeginProgram(Builder))
+            TableWordMemo.NoteGpuWrite(Word - 0x28, 0x100);
+        Assert.False(TableWordMemo.TryGet(Word, out _));
+    });
 }

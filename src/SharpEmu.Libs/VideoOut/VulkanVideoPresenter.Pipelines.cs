@@ -814,6 +814,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         Gpu.Buffers.TableWordMemo.NoteHit();
                         if (Gpu.Buffers.TableWordMemo.Mode == 1)
                         {
+                            if (Gpu.Buffers.TableWordMemo.NoteAnsweredHit(address, out var speculated)) // [local] SHARPEMU_TABLE_WORD_MEMO_AUDIT
+                                _bufferCache.AuditMemoWord(address, memoValue, speculated);
                             word = memoValue;
                             return true;
                         }
