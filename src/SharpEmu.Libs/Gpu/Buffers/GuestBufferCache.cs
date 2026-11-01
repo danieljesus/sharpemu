@@ -87,13 +87,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private long _gpuModifiedRemovals; // [local]
 
-    // [local] SHARPEMU_CP_WRITE_CLEAN=1 (off by default): a command-processor write (WRITE_DATA, DMA from host data) puts
+    // [local] SHARPEMU_CP_WRITE_CLEAN (on by default, =0 off): a command-processor write (WRITE_DATA, DMA from host data) puts
     // the same bytes in the backing and, in stream order, in the device buffer, so after it neither copy is newer than
     // the other: the bytes leave the GPU-modified set. Before, a word the CP rewrote every frame stayed GPU-modified
     // through the conservative marks of earlier dispatches, and its next synchronous read downloaded it again, waiting
     // for whatever was recorded since. A download already queued over those bytes is no longer current (the copy moved
     // its write tick and the bytes left the set), so it is not applied; a later dispatch that writes them marks them again.
-    internal static readonly bool CpWriteClean = Environment.GetEnvironmentVariable("SHARPEMU_CP_WRITE_CLEAN") == "1";
+    internal static readonly bool CpWriteClean = Environment.GetEnvironmentVariable("SHARPEMU_CP_WRITE_CLEAN") != "0";
     private long _cpCleanedWrites, _cpCleanedBytes;
 
     private void CleanCpWritten(ulong address, ulong size)

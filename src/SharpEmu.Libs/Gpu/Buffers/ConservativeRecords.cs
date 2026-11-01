@@ -53,9 +53,10 @@ internal static class ConservativeRecords
     // one that flushes the open batch. 0x4481's V# at +0xD8 is the same pattern (writer 0x10CD's wide binding, changed=0),
     // and 0x994A's self-relative V# (+0x28 offset, +0x74 records). A writer tick that was submitted but has not completed
     // is waited for on the GPU timeline (GuestBufferCache.AllowInFlightPrecise) instead of the open batch.
+    // On by default as PRECISE_TABLE_READ=1 with PRECISE_TABLE_WORDS=all (=0 / a word list to change it).
     // SHARPEMU_PRECISE_TABLE_WORDS=all: every synchronizing table read of every shader takes the precise read (no hashes;
     // it stays exact because a byte is only copied after its own recorded writer; a read without one falls back).
-    public static readonly int PreciseTableMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_TABLE_READ"), out var preciseMode) ? (preciseMode is 1 or 2 ? preciseMode : 0) : 0;
+    public static readonly int PreciseTableMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_TABLE_READ"), out var preciseMode) ? (preciseMode is 1 or 2 ? preciseMode : 0) : 1;
 
     private static readonly HashSet<(ulong Hash, ulong Offset)> PreciseWords = (Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_TABLE_WORDS") is { } words and not "all" ? words : "F5EBBA997605508B+50,F5EBBA997605508B+54,4481C2A89BEA7646+D8,4481C2A89BEA7646+DC,4481C2A89BEA7646+E0,4481C2A89BEA7646+E4,994AF59D50BEDCA8+28,994AF59D50BEDCA8+2C,994AF59D50BEDCA8+74")
         .Split(',', StringSplitOptions.RemoveEmptyEntries)
@@ -68,7 +69,7 @@ internal static class ConservativeRecords
 
     public static bool PreciseRecording => Mode >= 3 || PreciseTableMode != 0;
 
-    private static readonly bool PreciseAll = Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_TABLE_WORDS") == "all";
+    private static readonly bool PreciseAll = Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_TABLE_WORDS") is null or "all";
 
     public static bool MatchesPrecise(ulong reader, ulong baseAddress, ulong address) =>
         PreciseTableMode != 0 && (PreciseAll || (baseAddress != 0 && address >= baseAddress && PreciseWords.Contains((reader, address - baseAddress))));

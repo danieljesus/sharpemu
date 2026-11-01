@@ -44,13 +44,22 @@ public sealed class ResourceTableReadPlanner
     // hardware does, so its word is read when the dispatch runs and the host never reads it while recording. Only the
     // loads' own address operands are still planned (DeviceAddressRangePlanner maps and uploads the loaded range).
     // =auto: the same per-site rule in every compute shader, without a list (no hashes); =auto-all also in the graphics
-    // stages. Off by default. SHARPEMU_DEVICE_DATA_READS_VERIFY=1 checks every such site on the device.
-    private static readonly string? DeviceDataReadsValue = System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS");
+    // stages. =auto by default (=0 off). SHARPEMU_DEVICE_DATA_READS_VERIFY=1 checks every such site on the device.
+    private static readonly string? DeviceDataReadsValue = System.Environment.GetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS") ?? "auto";
 
     private static readonly HashSet<ulong> DeviceDataReadHashes = DeviceDataReadsValue is "auto" or "auto-all" ? [] : ParseHashes(DeviceDataReadsValue);
 
-    // [local] 0 off, 1 compute shaders, 2 every stage (SHARPEMU_DEVICE_DATA_READS=auto / auto-all). Tests set it.
-    internal static int DeviceDataReadsAuto = DeviceDataReadsValue switch { "auto" => 1, "auto-all" => 2, _ => 0 };
+    // [local] 0 off, 1 compute shaders, 2 every stage (SHARPEMU_DEVICE_DATA_READS=auto / auto-all). Tests set it; the
+    // value they set is scoped to their own execution flow, so tests running in parallel keep the default.
+    private static readonly int DefaultDeviceDataReadsAuto = DeviceDataReadsValue switch { "auto" => 1, "auto-all" => 2, _ => 0 };
+
+    private static readonly System.Threading.AsyncLocal<int?> DeviceDataReadsAutoOverride = new();
+
+    public static int DeviceDataReadsAuto
+    {
+        get => DeviceDataReadsAutoOverride.Value ?? DefaultDeviceDataReadsAuto;
+        set => DeviceDataReadsAutoOverride.Value = value;
+    }
 
     internal static HashSet<ulong> ParseHashes(string? value) =>
         value is null or "0" ? [] : new(value.Split(['/', ','], System.StringSplitOptions.RemoveEmptyEntries).Select(h => System.Convert.ToUInt64(h, 16)));
