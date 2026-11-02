@@ -178,6 +178,34 @@ public sealed class ProtectOutsideLockTests
         Assert.NotEmpty(Sequence(mode: 1));
     }
 
+    // [local] SHARPEMU_DEFERRED_HOT_PRESERVE: a deferred upload that preserves hot pages lists them for the copy but
+    // leaves them dirty and writable, so it makes no protection change for them.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void APreservedHotPageIsCopiedButNotProtected(int mode)
+    {
+        var space = new BlockingSpace();
+        var (_, tracker) = Create(space, mode);
+        using var __ = space;
+        for (var round = 0; round < 2; round++)
+        {
+            GuestPageTracker.ApplyDeferredProtection(DeferredUpload(tracker, Base, Page * 2));
+            tracker.MarkCpuDirtyPages(Base + 16, 8);
+        }
+
+        var protects = space.Protects.Count;
+        var uploads = new List<(ulong, ulong)>();
+        var pending = new List<TrackedRegion>();
+        tracker.ForEachUploadRange(Base, Page * 2, false, (address, size) => uploads.Add((address, size)), static () => { },
+            preserveCpuWriteHotPages: true, pending);
+        GuestPageTracker.ApplyDeferredProtection(pending);
+
+        Assert.Equal([(Base, Page)], uploads);
+        Assert.Equal(protects, space.Protects.Count);
+        Assert.True(tracker.HasCpuDirtyPages(Base, Page));
+    }
+
     private static List<(ulong Address, ulong Size, GuestPageProtection Protection)> Sequence(int mode)
     {
         var space = new BlockingSpace();

@@ -110,7 +110,16 @@ public sealed unsafe class SharedBackingViews : IDisposable
         }
     }
 
+    // [local] SHARPEMU_DEFERRED_PROTECT_VERIFY: every backing write is logged after it lands (see BackingWriteLog).
     public bool TryWriteBacking(ulong address, ReadOnlySpan<byte> data)
+    {
+        var written = TryWriteBackingCore(address, data);
+        if (GpuMemory.BackingWriteLog.Enabled)
+            GpuMemory.BackingWriteLog.Note(address, (ulong)data.Length);
+        return written;
+    }
+
+    private bool TryWriteBackingCore(ulong address, ReadOnlySpan<byte> data)
     {
         if (TryAccessSingleView(address, (ulong)data.Length, out var target))
         {

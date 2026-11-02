@@ -45,6 +45,23 @@ public static class DeferredProtectProbe
         Interlocked.Add(ref _regions, regions);
     }
 
+    // Pages an upload clears (they are protected again) and, of them, pages already CPU-write hot.
+    private static long _clearedDeferred, _hotDeferred, _clearedDirect, _hotDirect;
+
+    public static void NoteCleared(bool deferred, int cleared, int hot)
+    {
+        if (deferred)
+        {
+            Interlocked.Add(ref _clearedDeferred, cleared);
+            Interlocked.Add(ref _hotDeferred, hot);
+        }
+        else
+        {
+            Interlocked.Add(ref _clearedDirect, cleared);
+            Interlocked.Add(ref _hotDirect, hot);
+        }
+    }
+
     public static void NoteGateWait(long ticks)
     {
         if (!Enabled)
@@ -70,6 +87,7 @@ public static class DeferredProtectProbe
             parts[index] = FormattableString.Invariant($"{Names[index]}={Interlocked.Exchange(ref Ticks[index], 0) * perFrame:F3}");
         var jobs = Interlocked.Exchange(ref _jobs, 0);
         return FormattableString.Invariant(
-            $"[GPU][UPLOAD_JOB_PROBE] frames={frames} jobs={jobs / (double)Math.Max(frames, 1):F1} regions={Interlocked.Exchange(ref _regions, 0) / (double)Math.Max(jobs, 1):F2} ms_per_frame: {string.Join(" ", parts)} gate_worker={Interlocked.Exchange(ref _workerGateWaits, 0) / (double)Math.Max(frames, 1):F1}/{Interlocked.Exchange(ref _workerGateTicks, 0) * perFrame:F3} gate_other={Interlocked.Exchange(ref _otherGateWaits, 0) / (double)Math.Max(frames, 1):F1}/{Interlocked.Exchange(ref _otherGateTicks, 0) * perFrame:F3}");
+            $"[GPU][UPLOAD_JOB_PROBE] frames={frames} jobs={jobs / (double)Math.Max(frames, 1):F1} regions={Interlocked.Exchange(ref _regions, 0) / (double)Math.Max(jobs, 1):F2} ms_per_frame: {string.Join(" ", parts)} gate_worker={Interlocked.Exchange(ref _workerGateWaits, 0) / (double)Math.Max(frames, 1):F1}/{Interlocked.Exchange(ref _workerGateTicks, 0) * perFrame:F3} gate_other={Interlocked.Exchange(ref _otherGateWaits, 0) / (double)Math.Max(frames, 1):F1}/{Interlocked.Exchange(ref _otherGateTicks, 0) * perFrame:F3}") +
+            FormattableString.Invariant($" cleared_pages_per_frame deferred={Interlocked.Exchange(ref _clearedDeferred, 0) / (double)Math.Max(frames, 1):F1} hot={Interlocked.Exchange(ref _hotDeferred, 0) / (double)Math.Max(frames, 1):F1} direct={Interlocked.Exchange(ref _clearedDirect, 0) / (double)Math.Max(frames, 1):F1} hot={Interlocked.Exchange(ref _hotDirect, 0) / (double)Math.Max(frames, 1):F1}");
     }
 }

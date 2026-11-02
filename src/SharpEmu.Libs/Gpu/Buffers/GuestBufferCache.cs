@@ -4242,6 +4242,14 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
     [ThreadStatic]
     private static UploadCollection? _uploadCollection;
 
+    // [local] SHARPEMU_DEFERRED_HOT_PRESERVE=1 (off by default): a deferred read upload keeps the CPU-write hot pages of
+    // its range dirty and writable, as the streaming path does, instead of protecting them again. Their bytes are
+    // still copied (every dirty page is), so the device buffer gets the same bytes; the difference is that the next
+    // obtain copies them again instead of waiting for a write fault. In GTA V panning ~95 % of the ~1000 pages a frame
+    // the deferred uploads protect are hot (SHARPEMU_UPLOAD_JOB_PROBE): each costs a protection change, then a guest
+    // write fault and an unprotection under the region lock.
+    internal static readonly bool DeferredHotPreserve = Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_HOT_PRESERVE") == "1";
+
     // The copies stay in the returned collection until ReleaseUploadCollection.
     private UploadCollection CollectUploadRanges(GpuBuffer buffer, ulong guestAddress, ulong size, bool isWritten,
         bool preserveCpuWriteHotPages)
@@ -4260,7 +4268,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
                     isWritten,
                     collection.RangeDeferred,
                     collection.UploadDeferred,
-                    preserveCpuWriteHotPages,
+                    preserveCpuWriteHotPages || DeferredHotPreserve,
                     pending);
                 if (collection.Reserved is { } reserved)
                 {

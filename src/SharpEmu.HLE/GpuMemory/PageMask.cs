@@ -47,6 +47,21 @@ public struct PageMask
 
     public bool None => !Any;
 
+    // [local] Set pages (diagnostics).
+    public int Count
+    {
+        get
+        {
+            var count = 0;
+            for (var word = 0; word < WordCount; word++)
+            {
+                count += System.Numerics.BitOperations.PopCount(_words[word]);
+            }
+
+            return count;
+        }
+    }
+
     public bool AnyInRange(int startPage, int endPage)
     {
         if (startPage < 0 || endPage > Bits || startPage >= endPage) return false;

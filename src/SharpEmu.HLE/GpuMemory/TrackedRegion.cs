@@ -51,7 +51,8 @@ public sealed class TrackedRegion
 
     public bool ProtectsOutsideLock => _protectOutsideLock;
 
-    // [local] Times a page of the region turned CPU-dirty (written under the lock; the upload verify reads it).
+    // [local] Times a page of the region turned CPU-dirty or changed GPU ownership (a download writes the bytes of a
+    // page it leaves clean). Written under the lock; the deferred upload verify reads it.
     public long CpuDirtyings => Volatile.Read(ref _cpuDirtyings);
 
     public ulong BaseAddress { get; }
@@ -157,7 +158,7 @@ public sealed class TrackedRegion
         }
 
         ref var bits = ref GetDirtyMask(side);
-        if (enable && side == WriteOrigin.Cpu)
+        if (enable || side == WriteOrigin.Gpu)
         {
             Volatile.Write(ref _cpuDirtyings, _cpuDirtyings + 1);
         }
@@ -202,6 +203,8 @@ public sealed class TrackedRegion
         var (start, end) = GetPageRange(address, size);
         var upload = new PageMask(_cpuDirty, start, end);
         var cleared = preserveHotPages ? upload & ~_hotCpuWrites : upload;
+        if (DeferredProtectProbe.Enabled)
+            DeferredProtectProbe.NoteCleared(deferProtection, cleared.Count, (cleared & _hotCpuWrites).Count);
         foreach (var (runStart, runEnd) in cleared)
         {
             visitCleared(BaseAddress + (ulong)runStart * PageBytes, (ulong)(runEnd - runStart) * PageBytes);
@@ -306,6 +309,11 @@ public sealed class TrackedRegion
         var mask = new PageMask(GetDirtyMask(side), start, end);
         if (clear)
         {
+            if (side == WriteOrigin.Gpu)
+            {
+                Volatile.Write(ref _cpuDirtyings, _cpuDirtyings + 1);
+            }
+
             GetDirtyMask(side).UnsetRange(start, end);
             if (side == WriteOrigin.Cpu)
             {

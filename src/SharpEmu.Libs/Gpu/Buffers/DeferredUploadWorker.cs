@@ -64,17 +64,23 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
     private int _blockedWaiters;
     private Exception? _failure;
 
-    // [local] SHARPEMU_PROTECT_OUTSIDE_LOCK=2: after each job's copy, with the job's region locks held (a clean page
-    // cannot change then: a write faults and waits for the lock), every clean page the job copied is read again from
-    // the backing and compared with its staging bytes. A difference on a page that stayed clean, in a region where no
-    // page turned CPU-dirty since the protection, is a lost write. Pages GPU-dirty or CPU-dirty again, and pages in
-    // regions the job did not lock or that turned dirty meanwhile, are counted apart and not compared.
+    // [local] SHARPEMU_DEFERRED_PROTECT_VERIFY=1 (also SHARPEMU_PROTECT_OUTSIDE_LOCK=2; works with either protection
+    // path): after each job's copy, with the job's region locks held (a clean page cannot change through its guest
+    // view then: a write faults and waits for the lock), every clean page the job copied is read again from the
+    // backing and compared with its staging bytes. Pages GPU-dirty or CPU-dirty again, and pages in regions the job
+    // did not lock or where a page turned CPU-dirty since the protection, are counted apart and not compared. A page
+    // that differs (raw) is checked again 2 ms later, after the locks were released: writers through the backing
+    // alias store their bytes first and mark the page afterwards, under the lock this check holds. Dirty by then, or
+    // its region dirtied, is a late mark; touched by a backing write since the job began (BackingWriteLog: command-
+    // processor writes and downloads leave pages clean on purpose) is counted apart; still clean with bytes still
+    // unlike the staging otherwise is a lost write (persistent).
     internal delegate bool BackingReader(ulong address, Span<byte> destination);
 
     internal BackingReader? VerifyReader { get; set; }
 
-    private readonly bool _verify = GuestPageTracker.ProtectOutsideLock == 2;
-    private long _verifyJobs, _verifyPages, _verifyDirty, _verifySkipped, _verifyDiscrepancies;
+    private readonly bool _verify = GuestPageTracker.ProtectOutsideLock == 2 ||
+        Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_PROTECT_VERIFY") == "1";
+    private long _verifyJobs, _verifyPages, _verifyDirty, _verifySkipped, _verifyRaw, _verifyLate, _verifyBacking, _verifyDiscrepancies;
     private static int _verifyLogs;
     private static long _probeFrames;
     private long _reportStarted = Stopwatch.GetTimestamp();
@@ -87,13 +93,16 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
             Interlocked.Increment(ref _probeFrames);
     }
 
-    public (long Jobs, long Pages, long Dirty, long Skipped, long Discrepancies) VerifyCounts =>
+    public (long Jobs, long Pages, long Dirty, long Skipped, long Raw, long Late, long Backing, long Discrepancies) VerifyCounts =>
         (Volatile.Read(ref _verifyJobs), Volatile.Read(ref _verifyPages), Volatile.Read(ref _verifyDirty),
-            Volatile.Read(ref _verifySkipped), Volatile.Read(ref _verifyDiscrepancies));
+            Volatile.Read(ref _verifySkipped), Volatile.Read(ref _verifyRaw), Volatile.Read(ref _verifyLate),
+            Volatile.Read(ref _verifyBacking), Volatile.Read(ref _verifyDiscrepancies));
 
     public DeferredUploadWorker(Vk? vk = null, Device device = default)
     {
         Instance = this;
+        if (_verify)
+            BackingWriteLog.Enabled = true; // [local] SHARPEMU_DEFERRED_PROTECT_VERIFY
         if (GpuWait && vk != null)
         {
             var typeInfo = new SemaphoreTypeCreateInfo
@@ -293,6 +302,7 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
             try
             {
                 var started = probe ? Stopwatch.GetTimestamp() : 0;
+                var backingWrites = _verify ? BackingWriteLog.Sequence : 0;
                 GuestPageTracker.ApplyDeferredProtection(job.Regions);
                 if (_verify)
                 {
@@ -306,7 +316,7 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
                 job.Uploader.ReadInto(job.Source, job.Reads);
                 var copied = probe ? Stopwatch.GetTimestamp() : 0;
                 if (_verify)
-                    Verify(job, dirtyings!);
+                    Verify(job, dirtyings!, backingWrites);
                 if (probe)
                 {
                     DeferredProtectProbe.Add(DeferredProtectProbe.Part.Queued, started - enqueued);
@@ -346,9 +356,9 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
             Console.Error.WriteLine(DeferredProtectProbe.TakeReport(frames));
         if (_verify)
         {
-            var (jobs, pages, dirty, skipped, discrepancies) = VerifyCounts;
+            var (jobs, pages, dirty, skipped, raw, late, backing, discrepancies) = VerifyCounts;
             Console.Error.WriteLine(
-                $"[GPU][DEFERRED_PROTECT_VERIFY] jobs={jobs} pages={pages} dirty_again={dirty} skipped={skipped} discrepancies={discrepancies}");
+                $"[GPU][DEFERRED_PROTECT_VERIFY] mode={(GuestPageTracker.ProtectOutsideLock != 0 ? "outside" : "locked")} jobs={jobs} pages={pages} dirty_again={dirty} skipped={skipped} raw={raw} late_mark={late} backing_write={backing} discrepancies={discrepancies}");
         }
 
         Volatile.Write(ref _reporting, 0);
@@ -358,7 +368,7 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
     private const ulong VerifyBlockBytes = TrackerLayout.BlockBytes;
     [ThreadStatic] private static byte[]? t_verifyBytes;
 
-    private void Verify(Job job, long[] dirtyings)
+    private void Verify(Job job, long[] dirtyings, long backingWrites)
     {
         var reader = VerifyReader;
         if (reader == null)
@@ -368,59 +378,44 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
         for (var index = 0; index < order.Length; index++)
             order[index] = index;
         Array.Sort(order, (left, right) => regions[left].BaseAddress.CompareTo(regions[right].BaseAddress));
-        var locked = new List<TrackedRegion>(order.Length);
         var buffer = t_verifyBytes ??= new byte[VerifyPageBytes];
+        List<(ulong Address, int Region, ulong Offset, int Bytes)>? differing = null;
+        Interlocked.Increment(ref _verifyJobs);
+        LockRegions(regions, order, out var locked);
         try
         {
-            // Address order, as the tracker takes several region locks.
-            foreach (var index in order)
-            {
-                if (locked.Count != 0 && ReferenceEquals(locked[^1], regions[index]))
-                    continue;
-                regions[index].Lock.Enter();
-                locked.Add(regions[index]);
-            }
-
-            Interlocked.Increment(ref _verifyJobs);
             foreach (var (address, offset, size) in job.Reads)
             {
                 var end = address + (ulong)size;
                 for (var cursor = address; cursor < end;)
                 {
                     var chunkEnd = Math.Min(end, (cursor / VerifyPageBytes + 1) * VerifyPageBytes);
-                    var bytes = chunkEnd - cursor;
-                    var at = cursor;
-                    var regionIndex = regions.FindIndex(region => region.BaseAddress <= at && at < region.BaseAddress + VerifyBlockBytes);
-                    var region = regionIndex >= 0 ? regions[regionIndex] : null;
-                    var regionOffset = region == null ? 0 : cursor - region.BaseAddress;
-                    if (region == null || region.IsModified(WriteOrigin.Gpu, regionOffset, bytes) ||
-                        region.CpuDirtyings != dirtyings[regionIndex])
+                    var bytes = (int)(chunkEnd - cursor);
+                    var stagedOffset = offset + (cursor - address);
+                    switch (Classify(regions, dirtyings, cursor, bytes, out var regionIndex))
                     {
-                        Interlocked.Increment(ref _verifySkipped);
-                    }
-                    else if (region.IsModified(WriteOrigin.Cpu, regionOffset, bytes))
-                    {
-                        Interlocked.Increment(ref _verifyDirty);
-                    }
-                    else
-                    {
-                        var current = buffer.AsSpan(0, (int)bytes);
-                        var staged = job.Source.Mapped.Slice((int)(offset + (cursor - address)), (int)bytes);
-                        if (!reader(cursor, current))
-                        {
+                        case PageState.Skipped:
                             Interlocked.Increment(ref _verifySkipped);
-                        }
-                        else
-                        {
-                            Interlocked.Increment(ref _verifyPages);
-                            if (!current.SequenceEqual(staged))
+                            break;
+                        case PageState.Dirty:
+                            Interlocked.Increment(ref _verifyDirty);
+                            break;
+                        default:
+                            var current = buffer.AsSpan(0, bytes);
+                            if (!reader(cursor, current))
                             {
-                                Interlocked.Increment(ref _verifyDiscrepancies);
-                                if (Interlocked.Increment(ref _verifyLogs) <= 20)
-                                    Console.Error.WriteLine(
-                                        $"[GPU][DEFERRED_PROTECT_VERIFY_MISMATCH] addr=0x{cursor:X16} bytes=0x{bytes:X} first_diff={current.CommonPrefixLength(staged)}");
+                                Interlocked.Increment(ref _verifySkipped);
+                                break;
                             }
-                        }
+
+                            Interlocked.Increment(ref _verifyPages);
+                            if (!current.SequenceEqual(job.Source.Mapped.Slice((int)stagedOffset, bytes)))
+                            {
+                                Interlocked.Increment(ref _verifyRaw);
+                                (differing ??= new()).Add((cursor, regionIndex, stagedOffset, bytes));
+                            }
+
+                            break;
                     }
 
                     cursor = chunkEnd;
@@ -431,6 +426,74 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
         {
             foreach (var region in locked)
                 region.Lock.Exit();
+        }
+
+        if (differing == null)
+            return;
+
+        // The staging slice stays valid: the job is not finished, so its submission has not been made.
+        Thread.Sleep(2);
+        LockRegions(regions, order, out locked);
+        try
+        {
+            foreach (var (address, regionIndex, stagedOffset, bytes) in differing)
+            {
+                var current = buffer.AsSpan(0, bytes);
+                if (Classify(regions, dirtyings, address, bytes, out _) != PageState.Clean || !reader(address, current) ||
+                    current.SequenceEqual(job.Source.Mapped.Slice((int)stagedOffset, bytes)))
+                {
+                    Interlocked.Increment(ref _verifyLate);
+                    continue;
+                }
+
+                if (BackingWriteLog.WrittenSince(backingWrites, address, (ulong)bytes))
+                {
+                    Interlocked.Increment(ref _verifyBacking);
+                    continue;
+                }
+
+                Interlocked.Increment(ref _verifyDiscrepancies);
+                if (Interlocked.Increment(ref _verifyLogs) <= 20)
+                    Console.Error.WriteLine(
+                        $"[GPU][DEFERRED_PROTECT_VERIFY_MISMATCH] addr=0x{address:X16} bytes=0x{bytes:X} first_diff={current.CommonPrefixLength(job.Source.Mapped.Slice((int)stagedOffset, bytes))} region={regionIndex}");
+            }
+        }
+        finally
+        {
+            foreach (var region in locked)
+                region.Lock.Exit();
+        }
+    }
+
+    private enum PageState
+    {
+        Clean,
+        Dirty,
+        Skipped,
+    }
+
+    private static PageState Classify(List<TrackedRegion> regions, long[] dirtyings, ulong address, int bytes, out int regionIndex)
+    {
+        regionIndex = regions.FindIndex(region => region.BaseAddress <= address && address < region.BaseAddress + VerifyBlockBytes);
+        if (regionIndex < 0)
+            return PageState.Skipped;
+        var region = regions[regionIndex];
+        var regionOffset = address - region.BaseAddress;
+        if (region.IsModified(WriteOrigin.Gpu, regionOffset, (ulong)bytes) || region.CpuDirtyings != dirtyings[regionIndex])
+            return PageState.Skipped;
+        return region.IsModified(WriteOrigin.Cpu, regionOffset, (ulong)bytes) ? PageState.Dirty : PageState.Clean;
+    }
+
+    // Address order, as the tracker takes several region locks.
+    private static void LockRegions(List<TrackedRegion> regions, int[] order, out List<TrackedRegion> locked)
+    {
+        locked = new List<TrackedRegion>(order.Length);
+        foreach (var index in order)
+        {
+            if (locked.Count != 0 && ReferenceEquals(locked[^1], regions[index]))
+                continue;
+            regions[index].Lock.Enter();
+            locked.Add(regions[index]);
         }
     }
 
