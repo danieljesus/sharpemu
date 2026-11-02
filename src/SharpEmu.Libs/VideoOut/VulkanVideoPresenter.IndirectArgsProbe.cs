@@ -91,6 +91,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (--_indirectArgsScanCountdown <= 0)
             {
                 _indirectArgsScanCountdown = 256;
+                CompareWriterInputs();
                 var ring = _indirectArgsRing;
                 foreach (var line in IndirectArgsProbe.Ledger.Scan(scanSlot => ReadIndirectArgsSlot(ring, scanSlot)))
                     Console.Error.WriteLine(line);
@@ -126,9 +127,11 @@ internal static unsafe partial class VulkanVideoPresenter
             for (var index = 0; index < shown; index++)
                 prefix[index] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(prefixBytes[(index * 4)..]);
             var (wrapped, text) = IndirectArgsLedger.DescribePrefix(prefix[..shown], count, total);
-            // The shader takes the three header words from the flattened resource table the host resolved, not from
-            // memory: a table without the raw values means the materialization is stale.
-            var stale = !flattenedTable.Contains(prefixOffset) || !flattenedTable.Contains(total) || !flattenedTable.Contains(count);
+            QueueWriterInputCheck(header, fields, prefixAddress, prefix[..Math.Min(shown, WriterPrefixWords)]);
+            // The shader takes P's offset and the count from the flattened resource table the host resolved (the total
+            // it loads itself, only in the last thread): a table without the raw values means the materialization is
+            // stale.
+            var stale = !flattenedTable.Contains(prefixOffset) || !flattenedTable.Contains(count);
             if (!wrapped && !stale && _prefixArgsLines >= 8)
                 return;
             if (_prefixArgsLines++ >= 200)
@@ -138,6 +141,122 @@ internal static unsafe partial class VulkanVideoPresenter
                 $"p=0x{prefixAddress:X} start:diff=[{text}] header_gpu_dirty={_bufferCache.HasGpuDirtyBytes(header + 112, 64)} " +
                 $"p_gpu_dirty={(shown > 0 && _bufferCache.HasGpuDirtyBytes(prefixAddress, (ulong)shown * 4))} " +
                 $"table=[{string.Join(",", flattenedTable.Length > 16 ? flattenedTable[..16].ToArray() : flattenedTable.ToArray())}]"));
+        }
+
+        // The GPU's view of 0x8039D8A00's inputs: after the dispatch is recorded, the header words (+112..+176) and the
+        // first prefix entries are copied from the buffer store into a host-visible ring, and later compared with the CPU
+        // view taken at recording. The game cannot rewrite them before the GPU has run the dispatch, so a difference is
+        // a stale upload (a CPU write the store missed), which a hang would need and which may show without one.
+        private const int WriterSlots = 1024;
+        private const int WriterSlotBytes = 256;
+        private const int WriterPrefixWords = 16;
+        private GpuBuffer? _writerRing;
+        private ulong _writerSequence;
+        private long _writerCompared, _writerMismatches;
+        private int _writerLines;
+        private readonly Queue<(ulong Sequence, int Slot, ulong Header, ulong Tick, byte[] Fields, uint[] Prefix)> _writerPending = new();
+
+        private void QueueWriterInputCheck(ulong header, ReadOnlySpan<byte> fields, ulong prefixAddress, ReadOnlySpan<uint> prefix)
+        {
+            _writerRing ??= new GpuBuffer(_deviceInfo, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, (ulong)WriterSlots * WriterSlotBytes);
+            CompareWriterInputs();
+            if (_writerPending.Count >= WriterSlots / 2)
+                return;
+            var sequence = ++_writerSequence;
+            var slot = (int)(sequence % WriterSlots);
+            _writerPending.Enqueue((sequence, slot, header, _scheduler.CurrentTick, fields.ToArray(), prefix.ToArray()));
+            var words = prefix.Length;
+            Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Add(() => RecordWriterInputCopy(sequence, slot, header, prefixAddress, words));
+        }
+
+        private void RecordWriterInputCopy(ulong sequence, int slot, ulong header, ulong prefixAddress, int words)
+        {
+            var ring = _writerRing!;
+            var command = BeginBatchedGuestCommands();
+            var slotOffset = (ulong)slot * WriterSlotBytes;
+            var (headerBuffer, headerOffset) = _bufferCache.ObtainBuffer(header + 112, 64, false);
+            var barriers = stackalloc BufferMemoryBarrier2[2];
+            var count = 1u;
+            barriers[0] = ReadBarrier(headerBuffer.Handle, headerOffset, 64);
+            (GpuBuffer Buffer, ulong Offset) prefixSource = default;
+            if (words > 0)
+            {
+                prefixSource = _bufferCache.ObtainBuffer(prefixAddress, (ulong)words * 4, false);
+                barriers[count++] = ReadBarrier(prefixSource.Buffer.Handle, prefixSource.Offset, (ulong)words * 4);
+            }
+
+            VulkanSynchronization.PipelineBarrier(_vk, command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, 0, 0, null, count, barriers, 0, null);
+            var headerCopy = new BufferCopy { SrcOffset = headerOffset, DstOffset = slotOffset, Size = 64 };
+            VkRecord.CmdCopyBuffer(_vk, command, headerBuffer.Handle, ring.Handle, 1, &headerCopy);
+            if (words > 0)
+            {
+                var prefixCopy = new BufferCopy { SrcOffset = prefixSource.Offset, DstOffset = slotOffset + 64, Size = (ulong)words * 4 };
+                VkRecord.CmdCopyBuffer(_vk, command, prefixSource.Buffer.Handle, ring.Handle, 1, &prefixCopy);
+            }
+
+            VkRecord.CmdFillBuffer(_vk, command, ring.Handle, slotOffset + WriterSlotBytes - 4, sizeof(uint), IndirectArgsLedger.SequenceWord(sequence));
+        }
+
+        private static BufferMemoryBarrier2 ReadBarrier(VkBuffer buffer, ulong offset, ulong size) => new()
+        {
+            SType = StructureType.BufferMemoryBarrier2,
+            SrcAccessMask = AccessFlags2.ShaderWriteBit | AccessFlags2.TransferWriteBit | AccessFlags2.MemoryWriteBit,
+            DstAccessMask = AccessFlags2.TransferReadBit,
+            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+            Buffer = buffer,
+            Offset = offset,
+            Size = size,
+        };
+
+        private void CompareWriterInputs()
+        {
+            var ring = _writerRing;
+            if (ring is null)
+                return;
+            while (_writerPending.Count > 0)
+            {
+                var pending = _writerPending.Peek();
+                var slot = ring.Mapped.Slice(pending.Slot * WriterSlotBytes, WriterSlotBytes);
+                var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(slot);
+                if (Volatile.Read(ref words[WriterSlotBytes / 4 - 1]) != IndirectArgsLedger.SequenceWord(pending.Sequence))
+                    return;
+
+                _writerPending.Dequeue();
+                _writerCompared++;
+                var gpuFields = slot[..64];
+                var gpuPrefix = words.Slice(16, pending.Prefix.Length);
+                if (!gpuFields.SequenceEqual(pending.Fields) || !gpuPrefix.SequenceEqual(pending.Prefix))
+                {
+                    _writerMismatches++;
+                    if (_writerLines++ < 64)
+                    {
+                        var differing = new System.Text.StringBuilder();
+                        for (var offset = 0; offset < 64; offset += 4)
+                        {
+                            var cpu = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(pending.Fields.AsSpan(offset));
+                            var gpu = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(gpuFields[offset..]);
+                            if (cpu != gpu)
+                                differing.Append(System.Globalization.CultureInfo.InvariantCulture, $"+{112 + offset}:cpu={cpu},gpu={gpu} ");
+                        }
+
+                        for (var index = 0; index < pending.Prefix.Length; index++)
+                        {
+                            if (pending.Prefix[index] != gpuPrefix[index])
+                                differing.Append(System.Globalization.CultureInfo.InvariantCulture, $"P[{index}]:cpu={pending.Prefix[index]},gpu={gpuPrefix[index]} ");
+                        }
+
+                        Console.Error.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                            $"[GPU][INDIRECT_ARGS] writer_stale seq={pending.Sequence} tick={pending.Tick} header=0x{pending.Header:X} {differing}"));
+                    }
+                }
+
+                if ((_writerCompared & 63) == 0)
+                {
+                    Console.Error.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                        $"[GPU][INDIRECT_ARGS] writer_check compared={_writerCompared} mismatches={_writerMismatches} pending={_writerPending.Count}"));
+                }
+            }
         }
 
         private static (uint X, uint Y, uint Z, uint Sequence) ReadIndirectArgsSlot(GpuBuffer ring, int slot)
