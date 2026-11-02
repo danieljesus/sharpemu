@@ -35,6 +35,78 @@ public sealed class ResourceMaterializationCache
         _stampStoreTables = stampStoreTables || _currentStoreTables;
     }
 
+    // [local] SHARPEMU_MATERIALIZE_POH=1: the primitive arrays an entry keeps (the recorded words and ranges, the user
+    // data and the snapshot's descriptor words, table and device ranges) are copied to the pinned object heap when the
+    // entry is stored, unless they already live in generation 2. GTA V panning (2026-11-02): an entry lives for
+    // thousands of draws, so every one stored since the previous collection survives it: ~6 MB/s of entries and their
+    // arrays were the bulk of what each gen0 promoted (~10 MB, ~1 ms per MB) and gen1 copied again into gen2. Pinned
+    // arrays are never marked or copied by gen0/gen1 collections. Same values, other heap: nothing to verify.
+    internal static readonly bool DefaultRetainPinned = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_POH") == "1";
+
+    public bool RetainPinned { get; init; } = DefaultRetainPinned;
+
+    private static T[] Pinned<T>(T[] array) where T : unmanaged
+    {
+        if (array.Length == 0 || GC.GetGeneration(array) >= GC.MaxGeneration)
+            return array;
+        var pinned = GC.AllocateUninitializedArray<T>(array.Length, pinned: true);
+        array.AsSpan().CopyTo(pinned);
+        return pinned;
+    }
+
+    private static T[]? PinnedOrNull<T>(T[]? array) where T : unmanaged => array is null ? null : Pinned(array);
+
+    private static uint[][] PinnedJagged(uint[][] arrays)
+    {
+        uint[][]? copy = null;
+        for (var index = 0; index < arrays.Length; index++)
+        {
+            var pinned = Pinned(arrays[index]);
+            if (!ReferenceEquals(pinned, arrays[index]))
+                (copy ??= (uint[][])arrays.Clone())[index] = pinned;
+        }
+
+        return copy ?? arrays;
+    }
+
+    private static ResourceSnapshot RetainSnapshot(ResourceSnapshot snapshot)
+    {
+        var buffers = PinnedJagged(snapshot.Buffers);
+        var images = PinnedJagged(snapshot.Images);
+        var samplers = PinnedJagged(snapshot.Samplers);
+        var table = Pinned(snapshot.FlattenedResourceTable);
+        var userData = Pinned(snapshot.UserData);
+        var ranges = Pinned(snapshot.DeviceAddressRanges);
+        if (ReferenceEquals(buffers, snapshot.Buffers) && ReferenceEquals(images, snapshot.Images) &&
+            ReferenceEquals(samplers, snapshot.Samplers) && ReferenceEquals(table, snapshot.FlattenedResourceTable) &&
+            ReferenceEquals(userData, snapshot.UserData) && ReferenceEquals(ranges, snapshot.DeviceAddressRanges))
+            return snapshot;
+        return new ResourceSnapshot
+        {
+            Buffers = buffers,
+            Images = images,
+            Samplers = samplers,
+            FlattenedResourceTable = table,
+            UserData = userData,
+            DeviceAddressRanges = ranges,
+        };
+    }
+
+    private static void Retain(Entry entry)
+    {
+        entry.Retained = true;
+        entry.UserData = Pinned(entry.UserData);
+        entry.RangeAddresses = Pinned(entry.RangeAddresses);
+        entry.RangeOffsets = Pinned(entry.RangeOffsets);
+        entry.RangeLengths = Pinned(entry.RangeLengths);
+        entry.RangeClean = Pinned(entry.RangeClean);
+        entry.RangeBase = Pinned(entry.RangeBase);
+        entry.RangeReadBase = PinnedOrNull(entry.RangeReadBase);
+        entry.WordTableOnly = Pinned(entry.WordTableOnly);
+        entry.Bytes = Pinned(entry.Bytes);
+        entry.Snapshot = RetainSnapshot(entry.Snapshot);
+    }
+
     // [local] SHARPEMU_PROGRAM_GATE_TABLES=3: a walk records none of the store-table scan's words, and every hit, refresh
     // or shift of a plan with store tables evaluates its tables again from the thread's scan cache (CurrentTables): the
     // V# words were validated, a cached scan is a list lookup, and a dropped one is rescanned, as a fresh walk would.
@@ -105,6 +177,8 @@ public sealed class ResourceMaterializationCache
         };
         if (owned)
         {
+            if (entry.Retained) // [local] SHARPEMU_MATERIALIZE_POH
+                snapshot = RetainSnapshot(snapshot);
             entry.Snapshot = snapshot;
             entry.UsedScans = rescans!;
         }
@@ -387,6 +461,8 @@ public sealed class ResourceMaterializationCache
             }
 
             Store(key, built);
+            if (built.Retained) // [local] SHARPEMU_MATERIALIZE_POH: the draw gets the entry's snapshot, as a hit would
+                snapshot = built.Snapshot;
             return true;
         }
         finally
@@ -1074,6 +1150,8 @@ public sealed class ResourceMaterializationCache
 
     private void Store(ulong key, Entry entry)
     {
+        if (RetainPinned && !entry.Retained) // [local] SHARPEMU_MATERIALIZE_POH
+            Retain(entry);
         if (_young.Count >= _generationCapacity && !_young.ContainsKey(key))
         {
             _old = _young;
@@ -1424,30 +1502,32 @@ public sealed class ResourceMaterializationCache
         // [local] The store-table scans the walk used, for a cache that stamps store tables.
         public DeviceStoreTablePlanner.UsedScan[] UsedScans = [];
         public required ShaderResourcePlan Plan { get; init; }
-        public required uint[] UserData { get; init; }
+        public required uint[] UserData { get; set; }
         public required ulong ShaderBase { get; init; }
         public required ComputeSelectorState? ComputeState { get; init; }
-        public required ulong[] RangeAddresses { get; init; }
-        public required int[] RangeOffsets { get; init; }
-        public required int[] RangeLengths { get; init; }
-        public required bool[] RangeClean { get; init; }
+        public required ulong[] RangeAddresses { get; set; }
+        public required int[] RangeOffsets { get; set; }
+        public required int[] RangeLengths { get; set; }
+        public required bool[] RangeClean { get; set; }
         // Per range: the user-data register pair its address was based on, AbsoluteBase when the
         // address does not move with the user data, UnknownBase when the reader could not tell.
-        public required int[] RangeBase { get; init; }
+        public required int[] RangeBase { get; set; }
         // [local] Per range: the base address its reads were relative to (0 unknown), with SHARPEMU_MATERIALIZE_REBASE.
-        public ulong[]? RangeReadBase { get; init; }
+        public ulong[]? RangeReadBase { get; set; }
         // A range read through an unknown base keeps the entry to draws with the same user data.
         public required bool ExactUserData { get; init; }
         // Per recorded dword: read only while the flattened table was evaluated.
-        public required bool[] WordTableOnly { get; init; }
+        public required bool[] WordTableOnly { get; set; }
         // By recorded dword: where the plan copies it verbatim (UserDataUseAnalysis.PatchableReads).
         public required Dictionary<int, UserDataUseAnalysis.PatchTarget[]>? WordPatches { get; init; }
         // The table has the plan's plain layout, so no specialization read or extended it.
         public required bool TableRefreshable { get; init; }
-        public required byte[] Bytes { get; init; }
+        public required byte[] Bytes { get; set; }
         public required ResourceSnapshot Snapshot { get; set; }
         public required ResourceSpecialization Specialization { get; init; }
         public Entry? Next { get; set; }
+        // [local] SHARPEMU_MATERIALIZE_POH: the arrays were moved to the pinned object heap when the entry was stored.
+        public bool Retained;
 
         public bool Matches(ShaderResourcePlan plan, ResourceRuntimeInputs inputs)
         {
@@ -1591,7 +1671,8 @@ public sealed class ResourceMaterializationCache
                 // The entry's own draw now reads these words: keep them, so the next one is a plain hit.
                 foreach (var (wordIndex, word) in patches)
                     System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(Bytes.AsSpan(wordIndex * sizeof(uint)), word);
-                Snapshot = snapshot;
+                Snapshot = Retained ? RetainSnapshot(snapshot) : snapshot; // [local] SHARPEMU_MATERIALIZE_POH
+                return Snapshot;
             }
 
             return snapshot;

@@ -509,4 +509,93 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal((0, 2), (cache.Hits, cache.Misses));
         Assert.Equal(0x2C005000u, second.Buffers[0][3]);
     }
+
+    // [local] SHARPEMU_MATERIALIZE_POH: the cache that keeps its arrays on the pinned object heap returns the same
+    // materializations, hits and misses as the one that does not, for misses, hits, patched hits and rebased hits.
+    private static IEnumerable<(ShaderResourcePlan Plan, Heap Heap, uint[] UserData, bool ReadsDirty)> RetentionSteps()
+    {
+        var plan = Plan();
+        var heap = new Heap();
+        yield return (plan, heap, [0x1000, 0], false);
+        yield return (plan, heap, [0x1000, 0], false);
+        var changed = new Heap();
+        changed.Words[HeapBase + 0x100 + 5 * 32] = 0x3000;
+        yield return (plan, changed, [0x1000, 0], false);
+        yield return (plan, heap, [0x1000, 0], false);
+        yield return (plan, heap.Moved(0x4000), [0x5000, 0], false);
+
+        var direct = DirectPlan();
+        var directHeap = DirectHeap();
+        yield return (direct, directHeap, [0x1000, 0], false);
+        yield return (direct, directHeap.Moved(0x4000), [0x5000, 0], false);
+        yield return (direct, directHeap.Moved(0x8000), [0x9000, 0], false);
+
+        var table = TableBufferPlan();
+        yield return (table, TableBufferHeap(0x7000), [0x1000, 0], true);
+        yield return (table, TableBufferHeap(0x9000), [0x1000, 0], true);
+        yield return (table, TableBufferHeap(0x9000), [0x1000, 0], true);
+
+        var pointer = PointerBufferPlan();
+        var pointerHeap = new Heap();
+        yield return (pointer, pointerHeap, [0x1000, 0x10], false);
+        yield return (pointer, pointerHeap, [0x5000, 0x11], false);
+        yield return (pointer, pointerHeap, [0x5000, 0x11], false);
+    }
+
+    private static void AssertSameSnapshot(ResourceSnapshot expected, ResourceSnapshot actual)
+    {
+        Assert.Equal(expected.Buffers.Select(words => words.ToArray()), actual.Buffers.Select(words => words.ToArray()));
+        Assert.Equal(expected.Images.Select(words => words.ToArray()), actual.Images.Select(words => words.ToArray()));
+        Assert.Equal(expected.Samplers.Select(words => words.ToArray()), actual.Samplers.Select(words => words.ToArray()));
+        Assert.Equal(expected.FlattenedResourceTable, actual.FlattenedResourceTable);
+        Assert.Equal(expected.UserData, actual.UserData);
+        Assert.Equal(expected.DeviceAddressRanges, actual.DeviceAddressRanges);
+    }
+
+    [Fact]
+    public void PinnedRetentionMaterializesTheSame()
+    {
+        var plain = new ResourceMaterializationCache { RetainPinned = false };
+        var pinned = new ResourceMaterializationCache { RetainPinned = true };
+        ResourceSnapshot? previousPlain = null, previousPinned = null;
+        foreach (var (plan, heap, userData, readsDirty) in RetentionSteps())
+        {
+            var plainOk = Run(plain, plan, heap, userData, out var expected, out var expectedSpecialization, readsDirty: readsDirty);
+            var pinnedOk = Run(pinned, plan, heap, userData, out var actual, out var actualSpecialization, readsDirty: readsDirty);
+            Assert.Equal(plainOk, pinnedOk);
+            Assert.Equal((plain.Hits, plain.Misses, plain.TableRefreshes), (pinned.Hits, pinned.Misses, pinned.TableRefreshes));
+            AssertSameSnapshot(expected, actual);
+            Assert.Equal(expectedSpecialization, actualSpecialization);
+            // A repeated draw gets the same snapshot object from both caches.
+            Assert.Equal(ReferenceEquals(previousPlain, expected), ReferenceEquals(previousPinned, actual));
+            previousPlain = expected;
+            previousPinned = actual;
+        }
+
+        Assert.NotEqual(0, pinned.Hits);
+    }
+
+    [Fact]
+    public void PinnedRetentionKeepsTheEntrysArraysOutOfTheYoungGenerations()
+    {
+        var plan = Plan();
+        var heap = new Heap();
+        var cache = new ResourceMaterializationCache { RetainPinned = true };
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var first, out _));
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var second, out _));
+        Assert.Equal((1, 1), (cache.Hits, cache.Misses));
+        Assert.Same(first, second);
+        Assert.NotEmpty(second.Images);
+        foreach (var words in second.Buffers.Concat(second.Images).Concat(second.Samplers))
+            if (words.Length != 0)
+                Assert.Equal(GC.MaxGeneration, GC.GetGeneration(words));
+        foreach (var array in new Array[] { second.FlattenedResourceTable, second.UserData, second.DeviceAddressRanges })
+            if (array.Length != 0)
+                Assert.Equal(GC.MaxGeneration, GC.GetGeneration(array));
+
+        // A collection of the young generations moves nothing the entry keeps.
+        GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var third, out _));
+        Assert.Same(second, third);
+    }
 }
