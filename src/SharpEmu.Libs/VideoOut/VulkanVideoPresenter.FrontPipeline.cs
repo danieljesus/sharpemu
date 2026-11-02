@@ -1263,6 +1263,7 @@ internal static unsafe partial class VulkanVideoPresenter
             GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs, KeyValuePair<uint, uint>[]? drawRegisters = null)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
+            Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.Draws); // [local]
             var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             try
@@ -1281,6 +1282,7 @@ internal static unsafe partial class VulkanVideoPresenter
             ulong indirectArgumentsAddress, ComputeProgram? prepared)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDispatchTranslation);
+            Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.Dispatches); // [local]
             var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             try

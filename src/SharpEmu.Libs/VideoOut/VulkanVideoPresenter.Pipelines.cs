@@ -193,6 +193,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!FrontPrepCheck || _bufferCache.EverGpuWrittenVersion == version)
                 return true;
             DiscardedFrontPreparations++;
+            Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.FrontDiscardedPreps); // [local]
             return false;
         }
 
@@ -214,6 +215,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (overlap < 0) Interlocked.Increment(ref FrontPrepReads.Unknown);
                     else Interlocked.Increment(ref FrontPrepReads.Discarded);
                     DiscardedFrontPreparations++;
+                    Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.FrontDiscardedPreps); // [local]
                     return false;
                 }
 
@@ -330,6 +332,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             SkippedPreparations++;
+            Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.FrontSkippedPreps); // [local]
             return true;
         }
 
@@ -537,6 +540,7 @@ internal static unsafe partial class VulkanVideoPresenter
             catch (DeferPreparationException)
             {
                 Interlocked.Increment(ref DeferredPreparations);
+                Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.FrontDeferredPreps); // [local]
                 inputs = default;
                 return null;
             }
@@ -568,6 +572,7 @@ internal static unsafe partial class VulkanVideoPresenter
             catch (DeferPreparationException)
             {
                 Interlocked.Increment(ref DeferredPreparations);
+                Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.FrontDeferredPreps); // [local]
                 return null;
             }
             finally

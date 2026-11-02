@@ -8,7 +8,7 @@ using SharpEmu.Libs.VideoOut;
 
 namespace SharpEmu.Libs.Diagnostics;
 
-// [local] SHARPEMU_FRAME_MISS_PROBE=1 (off; =2 adds the per-draw phases): what the presentations that missed the 30 Hz grid spent their time on. It turns
+// [local] SHARPEMU_FRAME_MISS_PROBE=1 (off; =2 adds the per-draw phases, =3 their pieces): what the presentations that missed the 30 Hz grid spent their time on. It turns
 // on the flip timestamps of SHARPEMU_FLIP_PROBE (and its [FLIP_PROBE]/[FLIP_PACING] lines) and adds cheap cumulative
 // counters, one Interlocked add per event: the render phases that wait (GPU completion, frame slot, uploads, the submit
 // thread, idle) and the compiles, timed through the dormant RenderPhaseProfile scopes without the phase profiler, per thread
@@ -21,10 +21,12 @@ namespace SharpEmu.Libs.Diagnostics;
 internal static class FrameMissProbe
 {
     private static readonly string? Mode = Environment.GetEnvironmentVariable("SHARPEMU_FRAME_MISS_PROBE");
-    internal static readonly bool Enabled = Mode is "1" or "2";
 
-    // =2 also times the render thread's coarse per-draw phases (two timestamps per scope, ~1300 draws a frame).
-    private static readonly bool Detail = Mode == "2";
+    // =2 also times the render thread's coarse per-draw phases (two timestamps per scope, ~1300 draws a frame); =3 adds
+    // their pieces (dispatch, program, binding and draw-preparation phases).
+    internal static readonly bool Enabled = Mode is "1" or "2" or "3";
+    private static readonly bool Detail = Mode is "2" or "3";
+    private static readonly bool Fine = Mode == "3";
 
     internal enum Role : byte
     {
@@ -63,6 +65,19 @@ internal static class FrameMissProbe
         ReadbackGuest,
         PresentLock,
         PresentCall,
+        // Counts: draws and dispatches the render thread translated, the program preparations and resource
+        // materializations it did itself (and how many of those missed the materialization cache), the front's
+        // preparations deferred, skipped or discarded (the render thread prepares those), managed KB allocated.
+        Draws,
+        Dispatches,
+        RenderGraphicsPreps,
+        RenderComputePreps,
+        RenderMaterializations,
+        RenderMaterializationMisses,
+        FrontDeferredPreps,
+        FrontSkippedPreps,
+        FrontDiscardedPreps,
+        AllocatedKB,
         Count,
     }
 
@@ -111,8 +126,38 @@ internal static class FrameMissProbe
         RenderPhaseProfile.Phase.PipelineCreation,
     ];
 
-    // Static fields initialize in order: after both lists.
-    private static readonly RenderPhaseProfile.Phase[] TrackedPhases = Detail ? [.. CoarsePhases, .. DetailPhases] : CoarsePhases;
+    private static readonly RenderPhaseProfile.Phase[] FinePhases =
+    [
+        RenderPhaseProfile.Phase.DispatchProgram,
+        RenderPhaseProfile.Phase.DispatchConsumers,
+        RenderPhaseProfile.Phase.ProgramSourceRead,
+        RenderPhaseProfile.Phase.VertexInputResolution,
+        RenderPhaseProfile.Phase.PixelInputResolution,
+        RenderPhaseProfile.Phase.ProgramCacheLookup,
+        RenderPhaseProfile.Phase.ProgramPermutationLookup,
+        RenderPhaseProfile.Phase.BindingSetup,
+        RenderPhaseProfile.Phase.BindingTextureDecode,
+        RenderPhaseProfile.Phase.BindingSamplers,
+        RenderPhaseProfile.Phase.BindingShaderData,
+        RenderPhaseProfile.Phase.BindingValidation,
+        RenderPhaseProfile.Phase.BindingBuffers,
+        RenderPhaseProfile.Phase.BindingDeviceRanges,
+        RenderPhaseProfile.Phase.BindingImages,
+        RenderPhaseProfile.Phase.DrawPrepBegin,
+        RenderPhaseProfile.Phase.DrawPrepBuffers,
+        RenderPhaseProfile.Phase.DrawPrepBindVertex,
+        RenderPhaseProfile.Phase.DrawPrepDynamicState,
+        RenderPhaseProfile.Phase.DrawPrepEnd,
+        RenderPhaseProfile.Phase.DrawPrepBindings,
+        RenderPhaseProfile.Phase.DrawPrepTargets,
+        RenderPhaseProfile.Phase.DrawPrepIndexBind,
+        RenderPhaseProfile.Phase.DrawPrepMemoryWrites,
+        RenderPhaseProfile.Phase.DrawPrepTail,
+    ];
+
+    // Static fields initialize in order: after the lists.
+    private static readonly RenderPhaseProfile.Phase[] TrackedPhases =
+        Fine ? [.. CoarsePhases, .. DetailPhases, .. FinePhases] : Detail ? [.. CoarsePhases, .. DetailPhases] : CoarsePhases;
     private static readonly int[] PhaseSlot = BuildPhaseSlots();
     private static readonly int RoleCount = (int)Role.Count - 1;
     private static readonly int PhaseBase = (int)Counter.Count;
@@ -140,6 +185,7 @@ internal static class FrameMissProbe
         var counts = new bool[CounterCount];
         for (var index = 0; index < (int)Counter.Count; index++) names[index] = ((Counter)index).ToString();
         counts[(int)Counter.Gen0] = counts[(int)Counter.Gen1] = counts[(int)Counter.Gen2] = counts[(int)Counter.CompileCount] = true;
+        for (var index = (int)Counter.Draws; index <= (int)Counter.AllocatedKB; index++) counts[index] = true;
         for (var role = 1; role <= RoleCount; role++)
         for (var phase = 0; phase < TrackedPhases.Length; phase++)
             names[PhaseBase + (role - 1) * TrackedPhases.Length + phase] = $"{(Role)role}.{TrackedPhases[phase]}";
@@ -170,6 +216,17 @@ internal static class FrameMissProbe
     }
 
     internal static bool Tracks(RenderPhaseProfile.Phase phase) => PhaseSlot[(int)phase] >= 0;
+
+    internal static void Count(Counter counter)
+    {
+        if (Enabled) Interlocked.Increment(ref Cumulative[(int)counter]);
+    }
+
+    // On the render thread only.
+    internal static void CountOnRender(Counter counter)
+    {
+        if (Enabled && CurrentRole == Role.Render) Interlocked.Increment(ref Cumulative[(int)counter]);
+    }
 
     internal static void AddPhase(RenderPhaseProfile.Phase phase, long ticks)
     {
@@ -219,6 +276,7 @@ internal static class FrameMissProbe
         Snapshot[(int)Counter.Gen0] = GC.CollectionCount(0);
         Snapshot[(int)Counter.Gen1] = GC.CollectionCount(1);
         Snapshot[(int)Counter.Gen2] = GC.CollectionCount(2);
+        Snapshot[(int)Counter.AllocatedKB] = GC.GetTotalAllocatedBytes(false) >> 10;
         Tracker.Presented(flip, openedAt, openedAt == 0 ? 0 : flipInterval, Snapshot);
     }
 }
@@ -497,11 +555,13 @@ internal sealed class FrameMissTracker
             $"[FRAME_HIST] uptime_s={(now - _originTicks) / (double)_frequency:F0} presentations={Presentations} misses={Misses} skipped_slots={SkippedSlots} by_skipped=[1:{SkippedHistogram[1]} 2:{SkippedHistogram[2]} 3+:{SkippedHistogram[3]}] late_ms=[{late.ToString().Trim()}] slack_ms_1=[{slack}] interval_ms_0.5=[{hist.ToString().Trim()}]");
         if (MissFrames == 0) yield break;
         var normal = Math.Max(1, NormalFrames);
-        var ranked = Enumerable.Range(0, _names.Length)
+        var entries = Enumerable.Range(0, _names.Length)
             .Select(index => (Index: index, Miss: MissSum[index] / MissFrames, Before: MissPreviousSum[index] / MissFrames, Normal: NormalSum[index] / normal))
             .Where(entry => entry.Miss + entry.Before + entry.Normal > 0.01)
-            .OrderByDescending(entry => _isCount[entry.Index] ? double.MinValue : entry.Miss - entry.Normal)
-            .Take(40);
+            .ToList();
+        // The 40 timed counters that grew most on missed presentations, then every count.
+        var ranked = entries.Where(entry => !_isCount[entry.Index]).OrderByDescending(entry => entry.Miss - entry.Normal).Take(40)
+            .Concat(entries.Where(entry => _isCount[entry.Index]));
         var builder = new StringBuilder(string.Create(CultureInfo.InvariantCulture,
             $"[FRAME_ATTR] miss_frames={MissFrames} normal_frames={NormalFrames} per_interval miss/before/normal:"));
         foreach (var entry in ranked)

@@ -463,6 +463,13 @@ internal sealed class ShaderProgramCache
                 materialized = MaterializeWith(materializations, entry, inputs, ref snapshot, ref specialization, out materializationFailure, captureIndirectImageFailure);
             }
 
+            if (Diagnostics.FrameMissProbe.Enabled) // [local]
+            {
+                Diagnostics.FrameMissProbe.CountOnRender(Diagnostics.FrameMissProbe.Counter.RenderMaterializations);
+                if (materializations is null || materializations.Hits == hitsBefore)
+                    Diagnostics.FrameMissProbe.CountOnRender(Diagnostics.FrameMissProbe.Counter.RenderMaterializationMisses);
+            }
+
             if (IndirectImageDiag.Hash != 0 && source.Hash == IndirectImageDiag.Hash) // [local] SHARPEMU_INDIRECT_IMAGE_DIAG
             {
                 if (materialized)
