@@ -12,7 +12,7 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // the ring wraps, the tick of the newest evicted entry bounds anything older.
 internal static class GpuWriteHistory
 {
-    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_WRITE_TICKS"), out var mode) ? mode : 0;
+    public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PRECISE_WRITE_TICKS"), out var mode) ? mode : 1; // [local] 1 by default, =0 off
 
     // [local] SHARPEMU_READBACK_PRECISE_WAIT=1 also records the ring, without narrowing any tick or window: only the
     // render thread's small reads ask it (GuestBufferCache.TryPreciseRead).

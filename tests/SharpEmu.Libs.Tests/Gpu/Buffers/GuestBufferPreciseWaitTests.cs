@@ -100,7 +100,9 @@ public sealed class GuestBufferPreciseWaitTests(HeadlessVulkanFixture fixture) :
             Assert.Equal((0L, 0L), (harness.Cache.PreciseWaitReads, harness.Cache.PreciseWaitFallbacks));
             Assert.Equal((1L, 0L), (harness.Cache.PreciseVerifyChecks, harness.Cache.PreciseVerifyMismatches));
             Assert.False(harness.Cache.HasGpuDirtyBytes(address, 0x100));
-            Assert.False(harness.Cache.HasGpuDirtyBytes(address + 0x1000, 0x100));
+            // [local] With SHARPEMU_PRECISE_WRITE_TICKS (on by default) the ordinary path only waits for the tick that
+            // wrote the read bytes, so the later write of the same block stays GPU-modified.
+            Assert.Equal(GpuWriteHistory.Mode != 0, harness.Cache.HasGpuDirtyBytes(address + 0x1000, 0x100));
             Assert.Equal(0x55555555u, BitConverter.ToUInt32(harness.Read(address + 8, 4)));
         }
         finally

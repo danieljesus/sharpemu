@@ -126,19 +126,19 @@ internal static class TableWordMemo
         }
     }
 
-    // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN=<k> (0 off by default): the writer allowlist learned per (word, program) instead
+    // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN=<k> (8 by default, =0 off): the writer allowlist learned per (word, program) instead
     // of given by hash. When a program's written binding drops a remembered word, the program and the value are kept; if
     // the next synchronizing read of the word gets the same value, that (word, program) pair survived once. After k
     // survivals in a row the program's marks no longer drop that word (a different value resets the run). In GTA V the
     // memo for 994A +0x28/+0x2C/+0x74 (the TLAS header: offset and record count of the V# 994A writes through) was dropped
     // every frame by 5F74's binding, and the read then waited for the open batch behind 5981's refit (~1.5-1.9 ms/frame).
     // A word whose memo turns out wrong (SHARPEMU_TABLE_WORD_MEMO_AUDIT, or =2) is banned from learning for the session.
-    internal static int LearnThreshold = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_LEARN"), out var learn) ? learn : 0;
+    internal static int LearnThreshold = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_LEARN"), out var learn) ? learn : 8;
 
-    // [local] SHARPEMU_TABLE_WORD_MEMO_AUDIT=<n> (0 off by default): one memo hit in n, answered without waiting, also copies
+    // [local] SHARPEMU_TABLE_WORD_MEMO_AUDIT=<n> (64 by default, =0 off): one memo hit in n, answered without waiting, also copies
     // the word from the device buffer at that point of the stream and compares it at completion with the value given
     // ([TABLE_WORD_MEMO_LEARN] audits=/audit_mismatches=, has to stay 0). =1 audits every hit. A mismatch bans the word.
-    internal static int AuditRate = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_AUDIT"), out var audit) ? audit : 0;
+    internal static int AuditRate = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_AUDIT"), out var audit) ? audit : 64;
 
     // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN_FLUSH=1 (off by default): a hit that learning kept (the synchronizing read it
     // replaces would have flushed the open batch when the word's writer was in it, then waited) still flushes the batch,
