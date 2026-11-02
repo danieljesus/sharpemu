@@ -105,7 +105,8 @@ internal static unsafe partial class VulkanVideoPresenter
         // 0x8039D8A00 (hash F6F44A551620914E) writes the thread counts of 0x8039D9800's indirect dispatches: for each of
         // its threads i < count, (P[i+1] - P[i], 1, 1), and (total - P[last], 1, 1) for the last, where the struct at
         // s[4:5] holds P's offset (+124), total (+140) and count (+152). A P that is not monotonic, or a total under
-        // P[last], wraps to a ~4e9 count. This prints the CPU's view of those inputs (raw guest memory, no sync) and
+        // P[last], wraps to a ~4e9 count. Measured (sl20): a count past maxComputeWorkGroupCount (2^31 - 1) costs
+        // nothing on the RTX 5080, so only a count in ~[1e9, 2^31) reproduces the 19-27 s stall (1.6e9: ~13 s, sl13). This prints the CPU's view of those inputs (raw guest memory, no sync) and
         // whether the buffer store holds GPU-written bytes there: always for the first few, then every wrap.
         public void NoteIndirectArgsWriter(ulong shaderHash, ReadOnlySpan<uint> userScalars, ReadOnlySpan<uint> flattenedTable, uint threads)
         {
