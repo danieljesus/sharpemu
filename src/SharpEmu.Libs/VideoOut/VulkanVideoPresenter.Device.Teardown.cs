@@ -15,6 +15,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            StopAsyncPresent(); // [local] SHARPEMU_ASYNC_PRESENT
             ShutdownScheduler();
             if (_debugUtils is not null && _debugMessenger.Handle != 0)
             {

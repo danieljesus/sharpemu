@@ -330,10 +330,12 @@ internal static unsafe partial class VulkanVideoPresenter
 
 
             Diagnostics.LabelTimeline.Log('K', 4); // [local]
+            FinishAsyncPresent(); // [local] SHARPEMU_ASYNC_PRESENT: the previous present, before the acquire
             uint imageIndex;
             Result acquireResult;
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Acquire))
             {
+                _asyncPresent?.NoteAcquire(); // [local]
                 acquireResult = _swapchainApi.AcquireNextImage(
                     _device,
                     _swapchain,
@@ -453,6 +455,27 @@ internal static unsafe partial class VulkanVideoPresenter
             Result presentResult;
             BindingRepeatProbe.EndFrame(); // [local]
             FpsLog.FramePresented(); // [local]
+            // [local] SHARPEMU_ASYNC_PRESENT: the present thread presents and reports the flip; the rare paths stay here.
+            if (AsyncPresentQueue.Mode != 0 && !recreateAfterPresent && !_swapchainReadbackPending && !presentation.IsSplash &&
+                _firstGuestDrawPresented)
+            {
+                var asyncPresent = _asyncPresent ??= new AsyncPresentQueue(PresentOnThread, CompletePresentOnThread, Console.Error.WriteLine);
+                _presentedSequence = presentation.Sequence;
+                asyncPresent.Submit(_submitTimeline, imageIndex, presentation.FlipRequestId);
+                if (AsyncPresentQueue.Mode == 2)
+                {
+                    FinishAsyncPresent();
+                }
+
+                Diagnostics.LabelTimeline.Log('K', 6);
+                PerfOverlay.RecordPresent();
+                RenderPhaseProfile.RecordFrame();
+                CollectCompletedGuestSubmissions(waitForOldest: false);
+                _imageInitialized[imageIndex] = true;
+                _currentFrameSlot = (frameSlot + 1) % MaxFramesInFlight;
+                return;
+            }
+
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueuePresent))
             {
                 // [local] The present waits on a binary semaphore: its signal must be submitted first.

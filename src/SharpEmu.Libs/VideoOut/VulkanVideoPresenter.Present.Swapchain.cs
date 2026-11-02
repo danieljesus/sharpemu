@@ -481,6 +481,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _swapchainRecreateDeferred = false;
+            FinishAsyncPresent(recreating: true); // [local] SHARPEMU_ASYNC_PRESENT: no present in flight on the old swapchain
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan VideoOut recreating swapchain after {operation}: {result}");
             _scheduler?.WaitAllSubmitted(); // [local] idle must cover the work still queued for the submit thread
