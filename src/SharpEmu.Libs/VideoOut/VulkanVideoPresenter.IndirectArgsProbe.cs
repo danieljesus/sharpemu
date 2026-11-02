@@ -27,7 +27,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     (ulong)IndirectArgsProbe.Slots * IndirectArgsProbe.SlotBytes);
                 _indirectArgsRing.Mapped.Clear();
                 var ring = _indirectArgsRing;
-                Gpu.Scheduling.GpuStallReport.Extra = () => IndirectArgsProbe.Ledger.DescribeLatest(48, slot => ReadIndirectArgsSlot(ring, slot));
+                Gpu.Scheduling.GpuStallReport.Extra = () => IndirectArgsProbe.Ledger.DescribeLatest(192, slot => ReadIndirectArgsSlot(ring, slot));
             }
 
             Span<byte> cpu = stackalloc byte[12];
@@ -106,7 +106,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // s[4:5] holds P's offset (+124), total (+140) and count (+152). A P that is not monotonic, or a total under
         // P[last], wraps to a ~4e9 count. This prints the CPU's view of those inputs (raw guest memory, no sync) and
         // whether the buffer store holds GPU-written bytes there: always for the first few, then every wrap.
-        public void NoteIndirectArgsWriter(ulong shaderHash, ReadOnlySpan<uint> userScalars, uint threads)
+        public void NoteIndirectArgsWriter(ulong shaderHash, ReadOnlySpan<uint> userScalars, ReadOnlySpan<uint> flattenedTable, uint threads)
         {
             if (shaderHash != 0xF6F44A551620914E || userScalars.Length < 6)
                 return;
@@ -126,14 +126,18 @@ internal static unsafe partial class VulkanVideoPresenter
             for (var index = 0; index < shown; index++)
                 prefix[index] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(prefixBytes[(index * 4)..]);
             var (wrapped, text) = IndirectArgsLedger.DescribePrefix(prefix[..shown], count, total);
-            if (!wrapped && _prefixArgsLines >= 8)
+            // The shader takes the three header words from the flattened resource table the host resolved, not from
+            // memory: a table without the raw values means the materialization is stale.
+            var stale = !flattenedTable.Contains(prefixOffset) || !flattenedTable.Contains(total) || !flattenedTable.Contains(count);
+            if (!wrapped && !stale && _prefixArgsLines >= 8)
                 return;
             if (_prefixArgsLines++ >= 200)
                 return;
             Console.Error.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
-                $"[GPU][INDIRECT_ARGS] prefix{(wrapped ? "_wrap" : "")} tick={_scheduler.CurrentTick} header=0x{header:X} threads={threads} count={count} total={total} " +
+                $"[GPU][INDIRECT_ARGS] prefix{(wrapped ? "_wrap" : "")}{(stale ? "_stale_table" : "")} tick={_scheduler.CurrentTick} header=0x{header:X} threads={threads} count={count} total={total} " +
                 $"p=0x{prefixAddress:X} start:diff=[{text}] header_gpu_dirty={_bufferCache.HasGpuDirtyBytes(header + 112, 64)} " +
-                $"p_gpu_dirty={(shown > 0 && _bufferCache.HasGpuDirtyBytes(prefixAddress, (ulong)shown * 4))}"));
+                $"p_gpu_dirty={(shown > 0 && _bufferCache.HasGpuDirtyBytes(prefixAddress, (ulong)shown * 4))} " +
+                $"table=[{string.Join(",", flattenedTable.Length > 16 ? flattenedTable[..16].ToArray() : flattenedTable.ToArray())}]"));
         }
 
         private static (uint X, uint Y, uint Z, uint Sequence) ReadIndirectArgsSlot(GpuBuffer ring, int slot)
