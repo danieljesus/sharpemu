@@ -454,6 +454,7 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
         if (DeferredUploadWorker.Enabled) // [local]
         {
             _deferredUploads = new DeferredUploadWorker(device.Vk, device.Device);
+            _deferredUploads.VerifyReader = _backing.TryReadBacking; // [local] SHARPEMU_PROTECT_OUTSIDE_LOCK=2
             // The capture runs on the recording thread; the join, before the submit, on whichever thread submits.
             var deferred = _deferredUploads;
             scheduler.CaptureSubmitTarget = () => deferred.Enqueued;

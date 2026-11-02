@@ -19,7 +19,25 @@ public sealed class GuestPageTracker
     private readonly object _regionGate = new();
     private readonly CpuDirtySummary _cpuDirtySummary = new();
 
-    public GuestPageTracker(PageGuard pages) => _pages = pages;
+    // [local] SHARPEMU_PROTECT_OUTSIDE_LOCK (see TrackedRegion): 0 off (default), 1 on, 2 on and every deferred upload
+    // verified. Captured by each tracker when it is created; tests set it with an AsyncLocal override.
+    private static readonly int DefaultProtectOutsideLock =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PROTECT_OUTSIDE_LOCK"), out var protectOutsideLock) ? protectOutsideLock : 0;
+    private static readonly AsyncLocal<int?> ProtectOutsideLockOverride = new();
+
+    public static int ProtectOutsideLock
+    {
+        get => ProtectOutsideLockOverride.Value ?? DefaultProtectOutsideLock;
+        set => ProtectOutsideLockOverride.Value = value;
+    }
+
+    private readonly bool _protectOutsideLock;
+
+    public GuestPageTracker(PageGuard pages)
+    {
+        _pages = pages;
+        _protectOutsideLock = ProtectOutsideLock != 0;
+    }
 
     public bool HasCpuDirtyPages(ulong vaddr, ulong size)
     {
@@ -447,12 +465,40 @@ public sealed class GuestPageTracker
         }
     }
 
-    // [local] Protects what deferred uploads left writable, one region lock at a time. Any thread.
+    // [local] Protects what deferred uploads left writable, one region lock at a time. Any thread. With
+    // SHARPEMU_PROTECT_OUTSIDE_LOCK the kernel call is made after the region lock is released (see TrackedRegion).
     public static void ApplyDeferredProtection(List<TrackedRegion> regions)
     {
+        var probe = DeferredProtectProbe.Enabled;
         foreach (var region in regions)
         {
+            var started = probe ? Stopwatch.GetTimestamp() : 0;
             region.Lock.Enter();
+            var locked = probe ? Stopwatch.GetTimestamp() : 0;
+            if (region.ProtectsOutsideLock)
+            {
+                PageMask protect;
+                try
+                {
+                    protect = region.TakePendingCpuProtection();
+                }
+                finally
+                {
+                    region.Lock.Exit();
+                }
+
+                var released = probe ? Stopwatch.GetTimestamp() : 0;
+                region.CompletePendingCpuProtection(protect);
+                if (probe)
+                {
+                    DeferredProtectProbe.Add(DeferredProtectProbe.Part.LockWait, locked - started);
+                    DeferredProtectProbe.Add(DeferredProtectProbe.Part.UnderLock, released - locked);
+                    DeferredProtectProbe.Add(DeferredProtectProbe.Part.Call, Stopwatch.GetTimestamp() - released);
+                }
+
+                continue;
+            }
+
             try
             {
                 region.ApplyPendingCpuProtection();
@@ -460,6 +506,12 @@ public sealed class GuestPageTracker
             finally
             {
                 region.Lock.Exit();
+            }
+
+            if (probe)
+            {
+                DeferredProtectProbe.Add(DeferredProtectProbe.Part.LockWait, locked - started);
+                DeferredProtectProbe.Add(DeferredProtectProbe.Part.UnderLock, Stopwatch.GetTimestamp() - locked);
             }
         }
     }
@@ -676,7 +728,7 @@ public sealed class GuestPageTracker
                 return existing;
             }
 
-            var created = new TrackedRegion(_pages, index * BlockBytes, _cpuDirtySummary);
+            var created = new TrackedRegion(_pages, index * BlockBytes, _cpuDirtySummary, _protectOutsideLock);
             Volatile.Write(ref _regions[index], created);
             Interlocked.Or(ref _presentRegions[index / 64], 1L << (int)(index % 64));
             return created;

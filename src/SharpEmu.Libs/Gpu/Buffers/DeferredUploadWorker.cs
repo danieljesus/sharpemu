@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
@@ -53,7 +54,7 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
     internal static readonly bool BlockWait = Environment.GetEnvironmentVariable("SHARPEMU_DEFERRED_UPLOAD_WAIT_BLOCK") != "0";
     private const int BlockSpins = 6;
 
-    private readonly BlockingCollection<(Job Job, long Number)> _queue = new();
+    private readonly BlockingCollection<(Job Job, long Number, long Enqueued)> _queue = new();
     private readonly object _enqueueGate = new();
     private readonly object _orderGate = new();
     private readonly HashSet<long> _finishedOutOfOrder = new();
@@ -62,6 +63,33 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
     private long _completed;
     private int _blockedWaiters;
     private Exception? _failure;
+
+    // [local] SHARPEMU_PROTECT_OUTSIDE_LOCK=2: after each job's copy, with the job's region locks held (a clean page
+    // cannot change then: a write faults and waits for the lock), every clean page the job copied is read again from
+    // the backing and compared with its staging bytes. A difference on a page that stayed clean, in a region where no
+    // page turned CPU-dirty since the protection, is a lost write. Pages GPU-dirty or CPU-dirty again, and pages in
+    // regions the job did not lock or that turned dirty meanwhile, are counted apart and not compared.
+    internal delegate bool BackingReader(ulong address, Span<byte> destination);
+
+    internal BackingReader? VerifyReader { get; set; }
+
+    private readonly bool _verify = GuestPageTracker.ProtectOutsideLock == 2;
+    private long _verifyJobs, _verifyPages, _verifyDirty, _verifySkipped, _verifyDiscrepancies;
+    private static int _verifyLogs;
+    private static long _probeFrames;
+    private long _reportStarted = Stopwatch.GetTimestamp();
+    private int _reporting;
+
+    // [local] SHARPEMU_UPLOAD_JOB_PROBE / SHARPEMU_PROTECT_OUTSIDE_LOCK=2: frames presented, for the reports.
+    public static void NoteFrame()
+    {
+        if (DeferredProtectProbe.Enabled || Instance is { _verify: true })
+            Interlocked.Increment(ref _probeFrames);
+    }
+
+    public (long Jobs, long Pages, long Dirty, long Skipped, long Discrepancies) VerifyCounts =>
+        (Volatile.Read(ref _verifyJobs), Volatile.Read(ref _verifyPages), Volatile.Read(ref _verifyDirty),
+            Volatile.Read(ref _verifySkipped), Volatile.Read(ref _verifyDiscrepancies));
 
     public DeferredUploadWorker(Vk? vk = null, Device device = default)
     {
@@ -95,7 +123,7 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
     {
         lock (_enqueueGate)
         {
-            _queue.Add((job, Interlocked.Increment(ref _enqueued)));
+            _queue.Add((job, Interlocked.Increment(ref _enqueued), DeferredProtectProbe.Enabled ? Stopwatch.GetTimestamp() : 0));
         }
     }
 
@@ -257,12 +285,38 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
     private void Run()
     {
         SharpEmu.HLE.Host.HostLaneReservation.ApplyToHelperThread();
-        foreach (var (job, number) in _queue.GetConsumingEnumerable())
+        DeferredProtectProbe.MarkWorkerThread();
+        var probe = DeferredProtectProbe.Enabled;
+        long[]? dirtyings = null;
+        foreach (var (job, number, enqueued) in _queue.GetConsumingEnumerable())
         {
             try
             {
+                var started = probe ? Stopwatch.GetTimestamp() : 0;
                 GuestPageTracker.ApplyDeferredProtection(job.Regions);
+                if (_verify)
+                {
+                    if (dirtyings == null || dirtyings.Length < job.Regions.Count)
+                        dirtyings = new long[Math.Max(job.Regions.Count, 16)];
+                    for (var index = 0; index < job.Regions.Count; index++)
+                        dirtyings[index] = job.Regions[index].CpuDirtyings;
+                }
+
+                var copyStarted = probe ? Stopwatch.GetTimestamp() : 0;
                 job.Uploader.ReadInto(job.Source, job.Reads);
+                var copied = probe ? Stopwatch.GetTimestamp() : 0;
+                if (_verify)
+                    Verify(job, dirtyings!);
+                if (probe)
+                {
+                    DeferredProtectProbe.Add(DeferredProtectProbe.Part.Queued, started - enqueued);
+                    DeferredProtectProbe.Add(DeferredProtectProbe.Part.Copy, copied - copyStarted);
+                    DeferredProtectProbe.Add(DeferredProtectProbe.Part.Verify, Stopwatch.GetTimestamp() - copied);
+                    DeferredProtectProbe.NoteJob(job.Regions.Count);
+                }
+
+                if (probe || _verify)
+                    MaybeReport();
             }
             catch (Exception exception)
             {
@@ -278,6 +332,105 @@ internal sealed unsafe class DeferredUploadWorker : IDisposable
                     Monitor.PulseAll(_idleGate);
                 }
             }
+        }
+    }
+
+    private void MaybeReport()
+    {
+        var now = Stopwatch.GetTimestamp();
+        if (now - Volatile.Read(ref _reportStarted) < 10 * Stopwatch.Frequency || Interlocked.Exchange(ref _reporting, 1) != 0)
+            return;
+        Volatile.Write(ref _reportStarted, now);
+        var frames = Interlocked.Exchange(ref _probeFrames, 0);
+        if (DeferredProtectProbe.Enabled)
+            Console.Error.WriteLine(DeferredProtectProbe.TakeReport(frames));
+        if (_verify)
+        {
+            var (jobs, pages, dirty, skipped, discrepancies) = VerifyCounts;
+            Console.Error.WriteLine(
+                $"[GPU][DEFERRED_PROTECT_VERIFY] jobs={jobs} pages={pages} dirty_again={dirty} skipped={skipped} discrepancies={discrepancies}");
+        }
+
+        Volatile.Write(ref _reporting, 0);
+    }
+
+    private const ulong VerifyPageBytes = TrackerLayout.PageBytes;
+    private const ulong VerifyBlockBytes = TrackerLayout.BlockBytes;
+    [ThreadStatic] private static byte[]? t_verifyBytes;
+
+    private void Verify(Job job, long[] dirtyings)
+    {
+        var reader = VerifyReader;
+        if (reader == null)
+            return;
+        var regions = job.Regions;
+        var order = new int[regions.Count];
+        for (var index = 0; index < order.Length; index++)
+            order[index] = index;
+        Array.Sort(order, (left, right) => regions[left].BaseAddress.CompareTo(regions[right].BaseAddress));
+        var locked = new List<TrackedRegion>(order.Length);
+        var buffer = t_verifyBytes ??= new byte[VerifyPageBytes];
+        try
+        {
+            // Address order, as the tracker takes several region locks.
+            foreach (var index in order)
+            {
+                if (locked.Count != 0 && ReferenceEquals(locked[^1], regions[index]))
+                    continue;
+                regions[index].Lock.Enter();
+                locked.Add(regions[index]);
+            }
+
+            Interlocked.Increment(ref _verifyJobs);
+            foreach (var (address, offset, size) in job.Reads)
+            {
+                var end = address + (ulong)size;
+                for (var cursor = address; cursor < end;)
+                {
+                    var chunkEnd = Math.Min(end, (cursor / VerifyPageBytes + 1) * VerifyPageBytes);
+                    var bytes = chunkEnd - cursor;
+                    var at = cursor;
+                    var regionIndex = regions.FindIndex(region => region.BaseAddress <= at && at < region.BaseAddress + VerifyBlockBytes);
+                    var region = regionIndex >= 0 ? regions[regionIndex] : null;
+                    var regionOffset = region == null ? 0 : cursor - region.BaseAddress;
+                    if (region == null || region.IsModified(WriteOrigin.Gpu, regionOffset, bytes) ||
+                        region.CpuDirtyings != dirtyings[regionIndex])
+                    {
+                        Interlocked.Increment(ref _verifySkipped);
+                    }
+                    else if (region.IsModified(WriteOrigin.Cpu, regionOffset, bytes))
+                    {
+                        Interlocked.Increment(ref _verifyDirty);
+                    }
+                    else
+                    {
+                        var current = buffer.AsSpan(0, (int)bytes);
+                        var staged = job.Source.Mapped.Slice((int)(offset + (cursor - address)), (int)bytes);
+                        if (!reader(cursor, current))
+                        {
+                            Interlocked.Increment(ref _verifySkipped);
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref _verifyPages);
+                            if (!current.SequenceEqual(staged))
+                            {
+                                Interlocked.Increment(ref _verifyDiscrepancies);
+                                if (Interlocked.Increment(ref _verifyLogs) <= 20)
+                                    Console.Error.WriteLine(
+                                        $"[GPU][DEFERRED_PROTECT_VERIFY_MISMATCH] addr=0x{cursor:X16} bytes=0x{bytes:X} first_diff={current.CommonPrefixLength(staged)}");
+                            }
+                        }
+                    }
+
+                    cursor = chunkEnd;
+                }
+            }
+        }
+        finally
+        {
+            foreach (var region in locked)
+                region.Lock.Exit();
         }
     }
 

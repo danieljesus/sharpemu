@@ -19,7 +19,17 @@ public sealed class TrackedRegion
     private PageMask _hotCpuWrites;
     private readonly CpuDirtySummary? _summary;
 
-    public TrackedRegion(PageGuard pages, ulong baseAddress, CpuDirtySummary? summary = null)
+    // [local] SHARPEMU_PROTECT_OUTSIDE_LOCK=1 (off by default; =2 also verifies every deferred upload): the deferred
+    // upload workers decide the pages to protect under the region lock and make the kernel call after releasing it.
+    // Every CPU-watch change of the region is then made under _protectGate, taken while holding the region lock, so
+    // the watch changes keep the order of the region-lock sections that decided them (an unprotect of a page dirtied
+    // meanwhile waits for the protect before it). A worker whose own pages another worker's call is protecting waits
+    // for that call through the gate before it copies. Fixed per region at creation (tests set it per tracker).
+    private readonly bool _protectOutsideLock;
+    private int _protectGate;
+    private long _cpuDirtyings;
+
+    public TrackedRegion(PageGuard pages, ulong baseAddress, CpuDirtySummary? summary = null, bool protectOutsideLock = false)
     {
         if (baseAddress % BlockBytes != 0)
         {
@@ -28,6 +38,7 @@ public sealed class TrackedRegion
 
         _pages = pages;
         _summary = summary;
+        _protectOutsideLock = protectOutsideLock;
         BaseAddress = baseAddress;
         _cpuDirty.Fill();
         _writable.Fill();
@@ -37,6 +48,11 @@ public sealed class TrackedRegion
     }
 
     public RegionLock Lock { get; } = new();
+
+    public bool ProtectsOutsideLock => _protectOutsideLock;
+
+    // [local] Times a page of the region turned CPU-dirty (written under the lock; the upload verify reads it).
+    public long CpuDirtyings => Volatile.Read(ref _cpuDirtyings);
 
     public ulong BaseAddress { get; }
 
@@ -141,6 +157,11 @@ public sealed class TrackedRegion
         }
 
         ref var bits = ref GetDirtyMask(side);
+        if (enable && side == WriteOrigin.Cpu)
+        {
+            Volatile.Write(ref _cpuDirtyings, _cpuDirtyings + 1);
+        }
+
         if (enable)
         {
             bits.SetRange(start, end);
@@ -200,6 +221,70 @@ public sealed class TrackedRegion
     // [local] Protects the clean pages a deferred upload left writable. Call with the lock held.
     public void ApplyPendingCpuProtection() => UpdateCpuProtection(track: true);
 
+    // [local] SHARPEMU_PROTECT_OUTSIDE_LOCK: ApplyPendingCpuProtection in two halves. With the lock held, this waits
+    // for another thread's call in flight, takes the gate and returns the pages to protect, already recorded as
+    // protected; the caller releases the lock and then calls CompletePendingCpuProtection, which makes the call and
+    // releases the gate. Always pair the two, also when the mask is empty.
+    public PageMask TakePendingCpuProtection()
+    {
+        EnterProtectGate();
+        try
+        {
+            _summary?.Set(BaseAddress / BlockBytes, _cpuDirty.Any);
+            var unprotect = _cpuDirty & ~_writable;
+            if (unprotect.Any)
+            {
+                // Not expected (dirty pages stay writable); kept under the lock, as in UpdateCpuProtection.
+                _summary?.NoteDirtied();
+                _pages.RemoveWatchMask(BaseAddress, unprotect, blockReads: false);
+            }
+
+            var protect = _writable & ~_cpuDirty;
+            _writable = _cpuDirty;
+            return protect;
+        }
+        catch
+        {
+            ExitProtectGate();
+            throw;
+        }
+    }
+
+    public void CompletePendingCpuProtection(in PageMask protect)
+    {
+        try
+        {
+            if (protect.Any)
+            {
+                _pages.AddWatchMask(BaseAddress, protect, blockReads: false);
+            }
+        }
+        finally
+        {
+            ExitProtectGate();
+        }
+    }
+
+    // [local] Spin gate (runs in the fault handler, which must not block in the kernel). Contended waits are counted
+    // for SHARPEMU_UPLOAD_JOB_PROBE.
+    private void EnterProtectGate()
+    {
+        if (Interlocked.CompareExchange(ref _protectGate, 1, 0) == 0)
+        {
+            return;
+        }
+
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        do
+        {
+            Thread.SpinWait(1);
+        }
+        while (Interlocked.CompareExchange(ref _protectGate, 1, 0) != 0);
+        DeferredProtectProbe.NoteGateWait(System.Diagnostics.Stopwatch.GetTimestamp() - started);
+    }
+
+    private void ExitProtectGate() => Volatile.Write(ref _protectGate, 0);
+
     public void ResetCpuWriteHeat(ulong address, ulong size)
     {
         var (start, end) = GetPageRange(address, size);
@@ -256,25 +341,42 @@ public sealed class TrackedRegion
         }
 
         var protect = _writable & ~_cpuDirty;
-        if (unprotect.Any)
+        // [local] SHARPEMU_PROTECT_OUTSIDE_LOCK: a watch change waits for a worker's call in flight (see the field).
+        var gated = _protectOutsideLock && (unprotect.Any || (!defer && protect.Any));
+        if (gated)
         {
-            _pages.RemoveWatchMask(BaseAddress, unprotect, blockReads: false);
+            EnterProtectGate();
         }
 
-        if (defer)
+        try
         {
-            // The pending pages stay writable in the mask, which is what the pages really are.
-            _writable = _cpuDirty ^ protect;
-            return protect.Any;
-        }
+            if (unprotect.Any)
+            {
+                _pages.RemoveWatchMask(BaseAddress, unprotect, blockReads: false);
+            }
 
-        if (protect.Any)
+            if (defer)
+            {
+                // The pending pages stay writable in the mask, which is what the pages really are.
+                _writable = _cpuDirty ^ protect;
+                return protect.Any;
+            }
+
+            if (protect.Any)
+            {
+                _pages.AddWatchMask(BaseAddress, protect, blockReads: false);
+            }
+
+            _writable = _cpuDirty;
+            return false;
+        }
+        finally
         {
-            _pages.AddWatchMask(BaseAddress, protect, blockReads: false);
+            if (gated)
+            {
+                ExitProtectGate();
+            }
         }
-
-        _writable = _cpuDirty;
-        return false;
     }
 
     private void UpdateGpuProtection(bool track)
