@@ -2788,7 +2788,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var key = description.Program.Id;
             if (_pendingComputePipelines.TryGetValue(key, out var pending))
             {
-                if (!pending.Compile.IsCompleted && description.Stage.Bindings is { CallTargetCount: not 0 })
+                if (!pending.Compile.IsCompleted)
                 {
                     return false;
                 }
