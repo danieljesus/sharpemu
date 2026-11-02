@@ -74,13 +74,14 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        // On the render thread: wait for the present in flight and handle its result (recreation, errors). While the
-        // swapchain is being recreated anyway, only errors are raised.
-        private void FinishAsyncPresent(bool recreating = false)
+        // On the render thread: wait for the present in flight and handle its result (recreation, errors); true when the
+        // swapchain was recreated. While it is being recreated anyway, only errors are raised. Called before the next
+        // presentation is taken: the flip pacing (CanPresentFlip) must see the previous flip's presentation timestamp.
+        private bool FinishAsyncPresent(bool recreating = false)
         {
             if (_asyncPresent is not { } queue)
             {
-                return;
+                return false;
             }
 
             bool finished;
@@ -93,26 +94,29 @@ internal static unsafe partial class VulkanVideoPresenter
             queue.MaybeReport();
             if (!finished)
             {
-                return;
+                return false;
             }
 
             var presentResult = (Result)result;
             if (recreating && presentResult is Result.ErrorOutOfDateKhr or Result.SuboptimalKhr)
             {
-                return;
+                return false;
             }
 
             if (presentResult == Result.ErrorOutOfDateKhr)
             {
                 RecreateSwapchainResources("vkQueuePresentKHR", presentResult);
-                return;
+                return true;
             }
 
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
             if (presentResult == Result.SuboptimalKhr)
             {
                 RecreateSwapchainResources("present suboptimal", presentResult);
+                return true;
             }
+
+            return false;
         }
 
         // At shutdown: the present in flight finishes; its result no longer matters.

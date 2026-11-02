@@ -205,6 +205,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (FinishAsyncPresent()) // [local] SHARPEMU_ASYNC_PRESENT: the previous flip is reported before pacing the next
+            {
+                return;
+            }
+
             bool tookPresentation;
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.TakePresentation))
             {
@@ -330,7 +335,6 @@ internal static unsafe partial class VulkanVideoPresenter
 
 
             Diagnostics.LabelTimeline.Log('K', 4); // [local]
-            FinishAsyncPresent(); // [local] SHARPEMU_ASYNC_PRESENT: the previous present, before the acquire
             uint imageIndex;
             Result acquireResult;
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Acquire))
@@ -462,17 +466,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 var asyncPresent = _asyncPresent ??= new AsyncPresentQueue(PresentOnThread, CompletePresentOnThread, Console.Error.WriteLine);
                 _presentedSequence = presentation.Sequence;
                 asyncPresent.Submit(_submitTimeline, imageIndex, presentation.FlipRequestId);
-                if (AsyncPresentQueue.Mode == 2)
-                {
-                    FinishAsyncPresent();
-                }
-
                 Diagnostics.LabelTimeline.Log('K', 6);
                 PerfOverlay.RecordPresent();
                 RenderPhaseProfile.RecordFrame();
                 CollectCompletedGuestSubmissions(waitForOldest: false);
                 _imageInitialized[imageIndex] = true;
                 _currentFrameSlot = (frameSlot + 1) % MaxFramesInFlight;
+                if (AsyncPresentQueue.Mode == 2)
+                {
+                    FinishAsyncPresent(); // verify: waited for at once, as the synchronous call
+                }
+
                 return;
             }
 

@@ -10,7 +10,8 @@ namespace SharpEmu.Libs.VideoOut;
 // and semaphores are the same; only the host thread that calls the present changes. The present thread waits for the
 // submit thread to queue the presentation's tick (the binary semaphore's signal), takes the queue gate, presents, and
 // then reports the flip to the guest (presented, or discarded when the swapchain is out of date), as the render thread
-// did right after the call. One present is in flight at most: the render thread waits for it before its next acquire
+// did right after the call. One present is in flight at most: the render thread waits for it before it takes the next
+// presentation (the flip pacing reads the previous flip's presentation time), before its next acquire
 // (the swapchain needs external synchronization between the two), before recreating the swapchain and at shutdown,
 // and handles its result there (recreation, errors). =2 (verify) takes the same path but waits for the present right
 // after handing it off, as the synchronous call did. Both modes count invariant violations (a hand-off while a
@@ -130,7 +131,7 @@ internal sealed class AsyncPresentQueue : IDisposable
         if (_reportAt == 0) _reportAt = now + 30 * Stopwatch.Frequency;
         if (now < _reportAt) return;
         _reportAt = now + 30 * Stopwatch.Frequency;
-        _sink($"[ASYNC_PRESENT] mode={Mode} presents={Interlocked.Read(ref Presents)} violations={Interlocked.Read(ref Violations)} render_wait_ms={WaitTicks * 1000.0 / Stopwatch.Frequency:F1}");
+        _sink(FormattableString.Invariant($"[ASYNC_PRESENT] mode={Mode} presents={Interlocked.Read(ref Presents)} violations={Interlocked.Read(ref Violations)} render_wait_ms={WaitTicks * 1000.0 / Stopwatch.Frequency:F1}"));
     }
 
     private void Run()
@@ -188,6 +189,6 @@ internal sealed class AsyncPresentQueue : IDisposable
             if (_hasResult) Violations++;
         }
 
-        _sink?.Invoke($"[ASYNC_PRESENT] mode={Mode} presents={Presents} violations={Violations} render_wait_ms={WaitTicks * 1000.0 / Stopwatch.Frequency:F1} final=1");
+        _sink?.Invoke(FormattableString.Invariant($"[ASYNC_PRESENT] mode={Mode} presents={Presents} violations={Violations} render_wait_ms={WaitTicks * 1000.0 / Stopwatch.Frequency:F1} final=1"));
     }
 }
