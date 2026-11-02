@@ -20,7 +20,7 @@ namespace SharpEmu.Libs.VideoOut;
 internal sealed class AsyncPresentQueue : IDisposable
 {
     private static readonly int EnvironmentMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_PRESENT"), out var mode) ? mode : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_PRESENT"), out var mode) ? mode : 1; // [local] 1 by default, =0 off
 
     private static readonly AsyncLocal<int?> ModeOverride = new();
 
