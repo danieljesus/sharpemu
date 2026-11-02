@@ -42,10 +42,10 @@ internal static partial class Program
     private const uint FILE_SHARE_WRITE = 0x00000002;
     private const uint OPEN_EXISTING = 3;
 
-    // [local] SHARPEMU_GC_GEN0_MB (default 64; 0 keeps the runtime's own budget): the minimum gen0 budget of the
-    // processes this one starts (the mitigated emulator child), passed as DOTNET_GCgen0size, which the GC reads at
-    // startup. The renderer allocates ~230 MB/s static and ~380 MB/s in camera moves; the default budget then means
-    // ~20 gen0 collections and ~40-47 ms of pauses per second. An explicit DOTNET_GCgen0size is left alone.
+    // [local] SHARPEMU_GC_GEN0_MB (default 64, 192 with SHARPEMU_MATERIALIZE_POH=1; 0 keeps the runtime's own budget):
+    // the minimum gen0 budget of the processes this one starts (the mitigated emulator child), passed as
+    // DOTNET_GCgen0size, which the GC reads at startup. The renderer allocates ~230 MB/s static and ~380 MB/s in camera
+    // moves; the default budget then means ~20 gen0 collections and ~40-47 ms of pauses per second. An explicit DOTNET_GCgen0size is left alone.
     private static void ApplyChildGcBudget()
     {
         if (Environment.GetEnvironmentVariable("DOTNET_GCgen0size") is not null)
@@ -53,7 +53,11 @@ internal static partial class Program
             return;
         }
 
-        var megabytes = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_GC_GEN0_MB"), out var value) ? value : 64;
+        // [local] SHARPEMU_MATERIALIZE_POH=1 keeps the resource cache's arrays out of gen0/gen1, so each collection
+        // promotes less and the runtime's own budget falls to this floor: twice the collections for the same total
+        // pause (GTA V panning, 2026-11-02). 192 MB keeps the collections as rare as before, each half as long.
+        var fallback = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_POH") == "1" ? 192 : 64;
+        var megabytes = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_GC_GEN0_MB"), out var value) ? value : fallback;
         if (megabytes > 0)
         {
             Environment.SetEnvironmentVariable("DOTNET_GCgen0size", ((ulong)megabytes << 20).ToString("X"));
