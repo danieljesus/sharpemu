@@ -341,7 +341,8 @@ public sealed class ResourceMaterializationCache
                 return true;
             }
 
-            if (RebaseMode != 0)
+            var rebaseMode = RebaseMode;
+            if (rebaseMode != 0)
             {
                 for (var variant = cached; variant is not null && shifted is null; variant = variant.Next)
                 {
@@ -364,7 +365,8 @@ public sealed class ResourceMaterializationCache
                 {
                     Interlocked.Increment(ref _rebaseCandidates);
                     var trust = _rebaseTrust.GetValueOrDefault(plan.Hash);
-                    if (RebaseMode == 3 || (RebaseMode == 1 && trust >= RebaseConfirmations && (++_rebaseUses & RebaseSampleMask) != 0))
+                    var sampled = rebaseMode is 1 or 4;
+                    if (rebaseMode == 3 || (sampled && trust >= RebaseConfirmations && (++_rebaseUses & RebaseSampleMask) != 0))
                     {
                         shifted.Next = cached;
                         TrimVariants(shifted);
@@ -372,13 +374,15 @@ public sealed class ResourceMaterializationCache
                         Hits++;
                         Interlocked.Increment(ref _totalHits);
                         Interlocked.Increment(ref _rebaseHits);
+                        RebaseHits++;
+                        NoteWatched(plan.Hash, hit: true);
                         snapshot = shifted.Snapshot;
                         specialization = shifted.Specialization;
                         failure = default;
                         return true;
                     }
 
-                    if (trust < 0 && RebaseMode == 1)
+                    if (trust < 0 && sampled)
                         shifted = null;
                 }
             }
@@ -515,8 +519,24 @@ public sealed class ResourceMaterializationCache
     // =2 verifies every candidate against the full walk (the walk's result is used); =1 uses a plan's candidates
     // once RebaseConfirmations of them agreed with the walk, rejects the plan for good on one disagreement, and
     // keeps verifying one use in RebaseSampleMask + 1; =3 uses every candidate unverified (measurement only).
-    internal static readonly int RebaseMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_REBASE"), out var rebaseMode) ? rebaseMode : 1;
-    private static readonly bool SplitByBaseAddress = RebaseMode != 0;
+    // Since 2026-11-03 a recorded word that read the same, and whose value is a moved base (a moved word's old value
+    // or a moved user-data pointer), refuses: output words are taken to their new values by value, so such a word
+    // copied into a buffer, table slot or range base would move too while the walk keeps it (coincident_word).
+    // =4 and =5 are =1 and =2 without that check (the rule before 2026-11-03, for A/B).
+    internal static int RebaseMode => RebaseModeOverrideValue.Value ?? DefaultRebaseMode;
+
+    private static readonly int DefaultRebaseMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_REBASE"), out var rebaseMode) ? rebaseMode : 1;
+    private static readonly System.Threading.AsyncLocal<int?> RebaseModeOverrideValue = new();
+
+    // For tests: this async flow's mode, null for the environment's. Only between non-zero modes: the recorder
+    // splits ranges by base address when the environment's mode is non-zero (SplitByBaseAddress, read per word).
+    internal static int? RebaseModeOverride
+    {
+        get => RebaseModeOverrideValue.Value;
+        set => RebaseModeOverrideValue.Value = value;
+    }
+
+    private static readonly bool SplitByBaseAddress = DefaultRebaseMode != 0;
     private static readonly bool RebaseLog = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_REBASE_LOG") == "1";
     private const ulong ConflictingBaseAddress = ulong.MaxValue;
     private const int RebaseConfirmations = 4;
@@ -528,6 +548,29 @@ public sealed class ResourceMaterializationCache
     private static readonly Dictionary<ulong, (long Agreed, long Mismatched)> _rebaseByPlan = new();
     private static int _rebaseMismatchLogs;
     private static long _rebaseMismatchTotal;
+
+    // Rebased hits of this cache (the static counters are process-wide).
+    public long RebaseHits { get; private set; }
+
+    // SHARPEMU_MATERIALIZE_REBASE_WATCH=hash[/hash...]: cumulative counts of these plans in the report.
+    private static readonly HashSet<ulong> RebaseWatch = (Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_REBASE_WATCH") ?? "")
+        .Split(['/', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(value => ulong.TryParse(value.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? value[2..] : value,
+            System.Globalization.NumberStyles.HexNumber, null, out var hash) ? hash : 0)
+        .Where(hash => hash != 0).ToHashSet();
+    private static readonly Dictionary<ulong, (long Tries, long Refused, long Hits, long Agreed, long Mismatched)> _rebaseWatched = new();
+
+    private static void NoteWatched(ulong planHash, bool tried = false, bool refused = false, bool hit = false, bool agreed = false, bool mismatched = false)
+    {
+        if (RebaseWatch.Count == 0 || !RebaseWatch.Contains(planHash))
+            return;
+        lock (_rebaseWatched)
+        {
+            var entry = _rebaseWatched.GetValueOrDefault(planHash);
+            _rebaseWatched[planHash] = (entry.Tries + (tried ? 1 : 0), entry.Refused + (refused ? 1 : 0), entry.Hits + (hit ? 1 : 0),
+                entry.Agreed + (agreed ? 1 : 0), entry.Mismatched + (mismatched ? 1 : 0));
+        }
+    }
 
     private static string TakeRebaseReport()
     {
@@ -548,8 +591,16 @@ public sealed class ResourceMaterializationCache
             _rebaseByPlan.Clear();
         }
 
+        var watched = string.Empty;
+        if (RebaseWatch.Count != 0)
+        {
+            lock (_rebaseWatched)
+                watched = " rebase_watch=[" + string.Join(",", _rebaseWatched.Select(pair => FormattableString.Invariant(
+                    $"{pair.Key:X16}:tries={pair.Value.Tries}/refused={pair.Value.Refused}/hits={pair.Value.Hits}/agreed={pair.Value.Agreed}/mismatched={pair.Value.Mismatched}"))) + "]";
+        }
+
         return FormattableString.Invariant(
-            $" rebase_candidates={Interlocked.Exchange(ref _rebaseCandidates, 0)} rebase_hits={Interlocked.Exchange(ref _rebaseHits, 0)} rebase_agreed={Interlocked.Exchange(ref _rebaseAgreed, 0)} rebase_mismatches={Interlocked.Exchange(ref _rebaseMismatches, 0)} rebase_mismatches_total={Interlocked.Read(ref _rebaseMismatchTotal)} rebase_unverifiable={Interlocked.Exchange(ref _rebaseUnverifiable, 0)} rebase_rejected_plans={Interlocked.Read(ref _rebaseRejectedPlans)} rebase_refusals=[{refusals}] rebase_plans=[{plans}]");
+            $" rebase_candidates={Interlocked.Exchange(ref _rebaseCandidates, 0)} rebase_hits={Interlocked.Exchange(ref _rebaseHits, 0)} rebase_agreed={Interlocked.Exchange(ref _rebaseAgreed, 0)} rebase_mismatches={Interlocked.Exchange(ref _rebaseMismatches, 0)} rebase_mismatches_total={Interlocked.Read(ref _rebaseMismatchTotal)} rebase_unverifiable={Interlocked.Exchange(ref _rebaseUnverifiable, 0)} rebase_rejected_plans={Interlocked.Read(ref _rebaseRejectedPlans)} rebase_refusals=[{refusals}] rebase_plans=[{plans}]{watched}");
     }
 
     private static void Refuse(string reason)
@@ -574,6 +625,13 @@ public sealed class ResourceMaterializationCache
     }
 
     private Entry? TryShift(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader)
+    {
+        var shifted = TryShift(entry, inputs, residentReader, exact: RebaseMode is not (4 or 5));
+        NoteWatched(entry.Plan.Hash, tried: true, refused: shifted is null);
+        return shifted;
+    }
+
+    private Entry? TryShift(Entry entry, ResourceRuntimeInputs inputs, ResidentGuestBytesReader residentReader, bool exact)
     {
         var count = entry.RangeAddresses.Length;
         if (entry.RangeReadBase is not { } readBases)
@@ -689,6 +747,20 @@ public sealed class ResourceMaterializationCache
                 grown |= movedBases.Add(was);
             if (!grown)
                 break;
+        }
+
+        // A word that read the same but holds a moved base: what it reached in the output would be moved by value.
+        if (exact)
+        {
+            for (var offset = 0; offset < current.Length; offset += sizeof(uint))
+            {
+                var now = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(current.AsSpan(offset));
+                if (now == System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(entry.Bytes.AsSpan(offset)) && movedBases.Contains(now))
+                {
+                    Refuse("coincident_word");
+                    return null;
+                }
+            }
         }
 
         var bufferMap = new Dictionary<uint, uint>(substitutions);
@@ -824,6 +896,8 @@ public sealed class ResourceMaterializationCache
             _rebaseByPlan[planHash] = difference is null ? (entry.Agreed + 1, entry.Mismatched) : (entry.Agreed, entry.Mismatched + 1);
         }
 
+        NoteWatched(planHash, agreed: difference is null, mismatched: difference is not null);
+
         if (difference is null)
         {
             Interlocked.Increment(ref _rebaseAgreed);
@@ -840,8 +914,8 @@ public sealed class ResourceMaterializationCache
             Interlocked.Increment(ref _rebaseRejectedPlans);
         }
 
-        // Always printed (the first 64, then every 1024th), with or without SHARPEMU_PROFILE_RENDER: grep for it.
-        if (Interlocked.Increment(ref _rebaseMismatchLogs) <= 64 || (total & 1023) == 0)
+        // Always printed (the first 64, then every 1024th, and a plan's first), with or without SHARPEMU_PROFILE_RENDER: grep for it.
+        if (Interlocked.Increment(ref _rebaseMismatchLogs) <= 64 || (total & 1023) == 0 || trust >= 0)
             Console.Error.WriteLine($"[MATERIALIZE_REBASE_MISMATCH] plan=0x{planHash:X16} total={total} {difference}");
     }
 
