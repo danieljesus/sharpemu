@@ -8,7 +8,7 @@ using SharpEmu.Libs.VideoOut;
 
 namespace SharpEmu.Libs.Diagnostics;
 
-// [local] SHARPEMU_FRAME_MISS_PROBE=1 (off): what the presentations that missed the 30 Hz grid spent their time on. It turns
+// [local] SHARPEMU_FRAME_MISS_PROBE=1 (off; =2 adds the per-draw phases): what the presentations that missed the 30 Hz grid spent their time on. It turns
 // on the flip timestamps of SHARPEMU_FLIP_PROBE (and its [FLIP_PROBE]/[FLIP_PACING] lines) and adds cheap cumulative
 // counters, one Interlocked add per event: the render phases that wait (GPU completion, frame slot, uploads, the submit
 // thread, idle) and the compiles, timed through the dormant RenderPhaseProfile scopes without the phase profiler, per thread
@@ -20,7 +20,11 @@ namespace SharpEmu.Libs.Diagnostics;
 // how late) and [FRAME_ATTR] (per counter, mean ms per interval on missed and on normal presentations, ranked).
 internal static class FrameMissProbe
 {
-    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_FRAME_MISS_PROBE") == "1";
+    private static readonly string? Mode = Environment.GetEnvironmentVariable("SHARPEMU_FRAME_MISS_PROBE");
+    internal static readonly bool Enabled = Mode is "1" or "2";
+
+    // =2 also times the render thread's coarse per-draw phases (two timestamps per scope, ~1300 draws a frame).
+    private static readonly bool Detail = Mode == "2";
 
     internal enum Role : byte
     {
@@ -62,7 +66,31 @@ internal static class FrameMissProbe
         Count,
     }
 
-    private static readonly RenderPhaseProfile.Phase[] TrackedPhases =
+    private static readonly RenderPhaseProfile.Phase[] DetailPhases =
+    [
+        RenderPhaseProfile.Phase.CommandMemorySync,
+        RenderPhaseProfile.Phase.CommandMemoryRead,
+        RenderPhaseProfile.Phase.CommandDrawTranslation,
+        RenderPhaseProfile.Phase.CommandDispatchTranslation,
+        RenderPhaseProfile.Phase.DrawExecutor,
+        RenderPhaseProfile.Phase.DrawResourcePreparation,
+        RenderPhaseProfile.Phase.StageImagePreparation,
+        RenderPhaseProfile.Phase.ProgramPreparation,
+        RenderPhaseProfile.Phase.ResourceMaterialization,
+        RenderPhaseProfile.Phase.DescriptorPreparation,
+        RenderPhaseProfile.Phase.DescriptorCommit,
+        RenderPhaseProfile.Phase.ImageLookup,
+        RenderPhaseProfile.Phase.ImageUpload,
+        RenderPhaseProfile.Phase.ImageTransitions,
+        RenderPhaseProfile.Phase.BufferDirtySynchronization,
+        RenderPhaseProfile.Phase.BufferStagingUpload,
+        RenderPhaseProfile.Phase.BufferStreamUpload,
+        RenderPhaseProfile.Phase.BufferFaults,
+        RenderPhaseProfile.Phase.Flush,
+        RenderPhaseProfile.Phase.QueueSubmit,
+    ];
+
+    private static readonly RenderPhaseProfile.Phase[] CoarsePhases =
     [
         RenderPhaseProfile.Phase.Idle,
         RenderPhaseProfile.Phase.IdleBlockedCommands,
@@ -83,6 +111,8 @@ internal static class FrameMissProbe
         RenderPhaseProfile.Phase.PipelineCreation,
     ];
 
+    // Static fields initialize in order: after both lists.
+    private static readonly RenderPhaseProfile.Phase[] TrackedPhases = Detail ? [.. CoarsePhases, .. DetailPhases] : CoarsePhases;
     private static readonly int[] PhaseSlot = BuildPhaseSlots();
     private static readonly int RoleCount = (int)Role.Count - 1;
     private static readonly int PhaseBase = (int)Counter.Count;
