@@ -41,6 +41,10 @@ public sealed class ResourceMaterializationCache
     // thousands of draws, so every one stored since the previous collection survives it: ~6 MB/s of entries and their
     // arrays were the bulk of what each gen0 promoted (~10 MB, ~1 ms per MB) and gen1 copied again into gen2. Pinned
     // arrays are never marked or copied by gen0/gen1 collections. Same values, other heap: nothing to verify.
+    // Measured (with the 192 MB gen0 floor the CLI then sets): gen0 pauses 11.3 -> 7.9 ms, gen1 28 -> 16 ms, total pause
+    // 291-390 -> 216 ms per 30 s (~0.2 ms/frame), but the pinned allocations cost more: materialization +0.46 ms/frame
+    // on the render thread and +1.65 ms/frame on the front (hits +0.8, misses +0.8). Panning A/B -0.09 FPS (5 of 6
+    // pairs lower), static -0.03, misses not fewer. Left off.
     internal static readonly bool DefaultRetainPinned = Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_POH") == "1";
 
     public bool RetainPinned { get; init; } = DefaultRetainPinned;
