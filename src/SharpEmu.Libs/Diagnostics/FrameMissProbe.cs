@@ -57,6 +57,8 @@ internal static class FrameMissProbe
         ReadbackSubmit,
         ReadbackEmulator,
         ReadbackGuest,
+        PresentLock,
+        PresentCall,
         Count,
     }
 
@@ -248,6 +250,11 @@ internal sealed class FrameMissTracker
     internal readonly long[] IntervalHistogram = new long[IntervalBins];
     internal readonly long[] SkippedHistogram = new long[4];
     internal readonly long[] LateHistogram = new long[LateBins];
+    // Time left before the end of the first usable slot when the render thread captured the flip (its presentation could
+    // follow), 1 ms bins from 0 to 34, clamped; misses not included.
+    internal readonly long[] SlackHistogram = new long[35];
+    // Per stage (FlipTimes order), the lead of normal presentations over that deadline, 1 ms bins from 0 to 199, clamped.
+    internal readonly long[][] LeadHistogram = Enumerable.Range(0, StageNames.Length).Select(_ => new long[200]).ToArray();
     internal long Presentations, Misses, SkippedSlots;
     internal readonly double[] MissSum, NormalSum, MissPreviousSum;
     internal long MissFrames, NormalFrames;
@@ -326,6 +333,12 @@ internal sealed class FrameMissTracker
             Presentations++;
             IntervalHistogram[IntervalBin(record.IntervalMs)]++;
             SkippedHistogram[Math.Min(record.Skipped, 3)]++;
+            if (record.Skipped == 0 && lastSlot >= 0 && flipInterval > 0)
+                for (var stage = 0; stage < StageNames.Length; stage++)
+                    if (flip.At(stage) is var at and not 0)
+                        LeadHistogram[stage][Math.Clamp((int)Ms(openedAt + (lastSlot + 2) * flipInterval - at), 0, 199)]++;
+            if (record.Skipped == 0 && lastSlot >= 0 && flipInterval > 0)
+                SlackHistogram[Math.Clamp((int)Ms(openedAt + (lastSlot + 2) * flipInterval - (flip.Captured != 0 ? flip.Captured : flip.Presented)), 0, SlackHistogram.Length - 1)]++;
             var previous = _ringCount >= 2 ? _ring[(_ringCount - 2) % _ring.Length] : null;
             if (record.Skipped > 0)
             {
@@ -422,19 +435,43 @@ internal sealed class FrameMissTracker
         for (var bin = 0; bin < LateBins; bin++)
         {
             if (LateHistogram[bin] == 0) continue;
-            var label = bin == 0 ? $"<{LateEdges[0]}" : bin == LateEdges.Length ? $">={LateEdges[^1]}" : $"{LateEdges[bin - 1]}-{LateEdges[bin]}";
+            var label = bin == 0 ? FormattableString.Invariant($"<{LateEdges[0]}")
+                : bin == LateEdges.Length ? FormattableString.Invariant($">={LateEdges[^1]}")
+                : FormattableString.Invariant($"{LateEdges[bin - 1]}-{LateEdges[bin]}");
             late.Append(CultureInfo.InvariantCulture, $" {label}:{LateHistogram[bin]}");
         }
 
+        var slack = string.Join(" ", Enumerable.Range(0, SlackHistogram.Length).Where(bin => SlackHistogram[bin] != 0)
+            .Select(bin => string.Create(CultureInfo.InvariantCulture, $"{bin}:{SlackHistogram[bin]}")));
+        var leads = new StringBuilder();
+        for (var stage = 0; stage < StageNames.Length; stage++)
+        {
+            var bins = LeadHistogram[stage];
+            var total = bins.Sum();
+            if (total == 0) continue;
+            int Percentile(double fraction)
+            {
+                var target = (long)Math.Ceiling(total * fraction);
+                var seen = 0L;
+                for (var bin = 0; bin < bins.Length; bin++)
+                    if ((seen += bins[bin]) >= Math.Max(1, target)) return bin;
+                return bins.Length - 1;
+            }
+
+            leads.Append(CultureInfo.InvariantCulture, $" {StageNames[stage]}={Percentile(0.1)}/{Percentile(0.5)}/{Percentile(0.9)}");
+        }
+
         yield return string.Create(CultureInfo.InvariantCulture,
-            $"[FRAME_HIST] uptime_s={(now - _originTicks) / (double)_frequency:F0} presentations={Presentations} misses={Misses} skipped_slots={SkippedSlots} by_skipped=[1:{SkippedHistogram[1]} 2:{SkippedHistogram[2]} 3+:{SkippedHistogram[3]}] late_ms=[{late.ToString().Trim()}] interval_ms_0.5=[{hist.ToString().Trim()}]");
+            $"[FRAME_LEAD] normal presentations, ms before the end of their slot, p10/p50/p90:{leads}");
+        yield return string.Create(CultureInfo.InvariantCulture,
+            $"[FRAME_HIST] uptime_s={(now - _originTicks) / (double)_frequency:F0} presentations={Presentations} misses={Misses} skipped_slots={SkippedSlots} by_skipped=[1:{SkippedHistogram[1]} 2:{SkippedHistogram[2]} 3+:{SkippedHistogram[3]}] late_ms=[{late.ToString().Trim()}] slack_ms_1=[{slack}] interval_ms_0.5=[{hist.ToString().Trim()}]");
         if (MissFrames == 0) yield break;
         var normal = Math.Max(1, NormalFrames);
         var ranked = Enumerable.Range(0, _names.Length)
             .Select(index => (Index: index, Miss: MissSum[index] / MissFrames, Before: MissPreviousSum[index] / MissFrames, Normal: NormalSum[index] / normal))
             .Where(entry => entry.Miss + entry.Before + entry.Normal > 0.01)
             .OrderByDescending(entry => _isCount[entry.Index] ? double.MinValue : entry.Miss - entry.Normal)
-            .Take(24);
+            .Take(40);
         var builder = new StringBuilder(string.Create(CultureInfo.InvariantCulture,
             $"[FRAME_ATTR] miss_frames={MissFrames} normal_frames={NormalFrames} per_interval miss/before/normal:"));
         foreach (var entry in ranked)

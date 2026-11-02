@@ -457,9 +457,16 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 // [local] The present waits on a binary semaphore: its signal must be submitted first.
                 _scheduler.WaitSubmitted(_submitTimeline);
+                var missLock = Diagnostics.FrameMissProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
                 lock (_queueGate)
                 {
+                    var missCall = missLock != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
                     presentResult = _swapchainApi.QueuePresent(_queue, &presentInfo);
+                    if (missLock != 0)
+                    {
+                        Diagnostics.FrameMissProbe.Add(Diagnostics.FrameMissProbe.Counter.PresentLock, missCall - missLock);
+                        Diagnostics.FrameMissProbe.Add(Diagnostics.FrameMissProbe.Counter.PresentCall, System.Diagnostics.Stopwatch.GetTimestamp() - missCall);
+                    }
                 }
             }
 

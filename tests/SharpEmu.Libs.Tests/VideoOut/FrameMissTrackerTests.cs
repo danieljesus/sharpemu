@@ -78,6 +78,20 @@ public sealed class FrameMissTrackerTests
     }
 
     [Fact]
+    public void SlackIsTheTimeLeftAfterTheCaptureBeforeTheDeadline()
+    {
+        var lines = new List<string>();
+        var tracker = Create(lines);
+        tracker.Presented(At(Slot), 0, Slot, [0, 0]);
+        // Due in slot 2 (ending at 3 * Slot), captured 5.2 ms before that end.
+        tracker.Presented(new FrameMissTracker.FlipTimes { Captured = 3 * Slot - 5_200, Presented = 3 * Slot - 5_000 }, 0, Slot, [0, 0]);
+        Assert.Equal(1, tracker.SlackHistogram[5]);
+        var report = tracker.Report(3 * Slot).ToList();
+        Assert.Equal("[FRAME_LEAD] normal presentations, ms before the end of their slot, p10/p50/p90: captured=5/5/5 presented=5/5/5", report[0]);
+        Assert.Contains("slack_ms_1=[5:1]", report[1]);
+    }
+
+    [Fact]
     public void PresentationsBeforeTheStartAreLeftOut()
     {
         var lines = new List<string>();
@@ -101,8 +115,8 @@ public sealed class FrameMissTrackerTests
         tracker.Presented(At(2 * Slot), 0, Slot, [2_000, 0]);
         tracker.Presented(At(4 * Slot), 0, Slot, [30_000, 1]);
         var report = tracker.Report(4 * Slot).ToList();
-        Assert.StartsWith("[FRAME_HIST]", report[0]);
-        Assert.Contains("misses=1 skipped_slots=1", report[0]);
-        Assert.Contains("[FRAME_ATTR] miss_frames=1 normal_frames=1 per_interval miss/before/normal: Wait=28.00/2.00/2.00 Compiles=1.00/0.00/0.00", report[1]);
+        Assert.StartsWith("[FRAME_HIST]", report[1]);
+        Assert.Contains("misses=1 skipped_slots=1", report[1]);
+        Assert.Contains("[FRAME_ATTR] miss_frames=1 normal_frames=1 per_interval miss/before/normal: Wait=28.00/2.00/2.00 Compiles=1.00/0.00/0.00", report[2]);
     }
 }
