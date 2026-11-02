@@ -1100,6 +1100,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (result is SliceResult.Progressed or SliceResult.Completed)
                     {
                         Interlocked.Add(ref _frontWorkTicks, System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted);
+                        if (Diagnostics.FrameMissProbe.Enabled) // [local]
+                            Diagnostics.FrameMissProbe.Add(Diagnostics.FrameMissProbe.Counter.FrontWork, System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted);
                     }
 
                     if (Diagnostics.LabelTimeline.Enabled) // [local] SHARPEMU_LABEL_TIMELINE: X front state (0 ran, 1 all blocked, 2 no work), wait kind, address

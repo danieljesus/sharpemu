@@ -12,11 +12,12 @@ namespace SharpEmu.Libs.Diagnostics;
 // reserved a new one (queue depth in flips).
 internal static class FlipLatencyProbe
 {
-    public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_FLIP_PROBE") == "1";
+    public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_FLIP_PROBE") == "1" ||
+        FrameMissProbe.Enabled; // [local] SHARPEMU_FRAME_MISS_PROBE rides these timestamps
 
     private sealed class Flip
     {
-        public long T1, T2, T3, T6, T7;
+        public long T0, T1, T2, T3, T6, T7; // [local] T0: the guest queued the submission the front reserved it in
         public ulong Tick;
         public int Depth;
     }
@@ -40,7 +41,7 @@ internal static class FlipLatencyProbe
         {
             var depth = 0;
             foreach (var flip in Open.Values) if (flip.T2 == 0) depth++;
-            Open[requestId] = new Flip { T1 = Stopwatch.GetTimestamp(), Depth = depth };
+            Open[requestId] = new Flip { T0 = Volatile.Read(ref FrameMissProbe.FrontSubmissionCreatedAt), T1 = Stopwatch.GetTimestamp(), Depth = depth };
         }
     }
 
@@ -112,6 +113,25 @@ internal static class FlipLatencyProbe
                 var earliest = Math.Max(completed, _lastSlot >= 0 ? openedAt + (_lastSlot + 1) * flipInterval : slotBoundary);
                 if (completed != 0) PickupDelay.Add(Ms(flip.T7 - earliest));
                 _lastSlot = slot;
+            }
+
+            if (FrameMissProbe.Enabled) // [local]
+            {
+                var tickSlot = (int)(flip.Tick & (TickRing - 1));
+                long completed;
+                lock (CompletedAt) completed = CompletedTick[tickSlot] == flip.Tick ? CompletedAt[tickSlot] : 0;
+                var times = new FrameMissTracker.FlipTimes
+                {
+                    Queued = flip.T0,
+                    Reserved = flip.T1,
+                    RenderStarted = flip.T2,
+                    Captured = flip.T3,
+                    Submitted = Volatile.Read(ref SubmittedTick[tickSlot]) == flip.Tick ? SubmittedAt[tickSlot] : 0,
+                    GpuCompleted = completed,
+                    FlipCompleted = flip.T6,
+                    Presented = flip.T7,
+                };
+                FrameMissProbe.Presented(times, openedAt, flipInterval);
             }
 
             Report(flip.T7);

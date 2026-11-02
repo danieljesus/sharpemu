@@ -1265,7 +1265,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void ReportPipelineCreation(long elapsedMilliseconds, string kind, string stages, string spirv)
         {
             Interlocked.Add(ref _pipelineCreationMilliseconds, elapsedMilliseconds);
-            if (Gpu.Pipelines.CompileLog.Enabled) // [local] SHARPEMU_COMPILE_LOG: the async compile ran on a compiler worker
+            if (Gpu.Pipelines.CompileLog.Timed) // [local] SHARPEMU_COMPILE_LOG: the async compile ran on a compiler worker
                 Gpu.Pipelines.CompileLog.Note(kind, elapsedMilliseconds, 0, $"{stages} spirv_bytes={spirv}".Replace(' ', ','),
                     kind == "compute-async" ? "compile_worker" : null);
             if (elapsedMilliseconds < SlowPipelineCreationMilliseconds)

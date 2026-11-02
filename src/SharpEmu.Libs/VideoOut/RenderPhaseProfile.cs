@@ -372,6 +372,14 @@ internal static class RenderPhaseProfile
         private readonly long _started;
         private readonly long _charges;
         private readonly long _allocated;
+        // [local] SHARPEMU_FRAME_MISS_PROBE without the profiler: when a tracked phase's scope began.
+        private readonly long _missStarted;
+
+        internal Scope(Phase phase, long missStarted)
+        {
+            _phase = phase;
+            _missStarted = missStarted;
+        }
 
         internal Scope(Phase previous)
         {
@@ -393,6 +401,7 @@ internal static class RenderPhaseProfile
         {
             if (!_active)
             {
+                if (_missStarted != 0) Diagnostics.FrameMissProbe.AddPhase(_phase, Stopwatch.GetTimestamp() - _missStarted); // [local]
                 return;
             }
 
@@ -422,7 +431,7 @@ internal static class RenderPhaseProfile
     {
         if (!Enabled)
         {
-            return default;
+            return Diagnostics.FrameMissProbe.Enabled ? MissScope(phase) : default; // [local]
         }
 
         var previous = Charge(phase);
@@ -465,7 +474,12 @@ internal static class RenderPhaseProfile
     // Cache calls on other threads must not enter the render-thread counters.
     // Check the switch first to avoid thread-local storage allocation when profiling is disabled.
     internal static Scope MeasureDetail(Phase phase) =>
-        Enabled && _scopeDepth > 0 && (FineEnabled || phase < Phase.BindingSetup) ? Measure(phase) : default;
+        Enabled && _scopeDepth > 0 && (FineEnabled || phase < Phase.BindingSetup) ? Measure(phase) :
+        !Enabled && Diagnostics.FrameMissProbe.Enabled ? MissScope(phase) : default; // [local]
+
+    // [local] SHARPEMU_FRAME_MISS_PROBE: a scope that only times the probe's tracked phases.
+    private static Scope MissScope(Phase phase) =>
+        Diagnostics.FrameMissProbe.Tracks(phase) ? new Scope(phase, Stopwatch.GetTimestamp()) : default;
 
     // [local] SHARPEMU_PROFILE_FINE=1: the Binding*, Dispatch*, ImageLookup* and DrawPrep* pieces. Off by default:
     // their scopes double the profiler's cost on the draw path, and their time stays in the parent phase. Every

@@ -251,6 +251,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             originStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         }
 
+        var missStarted = Diagnostics.FrameMissProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
         try
         {
             var vk = _device.Vk;
@@ -323,6 +324,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.GpuWaitEnd, Environment.CurrentManagedThreadId, 1, ticket.WaitTick, ticket.Value); // [local]
             Scheduling.GpuStarveProbe.ExitGpuWait(starveEntered);
             if (guestWait) Scheduling.RunaheadBound.ExitGuestWait();
+            if (missStarted != 0) Diagnostics.FrameMissProbe.AddReadbackWait(System.Diagnostics.Stopwatch.GetTimestamp() - missStarted); // [local]
             if (originStarted != 0)
                 Diagnostics.ReadbackOriginProbe.NoteWait(ticket.Origin, ticket.WaitTick, originCompleted, originSubmitted, originCurrent,
                     System.Diagnostics.Stopwatch.GetTimestamp() - originStarted);

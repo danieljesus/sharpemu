@@ -17,6 +17,8 @@ namespace SharpEmu.Libs.Gpu.Pipelines;
 internal static class CompileLog
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_COMPILE_LOG") == "1";
+    // [local] Call sites time their compiles for the log or for SHARPEMU_FRAME_MISS_PROBE.
+    internal static readonly bool Timed = Enabled || Diagnostics.FrameMissProbe.Enabled;
     private const double EventMilliseconds = 20;
     private static readonly long Started = Stopwatch.GetTimestamp();
     private static readonly object Gate = new();
@@ -31,6 +33,7 @@ internal static class CompileLog
 
     internal static void Note(string kind, double milliseconds, ulong hash, string detail = "", string? thread = null, bool always = false)
     {
+        if (Diagnostics.FrameMissProbe.Enabled) Diagnostics.FrameMissProbe.NoteCompile(kind, milliseconds); // [local]
         if (!Enabled)
             return;
         thread ??= ThreadLabel();

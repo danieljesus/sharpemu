@@ -974,7 +974,7 @@ internal sealed class ShaderProgramCache
             throw SubmissionScheduler.Fatal($"The shader binding layout is invalid: stage={source.Label} hash=0x{source.Hash:X16} error={exception.Message}.");
         }
 
-        var compileStarted = CompileLog.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_COMPILE_LOG
+        var compileStarted = CompileLog.Timed ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_COMPILE_LOG
         var request = BuildRequest(source, options, entry, resources, layout);
         var permutationDump = ShaderPermutationDump.WriteInputs(
             source, key, sourceWasCached, _programs.Keys, entry.Permutations,
@@ -1011,7 +1011,7 @@ internal sealed class ShaderProgramCache
         CompiledShaderDump.Write(source.Label, source.Address, source.Hash, compiled, program);
         var id = ++_nextProgramId;
         var module = _host.CreateShaderModule(compiled, source.Stage, source.Hash, id);
-        if (CompileLog.Enabled) // [local]
+        if (CompileLog.Timed) // [local]
         {
             var indirect = IndirectSignature(specialization);
             CompileLog.Note("translate", System.Diagnostics.Stopwatch.GetElapsedTime(compileStarted).TotalMilliseconds, source.Hash,

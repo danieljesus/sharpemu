@@ -281,9 +281,9 @@ public sealed unsafe class GpuTiler : IDisposable
                 },
                 Layout = _pipelineLayout,
             };
-            var compileStarted = Gpu.Pipelines.CompileLog.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_COMPILE_LOG
+            var compileStarted = Gpu.Pipelines.CompileLog.Timed ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_COMPILE_LOG
             created = vk.CreateComputePipelines(_device.Device, default, 1, &pipelineInfo, null, out pipeline);
-            if (Gpu.Pipelines.CompileLog.Enabled)
+            if (Gpu.Pipelines.CompileLog.Timed)
                 Gpu.Pipelines.CompileLog.Note("emulator", System.Diagnostics.Stopwatch.GetElapsedTime(compileStarted).TotalMilliseconds, 0, $"tiler {operation}".Replace(' ', '_'));
         }
         finally

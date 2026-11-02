@@ -34,6 +34,12 @@ internal static class SubmitThreadStats
 
     public static void Submitted(long joinTicks, long submitTicks)
     {
+        if (Diagnostics.FrameMissProbe.Enabled) // [local]
+        {
+            Diagnostics.FrameMissProbe.Add(Diagnostics.FrameMissProbe.Counter.SubmitJoin, joinTicks);
+            Diagnostics.FrameMissProbe.Add(Diagnostics.FrameMissProbe.Counter.SubmitCall, submitTicks);
+        }
+
         Interlocked.Increment(ref _submits);
         Interlocked.Add(ref _joinTicks, joinTicks);
         Interlocked.Add(ref _submitTicks, submitTicks);
@@ -59,6 +65,7 @@ internal static class SubmitThreadStats
 
     public static void Waited(long ticks)
     {
+        if (Diagnostics.FrameMissProbe.Enabled) Diagnostics.FrameMissProbe.Add(Diagnostics.FrameMissProbe.Counter.SubmitWait, ticks); // [local]
         Interlocked.Increment(ref _waits);
         Interlocked.Add(ref _waitTicks, ticks);
     }

@@ -719,6 +719,7 @@ public sealed class CommandStreamQueue
 
         SlicesRun++;
         processor.ProbeSubmissionEnqueued = submission.CreatedAt; // [local] SHARPEMU_LABEL_PROBE
+        if (Diagnostics.FrameMissProbe.Enabled) Volatile.Write(ref Diagnostics.FrameMissProbe.FrontSubmissionCreatedAt, submission.CreatedAt); // [local]
         processor.ProbeSubmission = submission;
         if (Diagnostics.LabelLatencyProbe.Enabled)
         {

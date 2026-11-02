@@ -82,7 +82,7 @@ public sealed class CommandSubmission
 {
     public CommandSubmission(CommandSubmissionKind kind, int queueId, ulong address, uint dwordCount, ulong submissionId, object? geometrySnapshots)
     {
-        CreatedAt = Diagnostics.LabelLatencyProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_LABEL_PROBE
+        CreatedAt = Diagnostics.LabelLatencyProbe.Enabled || Diagnostics.FrameMissProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_LABEL_PROBE, SHARPEMU_FRAME_MISS_PROBE
         if (Diagnostics.LabelLatencyProbe.Enabled)
         {
             ProbeGfxAtCreate = Diagnostics.LabelLatencyProbe.SliceTicks(0);

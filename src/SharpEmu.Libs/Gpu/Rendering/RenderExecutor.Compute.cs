@@ -238,7 +238,7 @@ public sealed partial class RenderExecutor
                 Thread.Sleep(1);
             }
 
-            if (waitStarted != 0 && Gpu.Pipelines.CompileLog.Enabled)
+            if (waitStarted != 0 && Gpu.Pipelines.CompileLog.Timed)
                 Gpu.Pipelines.CompileLog.Note("dispatch-wait", System.Diagnostics.Stopwatch.GetElapsedTime(waitStarted).TotalMilliseconds, program.Hash);
 
             if (Gpu.Buffers.WriteDiffProbe.Enabled) Gpu.Buffers.WriteDiffProbe.Arm(program.Hash); // [local] SHARPEMU_WRITE_DIFF
