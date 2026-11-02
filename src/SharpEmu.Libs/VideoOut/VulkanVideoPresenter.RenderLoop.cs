@@ -205,7 +205,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            if (FinishAsyncPresent()) // [local] SHARPEMU_ASYNC_PRESENT: the previous flip is reported before pacing the next
+            // [local] SHARPEMU_ASYNC_PRESENT: the previous flip is reported before the next one is paced. While its present
+            // is in flight and commands are queued, the render thread records them and takes no presentation this pass.
+            if (_asyncPresent is { Pending: true } && (_front is null ? _commandStream.HasUnblockedPending : _front.HasQueuedWork))
+            {
+                return;
+            }
+
+            if (FinishAsyncPresent())
             {
                 return;
             }
