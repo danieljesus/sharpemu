@@ -21,6 +21,9 @@ internal static class GpuStallReport
     // The last submissions (tick, last recorded operation, shader, semaphore waits), printed with the first reports.
     internal static Func<IEnumerable<string>>? History;
 
+    // [local] More lines for the first reports (SHARPEMU_INDIRECT_ARGS_PROBE: the latest indirect dispatch arguments).
+    internal static Func<IEnumerable<string>>? Extra;
+
     private static int _reports;
 
     internal static void Report(string what)
@@ -43,6 +46,21 @@ internal static class GpuStallReport
             catch (Exception exception)
             {
                 Console.Error.WriteLine($"[GPU][STALL] history_failed={exception.GetType().Name}");
+            }
+        }
+
+        if (report <= 6 && Extra is { } extra)
+        {
+            try
+            {
+                foreach (var line in extra())
+                {
+                    Console.Error.WriteLine($"[GPU][STALL] {line}");
+                }
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"[GPU][STALL] extra_failed={exception.GetType().Name}");
             }
         }
 

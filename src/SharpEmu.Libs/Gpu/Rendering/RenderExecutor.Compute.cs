@@ -129,6 +129,7 @@ public sealed partial class RenderExecutor
         var input = computeProgram.Input;
         var program = input.Stage.Program ?? throw _host.Fatal($"The compute program is missing: shader=0x{compute.Address:X16}.");
         Gpu.Buffers.TlasHle.Instance?.NoteProgram(compute.Address, program.Hash); // [local] SHARPEMU_TLAS_HLE
+        if (Gpu.Vulkan.IndirectArgsProbe.Enabled) _host.NoteIndirectArgsWriter(program.Hash, compute.UserScalars.Values.AsSpan(0, (int)compute.UserScalars.Count), groupsX); // [local]
         if (Gpu.Buffers.RayQueryHle.Instance?.NoteDispatch(program.Hash) == true) // [local] SHARPEMU_RT_RAYQUERY / SHARPEMU_RQ_MAP
             _host.ResetBindings();
         if (Diagnostics.DccWriterTrace.Enabled)
@@ -290,6 +291,7 @@ public sealed partial class RenderExecutor
 
             if (DispatchExecLog && physicalGroups[0] == 1 && physicalGroups[1] == 1 && physicalGroups[2] == 1 && _hdrDispatchLogs++ < 600) Console.Error.WriteLine($"[DISPATCH_EXEC] shader=0x{compute.Address:X} groups=1,1,1 indirect=0x{indirectArgumentsAddress:X}"); // [local]
             if (Gpu.Buffers.WriteDiffProbe.Enabled) Gpu.Buffers.WriteDiffProbe.BeforeDispatch(); // [local]
+            if (Gpu.Vulkan.IndirectArgsProbe.Enabled) Gpu.Vulkan.IndirectArgsProbe.CurrentShader = compute.Address; // [local]
             if (gpuThreadIndirect)
             {
                 if (!_host.TryDispatchIndirectThreads(indirectArgumentsAddress, bindings))

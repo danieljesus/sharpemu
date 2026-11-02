@@ -1363,14 +1363,21 @@ internal static class CompiledShaderDump
         var addressFilter = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_SPIRV_ADDRESS");
         if (!string.IsNullOrWhiteSpace(addressFilter))
         {
-            var span = addressFilter.AsSpan();
-            if (span.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            // [local] A comma-separated list of addresses.
+            var matched = false;
+            foreach (var filter in addressFilter.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
-                span = span[2..];
+                var span = filter.AsSpan();
+                if (span.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                {
+                    span = span[2..];
+                }
+
+                matched |= ulong.TryParse(span, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var filteredAddress) &&
+                    shaderAddress == filteredAddress;
             }
 
-            if (!ulong.TryParse(span, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var filteredAddress) ||
-                shaderAddress != filteredAddress)
+            if (!matched)
             {
                 return false;
             }

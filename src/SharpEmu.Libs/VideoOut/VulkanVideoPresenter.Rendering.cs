@@ -1591,12 +1591,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 Size = 3u * sizeof(uint),
             };
             VulkanSynchronization.PipelineBarrier(_vk,command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.DrawIndirectBit, 0, 0, null, 1, &barrier, 0, null);
+            var (argumentsBuffer, argumentsOffset) = IndirectArgsProbe.Enabled // [local] SHARPEMU_INDIRECT_ARGS_PROBE
+                ? RecordIndirectArgsProbe(command, buffer.Handle, offset, argumentsAddress, threadUnits: false)
+                : (buffer.Handle, offset);
             // [local] SHARPEMU_PROFILE_GPU_PASSES: an indirect dispatch is guest work with an interval of its own, not part
             // of the gap before the next marker (it was counted as gap_emu_shader).
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             var vkProbe1202 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = true; // [local] the stage path noted this command's writes
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatchIndirect(_vk, command, buffer.Handle, offset); // [local]
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatchIndirect(_vk, command, argumentsBuffer, argumentsOffset); // [local]
             Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = false;
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DispatchIndirect, vkProbe1202); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch, _profileComputePipeline, 0, 0, 0); // [local]
@@ -1666,10 +1669,13 @@ internal static unsafe partial class VulkanVideoPresenter
             var vkProbe1260 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(_vk, command, &afterInfo); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe1260); // [local]
+            var (threadsBuffer, threadsOffset) = IndirectArgsProbe.Enabled // [local] SHARPEMU_INDIRECT_ARGS_PROBE
+                ? RecordIndirectArgsProbe(command, buffer.Handle, offset, argumentsAddress, threadUnits: true)
+                : (buffer.Handle, offset);
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation); // [local] as TryDispatchIndirect
             var vkProbe1261 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = true; // [local] the stage path noted this command's writes
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatchIndirect(_vk, command, buffer.Handle, offset); // [local]
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDispatchIndirect(_vk, command, threadsBuffer, threadsOffset); // [local]
             Gpu.Vulkan.ScopeBarrierTracker.t_guestStage = false;
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.DispatchIndirect, vkProbe1261); // [local]
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Dispatch, _profileComputePipeline, 0, 0, 0); // [local]
