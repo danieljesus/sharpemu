@@ -619,7 +619,24 @@ internal static unsafe partial class VulkanVideoPresenter
 
             public bool ReadCleanWord(ulong address, out uint word) => presenter.TryReadCleanGuestWord(address, out word);
 
-            public bool ReadResident(ulong address, Span<byte> destination, bool clean) => presenter.TryReadResidentGuestBytes(address, destination, clean);
+            // A resident read the render thread refuses (the GPU owns the range) makes its materialization miss and walk
+            // the plan again, reading each recorded word through TryReadGuestWord; those synchronized words decide.
+            public bool ReadResident(ulong address, Span<byte> destination, bool clean)
+            {
+                if (presenter.TryReadResidentGuestBytes(address, destination, clean))
+                    return true;
+                if (clean || (destination.Length & 3) != 0 || (address & 3) != 0 || !presenter._guestMemory.CanRead(address, (ulong)destination.Length))
+                    return false;
+                Interlocked.Increment(ref FrontSpeculation.SynchronizedResidentReads);
+                for (var offset = 0; offset < destination.Length; offset += sizeof(uint))
+                {
+                    if (!presenter.TryReadGuestWord(address + (ulong)offset, out var word))
+                        return false;
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(destination[offset..], word);
+                }
+
+                return true;
+            }
 
             public (ulong Reader, ulong BaseAddress) Enter(ulong reader, ulong baseAddress)
             {
@@ -657,9 +674,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 prepared.Accept = null;
                 var started = System.Diagnostics.Stopwatch.GetTimestamp();
                 FrontSpeculation.Outcome outcome;
+                int index;
+                uint answered;
                 try
                 {
-                    outcome = FrontSpeculation.Validate(reads, _speculationReplay ??= new SpeculationReplay(this));
+                    outcome = FrontSpeculation.Validate(reads, _speculationReplay ??= new SpeculationReplay(this), out index, out answered);
                 }
                 finally
                 {
@@ -667,6 +686,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 var count = reads.Items.Count;
+                FrontSpeculation.NoteOutcome(prepared.Input.Stage.Program?.Hash ?? 0, outcome, reads, index, answered);
                 FrontSpeculation.Release(reads);
                 NoteFrontPreparation(key, empty: outcome != FrontSpeculation.Outcome.Same);
                 if (outcome != FrontSpeculation.Outcome.Same)

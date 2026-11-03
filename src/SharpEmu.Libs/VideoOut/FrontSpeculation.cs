@@ -93,11 +93,17 @@ internal static class FrontSpeculation
     }
 
     // Replays the reads in order and stops at the first one whose answer differs.
-    internal static Outcome Validate(Reads reads, IReplay replay)
+    internal static Outcome Validate(Reads reads, IReplay replay) => Validate(reads, replay, out _, out _);
+
+    // `index` names the first read that differs and `answer` the first word of what it answered.
+    internal static Outcome Validate(Reads reads, IReplay replay, out int index, out uint answered)
     {
         Span<byte> small = stackalloc byte[64];
-        foreach (var read in reads.Items)
+        index = -1;
+        answered = 0;
+        for (var item = 0; item < reads.Items.Count; item++)
         {
+            var read = reads.Items[item];
             var previous = replay.Enter(read.Reader, read.BaseAddress);
             try
             {
@@ -124,10 +130,12 @@ internal static class FrontSpeculation
                     }
                 }
 
-                if (ok != read.Ok)
-                    return Outcome.Success;
-                if (ok && !answer.SequenceEqual(reads.BytesOf(read)))
-                    return Outcome.Value;
+                if (ok != read.Ok || (ok && !answer.SequenceEqual(reads.BytesOf(read))))
+                {
+                    index = item;
+                    answered = answer.Length >= sizeof(uint) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(answer) : 0;
+                    return ok != read.Ok ? Outcome.Success : Outcome.Value;
+                }
             }
             finally
             {
@@ -198,8 +206,51 @@ internal static class FrontSpeculation
 
     public sealed class AbandonException(string message) : Exception(message);
 
-    internal static long SpeculatedPreps, SpeculatedReads, Kept, ValueMismatches, SuccessMismatches, Abandoned, Invalidated, VerifyChecked, VerifyMismatched, VerifyRenderEmpty;
+    internal static long SynchronizedResidentReads, SpeculatedPreps, SpeculatedReads, Kept, ValueMismatches, SuccessMismatches, Abandoned, Invalidated, VerifyChecked, VerifyMismatched, VerifyRenderEmpty;
     internal static long ValidateTicks;
+
+    // Per program: kept, value and success mismatches.
+    private static readonly Dictionary<ulong, (long Kept, long Value, long Success)> _byProgram = new();
+    private static long _lastReport = System.Diagnostics.Stopwatch.GetTimestamp();
+    private static int _mismatchLogs;
+    private static readonly bool MismatchLog = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SPECULATE_LOG") == "1";
+
+    // On the render thread, after each replay; every 10 s prints the counters (the profiler's report may be off).
+    public static void NoteOutcome(ulong program, Outcome outcome, Reads reads, int index, uint answered)
+    {
+        lock (_byProgram)
+        {
+            var (kept, value, success) = _byProgram.GetValueOrDefault(program);
+            _byProgram[program] = outcome switch
+            {
+                Outcome.Same => (kept + 1, value, success),
+                Outcome.Value => (kept, value + 1, success),
+                _ => (kept, value, success + 1),
+            };
+        }
+
+        if (MismatchLog && outcome != Outcome.Same && index >= 0 && Interlocked.Increment(ref _mismatchLogs) <= 400)
+        {
+            var read = reads.Items[index];
+            var bytes = reads.BytesOf(read);
+            var front = bytes.Length >= sizeof(uint) ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes) : 0;
+            Console.Error.WriteLine($"[FRONT_SPEC_DIFF] program=0x{program:X16} outcome={outcome} read={index}/{reads.Items.Count} kind={read.Kind} address=0x{read.Address:X} length={read.Length} front_ok={read.Ok} front=0x{front:X8} render=0x{answered:X8}");
+        }
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var last = Interlocked.Read(ref _lastReport);
+        if (now - last < 10 * System.Diagnostics.Stopwatch.Frequency || Interlocked.CompareExchange(ref _lastReport, now, last) != last)
+            return;
+        string top;
+        lock (_byProgram)
+        {
+            top = string.Join(" ", _byProgram.OrderByDescending(pair => pair.Value.Kept + pair.Value.Value + pair.Value.Success).Take(10)
+                .Select(pair => $"0x{pair.Key:X16}={pair.Value.Kept}/{pair.Value.Value}/{pair.Value.Success}"));
+            _byProgram.Clear();
+        }
+
+        Console.Error.WriteLine(TakeReport().TrimStart('\n') + " top(kept/value/success): " + top);
+    }
 
     public static string TakeReport()
     {
@@ -207,6 +258,6 @@ internal static class FrontSpeculation
             return string.Empty;
         var ticks = Interlocked.Exchange(ref ValidateTicks, 0);
         return FormattableString.Invariant(
-            $"\n[PERF][FRONT_SPEC] preps={Interlocked.Exchange(ref SpeculatedPreps, 0)} reads={Interlocked.Exchange(ref SpeculatedReads, 0)} kept={Interlocked.Exchange(ref Kept, 0)} value_mismatch={Interlocked.Exchange(ref ValueMismatches, 0)} success_mismatch={Interlocked.Exchange(ref SuccessMismatches, 0)} abandoned={Interlocked.Exchange(ref Abandoned, 0)} invalidated={Interlocked.Exchange(ref Invalidated, 0)} validate_ms={ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} verify_checked={Interlocked.Read(ref VerifyChecked)} verify_mismatched={Interlocked.Read(ref VerifyMismatched)} verify_render_empty={Interlocked.Read(ref VerifyRenderEmpty)}");
+            $"\n[PERF][FRONT_SPEC] preps={Interlocked.Exchange(ref SpeculatedPreps, 0)} reads={Interlocked.Exchange(ref SpeculatedReads, 0)} kept={Interlocked.Exchange(ref Kept, 0)} value_mismatch={Interlocked.Exchange(ref ValueMismatches, 0)} success_mismatch={Interlocked.Exchange(ref SuccessMismatches, 0)} abandoned={Interlocked.Exchange(ref Abandoned, 0)} synced_resident={Interlocked.Exchange(ref SynchronizedResidentReads, 0)} invalidated={Interlocked.Exchange(ref Invalidated, 0)} validate_ms={ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} verify_checked={Interlocked.Read(ref VerifyChecked)} verify_mismatched={Interlocked.Read(ref VerifyMismatched)} verify_render_empty={Interlocked.Read(ref VerifyRenderEmpty)}");
     }
 }
