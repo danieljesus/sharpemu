@@ -60,7 +60,9 @@ public static class DeviceStoreTablePlanner
     // the bytes the decode sees and the synchronizations are the same. GTA: a 2 MB table the CPU rewrites
     // with identical bytes every frame, 0.3-1 ms of copies per presentation interval on the render thread. =2 also
     // copies every chunk found equal and counts the copies that differ (a second compare that agrees with the copy
-    // means a write raced the two reads).
+    // means a write raced the two reads). Measured (2026-11-03): verify 0 mismatches in 95k equal chunks (~12 chunks,
+    // ~0.8 MB of copies a frame avoided); render CommandStream 30.65 vs 30.92 ms normal, 47.2 vs 46.7 missed (noise);
+    // panning 29.80 vs 29.80, static 30.09 vs 30.10: neutral, left off.
     public static readonly int CompareModeConfigured =
         int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_COMPARE"), out var compareMode) ? compareMode : 0;
 
