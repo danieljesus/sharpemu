@@ -138,9 +138,9 @@ public sealed unsafe partial class RenderHostDeviceTests
         private GraphicsPrograms? _programs;
         private PipelineHandle? _pipeline;
 
-        public GraphicsPrograms GetGraphicsPrograms(VertexStageRegisters vertex, PixelStageRegisters pixel, ShaderInterfaceRegisters shaderInterface,
-            ContextRegisters context, ReadOnlySpan<ColorComponentMap> targetExportMapping, bool pixelActive, bool depthBound) =>
-            _programs ??= inner.GetGraphicsPrograms(vertex, pixel, shaderInterface, context, targetExportMapping, pixelActive, depthBound);
+        public GraphicsPrograms GetGraphicsPrograms(RegisterBanks banks, ReadOnlySpan<ColorComponentMap> targetExportMapping,
+            bool pixelActive, bool depthBound) =>
+            _programs ??= inner.GetGraphicsPrograms(banks, targetExportMapping, pixelActive, depthBound);
 
         public PipelineHandle CreateGraphicsPipeline(ReadOnlySpan<ColorTargetState> colors, in DepthAttachmentState depth, VertexInputInfo vertexInput,
             PixelInputInfo? pixelInput, ContextRegisters context, in RenderingState rendering, PrimitiveTopology topology, bool primitiveRestartEnabled,

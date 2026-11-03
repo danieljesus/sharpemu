@@ -1064,6 +1064,112 @@ internal static unsafe class VkRecord
         function(command);
     }
 
+    // [local] Occlusion queries (upstream's occlusion counting) and their reduction.
+    public static void CmdBeginQuery(Vk vk, CommandBuffer command, QueryPool pool, uint query, QueryControlFlags flags)
+    {
+        if (Ring(command) is { } ring)
+        {
+            var args = (RingArgs.Query*)ring.Reserve(RingOp.BeginQuery, sizeof(RingArgs.Query));
+            args->Pool = pool;
+            args->Stage = 0;
+            args->First = query;
+            args->Count = (uint)flags;
+            ring.Commit();
+            return;
+        }
+
+        vk.CmdBeginQuery(command, pool, query, flags);
+    }
+
+    public static void CmdEndQuery(Vk vk, CommandBuffer command, QueryPool pool, uint query)
+    {
+        if (Ring(command) is { } ring)
+        {
+            var args = (RingArgs.Query*)ring.Reserve(RingOp.EndQuery, sizeof(RingArgs.Query));
+            args->Pool = pool;
+            args->Stage = 0;
+            args->First = query;
+            args->Count = 0;
+            ring.Commit();
+            return;
+        }
+
+        vk.CmdEndQuery(command, pool, query);
+    }
+
+    public static void CmdCopyQueryPoolResults(Vk vk, CommandBuffer command, QueryPool pool, uint first, uint count, VkBuffer destination,
+        ulong offset, ulong stride, QueryResultFlags flags)
+    {
+        if (Ring(command) is { } ring)
+        {
+            var args = (RingArgs.QueryResults*)ring.Reserve(RingOp.CopyQueryPoolResults, sizeof(RingArgs.QueryResults));
+            args->Pool = pool;
+            args->Destination = destination;
+            args->Offset = offset;
+            args->Stride = stride;
+            args->First = first;
+            args->Count = count;
+            args->Flags = flags;
+            ring.Commit();
+            return;
+        }
+
+        vk.CmdCopyQueryPoolResults(command, pool, first, count, destination, offset, stride, flags);
+    }
+
+    // [local] vkCmdDrawIndirect (upstream's non-indexed indirect draws).
+    public static void CmdDrawIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset, uint drawCount, uint stride)
+    {
+        if (Ring(command) is { } ring)
+        {
+            var args = (RingArgs.Indirect*)ring.Reserve(RingOp.DrawIndirect, sizeof(RingArgs.Indirect));
+            args->Buffer = buffer;
+            args->Offset = offset;
+            args->DrawCount = drawCount;
+            args->Stride = stride;
+            ring.Commit();
+            return;
+        }
+
+        vk.CmdDrawIndirect(command, buffer, offset, drawCount, stride);
+    }
+
+    // [local] VK_EXT_mesh_shader draws, called through the device's function pointers.
+    public static void CmdDrawMeshTasks(delegate* unmanaged<CommandBuffer, uint, uint, uint, void> function, CommandBuffer command,
+        uint groupCountX, uint groupCountY, uint groupCountZ)
+    {
+        if (Ring(command) is { } ring)
+        {
+            var args = (RingArgs.MeshTasks*)ring.Reserve(RingOp.DrawMeshTasks, sizeof(RingArgs.MeshTasks));
+            args->Function = (nint)function;
+            args->X = groupCountX;
+            args->Y = groupCountY;
+            args->Z = groupCountZ;
+            ring.Commit();
+            return;
+        }
+
+        function(command, groupCountX, groupCountY, groupCountZ);
+    }
+
+    public static void CmdDrawMeshTasksIndirect(delegate* unmanaged<CommandBuffer, VkBuffer, ulong, uint, uint, void> function, CommandBuffer command,
+        VkBuffer buffer, ulong offset, uint drawCount, uint stride)
+    {
+        if (Ring(command) is { } ring)
+        {
+            var args = (RingArgs.MeshTasksIndirect*)ring.Reserve(RingOp.DrawMeshTasksIndirect, sizeof(RingArgs.MeshTasksIndirect));
+            args->Function = (nint)function;
+            args->Buffer = buffer;
+            args->Offset = offset;
+            args->DrawCount = drawCount;
+            args->Stride = stride;
+            ring.Commit();
+            return;
+        }
+
+        function(command, buffer, offset, drawCount, stride);
+    }
+
     public static void CmdWriteTimestamp2(Vk vk, CommandBuffer command, PipelineStageFlags2 stage, QueryPool pool, uint query)
     {
         if (Ring(command) is { } ring)

@@ -19,7 +19,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Records the copy of the 12 argument bytes at (buffer, offset) into the next ring slot, after the writes that
         // produced them. Returns where the dispatch takes its arguments from: the guest buffer, or the ring slot when
         // SHARPEMU_INDIRECT_ARGS_INJECT replaces this dispatch's X group count.
-        private (VkBuffer Buffer, ulong Offset) RecordIndirectArgsProbe(CommandBuffer command, VkBuffer buffer, ulong offset, ulong address, bool threadUnits)
+        internal (VkBuffer Buffer, ulong Offset) RecordIndirectArgsProbe(CommandBuffer command, VkBuffer buffer, ulong offset, ulong address, bool threadUnits)
         {
             if (_indirectArgsRing is null)
             {
@@ -265,6 +265,15 @@ internal static unsafe partial class VulkanVideoPresenter
             var words = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(
                 ring.Mapped.Slice(slot * IndirectArgsProbe.SlotBytes, IndirectArgsProbe.SlotBytes));
             return (Volatile.Read(ref words[0]), Volatile.Read(ref words[1]), Volatile.Read(ref words[2]), Volatile.Read(ref words[3]));
+        }
+    }
+
+    // [local] IRenderHost: RecordingHost is the render host now; the probe's state stays on the presenter.
+    private sealed partial class RecordingHost
+    {
+        public void NoteIndirectArgsWriter(ulong shaderHash, ReadOnlySpan<uint> userScalars, ReadOnlySpan<uint> flattenedTable, uint threads)
+        {
+            if (!_worker) _presenter.NoteIndirectArgsWriter(shaderHash, userScalars, flattenedTable, threads);
         }
     }
 }

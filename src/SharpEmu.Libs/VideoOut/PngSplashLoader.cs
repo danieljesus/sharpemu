@@ -17,7 +17,8 @@ internal static class PngSplashLoader
     ];
 
     public static bool TryLoad(out byte[] pixels, out uint width, out uint height)
-        => TryLoad("pic0.png", requestRgba: false, out pixels, out width, out height);
+        => TryLoad("pic0.png", requestRgba: false, out pixels, out width, out height) ||
+           TryLoad("pic1.png", requestRgba: false, out pixels, out width, out height);
 
     public static bool TryLoadIcon(out byte[] pixels, out uint width, out uint height)
         => TryLoad("icon0.png", requestRgba: true, out pixels, out width, out height);

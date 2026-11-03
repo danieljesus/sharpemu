@@ -1,7 +1,9 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Runtime.InteropServices;
 using SharpEmu.HLE.GpuMemory;
+using SharpEmu.Libs.Gpu.Rendering;
 using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Scheduling;
@@ -20,7 +22,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         Closed,
     }
 
-    private readonly record struct TickWork(Action Callback, ulong Tick);
+    private readonly record struct TickWork(Action Callback, ulong Tick, bool MemoryPublication = false);
+    private readonly record struct ParkedWork(Action Callback, long Generation, ulong Tick = 0, bool MemoryPublication = false);
     private readonly record struct SubmissionTraceEntry(ulong Tick, uint Op, ulong SubmitId,
         uint Arg0, uint Arg1, uint Arg2, uint Arg3, ulong Arg4, int Waits = 0);
     private readonly SubmissionTraceEntry[] _submissionHistory = new SubmissionTraceEntry[32];
@@ -29,13 +32,15 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     private readonly IGpuTickDevice _device;
     private readonly TickTimeline _timeline;
-    private readonly TickedBufferRing _ring;
     private readonly RecordingBuffer _command;
     private readonly Action<SubmitBundle>? _prepareSubmit;
     private readonly Action<ulong>? _submitted;
     private readonly Action<ulong>? _completed;
     private readonly Queue<TickWork> _pending = new();
     private readonly Queue<TickWork> _priority = new();
+    private readonly Queue<ParkedWork> _parked = new();
+    private long _cutGeneration;
+    private readonly SortedSet<long> _unjoinedCuts = new();
     private readonly object _operationLock = new();
     private readonly Thread _priorityThread;
     private bool _priorityActive;
@@ -47,6 +52,80 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     private SubmissionContext? _context;
     private readonly IRenderingState _rendering;
     private ulong _lastMemoryDrainTick;
+    private bool _publishingMemory;
+    private ulong _pendingTailTick;
+    private ulong _enqueueSequence;
+    private const int MaxDeferredSubmissions = 8;
+    private readonly List<nint> _deferredBuffers = new();
+    private readonly List<ulong> _deferredTicks = new();
+    private static long _deferredSubmissions;
+    private static long _batchedSubmissions;
+    private const int TickLedgerSize = 4096;
+    private readonly ulong[] _ledgerTicks = new ulong[TickLedgerSize];
+    private readonly long[] _reservedAt = new long[TickLedgerSize];
+    private readonly long[] _submittedAt = new long[TickLedgerSize];
+    private static readonly HLE.Diagnostics.ThreadCounter _heldTicks = new();
+    private static readonly HLE.Diagnostics.ThreadCounter _heldTime = new();
+    private static readonly HLE.Diagnostics.ThreadCounter _submitsAtLimit = new();
+    private static readonly HLE.Diagnostics.ThreadCounter _submitsEnsured = new();
+    private static readonly HLE.Diagnostics.ThreadCounter _submitsFolded = new();
+    private static readonly HLE.Diagnostics.ThreadCounter _completions = new();
+    private static readonly HLE.Diagnostics.ThreadCounter _completionAfterSubmit = new();
+
+    public static string TakeTickLedgerReport()
+    {
+        var held = _heldTicks.Take();
+        var completions = _completions.Take();
+        return FormattableString.Invariant($"tick_hold=ticks:{held},avg_us:{Microseconds(_heldTime.Take(), held):F1} submits=limit:{_submitsAtLimit.Take()},ensure:{_submitsEnsured.Take()},fold:{_submitsFolded.Take()} ") +
+            FormattableString.Invariant($"completion_callbacks={completions}/after_submit_us:{Microseconds(_completionAfterSubmit.Take(), completions):F1}");
+    }
+
+    private static double Microseconds(long ticks, long samples) =>
+        samples == 0 ? 0 : ticks * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency / samples;
+
+    public long ReservedAt(ulong tick) => Volatile.Read(ref _ledgerTicks[tick % TickLedgerSize]) == tick ? Volatile.Read(ref _reservedAt[tick % TickLedgerSize]) : 0;
+
+    public long SubmittedAt(ulong tick) => Volatile.Read(ref _ledgerTicks[tick % TickLedgerSize]) == tick ? Volatile.Read(ref _submittedAt[tick % TickLedgerSize]) : 0;
+
+    private void NoteReserved(ulong tick, long now, bool submitted)
+    {
+        var slot = tick % TickLedgerSize;
+        Volatile.Write(ref _ledgerTicks[slot], 0);
+        Volatile.Write(ref _reservedAt[slot], now);
+        Volatile.Write(ref _submittedAt[slot], submitted ? now : 0);
+        Volatile.Write(ref _ledgerTicks[slot], tick);
+    }
+
+    private void NoteDeferredSubmitted(long now)
+    {
+        foreach (var tick in _deferredTicks)
+        {
+            if (Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(tick); // [local]
+            if (Diagnostics.LabelLatencyProbe.Enabled) Diagnostics.LabelLatencyProbe.NoteSubmitted(tick); // [local]
+            var slot = tick % TickLedgerSize;
+            if (Volatile.Read(ref _ledgerTicks[slot]) != tick)
+            {
+                continue;
+            }
+
+            Volatile.Write(ref _submittedAt[slot], now);
+            _heldTicks.Increment();
+            _heldTime.Add(now - Volatile.Read(ref _reservedAt[slot]));
+        }
+    }
+
+    // [local] SHARPEMU_SUBMIT_THREAD: the submit thread stamps the ledger when the queue takes a sealed tick.
+    private void NoteSubmittedAt(ulong tick, long now)
+    {
+        var slot = tick % TickLedgerSize;
+        if (Volatile.Read(ref _ledgerTicks[slot]) == tick)
+        {
+            Volatile.Write(ref _submittedAt[slot], now);
+        }
+    }
+
+    public static string TakeDeferredReport() =>
+        FormattableString.Invariant($"deferred_submits={Interlocked.Exchange(ref _deferredSubmissions, 0)} batched_submits={Interlocked.Exchange(ref _batchedSubmissions, 0)}");
 
     // [local] SHARPEMU_SUBMIT_THREAD (on by default for the presenter; =0 disables): the recording thread seals each
     // buffer (end, tick, signal, completion work) and a submit thread joins its deferred uploads and calls
@@ -54,8 +133,10 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     // present and the readback queue wait for the submit first. A/B of 2026-10-12: -1.5 ms/frame, +0.47 FPS.
     internal static readonly bool SubmitThreadDefault = Environment.GetEnvironmentVariable("SHARPEMU_SUBMIT_THREAD") != "0";
 
-    private readonly record struct SealedSubmit(nint Buffer, SubmitBundle Bundle, ulong Tick, long Target, SubmissionTraceEntry Trace,
-        long Recorded = 0);
+    // Buffer is the scheduler's own buffer; Buffers is everything the submission carries in order (upstream's deferred
+    // buffers, the own buffer, then the trailing worker buffers) under one bundle.
+    private readonly record struct SealedSubmit(nint Buffer, nint[] Buffers, SubmitBundle Bundle, ulong Tick, long Target,
+        SubmissionTraceEntry Trace, long Recorded = 0);
 
     [ThreadStatic]
     private static bool _onSubmitThread;
@@ -82,7 +163,6 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _submitted = submitted;
         _completed = completed;
         _timeline = new TickTimeline(device);
-        _ring = new TickedBufferRing(device, _timeline);
         _command = new RecordingBuffer(this, device, rendering);
         _priorityThread = new Thread(RunPriorityWorker) { IsBackground = true, Name = "SharpEmu GPU priority" };
         _priorityThread.Start();
@@ -100,8 +180,13 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     internal static bool OnSubmitThread => _onSubmitThread;
 
-    // [local] The highest tick handed to the queue. Without a submit thread every sealed tick is submitted.
-    public ulong SubmittedTick => _submitThread == null ? CurrentTick - 1 : Volatile.Read(ref _submittedTick);
+    // [local] The highest tick handed to the queue. Without a submit thread every sealed tick is submitted except the
+    // ticks FlushDeferred holds back (upstream's deferred submissions; never held with the submit thread).
+    public ulong SubmittedTick => _submitThread == null
+        ? (Volatile.Read(ref _firstDeferredTick) is var firstDeferred and not 0 ? firstDeferred - 1 : CurrentTick - 1)
+        : Volatile.Read(ref _submittedTick);
+
+    private ulong _firstDeferredTick; // [local] the oldest tick in _deferredTicks, 0 when none; read by other threads
 
     public static bool InDeferredOperation => _callbackOwner != null;
 
@@ -120,9 +205,30 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     public ulong CurrentTick => _timeline.CurrentTick;
 
+    public ulong CompletedTick => _timeline.CompletedTick;
+
+    public Action<nint, MemoryBarrierRequest>? MemoryBarrierRecorder { get; set; }
+
     public TickTimeline Timeline => _timeline;
 
     internal bool PriorityWorkerAlive => _priorityThread.IsAlive;
+
+    // Set on a thread that does work ahead of the render thread: there a fatal condition only
+    // abandons that work, which the render thread then does itself and fails on if it is real.
+    [ThreadStatic]
+    internal static bool ThrowOnFatal;
+
+    public static bool ThrowsOnFatal => ThrowOnFatal;
+    [ThreadStatic]
+    private static Func<string, Exception>? s_readOnlyViolation;
+
+    public static bool ReadOnlyThread => s_readOnlyViolation is not null;
+
+    public static void MarkReadOnlyThread(Func<string, Exception> violation) => s_readOnlyViolation = violation;
+
+    public static Exception ReadOnlyViolation(string operation) => s_readOnlyViolation!(operation);
+
+    public sealed class AbandonedWorkException(string message) : Exception(message);
 
     // Report the fatal error, then return an exception to stop the caller.
     internal static Exception Fatal(string message)
@@ -131,6 +237,11 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         {
             Interlocked.Increment(ref VideoOut.FrontSpeculation.Abandoned);
             throw new VideoOut.FrontSpeculation.AbandonException(message);
+        }
+
+        if (ThrowOnFatal)
+        {
+            throw new AbandonedWorkException(message);
         }
 
         Console.Error.WriteLine($"[GPU][FATAL] {message}");
@@ -195,6 +306,10 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             }
 
             _state = OperationState.Draining;
+            while (_parked.Count != 0)
+            {
+                Unpark(_parked.Dequeue());
+            }
         }
 
         if (!_command.IsInvalid)
@@ -263,17 +378,168 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
     }
 
+    public void EndRendering(Vulkan.ScopeBreak reason)
+    {
+        if (Active && !_command.IsInvalid && _rendering.IsRendering)
+        {
+            Vulkan.BarrierTally.CountScopeBreak(reason);
+        }
+
+        EndRendering();
+    }
+
     public bool TryDeferUntilRenderingEnds(PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, List<ImageMemoryBarrier2> barriers) =>
         Active && !_command.IsInvalid && _rendering.IsRendering &&
         _rendering.TryDeferUntilRenderingEnds(sourceStages, destinationStages, barriers);
 
     public ulong Flush() => Flush(new SubmitBundle());
 
-    public ulong Flush(SubmitBundle bundle)
+    public ulong Flush(SubmitBundle bundle) => Flush(bundle, default);
+
+    public ulong Flush(SubmitBundle bundle, ReadOnlySpan<RecordingBuffer> trailing)
     {
-        var tick = Submit(bundle);
+        var tick = Submit(bundle, trailing);
         BeginNextCommandBuffer();
         return tick;
+    }
+
+    public ulong FlushDeferred(ReadOnlySpan<RecordingBuffer> trailing)
+    {
+        if (_command.IsInvalid)
+        {
+            throw Fatal("Cannot submit without a command buffer that is recording.");
+        }
+
+        // [local] SHARPEMU_SUBMIT_THREAD: the submit thread already keeps vkQueueSubmit2 off the recording thread and
+        // submits in tick order; a tick held back here would be submitted out of order by the recording thread (a
+        // timeline signal below one already submitted) and would never reach WaitSubmitted. Each tick is sealed.
+        if (_submitThread != null)
+        {
+            return Flush(new SubmitBundle(), trailing);
+        }
+
+        var bundle = new SubmitBundle();
+        _prepareSubmit?.Invoke(bundle);
+        if (bundle.WaitCount != 0 || bundle.SignalCount != 0)
+        {
+            return Flush(bundle, trailing);
+        }
+
+        foreach (var recording in trailing)
+        {
+            if (recording.IsInvalid || !recording.Ended)
+            {
+                throw Fatal("A trailing command buffer must be recorded and ended before it is submitted.");
+            }
+        }
+
+        // [local] As in Submit: the hooks that record into the buffer before it ends and join its deferred uploads.
+        BeforeSubmit?.Invoke();
+        WaitSubmitTarget?.Invoke(CaptureSubmitTarget?.Invoke() ?? 0);
+        _command.End();
+        _device.MarkSealed(_command.Buffer); // [local]
+        ulong tick;
+        lock (_operationLock)
+        {
+            lock (_device.QueueGate)
+            {
+                tick = _timeline.ReserveTick();
+                if (Diagnostics.FrameGpuProbe.Enabled) // [local] SHARPEMU_FRAME_MISS_GPU
+                {
+                    Vulkan.VulkanCommandProfile.NoteSealed(_command.Buffer, tick);
+                    Diagnostics.FrameGpuProbe.NoteSealed(tick);
+                }
+            }
+        }
+
+        _deferredBuffers.Add(_command.Buffer);
+        foreach (var recording in trailing)
+        {
+            _deferredBuffers.Add(recording.Buffer);
+        }
+
+        _deferredTicks.Add(tick);
+        if (_deferredTicks.Count == 1) Volatile.Write(ref _firstDeferredTick, tick); // [local]
+        NoteReserved(tick, System.Diagnostics.Stopwatch.GetTimestamp(), submitted: false);
+        _command.Submitted(tick);
+        foreach (var recording in trailing)
+        {
+            recording.Submitted(tick);
+        }
+
+        _submitted?.Invoke(tick);
+        Interlocked.Increment(ref _deferredSubmissions);
+        if (_deferredTicks.Count >= MaxDeferredSubmissions)
+        {
+            _submitsAtLimit.Increment();
+            SubmitDeferred();
+        }
+
+        BeginNextCommandBuffer();
+        return tick;
+    }
+
+    public void SubmitDeferred()
+    {
+        if (_deferredTicks.Count == 0)
+        {
+            return;
+        }
+
+        var submit = new SubmitBundle();
+        var last = _deferredTicks[^1];
+        Span<nint> buffers = stackalloc nint[_deferredBuffers.Count];
+        CollectionsMarshal.AsSpan(_deferredBuffers).CopyTo(buffers);
+        _device.WaitRecorded(_device.RecordedPosition); // [local] SHARPEMU_RECORD_RING: the deferred buffers ended on the ring
+        bool submitted;
+        string failure;
+        lock (_operationLock)
+        {
+            lock (_device.QueueGate)
+            {
+                submit.AddSignal(_timeline.Handle, last);
+                submitted = _device.TrySubmit(buffers, submit, out failure);
+            }
+
+            if (submitted)
+            {
+                NoteDeferredSubmitted(System.Diagnostics.Stopwatch.GetTimestamp());
+                EnqueueDeferredCompletions();
+            }
+        }
+
+        if (!submitted)
+        {
+            throw Fatal($"vkQueueSubmit failed for the deferred buffers: {failure}, tick={last}");
+        }
+
+        _deferredBuffers.Clear();
+        _deferredTicks.Clear();
+        Volatile.Write(ref _firstDeferredTick, 0); // [local]
+    }
+
+    private void EnqueueDeferredCompletions()
+    {
+        if (_completed is not { } completed)
+        {
+            return;
+        }
+
+        foreach (var tick in _deferredTicks)
+        {
+            _priority.Enqueue(new TickWork(() => completed(tick), tick));
+        }
+
+        Monitor.Pulse(_operationLock);
+    }
+
+    public void EnsureSubmitted(ulong tick)
+    {
+        if (_deferredTicks.Count != 0 && tick >= _deferredTicks[0])
+        {
+            _submitsEnsured.Increment();
+            SubmitDeferred();
+        }
     }
 
     public void FlushAndWait()
@@ -311,7 +577,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         {
             // Reuse a completed drain only while its next command buffer and callback queues stay unused.
             if (_lastMemoryDrainTick == CurrentTick && !_command.IsInvalid && !_command.HasPendingCommands &&
-                _pending.Count == 0 && _priority.Count == 0 && !_priorityActive)
+                _pending.Count == 0 && _parked.Count == 0 && _priority.Count == 0 && !_priorityActive)
             {
                 return;
             }
@@ -348,6 +614,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         else
         {
             WaitSubmitted(tick); // [local]
+            EnsureSubmitted(tick);
             _timeline.Wait(tick);
         }
     }
@@ -366,12 +633,55 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                     return;
                 }
 
+                if (_publishingMemory && _pending.Peek().MemoryPublication) return;
+
                 operation = _pending.Dequeue();
             }
 
             WaitForPriorityOperations(operation.Tick);
-            RunDeferredCallback(operation.Callback);
+            if (operation.MemoryPublication)
+            {
+                if (InsideTickCallback)
+                    throw Fatal("Cannot publish guest memory inside a completion callback.");
+                _publishingMemory = true;
+                try { operation.Callback(); }
+                finally { _publishingMemory = false; }
+            }
+            else
+                RunDeferredCallback(operation.Callback);
         }
+    }
+
+    // Slices recorded ahead of the stream may still reference what a completion action destroys;
+    // while any is unjoined the action waits until the slices cut so far have been submitted.
+    public long BeginSliceCut()
+    {
+        lock (_operationLock)
+        {
+            var generation = ++_cutGeneration;
+            _unjoinedCuts.Add(generation);
+            return generation;
+        }
+    }
+
+    public void NoteSliceJoined(long generation)
+    {
+        lock (_operationLock)
+        {
+            _unjoinedCuts.Remove(generation);
+            var joined = _unjoinedCuts.Count == 0 ? _cutGeneration : _unjoinedCuts.Min - 1;
+            while (_parked.Count != 0 && _parked.Peek().Generation <= joined)
+            {
+                Unpark(_parked.Dequeue());
+            }
+        }
+    }
+
+    private void Unpark(ParkedWork parked)
+    {
+        var tick = parked.MemoryPublication ? parked.Tick : CurrentTick;
+        _pendingTailTick = _pending.Count == 0 ? tick : Math.Max(_pendingTailTick, tick);
+        _pending.Enqueue(new TickWork(parked.Callback, tick, parked.MemoryPublication));
     }
 
     public void QueueCompletionAction(Action operation)
@@ -382,7 +692,17 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         {
             if (_state == OperationState.Open)
             {
-                _pending.Enqueue(new TickWork(operation, CurrentTick));
+                if (_unjoinedCuts.Count != 0)
+                {
+                    _parked.Enqueue(new ParkedWork(operation, _cutGeneration));
+                }
+                else
+                {
+                    _pending.Enqueue(new TickWork(operation, CurrentTick));
+                    _pendingTailTick = CurrentTick;
+                }
+
+                _enqueueSequence++;
                 return;
             }
 
@@ -396,6 +716,49 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
 
         operation();
+    }
+
+    // Publication runs on the queue owner, outside callback scope, so memory ownership can drain.
+    // Dependent guest signals must not become visible before publication succeeds.
+    internal void QueueMemoryPublication(Action operation) => QueueMemoryPublication(operation, CurrentTick);
+
+    internal ulong QueueMemoryPublication(Action operation, ulong dependencyTick) =>
+        QueueMemoryPublication(operation, dependencyTick, out _);
+
+    // True while the publication with this sequence is still queued, nothing was queued after it,
+    // and a new publication with this dependency would take the same tick, so it may join it.
+    internal bool IsLastQueuedPublication(ulong sequence, ulong dependencyTick, ulong tick)
+    {
+        lock (_operationLock)
+            return _enqueueSequence == sequence && _parked.Count == 0 && _pending.Count != 0 && Math.Max(dependencyTick, _pendingTailTick) == tick;
+    }
+
+    internal ulong QueueMemoryPublication(Action operation, ulong dependencyTick, out ulong sequence)
+    {
+        RequireActiveScheduler();
+        if (InsideTickCallback)
+            throw Fatal("Cannot queue a memory publication from a completion callback.");
+        lock (_operationLock)
+        {
+            if (_state != OperationState.Open)
+                throw Fatal("Cannot queue a memory publication after shutdown starts.");
+            if (dependencyTick > CurrentTick)
+                throw Fatal("Cannot publish memory for an unknown submission tick.");
+            // Keep ready results behind earlier work without attaching them to an unused future tick.
+            var tick = _pending.Count == 0 && _parked.Count == 0 ? dependencyTick : Math.Max(dependencyTick, _pendingTailTick);
+            if (_parked.Count != 0)
+            {
+                _parked.Enqueue(new ParkedWork(operation, _cutGeneration, tick, MemoryPublication: true));
+            }
+            else
+            {
+                _pending.Enqueue(new TickWork(operation, tick, MemoryPublication: true));
+                _pendingTailTick = tick;
+            }
+
+            sequence = ++_enqueueSequence;
+            return tick;
+        }
     }
 
     public void QueuePriorityCompletionAction(Action operation)
@@ -465,6 +828,9 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         return SubmittedTick >= sealedTick && IsTickComplete(sealedTick);
     }
 
+    // Uses the last completed tick read from the device; it does not query the device.
+    internal bool IsTickKnownComplete(ulong tick) => _timeline.IsTickComplete(tick);
+
     public bool IsTickComplete(ulong tick)
     {
         if (_timeline.IsTickComplete(tick))
@@ -486,17 +852,10 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     public RecordingBuffer BeginCommand()
     {
-        if (!_command.IsInvalid)
-        {
-            throw Fatal("Cannot start recording. The command buffer is already recording.");
-        }
-
-        _command.Buffer = _ring.AcquireBuffer();
-        _command.Begin();
+        _command.Acquire();
         return _command;
     }
 
-    // Add the timeline signal to a copy. Keep the caller's submission bundle unchanged.
     private static readonly bool SubmitProbe = Environment.GetEnvironmentVariable("SHARPEMU_SUBMIT_PROBE") == "1"; // [local]
     private static readonly Dictionary<string, int> _submitSites = new();
     private static long _submitReport = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -546,10 +905,34 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     internal int SubmitBatchLimit { get; set; } = SubmitBatchDefault;
 
     private readonly List<SealedSubmit> _batch = new();
-    private nint[] _batchBuffers = [];
+    private nint[][] _batchBuffers = [];
     private SubmitBundle[] _batchBundles = [];
 
-    public ulong Submit(SubmitBundle? bundle = null)
+    public RecordingBuffer CreateRecordingBuffer(IRenderingState rendering) => new(this, _device.CreateBufferSource(), rendering);
+
+    public void BeginRecording(RecordingBuffer buffer)
+    {
+        buffer.Bind(_context ?? throw Fatal("The scheduler requires a submission context."));
+        buffer.Acquire();
+    }
+
+    public void EndRecording(RecordingBuffer buffer) => buffer.End();
+
+    public void EndDiscardedRecording(RecordingBuffer buffer) => buffer.EndDiscarded();
+
+    public void NoteMappedMemoryWrite()
+    {
+        if (Active && !_command.IsInvalid)
+        {
+            _command.NoteMappedMemoryWrite();
+        }
+    }
+
+    public void DiscardRecording(RecordingBuffer buffer) => buffer.Discard();
+
+    // Add the timeline signal to a copy. Keep the caller's submission bundle unchanged. Trailing
+    // buffers were ended by their recording threads and execute after the current buffer.
+    public ulong Submit(SubmitBundle? bundle = null, ReadOnlySpan<RecordingBuffer> trailing = default)
     {
         if (SubmitProbe) RecordSubmit(); // [local]
         ThrowIfSubmitFailed(); // [local]
@@ -572,16 +955,30 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             throw Fatal($"The submission exceeds its capacity: waits={submit.WaitCount} signals={submit.SignalCount}.");
         }
 
+        var deferred = _deferredBuffers.Count;
+        Span<nint> buffers = stackalloc nint[deferred + 1 + trailing.Length];
+        CollectionsMarshal.AsSpan(_deferredBuffers).CopyTo(buffers);
+        for (var index = 0; index < trailing.Length; index++)
+        {
+            if (trailing[index].IsInvalid || !trailing[index].Ended)
+            {
+                throw Fatal("A trailing command buffer must be recorded and ended before it is submitted.");
+            }
+
+            buffers[deferred + index + 1] = trailing[index].Buffer;
+        }
+
         _command.End();
         var buffer = _command.Buffer;
+        buffers[deferred] = buffer;
         var recorded = _device.RecordedPosition; // [local]
         _device.MarkSealed(buffer); // [local]
         if (_submitThread != null)
         {
-            return SealForSubmitThread(buffer, submit, target, recorded);
+            return SealForSubmitThread(buffer, buffers.ToArray(), submit, target, recorded, trailing);
         }
 
-        _device.WaitRecorded(recorded); // [local]
+        _device.WaitRecorded(recorded); // [local] covers the deferred buffers too: they ended earlier on the ring
 
         bool submitted;
         string failure;
@@ -600,7 +997,20 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
                 }
 
                 submit.AddSignal(_timeline.Handle, tick);
-                submitted = _device.TrySubmit(buffer, submit, out failure);
+                submitted = _device.TrySubmit(buffers, submit, out failure);
+            }
+
+            if (submitted)
+            {
+                var now = System.Diagnostics.Stopwatch.GetTimestamp();
+                NoteReserved(tick, now, submitted: true);
+                if (deferred != 0)
+                {
+                    _submitsFolded.Increment();
+                    NoteDeferredSubmitted(now);
+                }
+
+                EnqueueDeferredCompletions();
             }
 
             if (submitted && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(tick); // [local]
@@ -613,6 +1023,15 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             }
         }
 
+        if (submitted && deferred != 0)
+        {
+            Interlocked.Increment(ref _batchedSubmissions);
+            _deferredBuffers.Clear();
+            _deferredTicks.Clear();
+            Volatile.Write(ref _firstDeferredTick, 0); // [local]
+        }
+
+        if (MeshDrawTrace.Enabled) MeshDrawTrace.Submitted((ulong)buffers[deferred], tick, submitted, failure);
         if (!submitted)
         {
             Console.Error.WriteLine($"[GPU][ERROR] submission history known_completed_tick={_timeline.CompletedTick}");
@@ -627,17 +1046,25 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3, _command.DebugArg4, submit.WaitCount);
         _nextSubmissionHistoryIndex = (_nextSubmissionHistoryIndex + 1) % _submissionHistory.Length;
         _submissionHistoryCount = Math.Min(_submissionHistoryCount + 1, _submissionHistory.Length);
-        _command.Buffer = 0;
+        _command.Submitted(tick);
+        foreach (var recording in trailing)
+        {
+            recording.Submitted(tick);
+        }
+
         _submitted?.Invoke(tick);
         return tick;
     }
 
     // [local] Reserve the tick and queue the sealed buffer for the submit thread. The tick is reserved and queued under
-    // one lock, so the thread submits in tick order and the sealed tick is the submitted tick.
-    private ulong SealForSubmitThread(nint buffer, SubmitBundle submit, long target, long recorded)
+    // one lock, so the thread submits in tick order and the sealed tick is the submitted tick. The trailing buffers
+    // (render workers) were recorded directly by their threads and go in the same submission.
+    private ulong SealForSubmitThread(nint buffer, nint[] buffers, SubmitBundle submit, long target, long recorded,
+        ReadOnlySpan<RecordingBuffer> trailing)
     {
         SealedSubmit item;
         bool inline;
+        var deferred = _deferredBuffers.Count;
         SharpEmu.HLE.LockProbe.Probe(_operationLock, 4 + 12, "scheduler.op_12");
         lock (_operationLock)
         {
@@ -647,9 +1074,18 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             if (Diagnostics.FrameGpuProbe.Enabled) Diagnostics.FrameGpuProbe.NoteSealed(tick); // [local] SHARPEMU_FRAME_MISS_GPU
             if (Buffers.CpWriteDeferProbe.Enabled) Buffers.CpWriteDeferProbe.OnOtherOp(); // [local] a seal ends the scope
             submit.AddSignal(_timeline.Handle, tick);
-            item = new SealedSubmit(buffer, submit, tick, target, new SubmissionTraceEntry(tick, _command.DebugOp,
+            item = new SealedSubmit(buffer, buffers, submit, tick, target, new SubmissionTraceEntry(tick, _command.DebugOp,
                 _command.DebugSubmitId, _command.DebugArg0, _command.DebugArg1, _command.DebugArg2, _command.DebugArg3,
                 _command.DebugArg4, submit.WaitCount), recorded);
+            NoteReserved(tick, System.Diagnostics.Stopwatch.GetTimestamp(), submitted: false);
+            if (deferred != 0)
+            {
+                // FlushDeferred seals instead of deferring while the submit thread runs, so nothing is held here.
+                _submitsFolded.Increment();
+                NoteDeferredSubmitted(System.Diagnostics.Stopwatch.GetTimestamp());
+                EnqueueDeferredCompletions();
+            }
+
             lock (_submitLock)
             {
                 // After shutdown stopped the thread, a late submit runs inline; the queue is empty by then.
@@ -672,6 +1108,14 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             }
         }
 
+        if (deferred != 0)
+        {
+            Interlocked.Increment(ref _batchedSubmissions);
+            _deferredBuffers.Clear();
+            _deferredTicks.Clear();
+            Volatile.Write(ref _firstDeferredTick, 0); // [local]
+        }
+
         if (inline)
         {
             if (!SubmitSealed(item, out var failure))
@@ -689,7 +1133,12 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         _submissionHistory[_nextSubmissionHistoryIndex] = item.Trace;
         _nextSubmissionHistoryIndex = (_nextSubmissionHistoryIndex + 1) % _submissionHistory.Length;
         _submissionHistoryCount = Math.Min(_submissionHistoryCount + 1, _submissionHistory.Length);
-        _command.Buffer = 0;
+        _command.Submitted(item.Tick);
+        foreach (var recording in trailing)
+        {
+            recording.Submitted(item.Tick);
+        }
+
         _submitted?.Invoke(item.Tick);
         return item.Tick;
     }
@@ -719,10 +1168,12 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         lock (_device.QueueGate)
         {
             GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitCall);
-            submitted = _device.TrySubmit(item.Buffer, item.Bundle, out failure);
+            submitted = _device.TrySubmit(item.Buffers, item.Bundle, out failure);
         }
 
         GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitOther);
+        if (submitted) NoteSubmittedAt(item.Tick, System.Diagnostics.Stopwatch.GetTimestamp());
+        if (MeshDrawTrace.Enabled) MeshDrawTrace.Submitted((ulong)item.Buffer, item.Tick, submitted, failure);
 
         if (submitted && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(item.Tick); // [local]
         if (submitted && Diagnostics.LabelLatencyProbe.Enabled) Diagnostics.LabelLatencyProbe.NoteSubmitted(item.Tick); // [local]
@@ -773,13 +1224,13 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         var count = _batch.Count;
         if (_batchBuffers.Length < count)
         {
-            _batchBuffers = new nint[limit];
+            _batchBuffers = new nint[limit][];
             _batchBundles = new SubmitBundle[limit];
         }
 
         for (var index = 0; index < count; index++)
         {
-            _batchBuffers[index] = _batch[index].Buffer;
+            _batchBuffers[index] = _batch[index].Buffers;
             _batchBundles[index] = _batch[index].Bundle;
         }
 
@@ -793,11 +1244,14 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
         GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitOther);
         Array.Clear(_batchBundles, 0, count);
+        Array.Clear(_batchBuffers, 0, count);
         var end = System.Diagnostics.Stopwatch.GetTimestamp();
         SubmitThreadStats.Batched(count);
         for (var index = 0; index < count; index++)
         {
             var tick = _batch[index].Tick;
+            if (submitted) NoteSubmittedAt(tick, end);
+            if (MeshDrawTrace.Enabled) MeshDrawTrace.Submitted((ulong)_batch[index].Buffer, tick, submitted, failure);
             if (submitted && Diagnostics.FlipLatencyProbe.Enabled) Diagnostics.FlipLatencyProbe.NoteSubmitted(tick);
             if (submitted && Diagnostics.LabelLatencyProbe.Enabled) Diagnostics.LabelLatencyProbe.NoteSubmitted(tick);
             SubmitThreadStats.Submitted(index == 0 ? joined - start : 0, index == 0 ? end - joined : 0);
@@ -1087,7 +1541,8 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
     private void RunPriorityWorker()
     {
-        SharpEmu.HLE.Host.HostLaneReservation.ApplyToHelperThread();
+        SharpEmu.HLE.Host.HostLaneReservation.ApplyToHostWorkerThread();
+        SharpEmu.HLE.Host.HostLaneReservation.ApplyToHelperThread(); // [local] SHARPEMU_HOST_HELPER_LANES: narrows the affinity to the guest lanes
         for (;;)
         {
             TickWork operation;
@@ -1111,6 +1566,12 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
             _timeline.Wait(operation.Tick);
             if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.PriorityDone, -1, 0, operation.Tick); // [local]
+            if (SubmittedAt(operation.Tick) is var submittedAt and not 0)
+            {
+                _completions.Increment();
+                _completionAfterSubmit.Add(System.Diagnostics.Stopwatch.GetTimestamp() - submittedAt);
+            }
+
             if (!Volatile.Read(ref _stopRequested))
             {
                 RunDeferredCallback(operation.Callback);

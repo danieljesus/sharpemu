@@ -19,6 +19,8 @@ namespace SharpEmu.Libs.Agc;
 public static partial class AgcExports
 {
     private const uint ItNop = 0x10;
+    private const uint Type2FillerHeader = 0x8000_0000u;
+    private const uint MaximumNopDwords = 0x4001;
     private const uint ItSetBase = 0x11;
     private const uint ItIndexBufferSize = 0x13;
     private const uint ItIndexBase = 0x26;
@@ -236,7 +238,7 @@ public static partial class AgcExports
         private RegisterBanks? _interpreterBanks;
 
         public Dictionary<uint, uint> CxRegisters { get; private set; } = new();
-        public Dictionary<uint, uint> ShRegisters { get; private set; } = new();
+        public ShaderRegisterMirror ShRegisters { get; private set; } = new();
         public Dictionary<uint, uint> UcRegisters { get; private set; } = new();
 
         // With an interpreter attached the banks and the composite extent are its own.
@@ -302,6 +304,7 @@ public static partial class AgcExports
     private sealed class SubmittedGpuState
     {
         public object Gate { get; } = new();
+        public ulong TessellationFactorRingAddress { get; set; }
         public object CommandSubmissionGate { get; } = new();
         public SubmittedDcbState Graphics { get; } = new();
         // The submit-time geometry prepass shadow; only the prepass reads or writes it.

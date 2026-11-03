@@ -25,7 +25,7 @@ public static partial class Gen5SpirvTranslator
 
         private void DeclareInterpolationParameters()
         {
-            foreach (var instruction in _program.Instructions)
+            foreach (var instruction in _request.Program.Instructions)
             {
                 if (instruction.Opcode == "VInterpMovF32" &&
                     instruction.Control is Gen5InterpolationControl interpolation)
@@ -44,7 +44,7 @@ public static partial class Gen5SpirvTranslator
                 // emitting SPV_KHR_fragment_shader_barycentric on an unsupported device.
                 foreach (var attribute in _perVertexAttributes.ToArray())
                 {
-                    if (_program.Instructions.All(instruction =>
+                    if (_request.Program.Instructions.All(instruction =>
                             instruction.Control is not Gen5InterpolationControl control ||
                             control.Attribute != attribute ||
                             (instruction.Opcode == "VInterpMovF32" && (instruction.Words[0] & 0xFFu) == 2)))
@@ -120,8 +120,7 @@ public static partial class Gen5SpirvTranslator
 
             if ((enabledInputs & (1u << 13)) != 0)
             {
-                _module.AddExtension("SPV_EXT_shader_viewport_index_layer");
-                _module.AddCapability(SpirvCapability.ShaderViewportIndexLayerExt);
+                _module.AddCapability(SpirvCapability.ShaderLayer);
                 _ancillaryLayerInput = _module.AddGlobalVariable(
                     _module.TypePointer(SpirvStorageClass.Input, _uintType), SpirvStorageClass.Input);
                 _module.AddDecoration(_ancillaryLayerInput, SpirvDecoration.BuiltIn, (uint)SpirvBuiltIn.Layer);
@@ -145,8 +144,9 @@ public static partial class Gen5SpirvTranslator
         private uint LoadFrontFaceInput() => _module.AddInstruction(
             SpirvOp.Select, _uintType, Load(_boolType, _frontFacingInput), UInt(0x3F800000u), UInt(0));
 
+        // ANCILLARY stores the render-target layer in bits 16 through 26.
         private uint LoadAncillaryInput() =>
-            ShiftLeftLogical(Load(_uintType, _ancillaryLayerInput), UInt(16));
+            ShiftLeftLogical(BitwiseAnd(Load(_uintType, _ancillaryLayerInput), UInt(0x7ff)), UInt(16));
 
         private uint LoadSampleCoverageInput()
         {

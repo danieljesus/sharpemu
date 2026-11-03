@@ -181,10 +181,9 @@ public sealed class Gen5ShaderAtomicDecodeTests
     [Theory]
     [InlineData(0xD8480004u, "DsMinF32")]
     [InlineData(0xD84C0008u, "DsMaxF32")]
-    public void DsFloatMinMax_UseSingleDataOperand(uint word, string opcode)
+    public void DsFloatMinMax_UseTheAddressAndOneDataRegister(uint word, string opcode)
     {
-        // DS_MIN/MAX_F32 v7, v9: mem = min/max(mem, DATA0). DATA1 (v1 here) is not an
-        // operand of these instructions, so the decoder must ignore it.
+        // ds_min_f32 and ds_max_f32 reduce DATA0 into memory; the DATA1 field is not an operand.
         var instruction = DecodeSingle(word, 0x00010907);
 
         Assert.Equal(opcode, instruction.Opcode);

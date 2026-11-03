@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.Libs.VideoOut;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Scheduling;
 using Silk.NET.Vulkan;
@@ -18,8 +19,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
 {
     private const ulong Alignment = 16;
     // [local] SHARPEMU_READBACK_SLOTS (2..64, default 8): slot 0 is the synchronous one, the rest carry asynchronous
-    // copies. 32 is sharpemu/sharpemu PR #1128's count (TarkusR, 6d963114). Kept at 8: in GTA V (2026-10-29, static and
-    // panning, SHARPEMU_CHEAP_PROBE) no guest read ever found the 7 asynchronous slots busy.
+    // copies. Upstream (#1128, TarkusR, 6d963114) uses 32. Kept at 8: in GTA V (2026-10-29, static and panning,
+    // SHARPEMU_CHEAP_PROBE) no guest read ever found the 7 asynchronous slots busy; SHARPEMU_READBACK_SLOTS=32 is upstream's.
     internal static readonly int SlotCount =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_READBACK_SLOTS"), out var slots) && slots is >= 2 and <= 64 ? slots : 8;
 
@@ -162,8 +163,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         return false;
     }
 
-    // [local] Adapted from 6d963114 by TarkusR: blocks the caller (not the GPU queue thread) until an asynchronous slot
-    // is free or the timeout passes; Complete pulses the gate when it frees a slot.
+    // Blocks the caller (not the GPU queue thread) until an asynchronous slot is free or the timeout passes; Complete
+    // pulses the gate when it frees a slot.
     public void WaitForFreeSlot(int timeoutMilliseconds)
     {
         lock (_gate)
@@ -285,6 +286,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             };
             var probeStart = System.Diagnostics.Stopwatch.GetTimestamp(); // [local]
             var probeCompleted = _scheduler.Timeline.CompletedTick; // [local] SHARPEMU_RENDER_WAIT_PROBE
+            var waitStart = VideoOut.GpuWaitSiteProfile.Begin();
             using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.GpuCompletionWait))
             {
                 var reports = 0;
@@ -316,6 +318,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
 
                 Require(result, "vkWaitSemaphores(readback)");
             }
+
+            VideoOut.GpuWaitSiteProfile.End(waitStart);
             if (VideoOut.Render2Probe.Enabled) VideoOut.Render2Probe.NoteBlocked(VideoOut.Render2Probe.SpinSite.Readback, System.Diagnostics.Stopwatch.GetTimestamp() - probeStart); // [local]
             VideoOut.RenderWaitProbe.Record("readback", probeStart, (long)ticket.WaitTick - (long)probeCompleted);
             if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.NoteWait(probeStart, ticket.WaitTick, 1, Scheduling.GpuWorkerRelay.OnAnyGpuQueueThread); // [local]
@@ -407,7 +411,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             finally
             {
                 ticket.Slot.Busy = false;
-                Monitor.PulseAll(_gate); // [local] WaitForFreeSlot
+                Monitor.PulseAll(_gate); // WaitForFreeSlot
             }
         }
     }
@@ -438,7 +442,10 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             var piece = pieces[index];
             offset = AlignUp(offset, Alignment);
             var region = new BufferCopy(piece.SourceOffset, offset, piece.Size);
-            vk.CmdCopyBuffer(command, piece.Source.Handle, staging.Handle, 1, &region);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                vk.CmdCopyBuffer(command, piece.Source.Handle, staging.Handle, 1, &region);
+            }
             offsets[index] = offset;
             sizes[index] = piece.Size;
             offset += piece.Size;
@@ -459,7 +466,10 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             MemoryBarrierCount = 1,
             PMemoryBarriers = &toHost,
         };
-        vk.CmdPipelineBarrier2(command, &dependency);
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            vk.CmdPipelineBarrier2(command, &dependency);
+        }
         Require(vk.EndCommandBuffer(command), "vkEndCommandBuffer(readback)");
 
         ulong aheadCount = 0, aheadTick = 0;

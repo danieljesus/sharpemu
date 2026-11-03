@@ -60,6 +60,14 @@ internal enum RingOp : ushort
     BeginDebugLabel,
     EndDebugLabel,
     SetDepthBounds,
+    // [local] Carried since the upstream merge (occlusion counting, indirect and mesh draws): before, the presenter
+    // drained the ring for them.
+    BeginQuery,
+    EndQuery,
+    CopyQueryPoolResults,
+    DrawIndirect,
+    DrawMeshTasks,
+    DrawMeshTasksIndirect,
     Count,
 }
 
@@ -227,6 +235,39 @@ internal static class RingArgs
         public PipelineStageFlags2 Stage;
         public uint First;
         public uint Count;
+    }
+
+    // [local] vkCmdBeginQuery: Count carries the control flags.
+    [StructLayout(LayoutKind.Sequential)]
+    public struct QueryResults
+    {
+        public QueryPool Pool;
+        public VkBuffer Destination;
+        public ulong Offset;
+        public ulong Stride;
+        public uint First;
+        public uint Count;
+        public QueryResultFlags Flags;
+    }
+
+    // [local] vkCmdDrawMeshTasksEXT / vkCmdDrawMeshTasksIndirectEXT, called through the device's function pointers.
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MeshTasks
+    {
+        public nint Function;
+        public uint X;
+        public uint Y;
+        public uint Z;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MeshTasksIndirect
+    {
+        public nint Function;
+        public VkBuffer Buffer;
+        public ulong Offset;
+        public uint DrawCount;
+        public uint Stride;
     }
 }
 
@@ -516,6 +557,42 @@ internal sealed unsafe partial class CommandRing
             case RingOp.EndDebugLabel:
                 ((delegate* unmanaged<CommandBuffer, void>)(*(nint*)payload))(command);
                 break;
+            case RingOp.BeginQuery: // [local]
+            {
+                var args = (RingArgs.Query*)payload;
+                vk.CmdBeginQuery(command, args->Pool, args->First, (QueryControlFlags)args->Count);
+                break;
+            }
+            case RingOp.EndQuery: // [local]
+            {
+                var args = (RingArgs.Query*)payload;
+                vk.CmdEndQuery(command, args->Pool, args->First);
+                break;
+            }
+            case RingOp.CopyQueryPoolResults: // [local]
+            {
+                var args = (RingArgs.QueryResults*)payload;
+                vk.CmdCopyQueryPoolResults(command, args->Pool, args->First, args->Count, args->Destination, args->Offset, args->Stride, args->Flags);
+                break;
+            }
+            case RingOp.DrawIndirect: // [local]
+            {
+                var args = (RingArgs.Indirect*)payload;
+                vk.CmdDrawIndirect(command, args->Buffer, args->Offset, args->DrawCount, args->Stride);
+                break;
+            }
+            case RingOp.DrawMeshTasks: // [local]
+            {
+                var args = (RingArgs.MeshTasks*)payload;
+                ((delegate* unmanaged<CommandBuffer, uint, uint, uint, void>)args->Function)(command, args->X, args->Y, args->Z);
+                break;
+            }
+            case RingOp.DrawMeshTasksIndirect: // [local]
+            {
+                var args = (RingArgs.MeshTasksIndirect*)payload;
+                ((delegate* unmanaged<CommandBuffer, VkBuffer, ulong, uint, uint, void>)args->Function)(command, args->Buffer, args->Offset, args->DrawCount, args->Stride);
+                break;
+            }
             default:
                 throw new InvalidOperationException($"Unknown record ring operation {op}.");
         }

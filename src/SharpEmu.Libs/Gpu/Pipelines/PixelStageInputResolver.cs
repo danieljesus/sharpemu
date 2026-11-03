@@ -63,19 +63,26 @@ public static class PixelStageInputResolver
         ShaderInterfaceRegisters shaderInterface,
         ReadOnlySpan<byte> targetOutputModes,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        uint inputCount) =>
+        uint inputCount,
+        uint[]? semantics = null) =>
         Resolve(shader, shaderInterface, targetOutputModes, targetExportMapping, inputCount,
-            ReadCustomInterpolationMask(context, shader, inputCount));
+            ReadCustomInterpolationMask(context, shader, inputCount, semantics));
 
-    // The inputs with custom (non-half) interpolation, from the shader's input semantics. It
-    // depends only on the binary and the input count, so a caller may read it once per shader.
-    public static uint ReadCustomInterpolationMask(CpuContext context, RegisteredShader shader, uint inputCount)
+    // The inputs with custom (non-half) interpolation, from the shader's input semantics (or the
+    // header words the caller already read). It depends only on the binary and the input count,
+    // so a caller may read it once per shader.
+    public static uint ReadCustomInterpolationMask(CpuContext context, RegisteredShader shader, uint inputCount, uint[]? semantics = null)
     {
         var customMask = 0u;
         var semanticCount = Math.Min(Math.Min(shader.InputSemanticsCount, inputCount), (uint)PixelInputInfo.InterpolatorCount);
         for (var index = 0u; index < semanticCount; index++)
         {
-            if (!context.TryReadUInt32(shader.InputSemanticsAddress + index * sizeof(uint), out var word))
+            uint word;
+            if (semantics is not null)
+            {
+                word = semantics[index];
+            }
+            else if (!context.TryReadUInt32(shader.InputSemanticsAddress + index * sizeof(uint), out word))
             {
                 throw SubmissionScheduler.Fatal($"The pixel input semantics are unreadable: shader=0x{shader.CodeAddress:X16} index={index}.");
             }
@@ -127,6 +134,7 @@ public static class PixelStageInputResolver
                 : PixelInputInfo.NoPerspectiveCenterRegister,
             InterpolatorSettings = interpolators,
             TargetOutputModes = outputModes,
+            TargetExportFormats = shaderInterface.TargetOutputModes.ToArray(),
             TargetExportMappings = mappings,
             ScratchDwords = shader.ScratchDwords,
             PositionX = (activeInputs & InputPositionX) != 0,

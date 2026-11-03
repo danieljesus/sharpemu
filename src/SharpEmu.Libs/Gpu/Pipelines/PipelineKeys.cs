@@ -248,8 +248,10 @@ public sealed class PipelineVertexInputState : IEquatable<PipelineVertexInputSta
 public sealed class GraphicsPipelineKey : IEquatable<GraphicsPipelineKey>
 {
     public required PipelineRenderingState Rendering { get; init; }
+    // Settable for the lookup key reused across draws; a key in the cache is never changed.
     public ulong VertexProgramId { get; set; }
     public ulong PixelProgramId { get; set; }
+    public TessellationPipelineStages? Tessellation { get; set; }
     public required PipelineVertexInputState VertexInput { get; init; }
     public required PipelineStaticParameters StaticParameters { get; init; }
 
@@ -258,17 +260,18 @@ public sealed class GraphicsPipelineKey : IEquatable<GraphicsPipelineKey>
         Rendering = Rendering.Clone(),
         VertexProgramId = VertexProgramId,
         PixelProgramId = PixelProgramId,
+        Tessellation = Tessellation,
         VertexInput = VertexInput.Clone(),
         StaticParameters = StaticParameters.Clone(),
     };
 
     public bool Equals(GraphicsPipelineKey? other) =>
         other is not null && Rendering.Equals(other.Rendering) && VertexProgramId == other.VertexProgramId && PixelProgramId == other.PixelProgramId &&
-        VertexInput.Equals(other.VertexInput) && StaticParameters.Equals(other.StaticParameters);
+        Tessellation == other.Tessellation && VertexInput.Equals(other.VertexInput) && StaticParameters.Equals(other.StaticParameters);
 
     public override bool Equals(object? obj) => Equals(obj as GraphicsPipelineKey);
 
-    public override int GetHashCode() => HashCode.Combine(Rendering, VertexProgramId, PixelProgramId, VertexInput, StaticParameters);
+    public override int GetHashCode() => HashCode.Combine(Rendering, VertexProgramId, PixelProgramId, VertexInput, StaticParameters, Tessellation);
 }
 
 public readonly record struct ComputePipelineKey(ulong ComputeProgramId);

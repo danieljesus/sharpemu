@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.Libs.VideoOut;
 using System.Runtime.InteropServices;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -15,7 +16,7 @@ public sealed unsafe class ColorToMultisampleDepthBlit : IDisposable
     // [local] Bumped whenever this blit binds its pipeline, which overrides the dynamic draw state.
     internal static int DynamicStateEpoch;
 
-    public const ImageLayout DestinationLayout = ImageLayout.DepthStencilAttachmentOptimal;
+    public const ImageLayout DestinationLayout = ImageLayout.General;
     private const uint SetsPerPool = 64;
 
     private readonly record struct PipelineKey(uint Samples, Format Format);
@@ -265,8 +266,8 @@ public sealed unsafe class ColorToMultisampleDepthBlit : IDisposable
 
         var vk = _device.Vk;
         var command = new CommandBuffer(_scheduler.Current.Handle);
-        source.Transition(ImageLayout.ShaderReadOnlyOptimal, AccessFlags.ShaderReadBit, null, command);
-        destination.Transition(DestinationLayout, AccessFlags.DepthStencilAttachmentWriteBit, null, command);
+        source.Transition(AccessFlags.ShaderReadBit, null, command);
+        destination.Transition(AccessFlags.DepthStencilAttachmentWriteBit, null, command);
 
         var cached = GetPipeline(new PipelineKey(destinationInfo.Samples, destinationInfo.PixelFormat));
         var extent = new Extent2D(destinationInfo.Extent.Width, destinationInfo.Extent.Height);
@@ -284,7 +285,7 @@ public sealed unsafe class ColorToMultisampleDepthBlit : IDisposable
         _scheduler.QueueCompletionAction(() => vk.DestroyFramebuffer(_device.Device, framebuffer, null));
 
         var set = _pools.Allocate(_descriptorLayout);
-        var imageInfo = new DescriptorImageInfo { ImageView = sourceView, ImageLayout = ImageLayout.ShaderReadOnlyOptimal };
+        var imageInfo = new DescriptorImageInfo { ImageView = sourceView, ImageLayout = ImageLayout.General };
         var write = new WriteDescriptorSet
         {
             SType = StructureType.WriteDescriptorSet,
@@ -306,16 +307,39 @@ public sealed unsafe class ColorToMultisampleDepthBlit : IDisposable
             ClearValueCount = 1,
             PClearValues = &clear,
         };
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRenderPass(vk, command, &begin, SubpassContents.Inline); // [local]
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Graphics, _pipelineLayout, 0, 1, &set, 0, null); // [local]
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Graphics, cached.Pipeline); // [local]
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRenderPass(vk, command, &begin, SubpassContents.Inline); // [local]
+        }
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Graphics, _pipelineLayout, 0, 1, &set, 0, null); // [local]
+        }
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Graphics, cached.Pipeline); // [local]
+        }
         // [local] This pipeline's static states replace the guest draws' dynamic ones.
         Interlocked.Increment(ref DynamicStateEpoch);
+        Vulkan.GraphicsDynamicStateEpoch.Advance();
+        Vulkan.NativeBindingEpoch.Advance();
         var viewport = new Viewport(0.0f, 0.0f, extent.Width, extent.Height, 0.0f, 1.0f);
         var scissor = new Rect2D(new Offset2D(0, 0), extent);
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetViewport(vk, command, 0, 1, &viewport); // [local]
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetScissor(vk, command, 0, 1, &scissor); // [local]
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDraw(vk, command, 3, 1, 0, 0); // [local]
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRenderPass(vk, command); // [local]
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetViewport(vk, command, 0, 1, &viewport); // [local]
+        }
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdSetScissor(vk, command, 0, 1, &scissor); // [local]
+        }
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDraw(vk, command, 3, 1, 0, 0); // [local]
+        }
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRenderPass(vk, command); // [local]
+        }
     }
 }

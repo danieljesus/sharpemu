@@ -15,17 +15,17 @@ internal static unsafe partial class VulkanVideoPresenter
 {
     private sealed partial class Presenter
     {
-        private const int ArgsWriterSlots = 256;
-        private const int ArgsWriterSlotBytes = 2048;
-        private const int ArgsWriterEntryOffset = 0;
-        private const int ArgsWriterHeaderOffset = 64;
-        private const int ArgsWriterPrefixOffset = 128;
-        private const int ArgsWriterOutputOffset = 512;
+        internal const int ArgsWriterSlots = 256;
+        internal const int ArgsWriterSlotBytes = 2048;
+        internal const int ArgsWriterEntryOffset = 0;
+        internal const int ArgsWriterHeaderOffset = 64;
+        internal const int ArgsWriterPrefixOffset = 128;
+        internal const int ArgsWriterOutputOffset = 512;
         private const int ArgsConsumerSlots = 1024;
         private const int ArgsConsumerSlotBytes = 16;
 
-        private GpuBuffer? _argsWriterRing, _argsConsumerRing;
-        private readonly ArgsWriterLedger _argsWriterLedger = new();
+        internal GpuBuffer? _argsWriterRing, _argsConsumerRing;
+        internal readonly ArgsWriterLedger _argsWriterLedger = new();
 
         // SHARPEMU_ARGS_WRITER_INJECT=<nth>: before the nth writer dispatch, the +140 word behind the page table becomes the
         // CPU's total + 2^24, so the last count of that writer is ~1.7e7 (~0.2 s of early-exiting groups): proves the
@@ -50,83 +50,8 @@ internal static unsafe partial class VulkanVideoPresenter
             Console.Error.WriteLine($"[GPU][ARGS_WRITER] inject nth={ArgsWriterInject} header=0x{header:X} total={value} tick={_scheduler.CurrentTick}");
         }
 
-        public void NoteArgsWriterRecorded(ulong shaderHash, IPreparedBindings bindings, ReadOnlySpan<uint> userScalars, ulong submitId, uint threads)
-        {
-            if (shaderHash != ArgsWriterProbe.WriterHash || bindings is not PreparedStageBindings prepared || userScalars.Length < 6)
-                return;
-            var sources = prepared.BufferSources;
-            var views = prepared.Descriptors.Buffers;
-            var table = prepared.Stage.Resources.FlattenedResourceTable;
-            var info = prepared.Resources.Info;
-            if (sources.Length < 2 || views.Length < 2 || table.Length < 2 || info.Buffers.Count < 2)
-                return;
-            var outputIndex = info.Buffers[0].Written ? 0 : 1;
-            var prefixIndex = 1 - outputIndex;
-
-            var header = ((ulong)userScalars[5] << 32 | userScalars[4]) & 0xFFFF_FFFF_FFFFUL;
-            var headerBytes = new byte[ArgsWriterProbe.HeaderBytes];
-            if (!_guestMemory.TryRead(header + ArgsWriterProbe.HeaderBase, headerBytes))
-                return;
-            var count = table[1];
-            var words = (int)Math.Min(count, (uint)ArgsWriterProbe.MaxPrefixWords);
-            var prefixAddress = sources[prefixIndex].Descriptor.Address;
-            var prefix = new uint[words];
-            if (words > 0 && !_guestMemory.TryRead(prefixAddress, System.Runtime.InteropServices.MemoryMarshal.AsBytes(prefix.AsSpan())))
-                return;
-
-            _argsWriterRing ??= CreateArgsWriterRing((ulong)ArgsWriterSlots * ArgsWriterSlotBytes);
-            var ring = _argsWriterRing;
-            var totalAddress = header + 140;
-            var entryOffset = (totalAddress >> PageOwnerTable.PageBits) * sizeof(ulong);
-            var registered = _bufferCache.RegisteredBufferAt(header + ArgsWriterProbe.HeaderBase, ArgsWriterProbe.HeaderBytes);
-            var expectedEntry = 0UL;
-            if (_bufferCache.RegisteredBufferAt(totalAddress, sizeof(uint)) is { } totalBuffer)
-                expectedEntry = totalBuffer.DeviceAddress + (((totalAddress >> PageOwnerTable.PageBits) << PageOwnerTable.PageBits) - totalBuffer.CpuAddress);
-            var backingHeader = new byte[ArgsWriterProbe.HeaderBytes];
-            var backingPrefix = new uint[words];
-            var backingRead = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TryReadBacking(header + ArgsWriterProbe.HeaderBase, backingHeader) &&
-                (words == 0 || SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TryReadBacking(prefixAddress, System.Runtime.InteropServices.MemoryMarshal.AsBytes(backingPrefix.AsSpan())));
-            var cpu = new ArgsWriterProbe.WriterCpu(header, sources[outputIndex].Descriptor.Address, threads, table[0], count, headerBytes, prefix,
-                expectedEntry, registered is not null, backingRead ? backingHeader : null, backingRead ? backingPrefix : null);
-
-            ulong sequence;
-            int slot;
-            lock (_argsWriterLedger)
-                sequence = _argsWriterLedger.ReserveWriter(ArgsWriterSlots, _scheduler.CurrentTick, submitId, cpu, out slot);
-            if (sequence == 0)
-                return;
-
-            var command = BeginBatchedGuestCommands();
-            var slotOffset = (ulong)slot * ArgsWriterSlotBytes;
-            RecordArgsProbeReadBarrier(command);
-            var regions = stackalloc BufferCopy[1];
-            var pageTable = _bufferCache.BdaPageTableBuffer;
-            if (entryOffset + sizeof(ulong) <= pageTable.Size)
-                CopyArgsProbeBytes(command, pageTable.Handle, entryOffset, ring.Handle, slotOffset + ArgsWriterEntryOffset, sizeof(ulong));
-            if (registered is not null)
-                CopyArgsProbeBytes(command, registered.Handle, header + ArgsWriterProbe.HeaderBase - registered.CpuAddress, ring.Handle,
-                    slotOffset + ArgsWriterHeaderOffset, ArgsWriterProbe.HeaderBytes);
-            var memoryOffsets = prepared.ShaderData;
-            var layout = prepared.Layout;
-            var prefixView = views[prefixIndex];
-            var prefixShift = MemoryOffsetOf(memoryOffsets, layout.MemoryOffsetDword, prefixIndex);
-            var prefixBytes = (ulong)words * sizeof(uint);
-            if (words > 0 && prefixView.Buffer.Handle != 0 && prefixShift + prefixBytes <= prefixView.Range)
-                CopyArgsProbeBytes(command, prefixView.Buffer, prefixView.Offset + prefixShift, ring.Handle, slotOffset + ArgsWriterPrefixOffset, prefixBytes);
-            var outputView = views[outputIndex];
-            var outputShift = MemoryOffsetOf(memoryOffsets, layout.MemoryOffsetDword, outputIndex);
-            var outputs = (ulong)Math.Min(count, (uint)ArgsWriterProbe.MaxOutputs) * ArgsWriterProbe.OutputStride;
-            if (outputView.Range > outputShift)
-                outputs = Math.Min(outputs, outputView.Range - outputShift);
-            if (outputs > 0 && outputView.Buffer.Handle != 0 && outputShift < outputView.Range)
-                CopyArgsProbeBytes(command, outputView.Buffer, outputView.Offset + outputShift, ring.Handle, slotOffset + ArgsWriterOutputOffset, outputs);
-            VkRecord.CmdFillBuffer(_vk, command, ring.Handle, slotOffset + ArgsWriterSlotBytes - sizeof(uint), sizeof(uint), IndirectArgsLedger.SequenceWord(sequence));
-            RecordArgsProbeHostBarrier(command);
-            DrainArgsWriterProbe();
-        }
-
         // Records the copy of a 0x8039D9800 dispatch's 12 argument bytes, after the barrier that made them readable.
-        private void RecordArgsConsumerProbe(CommandBuffer command, VkBuffer buffer, ulong offset, ulong address)
+        internal void RecordArgsConsumerProbe(CommandBuffer command, VkBuffer buffer, ulong offset, ulong address)
         {
             _argsConsumerRing ??= CreateArgsWriterRing((ulong)ArgsConsumerSlots * ArgsConsumerSlotBytes);
             ulong sequence;
@@ -143,7 +68,7 @@ internal static unsafe partial class VulkanVideoPresenter
             DrainArgsWriterProbe();
         }
 
-        private GpuBuffer CreateArgsWriterRing(ulong size)
+        internal GpuBuffer CreateArgsWriterRing(ulong size)
         {
             var ring = new GpuBuffer(_deviceInfo, _scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, size);
             ring.Mapped.Clear();
@@ -162,13 +87,13 @@ internal static unsafe partial class VulkanVideoPresenter
             return ring;
         }
 
-        private static uint MemoryOffsetOf(uint[] shaderData, uint memoryOffsetDword, int index)
+        internal static uint MemoryOffsetOf(uint[] shaderData, uint memoryOffsetDword, int index)
         {
             var dword = (int)memoryOffsetDword + index / 4;
             return dword < shaderData.Length ? (shaderData[dword] >> (index % 4 * 8)) & 0xFF : 0;
         }
 
-        private void RecordArgsProbeReadBarrier(CommandBuffer command)
+        internal void RecordArgsProbeReadBarrier(CommandBuffer command)
         {
             var barrier = new MemoryBarrier2
             {
@@ -179,7 +104,7 @@ internal static unsafe partial class VulkanVideoPresenter
             VulkanSynchronization.PipelineBarrier(_vk, command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit, 0, 1, &barrier, 0, null, 0, null);
         }
 
-        private void RecordArgsProbeHostBarrier(CommandBuffer command)
+        internal void RecordArgsProbeHostBarrier(CommandBuffer command)
         {
             var barrier = new MemoryBarrier2
             {
@@ -190,7 +115,7 @@ internal static unsafe partial class VulkanVideoPresenter
             VulkanSynchronization.PipelineBarrier(_vk, command, PipelineStageFlags.TransferBit, PipelineStageFlags.HostBit, 0, 1, &barrier, 0, null, 0, null);
         }
 
-        private void CopyArgsProbeBytes(CommandBuffer command, VkBuffer source, ulong sourceOffset, VkBuffer destination, ulong destinationOffset, ulong size)
+        internal void CopyArgsProbeBytes(CommandBuffer command, VkBuffer source, ulong sourceOffset, VkBuffer destination, ulong destinationOffset, ulong size)
         {
             var region = new BufferCopy { SrcOffset = sourceOffset, DstOffset = destinationOffset, Size = size };
             Gpu.Vulkan.ScopeBarrierTracker.BeginSelfOrdered();
@@ -198,7 +123,7 @@ internal static unsafe partial class VulkanVideoPresenter
             Gpu.Vulkan.ScopeBarrierTracker.EndSelfOrdered();
         }
 
-        private void DrainArgsWriterProbe()
+        internal void DrainArgsWriterProbe()
         {
             List<string> lines;
             lock (_argsWriterLedger)
@@ -236,6 +161,92 @@ internal static unsafe partial class VulkanVideoPresenter
             if (Volatile.Read(ref words[3]) != IndirectArgsLedger.SequenceWord(consumer.Sequence))
                 return null;
             return (words[0], words[1], words[2]);
+        }
+    }
+
+    // [local] The IRenderHost probe members: RecordingHost is the render host now; the probes' state stays on the presenter.
+    private sealed partial class RecordingHost
+    {
+        public void BeforeArgsWriterDispatch(ulong shaderHash, ReadOnlySpan<uint> userScalars)
+        {
+            if (!_worker) _presenter.BeforeArgsWriterDispatch(shaderHash, userScalars);
+        }
+
+        // [local] IRenderHost: the host that recorded the dispatch holds its bindings; the ring and the ledger are the
+        // presenter's (main recording host only: the probe records into the presenter's command buffer).
+        public void NoteArgsWriterRecorded(ulong shaderHash, IPreparedBindings bindings, ReadOnlySpan<uint> userScalars, ulong submitId, uint threads)
+        {
+            if (_worker || shaderHash != ArgsWriterProbe.WriterHash || bindings is not PreparedStageBindings prepared || userScalars.Length < 6)
+                return;
+            var sources = prepared.BufferSources;
+            var views = prepared.Descriptors.Buffers;
+            var table = prepared.Stage.Resources.FlattenedResourceTable;
+            var info = prepared.Resources.Info;
+            if (sources.Length < 2 || views.Length < 2 || table.Length < 2 || info.Buffers.Count < 2)
+                return;
+            var outputIndex = info.Buffers[0].Written ? 0 : 1;
+            var prefixIndex = 1 - outputIndex;
+
+            var header = ((ulong)userScalars[5] << 32 | userScalars[4]) & 0xFFFF_FFFF_FFFFUL;
+            var headerBytes = new byte[ArgsWriterProbe.HeaderBytes];
+            if (!_guestMemory.TryRead(header + ArgsWriterProbe.HeaderBase, headerBytes))
+                return;
+            var count = table[1];
+            var words = (int)Math.Min(count, (uint)ArgsWriterProbe.MaxPrefixWords);
+            var prefixAddress = sources[prefixIndex].Descriptor.Address;
+            var prefix = new uint[words];
+            if (words > 0 && !_guestMemory.TryRead(prefixAddress, System.Runtime.InteropServices.MemoryMarshal.AsBytes(prefix.AsSpan())))
+                return;
+
+            _presenter._argsWriterRing ??= _presenter.CreateArgsWriterRing((ulong)Presenter.ArgsWriterSlots * Presenter.ArgsWriterSlotBytes);
+            var ring = _presenter._argsWriterRing;
+            var totalAddress = header + 140;
+            var entryOffset = (totalAddress >> PageOwnerTable.PageBits) * sizeof(ulong);
+            var registered = _bufferCache.RegisteredBufferAt(header + ArgsWriterProbe.HeaderBase, ArgsWriterProbe.HeaderBytes);
+            var expectedEntry = 0UL;
+            if (_bufferCache.RegisteredBufferAt(totalAddress, sizeof(uint)) is { } totalBuffer)
+                expectedEntry = totalBuffer.DeviceAddress + (((totalAddress >> PageOwnerTable.PageBits) << PageOwnerTable.PageBits) - totalBuffer.CpuAddress);
+            var backingHeader = new byte[ArgsWriterProbe.HeaderBytes];
+            var backingPrefix = new uint[words];
+            var backingRead = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TryReadBacking(header + ArgsWriterProbe.HeaderBase, backingHeader) &&
+                (words == 0 || SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TryReadBacking(prefixAddress, System.Runtime.InteropServices.MemoryMarshal.AsBytes(backingPrefix.AsSpan())));
+            var cpu = new ArgsWriterProbe.WriterCpu(header, sources[outputIndex].Descriptor.Address, threads, table[0], count, headerBytes, prefix,
+                expectedEntry, registered is not null, backingRead ? backingHeader : null, backingRead ? backingPrefix : null);
+
+            ulong sequence;
+            int slot;
+            lock (_presenter._argsWriterLedger)
+                sequence = _presenter._argsWriterLedger.ReserveWriter(Presenter.ArgsWriterSlots, _scheduler.CurrentTick, submitId, cpu, out slot);
+            if (sequence == 0)
+                return;
+
+            var command = BeginBatchedGuestCommands();
+            var slotOffset = (ulong)slot * Presenter.ArgsWriterSlotBytes;
+            _presenter.RecordArgsProbeReadBarrier(command);
+            var regions = stackalloc BufferCopy[1];
+            var pageTable = _bufferCache.BdaPageTableBuffer;
+            if (entryOffset + sizeof(ulong) <= pageTable.Size)
+                _presenter.CopyArgsProbeBytes(command, pageTable.Handle, entryOffset, ring.Handle, slotOffset + Presenter.ArgsWriterEntryOffset, sizeof(ulong));
+            if (registered is not null)
+                _presenter.CopyArgsProbeBytes(command, registered.Handle, header + ArgsWriterProbe.HeaderBase - registered.CpuAddress, ring.Handle,
+                    slotOffset + Presenter.ArgsWriterHeaderOffset, ArgsWriterProbe.HeaderBytes);
+            var memoryOffsets = prepared.ShaderData;
+            var layout = prepared.Layout;
+            var prefixView = views[prefixIndex];
+            var prefixShift = Presenter.MemoryOffsetOf(memoryOffsets, layout.MemoryOffsetDword, prefixIndex);
+            var prefixBytes = (ulong)words * sizeof(uint);
+            if (words > 0 && prefixView.Buffer.Handle != 0 && prefixShift + prefixBytes <= prefixView.Range)
+                _presenter.CopyArgsProbeBytes(command, prefixView.Buffer, prefixView.Offset + prefixShift, ring.Handle, slotOffset + Presenter.ArgsWriterPrefixOffset, prefixBytes);
+            var outputView = views[outputIndex];
+            var outputShift = Presenter.MemoryOffsetOf(memoryOffsets, layout.MemoryOffsetDword, outputIndex);
+            var outputs = (ulong)Math.Min(count, (uint)ArgsWriterProbe.MaxOutputs) * ArgsWriterProbe.OutputStride;
+            if (outputView.Range > outputShift)
+                outputs = Math.Min(outputs, outputView.Range - outputShift);
+            if (outputs > 0 && outputView.Buffer.Handle != 0 && outputShift < outputView.Range)
+                _presenter.CopyArgsProbeBytes(command, outputView.Buffer, outputView.Offset + outputShift, ring.Handle, slotOffset + Presenter.ArgsWriterOutputOffset, outputs);
+            VkRecord.CmdFillBuffer(_vk, command, ring.Handle, slotOffset + Presenter.ArgsWriterSlotBytes - sizeof(uint), sizeof(uint), IndirectArgsLedger.SequenceWord(sequence));
+            _presenter.RecordArgsProbeHostBarrier(command);
+            _presenter.DrainArgsWriterProbe();
         }
     }
 }

@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
+using SharpEmu.HLE.Host.Windows;
 
 namespace SharpEmu.GUI;
 
@@ -27,9 +28,6 @@ internal sealed class EmulatorProcess : IDisposable
     private const int JobObjectExtendedLimitInformationClass = 9;
     private const string MitigatedChildFlag = "--sharpemu-mitigated-child";
     private const string MitigatedChildEnvironment = "SHARPEMU_MITIGATED_CHILD";
-    private const ulong ControlFlowGuardAlwaysOff = 0x00000002UL << 40;
-    private const ulong CetUserShadowStacksAlwaysOff = 0x00000002UL << 28;
-    private const ulong UserCetSetContextIpValidationAlwaysOff = 0x00000002UL << 32;
 
     private static readonly object EnvironmentGate = new();
 
@@ -56,7 +54,8 @@ internal sealed class EmulatorProcess : IDisposable
         }
     }
 
-    public void Start(string exePath, IReadOnlyList<string> arguments, string? workingDirectory)
+    public void Start(string exePath, IReadOnlyList<string> arguments, string? workingDirectory,
+        IReadOnlyDictionary<string, string?>? environment = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(exePath);
         ArgumentNullException.ThrowIfNull(arguments);
@@ -72,13 +71,32 @@ internal sealed class EmulatorProcess : IDisposable
             _stopRequested = false;
         }
 
-        if (OperatingSystem.IsWindows())
+        // CreateProcess and Process.Start both inherit the calling process's environment.
+        // Scope the game's values to process creation and restore them even when startup fails.
+        // The Windows mitigation path takes the same (reentrant) gate.
+        lock (EnvironmentGate)
         {
-            StartWindows(exePath, arguments, workingDirectory);
-            return;
+            var previous = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+            foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+                previous[(string)entry.Key] = (string?)entry.Value;
+            IReadOnlyList<string> loaderVariables = [];
+            try
+            {
+                foreach (var (name, value) in environment ?? new Dictionary<string, string?>())
+                    Environment.SetEnvironmentVariable(name, value);
+                // SHARPEMU_VK_DISABLE_IMPLICITS also needs the Vulkan loader configured in the
+                // child's environment; undo those variables along with the game's own.
+                if (SharpEmu.Libs.VideoOut.RenderDocCapture.ApplyVulkanLoaderEnvironment())
+                    loaderVariables = ["VK_LOADER_DEBUG", "VK_LOADER_LAYERS_DISABLE", "VK_LOADER_LAYERS_ALLOW"];
+                if (OperatingSystem.IsWindows()) StartWindows(exePath, arguments, workingDirectory);
+                else StartFallback(exePath, arguments, workingDirectory);
+            }
+            finally
+            {
+                foreach (var name in (environment?.Keys ?? []).Concat(loaderVariables).Distinct(StringComparer.OrdinalIgnoreCase))
+                    Environment.SetEnvironmentVariable(name, previous.GetValueOrDefault(name));
+            }
         }
-
-        StartFallback(exePath, arguments, workingDirectory);
     }
 
     public void Stop()
@@ -214,10 +232,10 @@ internal sealed class EmulatorProcess : IDisposable
             }
 
             mitigationPolicies = Marshal.AllocHGlobal(sizeof(ulong) * 2);
-            Marshal.WriteInt64(mitigationPolicies, unchecked((long)ControlFlowGuardAlwaysOff));
+            Marshal.WriteInt64(mitigationPolicies, unchecked((long)GuestProcessMitigationPolicy.Primary));
             Marshal.WriteInt64(
                 nint.Add(mitigationPolicies, sizeof(long)),
-                unchecked((long)(CetUserShadowStacksAlwaysOff | UserCetSetContextIpValidationAlwaysOff)));
+                unchecked((long)GuestProcessMitigationPolicy.Secondary));
             if (!UpdateProcThreadAttribute(
                     attributeList,
                     0,
@@ -253,7 +271,7 @@ internal sealed class EmulatorProcess : IDisposable
                             0,
                             0,
                             true,
-                            ExtendedStartupInfoPresent | CreateNoWindow,
+                            ExtendedStartupInfoPresent | CreateNoWindow | WindowsGuestAddressReservation.CreateSuspended,
                             0,
                             string.IsNullOrWhiteSpace(workingDirectory)
                                 ? Path.GetDirectoryName(exePath) ?? Environment.CurrentDirectory
@@ -272,6 +290,7 @@ internal sealed class EmulatorProcess : IDisposable
 
             processHandle = processInfo.Process;
             threadHandle = processInfo.Thread;
+            WindowsGuestAddressReservation.PrepareAndResume(processHandle, threadHandle);
             CloseHandle(stdoutWrite);
             stdoutWrite = 0;
             CloseHandle(stderrWrite);

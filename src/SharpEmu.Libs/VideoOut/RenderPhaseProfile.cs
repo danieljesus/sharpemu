@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Diagnostics;
+using SharpEmu.HLE.Diagnostics;
 
 namespace SharpEmu.Libs.VideoOut;
 
@@ -121,6 +122,8 @@ internal static class RenderPhaseProfile
         BufferResources,
         DescriptorSetup,
         PipelineSetup,
+        GraphicsPipelineDriver,
+        ComputePipelineDriver,
         DrawRecording,
         ResourceDestroy,
         ImageVersions,
@@ -137,6 +140,20 @@ internal static class RenderPhaseProfile
         SubmissionCapacity,
         CompletedSubmissionCleanup,
         MovieFramePolling,
+        // Upstream's phases stay before ours: every phase from BindingSetup on is a fine one (SHARPEMU_PROFILE_FINE).
+        ProgramSharedGateWait,
+        PipelineSharedGateWait,
+        ComputePipelineWait,
+        ProgramDecode,
+        ProgramPlanning,
+        ProgramLayoutRequest,
+        ProgramTranslation,
+        VulkanCommands,
+        DispatchConsume,
+        DispatchPipeline,
+        CommandPacketRead,
+        CommandPacketHandler,
+        CommandSpaceWait,
         // [local] The render thread waits for deferred uploads before a submit.
         DeferredUploadWait,
         // [local] The render thread waits for the submit thread to hand a tick to the queue (present, readback, drain).
@@ -287,6 +304,26 @@ internal static class RenderPhaseProfile
     private static readonly long[] _commandReadCalls = new long[(int)CommandReadKind.Count];
     private static readonly long[] _commandReadBytes = new long[(int)CommandReadKind.Count];
 
+    private static long _cleanReadHits;
+    private static long _cleanReadMisses;
+
+    internal static void RecordCleanRead(bool hit)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        if (hit)
+        {
+            _cleanReadHits++;
+        }
+        else
+        {
+            _cleanReadMisses++;
+        }
+    }
+
     internal static void RecordCommandRead(CommandReadKind kind, int bytes)
     {
         if (!Enabled || _scopeDepth == 0)
@@ -394,6 +431,44 @@ internal static class RenderPhaseProfile
     [ThreadStatic] private static Phase _current;
     [ThreadStatic] private static long _lastTimestamp;
     [ThreadStatic] private static int _scopeDepth;
+    [ThreadStatic] private static ThreadCounter[]? _threadTicks;
+    [ThreadStatic] private static ThreadCounter[]? _threadEntries;
+
+    private static class ResolveCounters
+    {
+        internal static readonly ThreadCounter[] Ticks = Enumerable.Range(0, (int)Phase.Count).Select(static _ => new ThreadCounter()).ToArray();
+        internal static readonly ThreadCounter[] Entries = Enumerable.Range(0, (int)Phase.Count).Select(static _ => new ThreadCounter()).ToArray();
+    }
+
+    internal static void AttachResolveWorker()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        _threadTicks = ResolveCounters.Ticks;
+        _threadEntries = ResolveCounters.Entries;
+        _current = Phase.IdleNoQueuedWork;
+        _lastTimestamp = Stopwatch.GetTimestamp();
+        _scopeDepth = 1;
+    }
+
+    internal static void ReportResolveWorker(double seconds, long frames)
+    {
+        var parts = new List<string>();
+        for (var index = 0; index < (int)Phase.Count; index++)
+        {
+            var ticks = ResolveCounters.Ticks[index].Take();
+            var entries = ResolveCounters.Entries[index].Take();
+            if (ticks > 0)
+            {
+                parts.Add(FormattableString.Invariant($"{(Phase)index}={ticks * 1000.0 / Stopwatch.Frequency:F2}ms/n{entries}"));
+            }
+        }
+
+        Console.Error.WriteLine(FormattableString.Invariant($"[PERF][RESOLVE_MS] window_s={seconds:F1} frames={frames} ") + string.Join(" ", parts));
+    }
 
     internal readonly ref struct Scope
     {
@@ -444,7 +519,7 @@ internal static class RenderPhaseProfile
 
             Charge(_previous);
             _scopeDepth--;
-            if (ResolveProfile.Enabled)
+            if (ResolveProfile.Enabled && _threadTicks is null)
             {
                 ResolveProfile.CloseScope(_previous, _phase, _lastTimestamp - _started, _chargeCount - _charges - 1,
                     _lastAllocated - _allocated);
@@ -460,7 +535,14 @@ internal static class RenderPhaseProfile
             }
 
             Charge(phase);
-            _entries[(int)phase]++;
+            if (_threadEntries is { } threadEntries)
+            {
+                threadEntries[(int)phase].Increment();
+            }
+            else
+            {
+                _entries[(int)phase]++;
+            }
         }
     }
 
@@ -473,8 +555,16 @@ internal static class RenderPhaseProfile
 
         var previous = Charge(phase);
         _scopeDepth++;
-        _entries[(int)phase]++;
-        if (ResolveProfile.Enabled)
+        if (_threadEntries is { } threadEntries)
+        {
+            threadEntries[(int)phase].Increment();
+        }
+        else
+        {
+            _entries[(int)phase]++;
+        }
+
+        if (ResolveProfile.Enabled && _threadTicks is null) // [local] SHARPEMU_PROFILE_RESOLVE: the render thread's scopes only
         {
             ResolveProfile.OpenScope(phase);
             return new Scope(previous, phase);
@@ -545,9 +635,17 @@ internal static class RenderPhaseProfile
         var previous = _current;
         if (_lastTimestamp != 0)
         {
-            _ticks[(int)previous] += now - _lastTimestamp;
-            _allocatedBytes[(int)previous] += allocated - _lastAllocated;
-            if (FrameTraceEnabled)
+            if (_threadTicks is { } threadTicks)
+            {
+                threadTicks[(int)previous].Add(now - _lastTimestamp);
+            }
+            else
+            {
+                _ticks[(int)previous] += now - _lastTimestamp;
+                _allocatedBytes[(int)previous] += allocated - _lastAllocated; // [local]
+            }
+
+            if (FrameTraceEnabled && _threadTicks is null)
             {
                 _framePhaseTicks[(int)previous] += now - _lastTimestamp;
             }
@@ -652,8 +750,21 @@ internal static class RenderPhaseProfile
         foreach (var vkCallLine in Gpu.Vulkan.VkCallProbe.TakeReport(seconds, frames)) Console.Error.WriteLine(vkCallLine); // [local]
         foreach (var ringLine in Gpu.Vulkan.CommandRing.TakeReport(seconds, frames)) Console.Error.WriteLine(ringLine); // [local]
         if (Render2Probe.TakeReport(frames) is { } render2) Console.Error.WriteLine(render2); // [local] SHARPEMU_RENDER2_PROBE
+        GpuWaitSiteProfile.Report();
+        ComputeCompileProfile.Report();
+        SharpEmu.ShaderCompiler.Vulkan.ShaderTranslationProfile.Report();
+        SharpEmu.Libs.Diagnostics.SubmitSiteTally.Report();
+        SharpEmu.Libs.Diagnostics.PromotionSiteTally.Report();
         ReportImageUploads();
         BufferUploadProfile.Report();
+        if (SharpEmu.Libs.Gpu.Rendering.TessellationProfile.TakeReport() is { } tessellationReport)
+        {
+            Console.Error.WriteLine(tessellationReport);
+        }
+        Console.Error.WriteLine(BufferUploadProfile.TakeTotalsReport());
+        Console.Error.WriteLine(BufferUploadProfile.TakeDirtyTrackingReport());
+        Console.Error.WriteLine(BufferUploadProfile.TakeSyncPointReport());
+        Console.Error.WriteLine("[PERF][MATERIALIZE] " + SharpEmu.ShaderCompiler.Resources.MaterializationTally.TakeReport());
         Console.Error.WriteLine(SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.TakeReport());
         if (SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.SyncValidateMode != 0) // [local]
             Console.Error.WriteLine($"[PERF][SYNC_VALIDATE] batched_downloads={Gpu.Buffers.GuestBufferCache.TakeBatchedSyncReads()}");
@@ -672,7 +783,24 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(Gpu.Pipelines.BackMaterializations.TakeReport()); // [local]
         Console.Error.WriteLine(FormattableString.Invariant(
             $"[PERF][PREPARED_PROGRAMS] used={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsUsed, 0)} rejected={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedProgramsRejected, 0)} dynamic_state_rebuilt={Interlocked.Exchange(ref Gpu.Rendering.RenderExecutor.PreparedDynamicStateMismatches, 0)}"));
+        Console.Error.WriteLine(SharpEmu.ShaderCompiler.Resources.ResourceMaterializationCache.TakeOutcomeReport());
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.GuestBufferCache.TakeAsyncReadbackReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Vulkan.GpuSyncProfile.TakeReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Vulkan.BarrierTally.TakeReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Rendering.PendingGpuWrites.TakeReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Diagnostics.CommandThreadTally.TakeReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Diagnostics.DispatchRunTally.TakeReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Agc.AgcExports.TakeResolvePoolReport());
+        SharpEmu.Libs.Agc.DcbParseProfile.TryReport();
+        Console.Error.WriteLine(SharpEmu.Libs.Diagnostics.PacketHandlerTally.TakeReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Pipelines.ShaderPipelineCache.TakeKeptProgramsReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Pipelines.ShaderPipelineCache.TakeFastPathReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Pipelines.ShaderPipelineCache.TakeCpuKernelReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.GpuCommands.GpuCommandInterpreter.TakePredicationReport());
+        Console.Error.WriteLine(VulkanVideoPresenter.TakeSliceReport());
+        Console.Error.WriteLine(VulkanVideoPresenter.TakeStagePreparationReport());
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.ContentUploadArena.TakeReport());
+        ReportResolveWorker(seconds, frames);
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeLookupReport());
         if (Gpu.Rendering.RenderExecutor.TakeTargetMemoReport() is { } targetMemo) Console.Error.WriteLine(targetMemo); // [local]
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeDccClearReport()); // [local]
@@ -680,7 +808,9 @@ internal static class RenderPhaseProfile
         if (VulkanVideoPresenter.TakeNativeStateReport() is { } nativeState) Console.Error.WriteLine(nativeState); // [local]
         var (invalidations, cpuDirtySkips) =SharpEmu.HLE.GpuMemory.GuestPageTracker.TakeInvalidationCounters(); // [local]
         Console.Error.WriteLine(FormattableString.Invariant($"[PERF][PAGE_TRACKER] invalidations={invalidations} cpu_dirty_skips={cpuDirtySkips}"));
+        Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeDccReport());
         SharpEmu.ShaderCompiler.Resources.ResourceMaterializationProfile.WriteReport();
+        DescriptorStallProfile.WriteReport();
         SharpEmu.Libs.Diagnostics.AgcRegisterPacketProfile.WriteReport();
         SharpEmu.HLE.GpuMemory.GpuMemoryAccessProfile.WriteReport();
         WindowPollProfile.Report();
@@ -697,7 +827,9 @@ internal static class RenderPhaseProfile
         }
         if (commandReads.Count != 0)
         {
-            Console.Error.WriteLine($"[PERF][COMMAND_READS] window_s={seconds:F1} {string.Join(" ", commandReads)}");
+            Console.Error.WriteLine($"[PERF][COMMAND_READS] window_s={seconds:F1} {string.Join(" ", commandReads)} " +
+                FormattableString.Invariant($"clean_hits={Interlocked.Exchange(ref _cleanReadHits, 0)} clean_misses={Interlocked.Exchange(ref _cleanReadMisses, 0)} ") +
+                FormattableString.Invariant($"gpu_version_bumps={SharpEmu.Libs.Gpu.Buffers.GuestBufferCache.TakeGpuVersionBumps()}"));
         }
     }
 

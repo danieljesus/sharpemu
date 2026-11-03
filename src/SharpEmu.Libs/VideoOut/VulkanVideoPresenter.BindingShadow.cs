@@ -11,16 +11,18 @@ namespace SharpEmu.Libs.VideoOut;
 
 // [local] SHARPEMU_NATIVE_STATE_REUSE: skip a pipeline, push-constant, descriptor, vertex-buffer or index-buffer bind
 // that repeats what the same command buffer already has bound. 1 = skip; 2 = only count what would be skipped
-// ([PERF][NATIVE_STATE]); unset or 0 = off. The shadow is dropped when the command buffer, the scheduler tick or the
-// NativeBindingEpoch changes (any bind recorded by someone else, e.g. a helper pass). Adapted from 1fbecd32 by
-// ParantezTech (#1082): our binds go through VkRecord and the epoch is advanced there, and a skipped descriptor
-// update also skips the descriptor-heap commit and vkUpdateDescriptorSets.
+// ([PERF][NATIVE_STATE]); unset or 0 = off (upstream turns it on by default; ours keeps it off). The shadow is dropped
+// when the command buffer, its recording or the NativeBindingEpoch changes (any bind recorded by someone else, e.g. a
+// helper pass). Upstream's implementation (#1082, per RecordingHost); our binds go through VkRecord, which advances the
+// epoch, so each one is accepted afterwards (AcceptOwnBind), and a skipped descriptor update also skips the
+// descriptor-heap commit and vkUpdateDescriptorSets. Our descriptor key also covers the array element and texel buffer
+// views, and a descriptor it cannot describe never repeats.
 internal static unsafe partial class VulkanVideoPresenter
 {
     internal static readonly int NativeStateReuseMode =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_STATE_REUSE"), out var reuse) ? reuse : 0;
 
-    private enum NativeStateKind { Pipeline, PushConstants, Descriptors, VertexBuffers, IndexBuffer, Count }
+    private static bool NativeStateReuse => NativeStateReuseMode != 0;
 
     private static readonly long[] _nativeStateCalls = new long[(int)NativeStateKind.Count];
     private static readonly long[] _nativeStateRepeats = new long[(int)NativeStateKind.Count];
@@ -43,7 +45,7 @@ internal static unsafe partial class VulkanVideoPresenter
         return text.ToString();
     }
 
-    private sealed partial class Presenter
+    private sealed partial class RecordingHost
     {
         private const int ShadowVertexBufferCapacity = 32;
 
@@ -76,12 +78,12 @@ internal static unsafe partial class VulkanVideoPresenter
         // Whether the shadow describes this command buffer; resets it when it does not.
         private bool SyncNativeShadow(CommandBuffer command)
         {
-            if (NativeStateReuseMode == 0)
+            if (!NativeStateReuse)
             {
                 return false;
             }
 
-            var tick = _scheduler.CurrentTick;
+            var tick = (ulong)CurrentRecording().Generation;
             var epoch = NativeBindingEpoch.Value;
             if (command.Handle == _shadowCommand && tick == _shadowTick && epoch == _shadowEpoch)
             {
@@ -109,21 +111,27 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
-        // Our own bind advanced the epoch; the shadow still describes the command buffer.
+        // [local] Our own bind advanced the epoch (VkRecord); the shadow still describes the command buffer.
         private void AcceptOwnBind()
         {
-            if (NativeStateReuseMode != 0)
+            if (NativeStateReuse)
             {
                 _shadowEpoch = NativeBindingEpoch.Value;
             }
         }
 
+        // Counts the bind (ours with a mode set, upstream's with the profile on); true when it may be skipped (mode 1).
         private static bool Reuse(NativeStateKind kind, bool repeated)
         {
             Interlocked.Increment(ref _nativeStateCalls[(int)kind]);
             if (repeated)
             {
                 Interlocked.Increment(ref _nativeStateRepeats[(int)kind]);
+            }
+
+            if (GpuSyncProfile.Enabled)
+            {
+                GpuSyncProfile.CountNativeState(kind, repeated);
             }
 
             return repeated && NativeStateReuseMode == 1;
@@ -142,11 +150,31 @@ internal static unsafe partial class VulkanVideoPresenter
                 bound = pipeline;
             }
 
-            VkRecord.CmdBindPipeline(_vk, command, bindPoint, pipeline);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                VkRecord.CmdBindPipeline(_vk, command, bindPoint, pipeline); // [local]
+            }
+
             AcceptOwnBind();
         }
 
-        // True when the same push constants are already recorded; otherwise the caller records them and calls AcceptOwnBind.
+        // Upstream's entry point: records the push constants unless the same ones are already recorded.
+        private void PushConstantsShadowed(CommandBuffer command, PipelineLayout layout, ShaderStageFlags stages, uint* data)
+        {
+            if (PushConstantsAlreadyRecorded(command, layout, stages, data))
+            {
+                return;
+            }
+
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                VkRecord.CmdPushConstants(_vk, command, layout, stages, 0, PushData.ByteSize, data); // [local]
+            }
+
+            AcceptOwnBind();
+        }
+
+        // [local] True when the same push constants are already recorded; otherwise the caller records them and calls AcceptOwnBind.
         private bool PushConstantsAlreadyRecorded(CommandBuffer command, PipelineLayout layout, ShaderStageFlags stages, uint* data)
         {
             if (!SyncNativeShadow(command))

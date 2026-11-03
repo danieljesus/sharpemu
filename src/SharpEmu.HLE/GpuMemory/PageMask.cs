@@ -72,7 +72,6 @@ public struct PageMask
         return false;
     }
 
-    // [local] Every bit of [startPage, endPage) is set; false for an empty or invalid range.
     public bool AllInRange(int startPage, int endPage)
     {
         if (startPage < 0 || endPage > Bits || startPage >= endPage) return false;
@@ -114,6 +113,20 @@ public struct PageMask
         }
     }
 
+    public void SetRangeAndClear(int start, int end, ref PageMask first, ref PageMask second, ref PageMask third)
+    {
+        if (start < 0 || end > Bits || start >= end) return;
+        var fullBlock = start == 0 && end == Bits;
+        for (var word = start / WordBits; word <= (end - 1) / WordBits; word++)
+        {
+            var mask = fullBlock ? ~0UL : RangeWord(word, start, end);
+            _words[word] |= mask;
+            first._words[word] &= ~mask;
+            second._words[word] &= ~mask;
+            third._words[word] &= ~mask;
+        }
+    }
+
     public static PageMask operator ^(in PageMask left, in PageMask right)
     {
         var result = default(PageMask);
@@ -131,6 +144,17 @@ public struct PageMask
         for (var word = 0; word < WordCount; word++)
         {
             result._words[word] = left._words[word] & right._words[word];
+        }
+
+        return result;
+    }
+
+    public static PageMask operator |(in PageMask left, in PageMask right)
+    {
+        var result = default(PageMask);
+        for (var word = 0; word < WordCount; word++)
+        {
+            result._words[word] = left._words[word] | right._words[word];
         }
 
         return result;

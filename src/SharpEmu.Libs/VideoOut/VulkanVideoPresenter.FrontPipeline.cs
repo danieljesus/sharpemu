@@ -456,6 +456,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private int _queueId;
         private bool _geometrySnapshots; // [local] the submission carries geometry snapshots to validate
         private readonly Action _flush = presenter.Flush;
+        private readonly Action _flushFrame = presenter.FlushFrame; // [local] upstream's frame boundary (frame ticks), in stream order
         private readonly Action _barrier = presenter.EmitGlobalBarrier;
         private readonly Action _collect = presenter.RunGarbageCollector;
         private readonly Action _pauseAlias = presenter.PauseFrontAliasAccess;
@@ -516,6 +517,8 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         public void Flush() => queue.Enqueue(_flush, _pauseAlias, _resumeAlias);
+
+        public void FlushFrame() => queue.Enqueue(_flushFrame, _pauseAlias, _resumeAlias);
 
         public void FlushAndWait() { FrontSyncStats.Note(3); queue.Run(() => { presenter.FlushAndWait(); return true; }, _pauseAlias, _resumeAlias); }
 
@@ -1258,14 +1261,15 @@ internal static unsafe partial class VulkanVideoPresenter
         // [local] SHARPEMU_PROFILE_RESOLVE: the draw or dispatch just executed, keyed by the pipeline it bound last.
         private void EndResolveDraw(in ResolveProfile.DrawToken token, bool dispatch)
         {
+            var recording = Recording; // [local] the main recording host binds the pipelines the render thread records
             if (dispatch)
             {
-                _pipelineEntries.TryGetValue(_profileComputePipeline, out var compute);
-                ResolveProfile.EndDraw(in token, dispatch: true, _profileComputePipeline, 0, 0, compute?.ProfileComputeHash ?? 0);
+                _pipelineEntries.TryGetValue(recording._profileComputePipeline, out var compute);
+                ResolveProfile.EndDraw(in token, dispatch: true, recording._profileComputePipeline, 0, 0, compute?.ProfileComputeHash ?? 0);
                 return;
             }
 
-            var entry = _boundGraphicsPipeline;
+            var entry = recording._boundGraphicsPipeline;
             ResolveProfile.EndDraw(in token, dispatch: false, entry?.Id ?? 0, entry?.ProfileVertexHash ?? 0, entry?.ProfilePixelHash ?? 0, 0);
         }
 

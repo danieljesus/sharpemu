@@ -22,6 +22,7 @@ public sealed class ResourceRuntimeInputs
     public GuestWordReader? ReadMemory { get; init; }
     public GuestWordReader? ReadCleanMemory { get; init; }
     public ComputeSelectorState? ComputeState { get; set; }
+    public Action<uint, uint, ulong, ulong, ReadOnlyMemory<uint>>? TraceImageCandidate { get; init; }
 
     // Told true before the flattened table's words are evaluated and false after, so a reader
     // wrapper can tell the words only the table reads from those the descriptors depend on.
@@ -48,12 +49,54 @@ public sealed class ResourceRuntimeInputs
         ReadMemory = reader,
         ReadCleanMemory = ReadCleanMemory,
         ComputeState = ComputeState,
+        TraceImageCandidate = TraceImageCandidate,
         TablePhase = TablePhase,
         ReadResidentMemory = ReadResidentMemory,
         ReadsClean = ReadsClean || ReferenceEquals(reader, ReadCleanMemory),
         SynchronizeRanges = SynchronizeRanges,
         SynchronizeTableRange = SynchronizeTableRange,
     };
+
+    // The inputs of a linked plan whose call entries read their arguments from user data
+    // (ScalarValueGraph.CallArgumentRegisterBase): this draw's user data, then two registers per argument.
+    public ResourceRuntimeInputs WithCallArguments(uint userDataBase, IReadOnlyList<ulong> arguments)
+    {
+        if (userDataBase > ScalarValueGraph.CallArgumentRegisterBase ||
+            UserData.Count > ScalarValueGraph.CallArgumentRegisterBase - userDataBase)
+        {
+            throw new ArgumentOutOfRangeException(nameof(userDataBase), "The user data reaches the call argument registers.");
+        }
+
+        var first = (int)(ScalarValueGraph.CallArgumentRegisterBase - userDataBase);
+        var userData = new uint[first + arguments.Count * 2];
+        for (var index = 0; index < UserData.Count; index++)
+        {
+            userData[index] = UserData[index];
+        }
+
+        var offset = first;
+        foreach (var argument in arguments)
+        {
+            userData[offset++] = (uint)argument;
+            userData[offset++] = (uint)(argument >> 32);
+        }
+
+        return new()
+        {
+            UserData = userData,
+            ShaderBase = ShaderBase,
+            ReadMemory = ReadMemory,
+            ReadCleanMemory = ReadCleanMemory,
+            ComputeState = ComputeState,
+            TraceImageCandidate = TraceImageCandidate,
+            TablePhase = TablePhase,
+            ReadResidentMemory = ReadResidentMemory,
+            CompareTableChunk = CompareTableChunk, // [local] same resident reader, so its comparer still applies
+            ReadsClean = ReadsClean,
+            SynchronizeRanges = SynchronizeRanges, // [local]
+            SynchronizeTableRange = SynchronizeTableRange, // [local]
+        };
+    }
 }
 
 public readonly record struct ComputeSelectorState(uint WaveSize, uint ThreadsX, uint ThreadsY, uint ThreadsZ,

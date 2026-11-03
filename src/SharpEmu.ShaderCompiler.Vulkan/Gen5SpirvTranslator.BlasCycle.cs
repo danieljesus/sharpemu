@@ -194,7 +194,7 @@ public static partial class Gen5SpirvTranslator
             EmitConditional(elected, () =>
             {
                 AtomicAdd(CycleCounter(BlasCycleTlasGuarded), SelectU(IsNotZero(Load(_uintType, _tlasCapped)), UInt(1), UInt(0)));
-                _module.AddInstruction(SpirvOp.AtomicUMax, _uintType, CycleCounter(BlasCycleTlasMax), UInt(1), UInt(0), Load(_uintType, _iterationGuard));
+                _module.AddInstruction(SpirvOp.AtomicUMax, _uintType, CycleCounter(BlasCycleTlasMax), UInt(1), UInt(0), Load(_uintType, IterationGuard()));
             });
         }
     }

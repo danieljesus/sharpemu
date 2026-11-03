@@ -4,8 +4,8 @@
 namespace SharpEmu.Libs.Gpu.Vulkan;
 
 // [local] Advances on every pipeline, descriptor, push-constant, vertex-buffer and index-buffer bind recorded through
-// VkRecord, so a cache of what a command buffer has bound can tell that someone else bound something since.
-// Adapted from ae97ac95 by ParantezTech (#1082), which advanced it in each helper pass; here VkRecord advances it.
+// VkRecord, and in each helper pass that binds its own state (upstream, #1082), so a cache of what a command buffer
+// has bound can tell that someone else bound something since. Both advance it: conservative.
 internal static class NativeBindingEpoch
 {
     private static long _value;

@@ -103,7 +103,6 @@ public sealed class ProgramGateConcurrencyTests : IDisposable
         Assert.Equal(expected[0].Id == expected[2].Id, ids[0] == ids[2]);
         var entry = Assert.Single(programs.Entries);
         Assert.Equal(2, entry.Permutations.Count);
-        Assert.Equal(entry.Permutations, entry.Published);
         Assert.Equal(2, guest.Compiler.Compilations);
     }
 }

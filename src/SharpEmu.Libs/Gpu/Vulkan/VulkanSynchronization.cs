@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.Libs.VideoOut;
 using Silk.NET.Vulkan;
 
 namespace SharpEmu.Libs.Gpu.Vulkan;
@@ -21,9 +22,16 @@ internal static unsafe class VulkanSynchronization
         BufferMemoryBarrier2* bufferMemoryBarriers,
         uint imageMemoryBarrierCount,
         ImageMemoryBarrier2* imageMemoryBarriers,
+        BarrierSource source = BarrierSource.Other,
         [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "", // [local]
         [System.Runtime.CompilerServices.CallerLineNumber] int callerLine = 0) // [local]
     {
+        if (GpuSyncProfile.Enabled)
+        {
+            GpuSyncProfile.CountBarrier(sourceStages, destinationStages, memoryBarrierCount, bufferMemoryBarrierCount, imageMemoryBarrierCount);
+            BarrierTally.Count(source, sourceStages, destinationStages);
+        }
+
         var sourceStages2 = (PipelineStageFlags2)(ulong)sourceStages;
         var destinationStages2 = (PipelineStageFlags2)(ulong)destinationStages;
         for (var index = 0u; index < memoryBarrierCount; index++)
@@ -54,8 +62,11 @@ internal static unsafe class VulkanSynchronization
             PImageMemoryBarriers = imageMemoryBarriers,
         };
         VkCallProbe.CountBarrier(command.Handle, memoryBarrierCount, bufferMemoryBarrierCount, imageMemoryBarrierCount, callerFile, callerLine); // [local]
-        var vkProbe54 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(vk, command, &dependencyInfo); // [local]
-        SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe54); // [local]
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            var vkProbe54 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(vk, command, &dependencyInfo); // [local]
+            SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe54); // [local]
+        }
     }
 }

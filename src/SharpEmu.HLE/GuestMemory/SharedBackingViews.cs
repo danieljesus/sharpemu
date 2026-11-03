@@ -11,28 +11,34 @@ public readonly record struct ViewRecord(ulong Address, ulong Size, ulong Offset
     public bool WasRestored { get; init; }
 }
 
-public sealed unsafe class SharedBackingViews : IDisposable
+public sealed unsafe partial class SharedBackingViews : IDisposable
 {
     internal static Action<string> OnFatal = message => Environment.FailFast(message);
 
     private readonly IHostViewMemory _host;
     private readonly HostBackingObject? _backing;
     private readonly object _lock = new();
-    private readonly SortedList<ulong, ViewRecord> _views = new();
-    private bool _disposed;
+    private readonly ViewRecordTree _views = new();
+    // Small copies stay under the metadata lock to avoid reservation overhead.
+    private const ulong ConcurrentCopyMinimumBytes = 64 * 1024;
+    private CopyReservation[]? _copyReservations;
+    private int _activeCopies;
+    private int _copyWaiters;
+    private int _mappingWaiters;
+    private int _copyAccessBlocked;
+    private volatile bool _disposed;
 
-    // Guest command writes and their reads by the render thread reach TryWriteBacking and
-    // TryReadBacking millions of times per second, a few bytes at a time, while views
-    // change rarely. Single-view accesses search this immutable copy of _views without
-    // the lock; every change to _views republishes it under the lock.
-    private ViewRecord[] _snapshot = [];
+    // Readers retain an immutable root. Updates copy only the affected tree branch.
+    private ViewRecordTree.Node? _snapshot;
+    private static readonly object EmptySnapshot = new();
 
     // Single-view accesses in flight; Dispose waits for them before releasing the alias.
     private int _activeAccesses;
 
     // [local] SHARPEMU_STRIPED_ACCESS_COUNT (on by default; =0 turns it off): the in-flight count is kept in per-thread stripes on
     // their own cache lines, so the render threads' lock-free accesses (every HLE guest read and write, several per Agc
-    // builder call) stop bouncing one shared line between cores. Only Dispose reads it, as the sum of the stripes: an
+    // builder call) stop bouncing one shared line between cores. Only Dispose and a copy reservation's admission wait
+    // (ActiveAccesses, Transfers) read it, as the sum of the stripes: an
     // access enters and leaves on the same thread, and an alias access left on another thread moves the count between
     // stripes without changing the sum. Read once per instance at construction; settable for tests.
     internal static bool StripedAccessCountDefault { get; set; } =
@@ -100,6 +106,7 @@ public sealed unsafe class SharedBackingViews : IDisposable
     {
         lock (_lock)
         {
+            WaitForCopies();
             if (!IsAvailable || !IsWithinBacking(offset, size))
             {
                 return false;
@@ -135,31 +142,34 @@ public sealed unsafe class SharedBackingViews : IDisposable
         }
 
         lock (_lock)
-        {
-            if (IsAvailable && TryFindRecord(address, (ulong)data.Length, out var record))
+            while (true)
             {
-                var offset = record.Offset + address - record.Address;
-                if (!IsWithinBacking(offset, (ulong)data.Length))
+                if (IsAvailable && TryFindRecord(address, (ulong)data.Length, out var record))
+                {
+                    var offset = record.Offset + address - record.Address;
+                    if (!IsWithinBacking(offset, (ulong)data.Length))
+                    {
+                        return false;
+                    }
+
+                    if (_activeCopies != 0 && WaitForBufferCopyConflict(offset, data)) continue;
+                    data.CopyTo(new Span<byte>((void*)(AliasBase + offset), data.Length));
+                    return true;
+                }
+
+                if (WaitForAnyCopy()) continue;
+                if (!TryCollectBackingSegments(address, (ulong)data.Length, out var pieces))
                 {
                     return false;
                 }
 
-                data.CopyTo(new Span<byte>((void*)(AliasBase + offset), data.Length));
+                foreach (var (backing, dataOffset, bytes) in pieces)
+                {
+                    data.Slice(dataOffset, bytes).CopyTo(new Span<byte>((void*)backing, bytes));
+                }
+
                 return true;
             }
-
-            if (!TryCollectBackingSegments(address, (ulong)data.Length, out var pieces))
-            {
-                return false;
-            }
-
-            foreach (var (backing, dataOffset, bytes) in pieces)
-            {
-                data.Slice(dataOffset, bytes).CopyTo(new Span<byte>((void*)backing, bytes));
-            }
-
-            return true;
-        }
     }
 
     // The lock-free single-view read only; false (with nothing read) for anything else.
@@ -269,85 +279,102 @@ public sealed unsafe class SharedBackingViews : IDisposable
         }
 
         lock (_lock)
-        {
-            // A read inside one mapping needs no temporary segment list.
-            if (IsAvailable && TryFindRecord(address, (ulong)data.Length, out var record))
+            while (true)
             {
-                var offset = record.Offset + address - record.Address;
-                if (!IsWithinBacking(offset, (ulong)data.Length))
+                // A read inside one mapping needs no temporary segment list.
+                if (IsAvailable && TryFindRecord(address, (ulong)data.Length, out var record))
+                {
+                    var offset = record.Offset + address - record.Address;
+                    if (!IsWithinBacking(offset, (ulong)data.Length))
+                    {
+                        return false;
+                    }
+
+                    if (_activeCopies != 0 && WaitForBufferCopyConflict(offset, data)) continue;
+                    new ReadOnlySpan<byte>((void*)(AliasBase + offset), data.Length).CopyTo(data);
+                    return true;
+                }
+
+                if (WaitForAnyCopy()) continue;
+                if (!TryCollectBackingSegments(address, (ulong)data.Length, out var pieces))
                 {
                     return false;
                 }
 
-                new ReadOnlySpan<byte>((void*)(AliasBase + offset), data.Length).CopyTo(data);
+                foreach (var (backing, dataOffset, bytes) in pieces)
+                {
+                    new ReadOnlySpan<byte>((void*)backing, bytes).CopyTo(data.Slice(dataOffset, bytes));
+                }
+
                 return true;
             }
-
-            if (!TryCollectBackingSegments(address, (ulong)data.Length, out var pieces))
-            {
-                return false;
-            }
-
-            foreach (var (backing, dataOffset, bytes) in pieces)
-            {
-                new ReadOnlySpan<byte>((void*)backing, bytes).CopyTo(data.Slice(dataOffset, bytes));
-            }
-
-            return true;
-        }
     }
 
     // Use temporary storage if a copy segment can overwrite another segment's source.
     public bool TryCopyBacking(ulong destination, ulong source, ulong size)
     {
-        lock (_lock)
+        if (size >= ConcurrentCopyMinimumBytes && size <= int.MaxValue &&
+            TryReserveCopy(destination, source, size, out var reservation))
         {
-            if (IsAvailable && size <= int.MaxValue &&
-                TryFindRecord(source, size, out var sourceRecord) &&
-                TryFindRecord(destination, size, out var destinationRecord))
+            using (reservation)
             {
-                var sourceOffset = sourceRecord.Offset + source - sourceRecord.Address;
-                var destinationOffset = destinationRecord.Offset + destination - destinationRecord.Address;
-                if (!IsWithinBacking(sourceOffset, size) || !IsWithinBacking(destinationOffset, size))
+                new ReadOnlySpan<byte>((void*)reservation.Source, (int)size)
+                    .CopyTo(new Span<byte>((void*)reservation.Destination, (int)size));
+                return true;
+            }
+        }
+
+        lock (_lock)
+            while (true)
+            {
+                if (IsAvailable && size <= int.MaxValue &&
+                    TryFindRecord(source, size, out var sourceRecord) &&
+                    TryFindRecord(destination, size, out var destinationRecord))
+                {
+                    var sourceOffset = sourceRecord.Offset + source - sourceRecord.Address;
+                    var destinationOffset = destinationRecord.Offset + destination - destinationRecord.Address;
+                    if (!IsWithinBacking(sourceOffset, size) || !IsWithinBacking(destinationOffset, size))
+                    {
+                        return false;
+                    }
+
+                    if (_activeCopies != 0 && WaitForCopyConflict(sourceOffset, size, destinationOffset, size)) continue;
+                    // Use the backing alias so CopyTo can detect overlap between different guest views.
+                    new ReadOnlySpan<byte>((void*)(AliasBase + sourceOffset), (int)size)
+                        .CopyTo(new Span<byte>((void*)(AliasBase + destinationOffset), (int)size));
+                    return true;
+                }
+
+                if (WaitForAnyCopy()) continue;
+                if (!TryCollectBackingSegments(source, size, out var from) || !TryCollectBackingSegments(destination, size, out var to))
                 {
                     return false;
                 }
 
-                // Use the backing alias so CopyTo can detect overlap between different guest views.
-                new ReadOnlySpan<byte>((void*)(AliasBase + sourceOffset), (int)size)
-                    .CopyTo(new Span<byte>((void*)(AliasBase + destinationOffset), (int)size));
-                return true;
-            }
-
-            if (!TryCollectBackingSegments(source, size, out var from) || !TryCollectBackingSegments(destination, size, out var to))
-            {
-                return false;
-            }
-
-            var chunks = CreateCopySegments(from, to);
-            if (!HasCrossSegmentOverlap(chunks))
-            {
-                foreach (var (fromPtr, toPtr, bytes) in chunks)
+                var chunks = CreateCopySegments(from, to);
+                if (!HasCrossSegmentOverlap(chunks))
                 {
-                    Buffer.MemoryCopy((void*)fromPtr, (void*)toPtr, bytes, bytes);
+                    foreach (var (fromPtr, toPtr, bytes) in chunks)
+                    {
+                        Buffer.MemoryCopy((void*)fromPtr, (void*)toPtr, bytes, bytes);
+                    }
+
+                    return true;
+                }
+
+                var staging = new byte[size];
+                foreach (var (backing, dataOffset, bytes) in from)
+                {
+                    new ReadOnlySpan<byte>((void*)backing, bytes).CopyTo(staging.AsSpan(dataOffset, bytes));
+                }
+
+                foreach (var (backing, dataOffset, bytes) in to)
+                {
+                    staging.AsSpan(dataOffset, bytes).CopyTo(new Span<byte>((void*)backing, bytes));
                 }
 
                 return true;
             }
-
-            var staging = new byte[size];
-            foreach (var (backing, dataOffset, bytes) in from)
-            {
-                new ReadOnlySpan<byte>((void*)backing, bytes).CopyTo(staging.AsSpan(dataOffset, bytes));
-            }
-
-            foreach (var (backing, dataOffset, bytes) in to)
-            {
-                staging.AsSpan(dataOffset, bytes).CopyTo(new Span<byte>((void*)backing, bytes));
-            }
-
-            return true;
-        }
     }
 
     public bool TryMapReservedRange(ulong address, ulong size, ulong offset, HostPageProtection protection, out HostViewFailure failure)
@@ -356,15 +383,16 @@ public sealed unsafe class SharedBackingViews : IDisposable
     private bool TryMapReservedRange(ulong address, ulong size, ulong offset, HostPageProtection protection,
         bool wasRestored, out HostViewFailure failure)
     {
-        if (!IsAvailable || !IsWithinBacking(offset, size))
-        {
-            failure = IsAvailable ? HostViewFailure.OffsetOutOfBounds : HostViewFailure.BackingUnavailable;
-            return false;
-        }
-
         // Keep the mapping and its record under one lock to prevent disposal between them.
         lock (_lock)
         {
+            WaitForCopies();
+            if (!IsAvailable || !IsWithinBacking(offset, size))
+            {
+                failure = IsAvailable ? HostViewFailure.OffsetOutOfBounds : HostViewFailure.BackingUnavailable;
+                return false;
+            }
+
             if (!_host.TryMapView(_backing!, address, offset, size, protection, out failure))
             {
                 return false;
@@ -392,6 +420,24 @@ public sealed unsafe class SharedBackingViews : IDisposable
 
     public bool Unmap(ulong address, ulong size, out bool holePreserved)
     {
+        var lockTaken = false;
+        try
+        {
+            using (GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.SharedViewUnmapLockAcquisition))
+                Monitor.Enter(_lock, ref lockTaken);
+            using (GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.SharedViewUnmapCopyWait))
+                WaitForCopies();
+            return UnmapCore(address, size, out holePreserved);
+        }
+        finally
+        {
+            if (lockTaken)
+                Monitor.Exit(_lock);
+        }
+    }
+
+    private bool UnmapCore(ulong address, ulong size, out bool holePreserved)
+    {
         holePreserved = false;
         if (!IsAvailable || size == 0 || ulong.MaxValue - address < size)
         {
@@ -400,6 +446,7 @@ public sealed unsafe class SharedBackingViews : IDisposable
 
         var end = address + size;
         var targets = new List<ViewRecord>();
+        using (GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.SharedViewUnmapTargetLookup))
         lock (_lock)
         {
             var current = address;
@@ -450,14 +497,14 @@ public sealed unsafe class SharedBackingViews : IDisposable
         var old = default(ViewRecord);
         lock (_lock)
         {
-            var index = RangeSearch.FindLastIndexAtOrBelow(_views, address);
-            if (index >= 0)
+            var record = _views.FindAtOrBelow(address);
+            if (record.Size != 0)
             {
-                var record = _views.Values[index];
                 if (address + size <= record.Address + record.Size)
                 {
                     old = record;
-                    _views.RemoveAt(index);
+                    using (GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.SharedViewUnmapRecordRemoval))
+                        _views.Remove(record);
                     PublishSnapshot();
                 }
             }
@@ -468,7 +515,12 @@ public sealed unsafe class SharedBackingViews : IDisposable
             return false;
         }
 
-        if (!_host.UnmapView(old.Address, old.Size))
+        bool unmapped;
+        GuestMemoryProfile.RecordUnmapSizes(size, old.Size, address - old.Address,
+            old.Address + old.Size - address - size);
+        using (GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.SharedViewUnmapNativeCall))
+            unmapped = _host.UnmapView(old.Address, old.Size);
+        if (!unmapped)
         {
             RestoreViewRecord(old);
             return false;
@@ -480,17 +532,20 @@ public sealed unsafe class SharedBackingViews : IDisposable
             return true;
         }
 
+        using var restorationProfile = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.SharedViewUnmapPartialRestoration);
         var leftSize = address - old.Address;
         var rightAddress = address + size;
         var rightSize = old.Address + old.Size - rightAddress;
         var ok = true;
         if (leftSize != 0 && leftSize != old.Size)
         {
+            using var splitProfile = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.SharedViewRestorationSplit);
             ok = _host.SplitHole(old.Address, leftSize) && ok;
         }
 
         if (rightSize != 0)
         {
+            using var splitProfile = GuestMemoryProfile.Measure(GuestMemoryProfile.Operation.SharedViewRestorationSplit);
             ok = _host.SplitHole(address, size) && ok;
         }
 
@@ -542,7 +597,7 @@ public sealed unsafe class SharedBackingViews : IDisposable
     // is as current as a locked one would be once the lock were released.
     public bool ContainsWithoutLock(ulong address, ulong size)
     {
-        if (size == 0 || ulong.MaxValue - address < size || Volatile.Read(ref _disposed))
+        if (size == 0 || ulong.MaxValue - address < size || _disposed)
         {
             return false;
         }
@@ -552,29 +607,13 @@ public sealed unsafe class SharedBackingViews : IDisposable
         var current = address;
         while (current < end)
         {
-            var low = 0;
-            var high = snapshot.Length - 1;
-            var found = -1;
-            while (low <= high)
-            {
-                var middle = low + ((high - low) >> 1);
-                if (snapshot[middle].Address <= current)
-                {
-                    found = middle;
-                    low = middle + 1;
-                }
-                else
-                {
-                    high = middle - 1;
-                }
-            }
-
-            if (found < 0 || current >= snapshot[found].Address + snapshot[found].Size)
+            var record = ViewRecordTree.FindAtOrBelow(snapshot, current);
+            if (record.Size == 0 || current >= record.Address + record.Size)
             {
                 return false;
             }
 
-            current = Math.Min(end, snapshot[found].Address + snapshot[found].Size);
+            current = Math.Min(end, record.Address + record.Size);
         }
 
         return true;
@@ -611,13 +650,14 @@ public sealed unsafe class SharedBackingViews : IDisposable
         List<ViewRecord> views;
         lock (_lock)
         {
+            WaitForCopies();
             if (_disposed)
             {
                 return;
             }
 
             _disposed = true;
-            views = new List<ViewRecord>(_views.Values);
+            views = new List<ViewRecord>(_views);
             _views.Clear();
             PublishSnapshot();
         }
@@ -723,13 +763,12 @@ public sealed unsafe class SharedBackingViews : IDisposable
             return false;
         }
 
-        var index = RangeSearch.FindLastIndexAtOrBelow(_views, address);
-        if (index < 0)
+        var candidate = _views.FindAtOrBelow(address);
+        if (candidate.Size == 0)
         {
             return false;
         }
 
-        var candidate = _views.Values[index];
         if (address + size > candidate.Address + candidate.Size)
         {
             return false;
@@ -742,13 +781,11 @@ public sealed unsafe class SharedBackingViews : IDisposable
     // Must be called under _lock after every change to _views.
     private void PublishSnapshot()
     {
-        var snapshot = new ViewRecord[_views.Count];
-        _views.Values.CopyTo(snapshot, 0);
-        Volatile.Write(ref _snapshot, snapshot);
+        Volatile.Write(ref _snapshot, _views.Snapshot);
     }
 
     // Resolves an access that lies inside one view to its alias address and registers
-    // it as in flight; the caller must decrement _activeAccesses when done. Anything
+    // it as in flight; the caller must call ExitAccess when done. Anything
     // else (spanning views, unmapped, disposed) is left to the locked path.
     private bool TryAccessSingleView(ulong address, ulong size, out ulong target)
     {
@@ -758,7 +795,14 @@ public sealed unsafe class SharedBackingViews : IDisposable
             return false;
         }
 
+        if (Volatile.Read(ref _copyAccessBlocked) != 0) return false;
         EnterAccess();
+        // Register before the gate check so a reservation waits for admitted access.
+        if (Volatile.Read(ref _copyAccessBlocked) != 0)
+        {
+            ExitAccess();
+            return false;
+        }
         if (TryFindAlias(Volatile.Read(ref _snapshot), address, size, out target))
         {
             return true;
@@ -768,12 +812,13 @@ public sealed unsafe class SharedBackingViews : IDisposable
         return false;
     }
 
-    public object AliasSnapshot => Volatile.Read(ref _snapshot);
+    public object AliasSnapshot => (object?)Volatile.Read(ref _snapshot) ?? EmptySnapshot;
 
     public bool TryEnterAliasAccess()
     {
+        if (Volatile.Read(ref _copyAccessBlocked) != 0) return false;
         EnterAccess();
-        if (!Volatile.Read(ref _disposed) && _backing != null)
+        if (Volatile.Read(ref _copyAccessBlocked) == 0 && !_disposed && _backing != null)
         {
             return true;
         }
@@ -790,29 +835,12 @@ public sealed unsafe class SharedBackingViews : IDisposable
         return size != 0 && ulong.MaxValue - address >= size && TryFindAlias(Volatile.Read(ref _snapshot), address, size, out target);
     }
 
-    private bool TryFindAlias(ViewRecord[] snapshot, ulong address, ulong size, out ulong target)
+    private bool TryFindAlias(ViewRecordTree.Node? snapshot, ulong address, ulong size, out ulong target)
     {
         target = 0;
-        var low = 0;
-        var high = snapshot.Length - 1;
-        var found = -1;
-        while (low <= high)
+        var record = ViewRecordTree.FindAtOrBelow(snapshot, address);
+        if (record.Size != 0 && !_disposed && _backing != null)
         {
-            var middle = low + ((high - low) >> 1);
-            if (snapshot[middle].Address <= address)
-            {
-                found = middle;
-                low = middle + 1;
-            }
-            else
-            {
-                high = middle - 1;
-            }
-        }
-
-        if (found >= 0 && !Volatile.Read(ref _disposed) && _backing != null)
-        {
-            var record = snapshot[found];
             if (address + size <= record.Address + record.Size)
             {
                 var offset = record.Offset + address - record.Address;

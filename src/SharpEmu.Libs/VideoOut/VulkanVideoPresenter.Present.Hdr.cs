@@ -349,28 +349,45 @@ internal static unsafe partial class VulkanVideoPresenter
                 ClearValueCount = 1,
                 PClearValues = &clearValue,
             };
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRenderPass(_vk, // [local]
-                _commandBuffer,
-                &renderPassInfo,
-                SubpassContents.Inline);
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, // [local]
-                _commandBuffer,
-                PipelineBindPoint.Graphics,
-                isHdr ? _hdrPqPipeline : _hdrPipeline);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRenderPass(_vk, // [local]
+                    _commandBuffer,
+                    &renderPassInfo,
+                    SubpassContents.Inline);
+            }
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(_vk, // [local]
+                    _commandBuffer,
+                    PipelineBindPoint.Graphics,
+                    isHdr ? _hdrPqPipeline : _hdrPipeline);
+            }
+            SharpEmu.Libs.Gpu.Vulkan.GraphicsDynamicStateEpoch.Advance();
+            SharpEmu.Libs.Gpu.Vulkan.NativeBindingEpoch.Advance();
             var descriptorSet = isHdr
                 ? _hdrPqDescriptorSets[imageIndex]
                 : _hdrDescriptorSets[imageIndex];
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(_vk, // [local]
-                _commandBuffer,
-                PipelineBindPoint.Graphics,
-                _hdrPipelineLayout,
-                0,
-                1,
-                &descriptorSet,
-                0,
-                null);
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDraw(_vk, _commandBuffer, 3, 1, 0, 0); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRenderPass(_vk, _commandBuffer); // [local]
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(_vk, // [local]
+                    _commandBuffer,
+                    PipelineBindPoint.Graphics,
+                    _hdrPipelineLayout,
+                    0,
+                    1,
+                    &descriptorSet,
+                    0,
+                    null);
+            }
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdDraw(_vk, _commandBuffer, 3, 1, 0, 0); // [local]
+            }
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRenderPass(_vk, _commandBuffer); // [local]
+            }
         }
     }
 }

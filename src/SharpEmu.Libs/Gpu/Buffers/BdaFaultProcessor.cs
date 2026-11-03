@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.Libs.VideoOut;
 using System.Runtime.InteropServices;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -22,10 +23,15 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     // BLAS loop's verify record and the region profile ([GPU][NATIVE_BLAS], [GPU][RT_PROFILE]), and
     // the first 256 the native TLAS loop's verify record ([GPU][NATIVE_TLAS]).
     private const ulong TraceTailBytes = 768;
+    // Without the trace only upstream's 64-byte record tail (fault record, unlinked-call record) follows the areas.
+    private readonly ulong _tailBytes;
+    private readonly bool _traceProbes; // [local] the trace tail was allocated (SHARPEMU_TRACE_GPU_MEMORY_ADDRESS)
     private const int ProbeAreaOffset = 512;
     private const int NativeBlasAreaOffset = 256;
 
     private static long _reportedFaults;
+    private static long _unlinkedCalls;
+    private static readonly bool StrictCompute = Environment.GetEnvironmentVariable("SHARPEMU_STRICT_COMPUTE") != "0";
     private readonly GpuDeviceInfo _device;
     private readonly SubmissionScheduler _scheduler;
     private readonly GuestBufferCache _cache;
@@ -65,6 +71,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     private static readonly bool RepairHeaders = Environment.GetEnvironmentVariable("SHARPEMU_REPAIR_BVH_HEADERS") == "1";
     private readonly HashSet<uint> _tlasDumped = new();
     private readonly SpanSet _faultRanges = new();
+    private readonly List<GuestSpan> _faultWindows = new();
     private readonly ulong _pageSize;
     private readonly ulong _pageCount;
     private readonly ulong _faultBufferSize;
@@ -125,10 +132,12 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             DeviceAddressPaging.FaultSummaryAreaBytes + DeviceAddressPaging.RqAreaBytes; // [local] SHARPEMU_RT_RAYQUERY / SHARPEMU_RQ_MAP
         if (ScanMappedMode != 0 && _traceTailOffset - DeviceAddressPaging.RqAreaBytes - DeviceAddressPaging.FaultSummaryBytes != DeviceAddressPaging.FaultSummaryOffset)
             throw new InvalidOperationException("The fault summary offset does not match DeviceAddressPaging.FaultSummaryOffset.");
+        _traceProbes = GuestGpuMemoryHook.TraceEnabled;
+        _tailBytes = _traceProbes ? TraceTailBytes : 64UL;
         _faultBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 0, GpuBuffer.AllFlags,
-            _traceTailOffset + (GuestGpuMemoryHook.TraceEnabled ? TraceTailBytes : 0UL));
-        if (GuestGpuMemoryHook.TraceEnabled)
-            _traceDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * TraceTailBytes);
+            _traceTailOffset + _tailBytes);
+        // The 64-byte record tail is always there: shaders report an unlinked shader call into its last 32 bytes.
+        _traceDownloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * _tailBytes);
         _downloadBuffer = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * PageFaultAreaSize);
         if (DeviceAddressPaging.ZeroPageMode != 0)
             _counterDownload = new GpuBuffer(device, scheduler, GpuBufferUsage.Download, 0, GpuBuffer.AllFlags, MaxPendingFaults * DeviceAddressPaging.ZeroPageCounterBytes);
@@ -328,7 +337,7 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         {
             if (_traceDownloadBuffer is not null && !_traceInitialized)
             {
-                _faultBuffer.Fill(_traceTailOffset, TraceTailBytes, 0);
+                _faultBuffer.Fill(_traceTailOffset, _tailBytes, 0);
                 _traceInitialized = true;
             }
             if (DeviceAddressPaging.ZeroPageMode != 0 && !_zeroPageAreaInitialized) // [local] counters and shadow bitmap
@@ -398,7 +407,10 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         VulkanSynchronization.PipelineBarrier(vk,
             command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.ComputeShaderBit, DependencyFlags.ByRegionBit,
             0, null, 1, &preBarrier, 0, null);
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, _pipeline); // [local]
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindPipeline(vk, command, PipelineBindPoint.Compute, _pipeline); // [local]
+        }
         var timed = _timestamps.Handle != 0; // [local] SHARPEMU_CHEAP_PROBE
         if (timed)
         {
@@ -406,8 +418,15 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdWriteTimestamp2(vk, command, PipelineStageFlags2.AllCommandsBit, _timestamps, 2 * _currentArea);
         }
         var set = _sets[_currentArea];
-        SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null); // [local]
-        DispatchScan(command, summary: true); // [local] SHARPEMU_BDA_SCAN_MAPPED
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBindDescriptorSets(vk, command, PipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null); // [local]
+        }
+        NativeBindingEpoch.Advance();
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+        {
+            DispatchScan(command, summary: true); // [local] SHARPEMU_BDA_SCAN_MAPPED
+        }
         if (_shadowDownload is not null) // [local] SHARPEMU_DA_ZERO_PAGE=2
         {
             var shadowSet = _shadowSets[_currentArea];
@@ -454,153 +473,169 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         }
         if (_traceDownloadBuffer is not null)
         {
-            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, _traceTailOffset, area * TraceTailBytes, TraceTailBytes,
+            _traceDownloadBuffer.CopyFrom(_scheduler.Current, _faultBuffer, _traceTailOffset, area * _tailBytes, _tailBytes,
                 destinationAfter: AccessFlags.HostReadBit);
-            _faultBuffer.Fill(_traceTailOffset, TraceTailBytes, 0);
+            _faultBuffer.Fill(_traceTailOffset, _tailBytes, 0);
         }
         _scheduler.QueueCompletionAction(() =>
         {
             if (_traceDownloadBuffer is not null)
             {
-                _traceDownloadBuffer.Invalidate(area * TraceTailBytes, TraceTailBytes);
-                var stack = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset, 128));
-                var stats = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 160, 32));
-                var oob = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 224, 32));
-                var record = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 192, 32));
-                var nativeBlas = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + NativeBlasAreaOffset, 256)); // [local]
-                var nativeTlas = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes), 256)); // [local]
-                if (stack[20] != 0)
+                _traceDownloadBuffer.Invalidate(area * _tailBytes, _tailBytes);
+                // The last 64 bytes: the fault record (words 0..7) and the unlinked-call record (words 8..15, claim 2);
+                // with SHARPEMU_TRACE_GPU_MEMORY_ADDRESS the [local] guard/OOB record shares words 8..15 (claim 1).
+                var record = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * _tailBytes + _tailBytes) - 64, 64));
+                if (record[8] == 2)
                 {
-                    var table = (ulong)stack[30] << 32 | stack[29];
-                    Console.Error.WriteLine($"[GPU][SPIN_INST] scan_tick={scanTick} active_spinning={stack[21]} s12=0x{stack[22]:X} blas_base=0x{(ulong)stack[20] << 8:X} last_node=0x{stack[23]:X} s8=0x{stack[24]:X} s9=0x{stack[25]:X} s23=0x{stack[26]:X} table=0x{table:X}");
-                    var blas = (ulong)stack[20] << 8;
-                    Console.Error.WriteLine($"[GPU][BLAS_HDR] scan_tick={scanTick} base=0x{blas:X} s0..s3=0x{stack[13]:X},0x{stack[14]:X},0x{stack[15]:X},0x{stack[16]:X} page: {_cache.DescribePage(blas, 256)}");
-                    if (table != 0 && _inst0Dumps < 2)
+                    var message = $"The shader called an unlinked function: hash=0x{((ulong)record[10] << 32 | record[9]):X16} pc=0x{record[11]:X} target=0x{((ulong)record[13] << 32 | record[12]):X16}.";
+                    if (StrictCompute) throw SubmissionScheduler.Fatal(message);
+                    // The wave that found no record ended at the call; like any other compute failure outside strict mode
+                    // the dispatch's result can be incomplete.
+                    var unlinked = Interlocked.Increment(ref _unlinkedCalls);
+                    if (unlinked <= 16 || (unlinked & (unlinked - 1)) == 0)
+                        Console.Error.WriteLine($"[GPU][WARN][UNLINKED_CALL] {message} count={unlinked}. The waves that made the call were ended; images can be incorrect. SHARPEMU_STRICT_COMPUTE=0 is set.");
+                }
+                if (_traceProbes) // [local] probe words before the records
+                {
+                    var stack = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * _tailBytes) + ProbeAreaOffset, 128));
+                    var stats = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * _tailBytes) + ProbeAreaOffset + 160, 32));
+                    var oob = record.Slice(8, 8);
+                    var nativeBlas = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * _tailBytes) + NativeBlasAreaOffset, 256)); // [local]
+                    var nativeTlas = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * _tailBytes), 256)); // [local]
+                    if (stack[20] != 0)
                     {
-                        _inst0Dumps++;
-                        try
+                        var table = (ulong)stack[30] << 32 | stack[29];
+                        Console.Error.WriteLine($"[GPU][SPIN_INST] scan_tick={scanTick} active_spinning={stack[21]} s12=0x{stack[22]:X} blas_base=0x{(ulong)stack[20] << 8:X} last_node=0x{stack[23]:X} s8=0x{stack[24]:X} s9=0x{stack[25]:X} s23=0x{stack[26]:X} table=0x{table:X}");
+                        var blas = (ulong)stack[20] << 8;
+                        Console.Error.WriteLine($"[GPU][BLAS_HDR] scan_tick={scanTick} base=0x{blas:X} s0..s3=0x{stack[13]:X},0x{stack[14]:X},0x{stack[15]:X},0x{stack[16]:X} page: {_cache.DescribePage(blas, 256)}");
+                        if (table != 0 && _inst0Dumps < 2)
                         {
-                            _cache.DumpDeviceRange(table, 160 * 128, $"C:/Users/danyy/AppData/Local/Temp/gta/insttab_{scanTick}_{table:X}.gpu.bin");
-                            _cache.DumpGuestRange(table, 160 * 128, $"C:/Users/danyy/AppData/Local/Temp/gta/insttab_{scanTick}_{table:X}.guest.bin");
+                            _inst0Dumps++;
+                            try
+                            {
+                                _cache.DumpDeviceRange(table, 160 * 128, $"C:/Users/danyy/AppData/Local/Temp/gta/insttab_{scanTick}_{table:X}.gpu.bin");
+                                _cache.DumpGuestRange(table, 160 * 128, $"C:/Users/danyy/AppData/Local/Temp/gta/insttab_{scanTick}_{table:X}.guest.bin");
+                            }
+                            catch (Exception e) { Console.Error.WriteLine($"[GPU][INSTTAB] dump failed: {e.Message}"); }
                         }
-                        catch (Exception e) { Console.Error.WriteLine($"[GPU][INSTTAB] dump failed: {e.Message}"); }
-                    }
-                    if (stack[23] == 0xFFFFFFFF && RepairHeaders)
-                    {
-                        _repairs++;
-                        if (_repairs <= 6)
+                        if (stack[23] == 0xFFFFFFFF && RepairHeaders)
+                        {
+                            _repairs++;
+                            if (_repairs <= 6)
+                            {
+                                try
+                                {
+                                    _cache.DumpDeviceRange(blas, 1024, $"C:/Users/danyy/AppData/Local/Temp/gta/repair_{_repairs:D2}_{blas:X}.gpu.bin");
+                                    _cache.DumpGuestRange(blas, 1024, $"C:/Users/danyy/AppData/Local/Temp/gta/repair_{_repairs:D2}_{blas:X}.guest.bin");
+                                }
+                                catch (Exception e) { Console.Error.WriteLine($"[GPU][REPAIR] dump failed: {e.Message}"); }
+                            }
+                            var ok = _cache.RepairFromGuest(blas, 4096);
+                            if (_repairs <= 20 || (_repairs & (_repairs - 1)) == 0) Console.Error.WriteLine($"[GPU][REPAIR] scan_tick={scanTick} base=0x{blas:X} ok={ok} count={_repairs}");
+                        }
+                        if (_traceArmed != 0 && _armedDumps < 16)
+                        {
+                            _armedDumps++;
+                            try
+                            {
+                                _cache.DumpDeviceRange(_traceArmed, 256, $"C:/Users/danyy/AppData/Local/Temp/gta/armed_{_armedDumps:D2}_{scanTick}.gpu.bin");
+                                _cache.DumpGuestRange(_traceArmed, 256, $"C:/Users/danyy/AppData/Local/Temp/gta/armed_{_armedDumps:D2}_{scanTick}.guest.bin");
+                            }
+                            catch (Exception e) { Console.Error.WriteLine($"[GPU][ARMED] dump failed: {e.Message}"); }
+                        }
+                        if (stack[23] == 0xFFFFFFFF && _traceArmed == 0)
+                        {
+                            _traceArmed = blas;
+                            SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.SelectDeviceFaultTracePage(blas);
+                            GuestBufferCache.BvhWatchBase = blas;
+                            Console.Error.WriteLine($"[GPU][TRACE_ARMED] scan_tick={scanTick} base=0x{blas:X}");
+                        }
+                        if (_tlasDumped.Count < 4 && _tlasDumped.Add(stack[20]))
                         {
                             try
                             {
-                                _cache.DumpDeviceRange(blas, 1024, $"C:/Users/danyy/AppData/Local/Temp/gta/repair_{_repairs:D2}_{blas:X}.gpu.bin");
-                                _cache.DumpGuestRange(blas, 1024, $"C:/Users/danyy/AppData/Local/Temp/gta/repair_{_repairs:D2}_{blas:X}.guest.bin");
+                                _cache.DumpDeviceRange(blas, 512, $"C:/Users/danyy/AppData/Local/Temp/gta/blashdr_{scanTick}_{blas:X}.gpu.bin");
+                                _cache.DumpGuestRange(blas, 512, $"C:/Users/danyy/AppData/Local/Temp/gta/blashdr_{scanTick}_{blas:X}.guest.bin");
                             }
-                            catch (Exception e) { Console.Error.WriteLine($"[GPU][REPAIR] dump failed: {e.Message}"); }
+                            catch (Exception e) { Console.Error.WriteLine($"[GPU][SPIN_INST] dump failed: {e.Message}"); }
                         }
-                        var ok = _cache.RepairFromGuest(blas, 4096);
-                        if (_repairs <= 20 || (_repairs & (_repairs - 1)) == 0) Console.Error.WriteLine($"[GPU][REPAIR] scan_tick={scanTick} base=0x{blas:X} ok={ok} count={_repairs}");
                     }
-                    if (_traceArmed != 0 && _armedDumps < 16)
+                    // [local] full dump of the BLAS a spinning ray is in (SHARPEMU_SPIN_BLOB_DUMP=1)
+                    if (SpinBlobDump && scanTick > 25000 && stack[20] != 0 && stack[23] != 0xFFFFFFFF && _spinBlobDumps < 3)
                     {
-                        _armedDumps++;
-                        try
+                        _spinBlobDumps++;
+                        var tlasBase = (ulong)stack[20] << 8; var tlasBytes = 4UL << 20;
+                        Console.Error.WriteLine($"[GPU][BLAS0] scan_tick={scanTick} base=0x{tlasBase:X} last_node=0x{stack[23]:X} bytes={tlasBytes}");
+                        try { _cache.DumpDeviceRange(tlasBase, tlasBytes, $"C:/Users/danyy/AppData/Local/Temp/gta/blas0_{scanTick}_{tlasBase:X}.gpu.bin"); }
+                        catch (Exception e) { Console.Error.WriteLine($"[GPU][TLAS] dump failed: {e.Message}"); }
+                    }
+                    if (stack[12] != 0)
+                        Console.Error.WriteLine($"[GPU][TLASHIST] scan_tick={scanTick} active_spinning={stack[21]} iters={stack[30]} ring={stack[30] & 3} e0: s12=0x{stack[13]:X} s96={stack[14]} v0=0x{stack[15]:X} | e1: s12=0x{stack[16]:X} s96={stack[17]} v0=0x{stack[18]:X} | e2: s12=0x{stack[19]:X} s96={stack[24]} v0=0x{stack[25]:X} | e3: s12=0x{stack[26]:X} s96={stack[27]} v0=0x{stack[29]:X}");
+                    if (stack[28] != 0)
+                        Console.Error.WriteLine($"[GPU][SPIN_BVH] scan_tick={scanTick} spinning={stack[28]} v8_samples=0x{stack[24]:X},0x{stack[25]:X},0x{stack[26]:X},0x{stack[27]:X} v0=0x{stack[29]:X} v1=0x{stack[30]:X} v42=0x{stack[31]:X} ");
+                    var hw = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * _tailBytes) + ProbeAreaOffset + 128, 32)); // [local]
+                    var wf = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * _tailBytes) + ProbeAreaOffset + 176, 16)); // [local] words 44..47
+                    if (wf[2] != 0)
+                        Console.Error.WriteLine($"[GPU][GUARD5981] scan_tick={scanTick} max_steps={wf[0]} lanes_past_90pct={wf[1]} lanes={wf[2]}");
+                    if (hw[0] != 0)
+                        Console.Error.WriteLine($"[GPU][APPEND] scan_tick={scanTick} adds={hw[0]} sum_operand={hw[1]} sum_saved_popcount={hw[2]} sum_inbounds={hw[3]} adds_over={hw[4]} max_excess={hw[5]} sum_excess={hw[6]} max_limit={hw[7]}");
+                    if (stack[0] != 0 || stack[2] != 0 || stack[3] != 0)
+                        Console.Error.WriteLine($"[GPU][STACK] scan_tick={scanTick} push_lds={stack[0]} push_scr={stack[1]} pop_lds={stack[2]} pop_scr={stack[3]} lds_zero={stack[4]} scr_zero={stack[5]} lds_m1={stack[6]} scr_m1={stack[7]} max_push_off=0x{stack[8]:X} lds_dwords={stack[9]} scratch_dwords={stack[10]} max_pop_off=0x{stack[11]:X}");
+                    if (stats[2] != 0)
+                        Console.Error.WriteLine($"[GPU][STEPS] scan_tick={scanTick} max={stats[0]} over1k={stats[3]} over10k={stats[1]} over30k={stats[4]} over90k={stats[5]} total={stats[2]} bvh_tests={stats[6]} bvh_tests_per_ray={(stats[2] == 0 ? 0 : (double)stats[6] / stats[2]):F1} bvh_tests_max={stats[7]}");
+                    if (nativeBlas[0] != 0 || nativeBlas[2] != 0) // [local] SHARPEMU_NATIVE_BLAS_LOOP: verify record (2), capped lanes (1 and 2)
+                    {
+                        Console.Error.WriteLine($"[GPU][NATIVE_BLAS] scan_tick={scanTick} compared={nativeBlas[0]} mismatches={nativeBlas[1]} capped={nativeBlas[2]} mask=0x{nativeBlas[3]:X} iterations={nativeBlas[5]} iterations_per_exit={(nativeBlas[0] == 0 ? 0 : (double)nativeBlas[5] / nativeBlas[0]):F1} iterations_max={nativeBlas[6]}");
+                        if (nativeBlas[1] != 0)
                         {
-                            _cache.DumpDeviceRange(_traceArmed, 256, $"C:/Users/danyy/AppData/Local/Temp/gta/armed_{_armedDumps:D2}_{scanTick}.gpu.bin");
-                            _cache.DumpGuestRange(_traceArmed, 256, $"C:/Users/danyy/AppData/Local/Temp/gta/armed_{_armedDumps:D2}_{scanTick}.guest.bin");
+                            string[] names = ["v23", "v29", "v31", "v21", "v22", "v6", "v7", "v9", "v43"];
+                            var values = nativeBlas.Slice(8, 18).ToArray();
+                            var registers = string.Join(" ", names.Select((name, index) => $"{name}=0x{values[index]:X}/0x{values[9 + index]:X}"));
+                            Console.Error.WriteLine($"[GPU][NATIVE_BLAS_FIRST] scan_tick={scanTick} lane={nativeBlas[7]} guest/native: {registers} | root=0x{nativeBlas[26]:X} tmax_in=0x{nativeBlas[27]:X} v29_in=0x{nativeBlas[28]:X} blas=0x{((ulong)nativeBlas[30] << 32) | nativeBlas[29]:X} instance=0x{((ulong)nativeBlas[32] << 32) | nativeBlas[31]:X} native_iterations={nativeBlas[33]}");
                         }
-                        catch (Exception e) { Console.Error.WriteLine($"[GPU][ARMED] dump failed: {e.Message}"); }
                     }
-                    if (stack[23] == 0xFFFFFFFF && _traceArmed == 0)
+                    if (nativeTlas[30] != 0 || nativeTlas[31] != 0 || nativeTlas[32] != 0 || nativeTlas[34] != 0 || nativeTlas[36] != 0) // [local] SHARPEMU_RT_STACK_SPLIT / SHARPEMU_SCRATCH_SLOTS=2 / SHARPEMU_RT_SPILL_SCALARS
                     {
-                        _traceArmed = blas;
-                        SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.SelectDeviceFaultTracePage(blas);
-                        GuestBufferCache.BvhWatchBase = blas;
-                        Console.Error.WriteLine($"[GPU][TRACE_ARMED] scan_tick={scanTick} base=0x{blas:X}");
+                        Console.Error.WriteLine($"[GPU][RT_STACK] scan_tick={scanTick} deep_pushes={nativeTlas[30]} slot_fallbacks={nativeTlas[31]} scratch_loads={nativeTlas[32]} scratch_mismatches={nativeTlas[33]} spill_restores={nativeTlas[34]} spill_mismatches={nativeTlas[35]} spill_nonuniform={nativeTlas[36]}");
                     }
-                    if (_tlasDumped.Count < 4 && _tlasDumped.Add(stack[20]))
+                    if (nativeTlas[0] != 0 || nativeTlas[2] != 0) // [local] SHARPEMU_NATIVE_TLAS_LOOP: verify record (2), capped walks (1 and 2)
                     {
-                        try
+                        Console.Error.WriteLine($"[GPU][NATIVE_TLAS] scan_tick={scanTick} compared={nativeTlas[0]} mismatches={nativeTlas[1]} capped={nativeTlas[2]} mask=0x{nativeTlas[3]:X} lane_map_errors={nativeTlas[22]}");
+                        if (nativeTlas[1] != 0)
                         {
-                            _cache.DumpDeviceRange(blas, 512, $"C:/Users/danyy/AppData/Local/Temp/gta/blashdr_{scanTick}_{blas:X}.gpu.bin");
-                            _cache.DumpGuestRange(blas, 512, $"C:/Users/danyy/AppData/Local/Temp/gta/blashdr_{scanTick}_{blas:X}.guest.bin");
+                            string[] names = ["v23", "v29", "v31", "v21", "v22", "v6", "v7"];
+                            var values = nativeTlas.Slice(5, 17).ToArray();
+                            var registers = string.Join(" ", names.Select((name, index) => $"{name}=0x{values[1 + index]:X}/0x{values[8 + index]:X}"));
+                            Console.Error.WriteLine($"[GPU][NATIVE_TLAS_FIRST] scan_tick={scanTick} lane={values[0]} guest/native: {registers} | instances=0x{((ulong)values[16] << 32) | values[15]:X}");
                         }
-                        catch (Exception e) { Console.Error.WriteLine($"[GPU][SPIN_INST] dump failed: {e.Message}"); }
                     }
-                }
-                // [local] full dump of the BLAS a spinning ray is in (SHARPEMU_SPIN_BLOB_DUMP=1)
-                if (SpinBlobDump && scanTick > 25000 && stack[20] != 0 && stack[23] != 0xFFFFFFFF && _spinBlobDumps < 3)
-                {
-                    _spinBlobDumps++;
-                    var tlasBase = (ulong)stack[20] << 8; var tlasBytes = 4UL << 20;
-                    Console.Error.WriteLine($"[GPU][BLAS0] scan_tick={scanTick} base=0x{tlasBase:X} last_node=0x{stack[23]:X} bytes={tlasBytes}");
-                    try { _cache.DumpDeviceRange(tlasBase, tlasBytes, $"C:/Users/danyy/AppData/Local/Temp/gta/blas0_{scanTick}_{tlasBase:X}.gpu.bin"); }
-                    catch (Exception e) { Console.Error.WriteLine($"[GPU][TLAS] dump failed: {e.Message}"); }
-                }
-                if (stack[12] != 0)
-                    Console.Error.WriteLine($"[GPU][TLASHIST] scan_tick={scanTick} active_spinning={stack[21]} iters={stack[30]} ring={stack[30] & 3} e0: s12=0x{stack[13]:X} s96={stack[14]} v0=0x{stack[15]:X} | e1: s12=0x{stack[16]:X} s96={stack[17]} v0=0x{stack[18]:X} | e2: s12=0x{stack[19]:X} s96={stack[24]} v0=0x{stack[25]:X} | e3: s12=0x{stack[26]:X} s96={stack[27]} v0=0x{stack[29]:X}");
-                if (stack[28] != 0)
-                    Console.Error.WriteLine($"[GPU][SPIN_BVH] scan_tick={scanTick} spinning={stack[28]} v8_samples=0x{stack[24]:X},0x{stack[25]:X},0x{stack[26]:X},0x{stack[27]:X} v0=0x{stack[29]:X} v1=0x{stack[30]:X} v42=0x{stack[31]:X} ");
-                var hw = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 128, 32)); // [local]
-                var wf = MemoryMarshal.Cast<byte, uint>(_traceDownloadBuffer.Mapped.Slice((int)(area * TraceTailBytes) + ProbeAreaOffset + 176, 16)); // [local] words 44..47
-                if (wf[2] != 0)
-                    Console.Error.WriteLine($"[GPU][GUARD5981] scan_tick={scanTick} max_steps={wf[0]} lanes_past_90pct={wf[1]} lanes={wf[2]}");
-                if (hw[0] != 0)
-                    Console.Error.WriteLine($"[GPU][APPEND] scan_tick={scanTick} adds={hw[0]} sum_operand={hw[1]} sum_saved_popcount={hw[2]} sum_inbounds={hw[3]} adds_over={hw[4]} max_excess={hw[5]} sum_excess={hw[6]} max_limit={hw[7]}");
-                if (stack[0] != 0 || stack[2] != 0 || stack[3] != 0)
-                    Console.Error.WriteLine($"[GPU][STACK] scan_tick={scanTick} push_lds={stack[0]} push_scr={stack[1]} pop_lds={stack[2]} pop_scr={stack[3]} lds_zero={stack[4]} scr_zero={stack[5]} lds_m1={stack[6]} scr_m1={stack[7]} max_push_off=0x{stack[8]:X} lds_dwords={stack[9]} scratch_dwords={stack[10]} max_pop_off=0x{stack[11]:X}");
-                if (stats[2] != 0)
-                    Console.Error.WriteLine($"[GPU][STEPS] scan_tick={scanTick} max={stats[0]} over1k={stats[3]} over10k={stats[1]} over30k={stats[4]} over90k={stats[5]} total={stats[2]} bvh_tests={stats[6]} bvh_tests_per_ray={(stats[2] == 0 ? 0 : (double)stats[6] / stats[2]):F1} bvh_tests_max={stats[7]}");
-                if (nativeBlas[0] != 0 || nativeBlas[2] != 0) // [local] SHARPEMU_NATIVE_BLAS_LOOP: verify record (2), capped lanes (1 and 2)
-                {
-                    Console.Error.WriteLine($"[GPU][NATIVE_BLAS] scan_tick={scanTick} compared={nativeBlas[0]} mismatches={nativeBlas[1]} capped={nativeBlas[2]} mask=0x{nativeBlas[3]:X} iterations={nativeBlas[5]} iterations_per_exit={(nativeBlas[0] == 0 ? 0 : (double)nativeBlas[5] / nativeBlas[0]):F1} iterations_max={nativeBlas[6]}");
-                    if (nativeBlas[1] != 0)
+                    if (nativeBlas[34] != 0 || nativeBlas[60] != 0) // [local] SHARPEMU_8395_PROFILE: region clocks per subgroup and counters
                     {
-                        string[] names = ["v23", "v29", "v31", "v21", "v22", "v6", "v7", "v9", "v43"];
-                        var values = nativeBlas.Slice(8, 18).ToArray();
-                        var registers = string.Join(" ", names.Select((name, index) => $"{name}=0x{values[index]:X}/0x{values[9 + index]:X}"));
-                        Console.Error.WriteLine($"[GPU][NATIVE_BLAS_FIRST] scan_tick={scanTick} lane={nativeBlas[7]} guest/native: {registers} | root=0x{nativeBlas[26]:X} tmax_in=0x{nativeBlas[27]:X} v29_in=0x{nativeBlas[28]:X} blas=0x{((ulong)nativeBlas[30] << 32) | nativeBlas[29]:X} instance=0x{((ulong)nativeBlas[32] << 32) | nativeBlas[31]:X} native_iterations={nativeBlas[33]}");
+                        string[] regions = ["setup", "raygen", "pretrav", "traversal", "instance", "blas", "alpha", "tlasnode", "hitshade", "hitlist", "reduction"];
+                        var words = nativeBlas.Slice(34, 30).ToArray();
+                        ulong Sum(int word) => ((ulong)words[word - 33] << 32) | words[word - 34];
+                        var total = Sum(35);
+                        var parts = string.Join(" ", regions.Select((name, region) =>
+                        {
+                            var cycles = Sum(37 + 2 * region);
+                            return $"{name}={(total == 0 ? 0 : 100.0 * cycles / total):F1}%";
+                        }));
+                        Console.Error.WriteLine($"[GPU][RT_PROFILE] scan_tick={scanTick} subgroups={words[0]} clock={(words[29] & 1) != 0} cycles_per_subgroup={(words[0] == 0 ? 0 : (double)total / words[0]):F0} {parts} alpha_tests={words[25]} blas_iterations={words[26]} tlas_node_visits={words[27]} instance_entries={words[28]}");
+                        if (nativeBlas[0] == 0) // [local] the extra counters share the verify record's words
+                        {
+                            var x = nativeBlas.Slice(8, 26).ToArray();
+                            Console.Error.WriteLine($"[GPU][RT_PROFILE2] scan_tick={scanTick} box_tests={x[0]} box_hits={x[1]} sorted_boxes={x[2]} tri_tests={x[3]} tri_candidates={x[4]} commits={x[5]} walks={x[6]} warp_iterations={x[7]} warp_walks={x[8]} walk_hist=[{string.Join(",", x[9..17])}] total_hist=[{string.Join(",", x[17..25])}] sum_subgroup_max_total={x[25]}");
+                        }
                     }
+                    if (oob[0] == 1)
+                        Console.Error.WriteLine($"[GPU][OOB_STORE] scan_tick={scanTick} hash=0x{((ulong)oob[2] << 32 | oob[1]):X16} pc=0x{oob[3]:X} binding={oob[4]} dword=0x{oob[5]:X} bound_dwords=0x{oob[6]:X} site={oob[7]}");
                 }
-                if (nativeTlas[30] != 0 || nativeTlas[31] != 0 || nativeTlas[32] != 0 || nativeTlas[34] != 0 || nativeTlas[36] != 0) // [local] SHARPEMU_RT_STACK_SPLIT / SHARPEMU_SCRATCH_SLOTS=2 / SHARPEMU_RT_SPILL_SCALARS
-                {
-                    Console.Error.WriteLine($"[GPU][RT_STACK] scan_tick={scanTick} deep_pushes={nativeTlas[30]} slot_fallbacks={nativeTlas[31]} scratch_loads={nativeTlas[32]} scratch_mismatches={nativeTlas[33]} spill_restores={nativeTlas[34]} spill_mismatches={nativeTlas[35]} spill_nonuniform={nativeTlas[36]}");
-                }
-                if (nativeTlas[0] != 0 || nativeTlas[2] != 0) // [local] SHARPEMU_NATIVE_TLAS_LOOP: verify record (2), capped walks (1 and 2)
-                {
-                    Console.Error.WriteLine($"[GPU][NATIVE_TLAS] scan_tick={scanTick} compared={nativeTlas[0]} mismatches={nativeTlas[1]} capped={nativeTlas[2]} mask=0x{nativeTlas[3]:X} lane_map_errors={nativeTlas[22]}");
-                    if (nativeTlas[1] != 0)
-                    {
-                        string[] names = ["v23", "v29", "v31", "v21", "v22", "v6", "v7"];
-                        var values = nativeTlas.Slice(5, 17).ToArray();
-                        var registers = string.Join(" ", names.Select((name, index) => $"{name}=0x{values[1 + index]:X}/0x{values[8 + index]:X}"));
-                        Console.Error.WriteLine($"[GPU][NATIVE_TLAS_FIRST] scan_tick={scanTick} lane={values[0]} guest/native: {registers} | instances=0x{((ulong)values[16] << 32) | values[15]:X}");
-                    }
-                }
-                if (nativeBlas[34] != 0 || nativeBlas[60] != 0) // [local] SHARPEMU_8395_PROFILE: region clocks per subgroup and counters
-                {
-                    string[] regions = ["setup", "raygen", "pretrav", "traversal", "instance", "blas", "alpha", "tlasnode", "hitshade", "hitlist", "reduction"];
-                    var words = nativeBlas.Slice(34, 30).ToArray();
-                    ulong Sum(int word) => ((ulong)words[word - 33] << 32) | words[word - 34];
-                    var total = Sum(35);
-                    var parts = string.Join(" ", regions.Select((name, region) =>
-                    {
-                        var cycles = Sum(37 + 2 * region);
-                        return $"{name}={(total == 0 ? 0 : 100.0 * cycles / total):F1}%";
-                    }));
-                    Console.Error.WriteLine($"[GPU][RT_PROFILE] scan_tick={scanTick} subgroups={words[0]} clock={(words[29] & 1) != 0} cycles_per_subgroup={(words[0] == 0 ? 0 : (double)total / words[0]):F0} {parts} alpha_tests={words[25]} blas_iterations={words[26]} tlas_node_visits={words[27]} instance_entries={words[28]}");
-                    if (nativeBlas[0] == 0) // [local] the extra counters share the verify record's words
-                    {
-                        var x = nativeBlas.Slice(8, 26).ToArray();
-                        Console.Error.WriteLine($"[GPU][RT_PROFILE2] scan_tick={scanTick} box_tests={x[0]} box_hits={x[1]} sorted_boxes={x[2]} tri_tests={x[3]} tri_candidates={x[4]} commits={x[5]} walks={x[6]} warp_iterations={x[7]} warp_walks={x[8]} walk_hist=[{string.Join(",", x[9..17])}] total_hist=[{string.Join(",", x[17..25])}] sum_subgroup_max_total={x[25]}");
-                    }
-                }
-                if (oob[0] != 0)
-                    Console.Error.WriteLine($"[GPU][OOB_STORE] scan_tick={scanTick} hash=0x{((ulong)oob[2] << 32 | oob[1]):X16} pc=0x{oob[3]:X} binding={oob[4]} dword=0x{oob[5]:X} bound_dwords=0x{oob[6]:X} site={oob[7]}");
                 if (record[0] != 0)
                     Console.Error.WriteLine($"[GPU][DEVICE_ADDRESS_FAULT] scan_tick={scanTick} hash=0x{((ulong)record[2] << 32 | record[1]):X16} pc=0x{record[3]:X} address=0x{((ulong)record[5] << 32 | record[4]):X16} stage={record[6]} extra=0x{record[7]:X}");
             }
             _downloadBuffer.Invalidate(offset, PageFaultAreaSize);
             _faultRanges.Clear();
+            _faultWindows.Clear();
             var faults = MemoryMarshal.Cast<byte, ulong>(_downloadBuffer.Mapped.Slice((int)offset, (int)PageFaultAreaSize));
             var count = Math.Min((uint)faults[0], MaxPageFaults - 1);
             if (timed) // [local] SHARPEMU_CHEAP_PROBE
@@ -616,7 +651,9 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                 if (DeviceAddressPaging.ZeroPageMode != 0 && !_cache.CanReadGuest(faults[index], _pageSize))
                     _zpUnreadable++;
 
-                _faultRanges.Add(faults[index], _pageSize);
+                var range = _cache.DeviceAddressFaultRange(faults[index], _pageSize);
+                _faultRanges.Add(range.Address, range.Size);
+                _faultWindows.Add(range);
                 GuestGpuMemoryHook.SelectDeviceFaultTracePage(faults[index]);
                 if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Traces(faults[index], _pageSize))
                     SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(faults[index], _pageSize,
@@ -635,7 +672,22 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
                     throw SubmissionScheduler.Fatal("The fault range exceeds the buffer.");
                 }
 
-                _ = _cache.FindBuffer(start, size);
+                // Adjacent fault ranges of two mappings join into a range one read cannot cover; each keeps its own buffer.
+                if (_cache.CanReadGuest(start, size))
+                {
+                    _ = _cache.FindBuffer(start, size);
+                }
+                else
+                {
+                    foreach (var window in _faultWindows)
+                    {
+                        if (window.Address >= start && window.End <= start + size)
+                        {
+                            _ = _cache.FindBuffer(window.Address, window.Size);
+                        }
+                    }
+                }
+
                 if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Traces(start, size))
                     SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(start, size,
                         $"device-address-fault-prepared scan_tick={scanTick} submission_tick={_scheduler.CurrentTick} registered={_cache.IsRegionRegistered(start, size)}");
@@ -667,7 +719,9 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
         {
             if (summaryReported < MaxPageFaults - 1 && ++lost <= 4)
                 Console.Error.WriteLine($"[GPU][BDA_SCAN_LOST] page=0x{pages[index]:X} summary_reported={summaryReported}");
-            _faultRanges.Add(pages[index], _pageSize);
+            var range = _cache.DeviceAddressFaultRange(pages[index], _pageSize);
+            _faultRanges.Add(range.Address, range.Size);
+            _faultWindows.Add(range);
         }
 
         Diagnostics.CheapProbe.NoteBdaVerify(summaryReported < MaxPageFaults - 1 ? lost : 0, 0);

@@ -82,6 +82,9 @@ public static class TlasHleShaders
         var merge = module.AllocateId();
         module.AddStatement(SpirvOp.Branch, header);
 
+        // The header reads nodeVar before its LoopMerge: without this the builder would forward the
+        // pre-loop store into it and the back edge's decrement would never be seen.
+        module.DeclareLoopHeader(header);
         module.AddLabel(header);
         var remaining = module.AddInstruction(SpirvOp.Load, uintType, nodeVar);
         var more = module.AddInstruction(SpirvOp.UGreaterThan, boolType, remaining, UInt(0));

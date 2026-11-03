@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.Libs.VideoOut;
 using SharpEmu.HLE.GpuMemory;
 using SharpEmu.Libs.Gpu.Buffers;
 using SharpEmu.Libs.Gpu.Scheduling;
@@ -11,13 +12,22 @@ namespace SharpEmu.Libs.Gpu.Images;
 // Surface metadata (HTile, DCC, CMask, FMask) keyed by its guest address.
 public sealed partial class GuestImageCache
 {
-    private void MaterializeDccClear(
+    private static long _dccSyncs;
+    private static long _dccSlicesUndecodable;
+    private static long _dccSlicesMixed;
+    private static long _dccSlicesCleared;
+
+    public static string TakeDccReport() => FormattableString.Invariant(
+        $"[PERF][DCC_SYNC] gpu_syncs={Interlocked.Exchange(ref _dccSyncs, 0)} cleared={Interlocked.Exchange(ref _dccSlicesCleared, 0)} mixed={Interlocked.Exchange(ref _dccSlicesMixed, 0)} undecodable={Interlocked.Exchange(ref _dccSlicesUndecodable, 0)}");
+
+    private unsafe void MaterializeDccClear(
         ResourceSlotIdentifier imageIdentifier,
         in ImageRequest request,
         uint metadataBaseLayer)
     {
         _dccClearCounts[(int)DccClearCount.Calls]++;
-        if (request.Description.Metadata.Kind != MetadataKind.Dcc)
+        // Native clears use the view-aware DCC and CMASK path after texture owner validation.
+        if (request.Description.Metadata.Kind != MetadataKind.Dcc || request.Description.Metadata.NativeColorClear)
         {
             return;
         }
@@ -63,13 +73,14 @@ public sealed partial class GuestImageCache
             }
 
             image.Description.Metadata = description.Metadata;
-            if (range.Size == 0 || description.Resources.Levels != 1 ||
-                image.Description.Resources.Levels != 1)
+            // The request decides: a one-level view of an image that a texture grew into a mip chain still takes its fast clear on that level.
+            if (range.Size == 0 || description.Resources.Levels != 1)
             {
                 return;
             }
 
             _surfaceMetadata.Remove(range.Address);
+            NoteMetadataChange(range.Address);
         }
 
         _dccClearCounts[(int)DccClearCount.Eligible]++;
@@ -139,6 +150,7 @@ public sealed partial class GuestImageCache
                         allowClearToRegister: request.Role == ImageRole.ColorTarget,
                         out var clear))
                 {
+                    Interlocked.Increment(ref _dccSlicesUndecodable);
                     continue;
                 }
 
@@ -158,20 +170,25 @@ public sealed partial class GuestImageCache
                             $"Could not read DCC metadata backing: address=0x{address + position:X16} size=0x{length:X}.");
                     }
 
-                    if (chunk.IndexOfAnyExcept(code) >= 0) // [local] vectorized; was a byte loop
-                    {
-                        uniform = false;
-                    }
-
+                    uniform = chunk.IndexOfAnyExcept(code) < 0;
                     position += (ulong)length;
                 }
 
                 if (!uniform)
                 {
+                    Interlocked.Increment(ref _dccSlicesMixed);
                     continue;
                 }
 
                 _dccClearCounts[(int)DccClearCount.Cleared]++;
+                Interlocked.Increment(ref _dccSlicesCleared);
+
+                // The fill that consumes the code is a GPU write into the surface's allocation. When the image's range covers the metadata it marks the image stale,
+                // so it comes first: the clear, which takes the ownership, has the last word.
+                if (request.Role != ImageRole.DisplaySurface)
+                {
+                    _bufferCache.FillBuffer(address, sliceSize, uint.MaxValue, isGds: false);
+                }
 
                 using (var held = _lock.Hold())
                 {
@@ -185,11 +202,6 @@ public sealed partial class GuestImageCache
                         request,
                         new SubresourceRange(view.BaseLevel, view.LevelCount, imageFirst + slice, 1),
                         clear);
-                }
-
-                if (request.Role != ImageRole.DisplaySurface)
-                {
-                    _bufferCache.FillBuffer(address, sliceSize, uint.MaxValue, isGds: false);
                 }
             }
         }
@@ -345,7 +357,6 @@ public sealed partial class GuestImageCache
                 ImageUsageFlags.ColorAttachmentBit);
             var view = image.GetOrCreateView(viewDescription);
             image.Transition(
-                ImageLayout.ColorAttachmentOptimal,
                 AccessFlags.ColorAttachmentWriteBit,
                 range,
                 command);
@@ -353,7 +364,7 @@ public sealed partial class GuestImageCache
             {
                 SType = StructureType.RenderingAttachmentInfo,
                 ImageView = view,
-                ImageLayout = ImageLayout.ColorAttachmentOptimal,
+                ImageLayout = ImageLayout.General,
                 LoadOp = AttachmentLoadOp.Clear,
                 StoreOp = AttachmentStoreOp.Store,
                 ClearValue = new ClearValue { Color = clear },
@@ -370,12 +381,18 @@ public sealed partial class GuestImageCache
                 ColorAttachmentCount = 1,
                 PColorAttachments = &attachment,
             };
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRendering(_device.Vk, command, &rendering); // [local]
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRendering(_device.Vk, command); // [local]
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdBeginRendering(_device.Vk, command, &rendering); // [local]
+            }
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdEndRendering(_device.Vk, command); // [local]
+            }
         }
         else
         {
-            image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
+            image.Transition(AccessFlags.TransferWriteBit, range, command);
             var nativeRange = new ImageSubresourceRange(
                 ImageAspectFlags.ColorBit,
                 range.BaseLevel,
@@ -383,46 +400,225 @@ public sealed partial class GuestImageCache
                 description.IsVolume ? 0u : range.BaseLayer,
                 description.IsVolume ? 1u : range.LayerCount);
             var nativeClear = clear;
-            SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearColorImage(_device.Vk, // [local]
-                command,
-                image.Backing.Handle,
-                ImageLayout.TransferDstOptimal,
-                &nativeClear,
-                1,
-                &nativeRange);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
+            {
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdClearColorImage(_device.Vk, // [local]
+                    command,
+                    image.Backing.Handle,
+                    ImageLayout.General,
+                    &nativeClear,
+                    1,
+                    &nativeRange);
+            }
         }
 
         TakeGpuOwnership(image);
     }
 
+    private readonly MetadataWriteRanges _metadataWriteRanges = new();
+    private ulong _maximumMetadataSize = 1;
+
+    // Publish coverage under the image lock before a registration grows.
+    private void IncludeMetadataWriteRange(ulong address, ulong size)
+    {
+        _maximumMetadataSize = Math.Max(_maximumMetadataSize, size);
+        _metadataWriteRanges.Include(address, size);
+    }
+
+    // Keep the bound after removals and shrinking fills. All growth passes through IncludeMetadataWriteRange.
+    private int FirstPossibleMetadataOverlap(ulong address)
+    {
+        if (address < _maximumMetadataSize) return 0;
+        var earliestExcluded = address - _maximumMetadataSize;
+        var low = 0;
+        var high = _surfaceMetadata.Count;
+        while (low < high)
+        {
+            var middle = low + (high - low) / 2;
+            if (_surfaceMetadata.GetKeyAtIndex(middle) <= earliestExcluded) low = middle + 1;
+            else high = middle;
+        }
+        return low;
+    }
+
+    internal bool MayOverlapMetadata(ulong address, ulong size)
+    {
+        return _metadataWriteRanges.Overlaps(address, size);
+    }
+
+    // A target that binds metadata of another kind where a registration lies ends the use of the surface that
+    // registered it: the guest reused that memory. The new kind starts as at an address nothing registered.
+    private SurfaceMetadata ReplaceSurfaceMetadata(ulong address, SurfaceMetadata previous, SurfaceMetadata replacement)
+    {
+        RecordMetadataEvent("replace-other-kind", address);
+        previous.ClearMask = 0;
+        previous.FillSize = 0;
+        previous.Invalidated = true;
+        _surfaceMetadata[address] = replacement;
+        NoteMetadataChange(address);
+        return replacement;
+    }
+
+    private void InvalidateMetadataForCpuWrite(ulong address, ulong size)
+    {
+        if (_surfaceMetadata.Count == 0 || !MayOverlapMetadata(address, size)) return;
+        var end = address + size;
+        for (var index = FirstPossibleMetadataOverlap(address); index < _surfaceMetadata.Count; index++)
+        {
+            var metadataAddress = _surfaceMetadata.GetKeyAtIndex(index);
+            if (metadataAddress >= end) break;
+            var metadata = _surfaceMetadata.GetValueAtIndex(index);
+            var metadataSize = Math.Max(1UL, Math.Max(metadata.Size, Math.Max(metadata.RangeSize, metadata.FillSize)));
+            if (metadataAddress >= address || address - metadataAddress < metadataSize)
+            {
+                RecordMetadataEvent("invalidate-cpu-write", metadataAddress);
+                metadata.ClearMask = 0;
+                metadata.FillSize = 0;
+                metadata.Invalidated = true;
+                NoteMetadataChange(metadataAddress);
+            }
+        }
+    }
+
+    private void TraceMetadataBinding(in ImageRequest request)
+    {
+        if (!ImageClearTrace.Enabled) return;
+        if (!request.Description.HasMetadata)
+        {
+            return;
+        }
+
+        var description = request.Description;
+        var address = description.Metadata.Range.Address;
+        _metadataHistory.Record(address, description.Metadata.Range.Size,
+            CreateMetadataEvent(request.Role == ImageRole.DepthTarget ? "bind-depth" : "bind-color",
+                address, description.Metadata.Range.Size, description.Data.Address,
+                description.Metadata.Kind == MetadataKind.Htile ? "HTile" : "Dcc"));
+        _surfaceMetadata.TryGetValue(address, out var previous);
+        var conflict = previous is not null && !previous.Invalidated && previous.Kind != SurfaceMetadataKind.PendingDcc &&
+            ((description.Metadata.Kind == MetadataKind.Dcc && previous.Kind != SurfaceMetadataKind.Dcc) ||
+             (request.Role == ImageRole.DepthTarget && previous.Kind != SurfaceMetadataKind.HTile));
+        if (!conflict && !Rendering.RenderTrace.Enabled)
+        {
+            return;
+        }
+
+        var previousKind = previous?.Kind.ToString() ?? "unregistered";
+        var message = $"MetadataBinding role={request.Role} " +
+            $"image=0x{description.Data.Address:X16} size=0x{description.Data.Size:X} " +
+            $"metadata=0x{address:X16} metadataSize=0x{description.Metadata.Range.Size:X} " +
+            $"kind={description.Metadata.Kind} previousKind={previousKind} " +
+            $"clearMask=0x{previous?.ClearMask ?? 0:X8} fill=0x{previous?.FillValue ?? 0:X8}";
+        if (!conflict)
+        {
+            Rendering.RenderTrace.Write(message);
+            return;
+        }
+
+        Console.Error.WriteLine($"[GPU][ERROR] {message}");
+        PrintMetadataHistory(address);
+        _slots.ForEach((identifier, owner) =>
+        {
+            if (owner.Description.HasMetadata && owner.Description.Metadata.Range.Address == address)
+            {
+                Console.Error.WriteLine($"[GPU][ERROR] MetadataOwner image=0x{owner.Description.Data.Address:X16} " +
+                    $"size=0x{owner.Description.Data.Size:X} kind={owner.Description.Metadata.Kind} " +
+                    $"registered={owner.Registered} gpuModified={owner.IsGpuModified} " +
+                    $"needsRebind={owner.Binding.NeedsRebind} depthTarget={owner.Uses.DepthTarget} " +
+                    $"colorTarget={owner.Uses.RenderTarget}");
+            }
+        });
+    }
+
+    private const int MetadataEventSlots = 1024;
+    private readonly (long Generation, ulong Address)[] _metadataEvents = new (long, ulong)[MetadataEventSlots];
+    private long _metadataGeneration = 1;
+
+    public long MetadataGeneration => Volatile.Read(ref _metadataGeneration);
+
+    private void NoteMetadataChange(ulong address)
+    {
+        var generation = _metadataGeneration + 1;
+        _metadataEvents[generation & (MetadataEventSlots - 1)] = (generation, address);
+        Volatile.Write(ref _metadataGeneration, generation);
+    }
+
+    internal bool MetadataUnchangedSinceForTest(long generation, ulong address)
+    {
+        using var held = _lock.Read();
+        return MetadataUnchangedSince(generation, address);
+    }
+
+    private bool MetadataUnchangedSince(long generation, ulong address)
+    {
+        var current = _metadataGeneration;
+        if (generation == current)
+        {
+            return true;
+        }
+
+        if (current - generation >= MetadataEventSlots)
+        {
+            return false;
+        }
+
+        for (var at = current; at > generation; at--)
+        {
+            if (_metadataEvents[at & (MetadataEventSlots - 1)].Address == address)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     public bool IsMetadata(ulong address)
     {
-        using var held = _lock.Hold();
-        return _surfaceMetadata.TryGetValue(address, out var found) && found.Kind != SurfaceMetadataKind.PendingDcc;
+        using var held = _lock.Read();
+        return _surfaceMetadata.TryGetValue(address, out var found) && !found.Invalidated && found.Kind != SurfaceMetadataKind.PendingDcc;
     }
 
     public bool IsMetadataCleared(ulong address, uint slice, out uint fillValue)
     {
         fillValue = 0;
-        using var held = _lock.Hold();
-        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Kind == SurfaceMetadataKind.PendingDcc || slice >= 32)
+        using var held = _lock.Read();
+        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Invalidated || found.Kind == SurfaceMetadataKind.PendingDcc ||
+            slice >= (found.Kind == SurfaceMetadataKind.Dcc ? found.DccSliceCount : 32))
         {
             return false;
         }
 
         fillValue = found.FillValue;
-        return (found.ClearMask & (1u << (int)slice)) != 0;
+        return found.IsSliceClear(slice);
     }
 
     public bool IsMetadataCleared(ulong address, uint slice) => IsMetadataCleared(address, slice, out _);
 
+    public SurfaceMetadataKind? PeekSurfaceMetadataKind(ulong address)
+    {
+        using var held = _lock.Read();
+        return _surfaceMetadata.TryGetValue(address, out var found) ? found.Kind : null;
+    }
+
+    // DCC metadata of a bound target, or the range of a DCC fill seen before its target: both are
+    // filled on the host, which keeps them CPU-readable instead of GPU-written.
     public bool OverlapsDccMetadata(ulong address, ulong size)
     {
-        using var held = _lock.Hold();
-        foreach (var (start, metadata) in _surfaceMetadata)
+        using var held = _lock.Read();
+        var end = address + size;
+        for (var index = FirstPossibleMetadataOverlap(address); index < _surfaceMetadata.Count; index++)
         {
-            if (metadata.Kind == SurfaceMetadataKind.Dcc && metadata.Size != 0 &&
-                address < start + metadata.Size && start < address + size)
+            var start = _surfaceMetadata.GetKeyAtIndex(index);
+            if (start >= end) break;
+            var metadata = _surfaceMetadata.GetValueAtIndex(index);
+            var extent = metadata.Kind switch
+            {
+                SurfaceMetadataKind.Dcc => metadata.Size,
+                SurfaceMetadataKind.PendingDcc => metadata.FillSize,
+                _ => metadata.NativeColorClear ? metadata.Size : 0UL,
+            };
+            if (extent != 0 && address < start + extent && start < address + size)
             {
                 return true;
             }
@@ -434,18 +630,31 @@ public sealed partial class GuestImageCache
     // A broad clear applies to CMask, FMask and HTile; DCC needs a validated fill value.
     public bool ClearMetadata(ulong address)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("metadata clear");
+        }
+
         using var held = _lock.Hold();
-        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Kind is SurfaceMetadataKind.PendingDcc or SurfaceMetadataKind.Dcc)
+        if (_surfaceMetadata.ContainsKey(address)) RecordMetadataEvent("clear-request", address);
+        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Invalidated || found.NativeColorClear ||
+            found.Kind is SurfaceMetadataKind.PendingDcc or SurfaceMetadataKind.Dcc)
         {
             return false;
         }
 
         found.ClearMask = uint.MaxValue;
+        NoteMetadataChange(address);
         return true;
     }
 
     public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("dcc fill");
+        }
+
         if (!IsValidRange(address, size))
         {
             throw SubmissionScheduler.Fatal($"The DCC fill range is invalid: address=0x{address:X16} size=0x{size:X16}.");
@@ -459,15 +668,19 @@ public sealed partial class GuestImageCache
             _ => 0u,
         };
         using var held = _lock.Hold();
-        if (!_surfaceMetadata.TryGetValue(address, out var found))
+        RecordMetadataEvent("dcc-fill-request", address, size, fillValue);
+        NoteMetadataChange(address);
+        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Invalidated)
         {
+            IncludeMetadataWriteRange(address, size);
             // The fill may precede color-target discovery; a pending entry stays invisible until then.
-            _surfaceMetadata.Add(address, new SurfaceMetadata { Kind = SurfaceMetadataKind.PendingDcc, ClearMask = dccClearMask, FillValue = fillValue, FillSize = size });
+            _surfaceMetadata[address] = new SurfaceMetadata { Kind = SurfaceMetadataKind.PendingDcc, ClearMask = dccClearMask, FillValue = fillValue, FillSize = size };
             return false;
         }
 
         if (found.Kind == SurfaceMetadataKind.PendingDcc)
         {
+            IncludeMetadataWriteRange(address, size);
             found.ClearMask = dccClearMask;
             found.FillValue = fillValue;
             found.FillSize = size;
@@ -476,6 +689,8 @@ public sealed partial class GuestImageCache
 
         if (found.Kind == SurfaceMetadataKind.Dcc)
         {
+            if (found.NativeColorClear) return false;
+            IncludeMetadataWriteRange(address, size);
             found.ClearMask = dccClearMask;
             found.FillValue = fillValue;
             found.FillSize = size;
@@ -539,6 +754,11 @@ public sealed partial class GuestImageCache
 
     public void SynchronizeGuestDccMetadata(ulong metadataAddress, ulong sliceSize, uint baseLayer, uint layerCount)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("dcc sync");
+        }
+
         if (metadataAddress == 0 || sliceSize == 0 || layerCount == 0 ||
             (ulong)baseLayer + layerCount > (ulong.MaxValue - metadataAddress) / sliceSize)
         {
@@ -550,26 +770,32 @@ public sealed partial class GuestImageCache
         if (!SkipDccSync && IsValidRange(address, size) && _bufferCache.HasGpuDirtyBytes(address, size)) // [local] A/B switch
         {
             if (DccSyncLog && _dccSyncLogs++ < 40) Console.Error.WriteLine($"[DCC_SYNC] address=0x{address:X} size=0x{size:X}"); // [local]
+            Interlocked.Increment(ref _dccSyncs);
+            if (Diagnostics.DccWriterTrace.Enabled)
+            {
+                Diagnostics.DccWriterTrace.ReportSync(address, size);
+            }
+
             _ = _bufferCache.TrySynchronizeCpuRead(address, size);
         }
     }
 
     public bool SetMetadataSlice(ulong address, uint slice, bool isClear)
     {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("metadata slice");
+        }
+
         using var held = _lock.Hold();
-        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Kind == SurfaceMetadataKind.PendingDcc || slice >= 32)
+        if (!_surfaceMetadata.TryGetValue(address, out var found) || found.Invalidated || found.Kind == SurfaceMetadataKind.PendingDcc ||
+            slice >= (found.Kind == SurfaceMetadataKind.Dcc ? found.DccSliceCount : 32))
         {
             return false;
         }
 
-        if (isClear)
-        {
-            found.ClearMask |= 1u << (int)slice;
-        }
-        else
-        {
-            found.ClearMask &= ~(1u << (int)slice);
-        }
+        NoteMetadataChange(address);
+        found.SetSliceClear(slice, isClear);
 
         return true;
     }

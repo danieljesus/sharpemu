@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Runtime.CompilerServices;
+using SharpEmu.HLE.Diagnostics;
 
 namespace SharpEmu.ShaderCompiler.Resources;
 
@@ -23,7 +24,7 @@ public delegate DeviceStoreTablePlanner.TableChunkCompare ResidentTableChunkComp
 // those words and reuses the result while every one of them is unchanged, so a draw
 // that re-binds the same resources skips the descriptor walk. Any failed read, any
 // GPU-owned range and any byte difference make the entry miss; nothing is guessed.
-public sealed class ResourceMaterializationCache
+public sealed partial class ResourceMaterializationCache
 {
     // Two generations approximate LRU: a full young generation becomes the old one,
     // and an old entry that is used again is promoted back.
@@ -33,9 +34,13 @@ public sealed class ResourceMaterializationCache
     private byte[] _scratch = new byte[256];
     private ReadRecorder? _spareRecorder;
 
-    public ResourceMaterializationCache(int generationCapacity = 16384, bool stampStoreTables = false, bool currentStoreTables = false)
+    // limitChurn: a key seen for the first time is materialized without recording, and an entry that keeps going stale
+    // is skipped for a growing period (Volatile), so draws that never repeat do not pay for recording.
+    public ResourceMaterializationCache(int generationCapacity = 16384, bool limitChurn = false, bool stampStoreTables = false,
+        bool currentStoreTables = false)
     {
         _generationCapacity = Math.Max(1, generationCapacity);
+        _sightings = limitChurn ? new ulong[SightingSlots] : null;
         _currentStoreTables = currentStoreTables && DeviceStoreTablePlanner.ExactMode == 0;
         _stampStoreTables = stampStoreTables || _currentStoreTables;
     }
@@ -98,6 +103,7 @@ public sealed class ResourceMaterializationCache
             FlattenedResourceTable = table,
             UserData = userData,
             DeviceAddressRanges = ranges,
+            Origin = snapshot.Origin,
         };
     }
 
@@ -183,6 +189,7 @@ public sealed class ResourceMaterializationCache
             FlattenedResourceTable = snapshot.FlattenedResourceTable,
             UserData = snapshot.UserData,
             DeviceAddressRanges = next,
+            Origin = snapshot.Origin,
         };
         if (owned)
         {
@@ -238,6 +245,19 @@ public sealed class ResourceMaterializationCache
     public long Misses { get; private set; }
     public long Uncacheable { get; private set; }
     public long TableRefreshes { get; private set; }
+    public long Unrecorded { get; private set; }
+
+    private const int VolatileStaleLookups = 3;
+    private const int MinVolatilePeriod = 32;
+    private const int MaxVolatilePeriod = 1024;
+    private const int SightingSlots = 1 << 15;
+
+    private readonly ulong[]? _sightings;
+    private static readonly ThreadCounter _totalFirstSightings = new();
+    private static readonly ThreadCounter _totalVolatile = new();
+    private static readonly ThreadCounter _totalRevalidated = new();
+    private static readonly ThreadCounter _totalRevalidateStale = new();
+    private static readonly ThreadCounter _totalRevalidateUnlinked = new();
 
     // Process-wide counters since the previous call, for the periodic render report.
     public static string TakeReport()
@@ -250,7 +270,95 @@ public sealed class ResourceMaterializationCache
         var refreshes = Interlocked.Exchange(ref _totalRefreshes, 0);
         var total = hits + misses;
         return FormattableString.Invariant(
-            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} table_stale={Interlocked.Exchange(ref _totalTableStale, 0)} tables_same={Interlocked.Exchange(ref _totalTablesSame, 0)} tables_equal={Interlocked.Exchange(ref _totalTablesEqual, 0)} tables_changed={Interlocked.Exchange(ref _totalTablesChanged, 0)} tables_failed={Interlocked.Exchange(ref _totalTablesFailed, 0)} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)} block_builds={Interlocked.Exchange(ref ReadRecorder.BlockBuilds, 0)} block_fallbacks={Interlocked.Exchange(ref ReadRecorder.BlockFallbacks, 0)} block_checked={Interlocked.Exchange(ref ReadRecorder.BlockChecked, 0)} block_mismatches={Interlocked.Exchange(ref ReadRecorder.BlockMismatches, 0)}{TakeRebaseReport()}{TakeSyncValidateReport()}{TakeInPlaceReport()}");
+            $"[PERF][RESOURCE_CACHE] hits={hits} misses={misses} stale={stale} stale_unreadable={staleUnreadable} table_stale={Interlocked.Exchange(ref _totalTableStale, 0)} tables_same={Interlocked.Exchange(ref _totalTablesSame, 0)} tables_equal={Interlocked.Exchange(ref _totalTablesEqual, 0)} tables_changed={Interlocked.Exchange(ref _totalTablesChanged, 0)} tables_failed={Interlocked.Exchange(ref _totalTablesFailed, 0)} refreshes={refreshes} uncacheable={uncacheable} hit_rate={(total == 0 ? 0 : hits * 100.0 / total):F1}% {RawReadPrefetch.TakeReport()} read_memo_hits={Interlocked.Exchange(ref ReadRecorder.MemoHits, 0)} read_memo_misses={Interlocked.Exchange(ref ReadRecorder.MemoMisses, 0)} runsort_checked={Interlocked.Exchange(ref ReadRecorder.RunSortChecked, 0)} runsort_mismatches={Interlocked.Exchange(ref ReadRecorder.RunSortMismatches, 0)} block_builds={Interlocked.Exchange(ref ReadRecorder.BlockBuilds, 0)} block_fallbacks={Interlocked.Exchange(ref ReadRecorder.BlockFallbacks, 0)} block_checked={Interlocked.Exchange(ref ReadRecorder.BlockChecked, 0)} block_mismatches={Interlocked.Exchange(ref ReadRecorder.BlockMismatches, 0)}{TakeRebaseReport()}{TakeSyncValidateReport()}{TakeInPlaceReport()}") +
+            FormattableString.Invariant($" first_sightings={_totalFirstSightings.Take()} volatile={_totalVolatile.Take()} revalidated={_totalRevalidated.Take()} revalidate_stale={_totalRevalidateStale.Take()} revalidate_unlinked={_totalRevalidateUnlinked.Take()}") +
+            TakeMissReport() + TakeDetailReport();
+    }
+
+    public enum MaterializeOutcome { Failed, Hit, RebaseHit, TableRefresh, Volatile, BecameVolatile, FirstSighting, Miss, Uncacheable, Count }
+
+    private static readonly bool OutcomeTimingEnabled = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_PERFORMANCE") == "1";
+    private const int OutcomeSides = 3;
+    private static readonly string[] OutcomeSideNames = ["render", "stream", "pool"];
+    private static readonly ThreadCounter[] _outcomeCounts = Enumerable.Range(0, OutcomeSides * (int)MaterializeOutcome.Count).Select(_ => new ThreadCounter()).ToArray();
+    private static readonly ThreadCounter[] _outcomeTicks = Enumerable.Range(0, OutcomeSides * (int)MaterializeOutcome.Count).Select(_ => new ThreadCounter()).ToArray();
+    private static readonly ThreadCounter[] _outcomeLookupTicks = Enumerable.Range(0, OutcomeSides).Select(_ => new ThreadCounter()).ToArray();
+    [ThreadStatic]
+    private static int _outcomeSide;
+    private MaterializeOutcome _outcome;
+    private long _lookupTicks;
+
+    private static int OutcomeSide()
+    {
+        if (_outcomeSide == 0)
+        {
+            var name = Thread.CurrentThread.Name;
+            _outcomeSide = name == "SharpEmu command stream" ? 2 : name is not null && name.StartsWith("SharpEmu resolve worker", StringComparison.Ordinal) ? 3 : 1;
+        }
+        return _outcomeSide - 1;
+    }
+
+    public MaterializeOutcome LastOutcome => _outcome;
+
+    private static long NormalizationOf(ShaderResourcePlan plan) => plan.ImageNormalizationVersion?.Invoke() ?? 0;
+
+    public static string TakeOutcomeReport()
+    {
+        static string Ms(long ticks) => FormattableString.Invariant($"{ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1}");
+        var lines = new List<string>();
+        for (var side = 0; side < OutcomeSides; side++)
+        {
+            var parts = new List<string>();
+            for (var index = 0; index < (int)MaterializeOutcome.Count; index++)
+            {
+                var count = _outcomeCounts[side * (int)MaterializeOutcome.Count + index].Take();
+                var ticks = _outcomeTicks[side * (int)MaterializeOutcome.Count + index].Take();
+                if (count != 0)
+                    parts.Add(FormattableString.Invariant($"{(MaterializeOutcome)index}={count}/{Ms(ticks)}ms"));
+            }
+
+            lines.Add("[PERF][RESOURCE_OUTCOMES] thread=" + OutcomeSideNames[side] + " " +
+                FormattableString.Invariant($"lookup_ms={Ms(_outcomeLookupTicks[side].Take())} ") +
+                string.Join(" ", parts));
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private bool MaterializeUnrecorded(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, ref ResourceSnapshot snapshot,
+        ref ResourceSpecialization specialization, out ResourceMaterializationFailure failure)
+    {
+        Unrecorded++;
+        return ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization, out failure);
+    }
+
+    // Whether a snapshot this cache returned is still current: its entry's recorded words read the same now.
+    public bool Revalidate(ResourceSnapshot snapshot, ResidentGuestBytesReader residentReader)
+    {
+        if (snapshot.Origin is not Entry entry || entry.VolatileLookups > 0)
+        {
+            _totalRevalidateUnlinked.Increment();
+            return false;
+        }
+
+        var inputs = new ResourceRuntimeInputs
+        {
+            UserData = snapshot.UserData,
+            ShaderBase = entry.ShaderBase,
+            ComputeState = entry.ComputeState,
+        };
+        // [local] A patchable word read differently means the held snapshot is stale; a stamped plan also needs its
+        // store-table scans still held (SHARPEMU_PROGRAM_GATE_TABLES).
+        var current = Validate(entry, inputs, residentReader, out _) && _patches.Count == 0 &&
+            (!StampsTables(entry.Plan) || _currentStoreTables || TablesCurrent(entry));
+        if (!current)
+        {
+            _totalRevalidateStale.Increment();
+            return false;
+        }
+
+        _totalRevalidated.Increment();
+        return true;
     }
 
     public bool Materialize(
@@ -262,9 +370,58 @@ public sealed class ResourceMaterializationCache
         out ResourceMaterializationFailure failure,
         ResidentGuestBytesComparer? residentComparer = null)
     {
+        _outcome = MaterializeOutcome.Failed;
+        var timing = new MaterializationTiming(MissDiagnosticsEnabled);
+        try
+        {
+            if (!OutcomeTimingEnabled)
+                return MaterializeCore(plan, inputs, residentReader, ref snapshot, ref specialization, out failure, residentComparer, ref timing);
+
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            _lookupTicks = started;
+            var result = MaterializeCore(plan, inputs, residentReader, ref snapshot, ref specialization, out failure, residentComparer, ref timing);
+            var ended = System.Diagnostics.Stopwatch.GetTimestamp();
+            var outcome = result ? _outcome : MaterializeOutcome.Failed;
+            var side = OutcomeSide();
+            var slot = side * (int)MaterializeOutcome.Count + (int)outcome;
+            _outcomeCounts[slot].Increment();
+            _outcomeTicks[slot].Add(ended - started);
+            _outcomeLookupTicks[side].Add(_lookupTicks - started);
+            return result;
+        }
+        finally
+        {
+            timing.Complete(plan);
+        }
+    }
+
+    private bool MaterializeCore(
+        ShaderResourcePlan plan,
+        ResourceRuntimeInputs inputs,
+        ResidentGuestBytesReader residentReader,
+        ref ResourceSnapshot snapshot,
+        ref ResourceSpecialization specialization,
+        out ResourceMaterializationFailure failure,
+        ResidentGuestBytesComparer? residentComparer,
+        ref MaterializationTiming timing)
+    {
         CurrentPlanHash = plan.Hash; // [local] for overlay diagnostics
+        // A frontend image conversion can depend on GPU attachments or detile guest
+        // texels. Unchanged descriptor bytes do not prove that its result is current.
+        if (plan.NormalizeImageDescriptor is not null && plan.Info.Images.Count != 0 && plan.ImageNormalizationVersion is null)
+        {
+            _outcome = MaterializeOutcome.Uncacheable;
+            Uncacheable++;
+            Interlocked.Increment(ref _totalUncacheable);
+            return ResourceMaterializer.Materialize(plan, inputs, ref snapshot, ref specialization, out failure);
+        }
+
+        var normalization = NormalizationOf(plan);
         var key = KeyOf(plan, inputs);
         var found = TryFind(key, plan, inputs, out var cached);
+        var keyFound = found; // before a store-table drop below: only a key never seen is a first sighting
+        if (OutcomeTimingEnabled)
+            _lookupTicks = System.Diagnostics.Stopwatch.GetTimestamp();
         var stamps = StampsTables(plan);
         var current = stamps && _currentStoreTables; // [local] the tables are evaluated again instead of stamped
         if (found && stamps && !current)
@@ -280,6 +437,28 @@ public sealed class ResourceMaterializationCache
         }
         Entry? shifted = null; // [local] SHARPEMU_MATERIALIZE_REBASE
         (ResourceSnapshot Snapshot, ResourceSpecialization Specialization)? syncCheck = null; // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE=2
+        if (found && cached.VolatileLookups > 0)
+        {
+            _outcome = MaterializeOutcome.Volatile;
+            cached.VolatileLookups--;
+            _totalVolatile.Increment();
+            return MaterializeUnrecorded(plan, inputs, ref snapshot, ref specialization, out failure);
+        }
+
+        if (!keyFound && _sightings is { } sightings)
+        {
+            ref var sighting = ref sightings[key & (SightingSlots - 1)];
+            if (sighting != key)
+            {
+                _outcome = MaterializeOutcome.FirstSighting;
+                sighting = key;
+                _totalFirstSightings.Increment();
+                return MaterializeUnrecorded(plan, inputs, ref snapshot, ref specialization, out failure);
+            }
+
+            sighting = 0;
+        }
+
         if (found)
         {
             if (StaleLog) _lastStaleReason = "nomatch";
@@ -313,6 +492,9 @@ public sealed class ResourceMaterializationCache
                         Store(key, variant);
                     }
 
+                    _outcome = MaterializeOutcome.Hit;
+                    variant.StaleLookups = 0;
+                    variant.VolatilePeriod = 0;
                     Hits++;
                     Interlocked.Increment(ref _totalHits);
                     snapshot = hit;
@@ -329,12 +511,14 @@ public sealed class ResourceMaterializationCache
             if (syncCheck is not null)
                 goto Walk;
 
+            timing.ChangePhase(MaterializationPhase.TableRefresh);
             var refreshStarted = MaterializeSplitProfile.Start(); // [local]
             Entry refreshed = null!;
             var refreshedTable = (!stamps || current || TablesCurrent(cached)) && cached.UserDataEquals(inputs) && TryRefreshTable(key, cached, plan, inputs, residentReader, out refreshed);
             MaterializeSplitProfile.Note(MaterializeSplitProfile.Kind.Refresh, refreshStarted);
             if (refreshedTable)
             {
+                _outcome = MaterializeOutcome.TableRefresh;
                 refreshed.UsedScans = cached.UsedScans;
                 TableRefreshes++;
                 Interlocked.Increment(ref _totalRefreshes);
@@ -380,6 +564,7 @@ public sealed class ResourceMaterializationCache
                         Interlocked.Increment(ref _totalHits);
                         Interlocked.Increment(ref _rebaseHits);
                         RebaseHits++;
+                        _outcome = MaterializeOutcome.RebaseHit;
                         NoteWatched(plan.Hash, hit: true);
                         snapshot = shifted.Snapshot;
                         specialization = shifted.Specialization;
@@ -397,10 +582,24 @@ public sealed class ResourceMaterializationCache
                 Interlocked.Increment(ref _totalStaleUnreadable);
             if (StaleLog)
                 NoteStale(plan.Hash, cached);
+            // limitChurn; not while a shifted candidate waits for this walk's verdict (SHARPEMU_MATERIALIZE_REBASE).
+            if (_sightings is not null && shifted is null && ++cached.StaleLookups >= VolatileStaleLookups)
+            {
+                _outcome = MaterializeOutcome.BecameVolatile;
+                cached.VolatilePeriod = Math.Clamp(cached.VolatilePeriod * 2, MinVolatilePeriod, MaxVolatilePeriod);
+                cached.VolatileLookups = cached.VolatilePeriod;
+                cached.StaleLookups = VolatileStaleLookups - 2;
+                cached.Next = null;
+                _totalVolatile.Increment();
+                return MaterializeUnrecorded(plan, inputs, ref snapshot, ref specialization, out failure);
+            }
         }
 
     Walk:
+        timing.ChangePhase(MaterializationPhase.Materialization);
+        _outcome = MaterializeOutcome.Miss;
         Misses++;
+        RecordMiss(plan, key, found);
         Interlocked.Increment(ref _totalMisses);
         var recorder = TakeRecorder();
         recorder.AllowBlocks(); // [local] SHARPEMU_RECORDER_BLOCKS
@@ -449,6 +648,7 @@ public sealed class ResourceMaterializationCache
             {
                 if (shifted is not null)
                     NoteRebaseVerdict(plan.Hash, shifted, snapshot, specialization, null, null);
+                _outcome = MaterializeOutcome.Uncacheable;
                 Uncacheable++;
                 Interlocked.Increment(ref _totalUncacheable);
                 return true;
@@ -456,13 +656,17 @@ public sealed class ResourceMaterializationCache
 
             var buildStarted = MaterializeSplitProfile.Start(); // [local]
             var bigBuild = recorder.RecordedWords > MaterializeSplitProfile.BigReads;
+            timing.ChangePhase(MaterializationPhase.CacheStore);
             var built = recorder.Build(plan, inputs, snapshot, specialization);
             built.UsedScans = usedScans;
+            built.Normalization = normalization;
             MaterializeSplitProfile.Note(bigBuild ? MaterializeSplitProfile.Kind.BigBuild : MaterializeSplitProfile.Kind.Build, buildStarted);
             if (shifted is not null)
                 NoteRebaseVerdict(plan.Hash, shifted, snapshot, specialization, built, null);
             if (found)
             {
+                built.StaleLookups = cached.StaleLookups;
+                built.VolatilePeriod = cached.VolatilePeriod;
                 built.Next = cached;
                 var depth = 1;
                 for (var variant = built; variant.Next is not null; variant = variant.Next)
@@ -868,6 +1072,7 @@ public sealed class ResourceMaterializationCache
             WordTableOnly = entry.WordTableOnly,
             WordPatches = entry.WordPatches,
             TableRefreshable = entry.TableRefreshable && sorted,
+            Normalization = entry.Normalization,
             Bytes = current,
             Snapshot = new ResourceSnapshot
             {
@@ -1095,6 +1300,7 @@ public sealed class ResourceMaterializationCache
                 WordTableOnly = cached.WordTableOnly,
                 WordPatches = cached.WordPatches,
                 TableRefreshable = true,
+                Normalization = cached.Normalization,
                 Bytes = current,
                 Snapshot = new ResourceSnapshot
                 {
@@ -1237,8 +1443,10 @@ public sealed class ResourceMaterializationCache
     {
         if (RetainPinned && !entry.Retained) // [local] SHARPEMU_MATERIALIZE_POH
             Retain(entry);
+        entry.Snapshot.Origin = entry;
         if (_young.Count >= _generationCapacity && !_young.ContainsKey(key))
         {
+            RecordEvictions(_old.Keys);
             _old = _young;
             _young = new Dictionary<ulong, Entry>(_generationCapacity);
         }
@@ -1537,6 +1745,7 @@ public sealed class ResourceMaterializationCache
                 CheckInPlace(inPlaceEqual, residentComparer!, address, current, cached, readable: true, entry.RangeClean[index]);
             if (current.SequenceEqual(cached))
                 continue;
+            RecordChangedWords(entry, index, current);
             if (StaleLog)
             {
                 var first = 0;
@@ -1613,11 +1822,17 @@ public sealed class ResourceMaterializationCache
         public Entry? Next { get; set; }
         // [local] SHARPEMU_MATERIALIZE_POH: the arrays were moved to the pinned object heap when the entry was stored.
         public bool Retained;
+        // The plan's image normalization version when the entry was built (ShaderResourcePlan.ImageNormalizationVersion).
+        public long Normalization { get; set; }
+        public int StaleLookups { get; set; }
+        public int VolatileLookups { get; set; }
+        public int VolatilePeriod { get; set; }
 
         public bool Matches(ShaderResourcePlan plan, ResourceRuntimeInputs inputs)
         {
             if (!ReferenceEquals(Plan, plan) || ShaderBase != inputs.ShaderBase ||
-                !Nullable.Equals(ComputeState, inputs.ComputeState) || UserData.Length != inputs.UserData.Count)
+                !Nullable.Equals(ComputeState, inputs.ComputeState) || UserData.Length != inputs.UserData.Count ||
+                Normalization != NormalizationOf(plan))
                 return false;
             if (ExactUserData || !ContentKeyed)
                 return UserDataEquals(inputs);
@@ -1750,6 +1965,7 @@ public sealed class ResourceMaterializationCache
                 FlattenedResourceTable = table,
                 UserData = sameUserData ? Snapshot.UserData : inputs.UserData as uint[] ?? [.. inputs.UserData],
                 DeviceAddressRanges = Snapshot.DeviceAddressRanges,
+                Origin = this,
             };
             if (sameUserData)
             {
@@ -2086,7 +2302,7 @@ public sealed class ResourceMaterializationCache
             var key = (address << 1) | (clean ? 1UL : 0UL);
             if (ReadMemo && _memo.TryGetValue(key, out word))
             {
-                MemoHits++;
+                Interlocked.Increment(ref MemoHits);
             }
             else
             {
@@ -2098,7 +2314,7 @@ public sealed class ResourceMaterializationCache
 
                 if (ReadMemo)
                 {
-                    MemoMisses++;
+                    Interlocked.Increment(ref MemoMisses);
                     _memo[key] = word;
                 }
             }

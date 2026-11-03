@@ -5,10 +5,7 @@ using SharpEmu.ShaderCompiler;
 
 namespace SharpEmu.ShaderCompiler.Vulkan;
 
-// IMAGE_BVH_INTERSECT_RAY tests one ray against one BVH node; the guest shader owns the
-// traversal loop and stack. This is the GFX10 (RT IP 1.1) node test as AMD's GPURT
-// software fallback defines it (IntersectCommon.hlsl, image_bvh64_intersect_ray_base),
-// with node layouts from GPURT's gfx10 TriangleNode1_0 and BoxNode1_0.
+// Each instruction tests one node. The guest shader controls traversal.
 public static partial class Gen5SpirvTranslator
 {
     private sealed partial class CompilationContext
@@ -16,13 +13,12 @@ public static partial class Gen5SpirvTranslator
         private const uint InvalidNode = 0xFFFF_FFFF;
 
         // Node pointer: the byte offset divided by eight above bits 2:0, which hold the type.
-        private const uint NodeTypeTriangle1 = 1;
+        private const uint LastTriangleNodeType = 3;
         private const uint NodeTypeBoxFloat16 = 4;
         private const uint NodeTypeBoxFloat32 = 5;
 
-        // Triangle node: four float3 vertices, then flags/indices, the triangle id at dword 15.
+        // Triangle fans contain five float3 vertices and one ID/remapping word.
         private const uint TriangleIdDword = 15;
-        private const int TriangleIdBitStride = 8;
         private const int TriangleIdISourceShift = 0;
         private const int TriangleIdJSourceShift = 2;
 
@@ -127,7 +123,17 @@ public static partial class Gen5SpirvTranslator
             var barycentrics = IsNotZero(BitwiseAnd(word3, UInt(1u << 24)));
             var nodeAddress = IAdd64(bvhBase, ShiftLeftLogical64(And64(nodePointer, ULong(~7ul)), ULong(3)));
 
-            var present = _module.AddInstruction(SpirvOp.INotEqual, _boolType, baseUnits, ULong(0));
+            var descriptorTypeValid = _module.AddInstruction(SpirvOp.IEqual, _boolType,
+                ShiftRightLogical(word3, UInt(28)), UInt(8));
+            _module.AddName(descriptorTypeValid, "rayDescriptorTypeValid");
+            // Check the last byte before any node load, including the second box unit.
+            var fullBox = _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeBoxFloat32));
+            var lastByte = IAdd64(nodeAddress,
+                _module.AddInstruction(SpirvOp.Select, _ulongType, fullBox, ULong(127), ULong(63)));
+            var addressValid = _module.AddInstruction(SpirvOp.ULessThan, _boolType, lastByte, ULong(1UL << 48));
+            _module.AddName(addressValid, "rayNodeAddressValid");
+            // A zero base is valid when the node pointer supplies the absolute address.
+            var present = LogicalAnd(descriptorTypeValid, addressValid);
             var inRange = _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, nodeIndex, lastNode);
             // A float32 box node spans two 64-byte units.
             var wideInRange = _module.AddInstruction(SpirvOp.ULessThan, _boolType, nodeIndex, lastNode);
@@ -135,7 +141,8 @@ public static partial class Gen5SpirvTranslator
             // [local] experiment: GTA V derives the T# size from its node count, which leaves every triangle-pair
             // node beyond it; let triangle nodes through on page validity alone (SHARPEMU_BVH_TRIANGLE_RANGE=0).
             var triangleValid = TriangleRangeCheck ? valid : present;
-            var isTriangle = LogicalAnd(triangleValid, _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, nodeType, UInt(Triangle23 ? 3u : NodeTypeTriangle1)));
+            // [local] SHARPEMU_BVH_TRIANGLE23=0 keeps triangle types 2 and 3 out (four invalid dwords).
+            var isTriangle = LogicalAnd(triangleValid, _module.AddInstruction(SpirvOp.ULessThanEqual, _boolType, nodeType, UInt(Triangle23 ? LastTriangleNodeType : 1u)));
             var isBox16 = LogicalAnd(valid, _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeBoxFloat16)));
             var isBox32 = LogicalAnd(LogicalAnd(present, wideInRange),
                 _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeBoxFloat32)));
@@ -147,8 +154,8 @@ public static partial class Gen5SpirvTranslator
             var direction = LoadRayVector(ray, bvh64, inverse: false);
             var inverseDirection = LoadRayVector(ray, bvh64, inverse: true);
 
-            // Other node types (user nodes 6 and 7, unused 2 and 3), a null BVH, an
-            // out-of-range node or a node on an unmapped page return four invalid dwords.
+            // User nodes, out-of-range nodes and box nodes on an unmapped page return four invalid dwords;
+            // a triangle node on an unmapped page misses.
             foreach (var variable in result)
                 Store(variable, UInt(InvalidNode));
             if (_bvhUnifiedFetch != 0)
@@ -162,6 +169,9 @@ public static partial class Gen5SpirvTranslator
 
             EmitConditional(isTriangle, () =>
             {
+                Store(result[0], UInt(0x7F80_0000));
+                Store(result[1], UInt(0x3F80_0000));
+                Store(result[3], UInt(0));
                 var unit = ResolveNodeUnit(nodeAddress, 0);
                 EmitConditional(unit.Valid, () =>
                 {
@@ -235,6 +245,10 @@ public static partial class Gen5SpirvTranslator
                     Store(result[component], values[component]);
             }
 
+            // A triangle node on an unmapped page misses (t_num = +inf over 1, no hit), as in the per-type path.
+            Store(result[0], SelectU(isTriangle, UInt(0x7F80_0000), UInt(InvalidNode)));
+            Store(result[1], SelectU(isTriangle, UInt(0x3F80_0000), UInt(InvalidNode)));
+            Store(result[3], SelectU(isTriangle, UInt(0), UInt(InvalidNode)));
             EmitConditional(Any(isTriangle, isBox16, isBox32), () =>
             {
                 var resolved = ResolveNodeUnit(nodeAddress, 0);
@@ -428,14 +442,154 @@ public static partial class Gen5SpirvTranslator
         private uint LoadNodeFloat(NodeUnit first, NodeUnit second, uint dword) =>
             Bitcast(_floatType, LoadNodeDword(first, second, dword));
 
-        // fast_intersect_triangle and SwizzleBarycentrics. Node type 0 tests (v0, v1, v2),
-        // type 1 tests (v1, v3, v2). A miss returns t_num = +inf over t_denom = 1. The
-        // barycentric return mode yields the i/j numerators the builder's rotation maps
-        // back; the other mode yields the triangle id and a hit flag.
+        // [local] SHARPEMU_BVH_NODE_TEST=gpurt runs the node test this branch measured GTA V with (AMD GPURT's software
+        // fallback: fast_intersect_triangle and fast_intersect_bbox, IntersectCommon.hlsl). Unset, the node test is
+        // upstream's (#1061: dominant-axis projection with a top-left rule, exit grown by ULPs). Both read the node
+        // through NodeUnit (SHARPEMU_BVH_UNIFIED_FETCH / SHARPEMU_BVH_LEAN_SLABS apply to both). Read on every compile.
+        private static bool GpurtNodeTest =>
+            string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_BVH_NODE_TEST"), "gpurt", StringComparison.OrdinalIgnoreCase);
+
         private uint[] EmitRayTriangle(NodeUnit node, uint nodeType, uint barycentrics,
+            IReadOnlyList<uint> origin, IReadOnlyList<uint> direction) =>
+            GpurtNodeTest
+                ? EmitRayTriangleGpurt(node, nodeType, barycentrics, origin, direction)
+                : EmitRayTriangleProjected(node, nodeType, barycentrics, origin, direction);
+
+        // Project onto the dominant ray axis. Shared edges use a top-left rule.
+        private uint[] EmitRayTriangleProjected(NodeUnit node, uint nodeType, uint barycentrics,
             IReadOnlyList<uint> origin, IReadOnlyList<uint> direction)
         {
-            var second = _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(NodeTypeTriangle1));
+            _module.AddName(nodeType, "rayTriangleType");
+            _module.AddName(barycentrics, "rayTriangleBarycentrics");
+            for (var axis = 0; axis < 3; axis++)
+            {
+                _module.AddName(origin[axis], $"rayOrigin{axis}");
+                _module.AddName(direction[axis], $"rayDirection{axis}");
+            }
+            uint IsType(uint type) => _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(type));
+            var second = IsType(1);
+            var third = IsType(2);
+            var fourth = IsType(3);
+            var v1 = new uint[3];
+            var v2 = new uint[3];
+            var v3 = new uint[3];
+            for (var axis = 0u; axis < 3; axis++)
+            {
+                var first = LoadNodeFloat(node, axis);
+                var vertex1 = LoadNodeFloat(node, 3 + axis);
+                var vertex2 = LoadNodeFloat(node, 6 + axis);
+                var vertex3 = LoadNodeFloat(node, 9 + axis);
+                var vertex4 = LoadNodeFloat(node, 12 + axis);
+                var inputs = new[] { first, vertex1, vertex2, vertex3, vertex4 };
+                for (var vertex = 0; vertex < inputs.Length; vertex++)
+                    _module.AddName(inputs[vertex], $"rayTriangleVertex{vertex}Axis{axis}");
+                v1[axis] = SelectF(IsType(0), first, SelectF(second, vertex1, vertex2));
+                v2[axis] = SelectF(IsType(0), vertex1, SelectF(fourth, vertex4, vertex3));
+                v3[axis] = SelectF(third, vertex4, SelectF(fourth, first, vertex2));
+            }
+
+            var useY = FCompare(SpirvOp.FOrdLessThan, Ext(4, _floatType, direction[0]), Ext(4, _floatType, direction[1]));
+            var useZ = FCompare(SpirvOp.FOrdLessThan,
+                SelectF(useY, Ext(4, _floatType, direction[1]), Ext(4, _floatType, direction[0])), Ext(4, _floatType, direction[2]));
+            uint[] Rotate(IReadOnlyList<uint> values) => Enumerable.Range(0, 3)
+                .Select(axis => SelectF(useZ, values[axis], SelectF(useY, values[(axis + 2) % 3], values[(axis + 1) % 3])))
+                .ToArray();
+            var ray = Rotate(direction);
+            var rayOrigin = Rotate(origin);
+            var projected = new uint[3][];
+            var vertices = new[] { v1, v2, v3 };
+            for (var vertex = 0; vertex < 3; vertex++)
+            {
+                var rotated = Rotate(vertices[vertex]);
+                var relative = Enumerable.Range(0, 3).Select(axis => RayArithmetic(SpirvOp.FSub, rotated[axis], rayOrigin[axis])).ToArray();
+                projected[vertex] =
+                [
+                    RayArithmetic(SpirvOp.FSub, RayArithmetic(SpirvOp.FMul, relative[0], ray[2]), RayArithmetic(SpirvOp.FMul, ray[0], relative[2])),
+                    RayArithmetic(SpirvOp.FSub, RayArithmetic(SpirvOp.FMul, relative[1], ray[2]), RayArithmetic(SpirvOp.FMul, ray[1], relative[2])),
+                    relative[2],
+                ];
+            }
+            var edges = new uint[3];
+            var weights = new uint[3];
+            for (var vertex = 0; vertex < 3; vertex++)
+            {
+                var next = projected[(vertex + 1) % 3];
+                var last = projected[(vertex + 2) % 3];
+                edges[vertex] = RayArithmetic(SpirvOp.FSub,
+                    RayArithmetic(SpirvOp.FMul, last[0], next[1]), RayArithmetic(SpirvOp.FMul, last[1], next[0]));
+                weights[vertex] = RayArithmetic(SpirvOp.FMul, edges[vertex], ray[2]);
+            }
+            var tNum = RayArithmetic(SpirvOp.FAdd,
+                RayArithmetic(SpirvOp.FAdd, RayArithmetic(SpirvOp.FMul, edges[0], projected[0][2]),
+                    RayArithmetic(SpirvOp.FMul, edges[1], projected[1][2])),
+                RayArithmetic(SpirvOp.FMul, edges[2], projected[2][2]));
+            var tDenom = RayArithmetic(SpirvOp.FAdd, RayArithmetic(SpirvOp.FAdd, weights[0], weights[1]), weights[2]);
+            var zero = Float(0f);
+            var one = Float(1f);
+            var winding = FCompare(SpirvOp.FOrdGreaterThan, tDenom, zero);
+            var missed = Any(
+                LogicalAnd(Any(edges.Select(edge => FCompare(SpirvOp.FOrdLessThan, edge, zero)).ToArray()),
+                    Any(edges.Select(edge => FCompare(SpirvOp.FOrdGreaterThan, edge, zero)).ToArray())),
+                FCompare(SpirvOp.FOrdLessThan, SelectF(winding, tNum, _module.AddInstruction(SpirvOp.FNegate, _floatType, tNum)), zero));
+            // [local] SHARPEMU_BVH_TRI_DEGENERATE on this test: 1 (default) rejects t_denom == 0 and a NaN t_num, as
+            // upstream does; 0 drops both rejections; 2 also rejects a NaN barycentric weight.
+            var degenerateMode = TriDegenerate;
+            var reject = degenerateMode == 0
+                ? 0u
+                : Any(FCompare(SpirvOp.FOrdEqual, tDenom, zero), _module.AddInstruction(SpirvOp.IsNan, _boolType, tNum));
+            if (degenerateMode == 2)
+                reject = Any(reject, Any(weights.Select(weight => _module.AddInstruction(SpirvOp.IsNan, _boolType, weight)).ToArray()));
+            for (var vertex = 0; vertex < 3; vertex++)
+            {
+                var nextY = projected[(vertex + 1) % 3][1];
+                var lastY = projected[(vertex + 2) % 3][1];
+                var nextZero = FCompare(SpirvOp.FOrdEqual, nextY, zero);
+                var horizontal = LogicalAnd(nextZero, FCompare(SpirvOp.FOrdEqual, lastY, zero));
+                var below = Any(FCompare(SpirvOp.FOrdLessThan, nextY, zero),
+                    LogicalAnd(nextZero, FCompare(SpirvOp.FOrdGreaterThan, lastY, zero)));
+                var rightEdge = _module.AddInstruction(SpirvOp.LogicalNotEqual, _boolType, below, winding);
+                var excluded = _module.AddInstruction(SpirvOp.Select, _boolType, horizontal,
+                    FCompare(SpirvOp.FOrdGreaterThan, projected[vertex][1], zero), rightEdge);
+                missed = Any(missed, LogicalAnd(FCompare(SpirvOp.FOrdEqual, edges[vertex], zero), excluded));
+            }
+            if (TriProbeActive)
+                EmitTriangleProbe(nodeType, missed, reject, tNum, tDenom, weights[1], weights[2]);
+            if (reject != 0)
+                missed = LogicalOr(missed, reject);
+            tNum = SelectF(missed, Float(float.PositiveInfinity), tNum);
+            tDenom = SelectF(missed, one, tDenom);
+
+            var triangleId = LoadNodeDword(node, TriangleIdDword);
+            _module.AddName(triangleId, "rayTriangleId");
+            var shift = ShiftLeftLogical(nodeType, UInt(3));
+            uint Barycentric(int sourceShift)
+            {
+                var source = BitwiseAnd(ShiftRightLogical(triangleId, IAdd(shift, UInt((uint)sourceShift))), UInt(3));
+                return SelectF(_module.AddInstruction(SpirvOp.IEqual, _boolType, source, UInt(1)), weights[1],
+                    SelectF(_module.AddInstruction(SpirvOp.IEqual, _boolType, source, UInt(2)), weights[2], weights[0]));
+            }
+
+            var hit = LogicalNot(missed);
+            uint[] results =
+            [
+                Bitcast(_uintType, tNum),
+                Bitcast(_uintType, tDenom),
+                SelectU(barycentrics, Bitcast(_uintType, Barycentric(TriangleIdISourceShift)), IAdd(triangleId, nodeType)),
+                SelectU(barycentrics, Bitcast(_uintType, Barycentric(TriangleIdJSourceShift)), SelectU(hit, UInt(1), UInt(0))),
+            ];
+            for (var component = 0; component < results.Length; component++)
+                _module.AddName(results[component], $"rayTriangleOutput{component}");
+            return results;
+        }
+
+        // [local] SHARPEMU_BVH_NODE_TEST=gpurt: fast_intersect_triangle and SwizzleBarycentrics. Node type 0 tests
+        // (v0, v1, v2), type 1 tests (v1, v3, v2), 2 (v2, v3, v4) and 3 (v2, v4, v0). A miss returns t_num = +inf over
+        // t_denom = 1. The barycentric return mode yields the i/j numerators the builder's rotation maps back; the
+        // other mode yields the triangle id and a hit flag.
+        private uint[] EmitRayTriangleGpurt(NodeUnit node, uint nodeType, uint barycentrics,
+            IReadOnlyList<uint> origin, IReadOnlyList<uint> direction)
+        {
+            var second = _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(1));
             var third = _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(2));
             var fourth = _module.AddInstruction(SpirvOp.IEqual, _boolType, nodeType, UInt(3));
             var v1 = new uint[3];
@@ -519,9 +673,13 @@ public static partial class Gen5SpirvTranslator
             ];
         }
 
-        // IntersectNodeBvh4 with fast_intersect_bbox: slab test clipped to [0, extent], a
-        // NaN interval misses, box_grow_value widens the exit time by that many 2^-24
-        // steps, and the optional sort orders hit children by entry time.
+        private uint RayArithmetic(SpirvOp opcode, uint left, uint right)
+        {
+            var result = _module.AddInstruction(opcode, _floatType, left, right);
+            _module.AddDecoration(result, SpirvDecoration.NoContraction);
+            return result;
+        }
+
         private uint[] EmitRayBoxes(NodeUnit first, NodeUnit second, bool fp16, uint boxGrow, uint boxSort, uint extent,
             IReadOnlyList<uint> origin, IReadOnlyList<uint> inverseDirection)
         {
@@ -539,17 +697,29 @@ public static partial class Gen5SpirvTranslator
             return lean;
         }
 
+        // Grow only the exit distance. The ray extent remains an exclusive limit. [local] With
+        // SHARPEMU_BVH_NODE_TEST=gpurt, fast_intersect_bbox: slab test clipped to [0, extent], box_grow_value
+        // widens the exit time by that many 2^-24 steps, and an invalid child always sinks in the sort.
         private uint[] EmitRayBoxes(NodeUnit first, NodeUnit second, bool fp16, uint boxGrow, uint boxSort, uint extent,
             IReadOnlyList<uint> origin, IReadOnlyList<uint> inverseDirection, bool lean)
         {
+            var gpurt = GpurtNodeTest;
+            var label = fp16 ? "rayBox16" : "rayBox32";
+            _module.AddName(boxGrow, "rayBoxGrow");
+            _module.AddName(boxSort, "rayBoxSort");
+            _module.AddName(extent, "rayExtent");
+            for (var axis = 0; axis < 3; axis++)
+                _module.AddName(inverseDirection[axis], $"rayInverseDirection{axis}");
             var zero = Float(0f);
-            var growFactor = FAdd(Float(1f), FMul(
-                _module.AddInstruction(SpirvOp.ConvertUToF, _floatType, boxGrow), Float(5.960464478e-8f)));
+            var growFactor = gpurt
+                ? FAdd(Float(1f), FMul(_module.AddInstruction(SpirvOp.ConvertUToF, _floatType, boxGrow), Float(5.960464478e-8f)))
+                : 0u;
             var children = new uint[4];
             var keys = new uint[4];
             for (var child = 0u; child < 4; child++)
             {
                 var pointer = LoadNodeDword(first, child);
+                _module.AddName(pointer, $"{label}Child{child}");
                 var enter = Float(float.NegativeInfinity);
                 var leave = Float(float.PositiveInfinity);
                 var anyNan = 0u;
@@ -557,6 +727,8 @@ public static partial class Gen5SpirvTranslator
                 {
                     var min = BoxBound(first, second, fp16, child, axis);
                     var max = BoxBound(first, second, fp16, child, axis + 3);
+                    _module.AddName(min, $"{label}Child{child}Min{axis}");
+                    _module.AddName(max, $"{label}Child{child}Max{axis}");
                     var planeMin = FMul(FSub(min, origin[(int)axis]), inverseDirection[(int)axis]);
                     var planeMax = FMul(FSub(max, origin[(int)axis]), inverseDirection[(int)axis]);
                     var positive = FCompare(SpirvOp.FOrdGreaterThanEqual, inverseDirection[(int)axis], zero);
@@ -589,28 +761,59 @@ public static partial class Gen5SpirvTranslator
                 var nan = lean ? anyNan : _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
                     _module.AddInstruction(SpirvOp.IsNan, _boolType, enter),
                     _module.AddInstruction(SpirvOp.IsNan, _boolType, leave));
-                var minT = SelectF(nan, Float(float.PositiveInfinity), Ext(40, _floatType, enter, zero));
-                var maxT = SelectF(nan, Float(float.NegativeInfinity), Ext(37, _floatType, leave, extent));
-                var hit = FCompare(SpirvOp.FOrdLessThanEqual, minT, FMul(maxT, growFactor));
+                if (gpurt)
+                {
+                    var minT = SelectF(nan, Float(float.PositiveInfinity), Ext(40, _floatType, enter, zero));
+                    var maxT = SelectF(nan, Float(float.NegativeInfinity), Ext(37, _floatType, leave, extent));
+                    var gpurtHit = FCompare(SpirvOp.FOrdLessThanEqual, minT, FMul(maxT, growFactor));
+                    children[child] = SelectU(gpurtHit, pointer, UInt(InvalidNode));
+                    keys[child] = minT;
+                    continue;
+                }
+
+                // Normalize negative zero before adding ULPs and saturate at infinity.
+                var exitBits = Bitcast(_uintType, SelectF(FCompare(SpirvOp.FOrdEqual, leave, zero), zero, leave));
+                var grownExit = Bitcast(_floatType, Ext(38, _uintType, IAdd(exitBits, boxGrow), UInt(0x7F80_0000)));
+                var hit = LogicalAnd(LogicalNot(nan), LogicalAnd(
+                    FCompare(SpirvOp.FOrdGreaterThanEqual, leave, zero), LogicalAnd(
+                        FCompare(SpirvOp.FOrdLessThan, enter, extent),
+                        FCompare(SpirvOp.FOrdLessThanEqual, enter, grownExit))));
                 children[child] = SelectU(hit, pointer, UInt(InvalidNode));
-                keys[child] = minT;
+                keys[child] = SelectF(hit, Ext(40, _floatType, enter, zero), Float(float.PositiveInfinity));
             }
 
-            // The hardware sorting network; an invalid child always sinks.
             var sorted = (uint[])children.Clone();
-            (int, int)[] network = [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)];
-            foreach (var (a, b) in network)
+            if (gpurt)
             {
-                var bValid = _module.AddInstruction(SpirvOp.INotEqual, _boolType, sorted[b], UInt(InvalidNode));
-                var aInvalid = _module.AddInstruction(SpirvOp.IEqual, _boolType, sorted[a], UInt(InvalidNode));
-                var swap = _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
-                    LogicalAnd(bValid, FCompare(SpirvOp.FOrdLessThan, keys[b], keys[a])), aInvalid);
-                (sorted[a], sorted[b]) = (SelectU(swap, sorted[b], sorted[a]), SelectU(swap, sorted[a], sorted[b]));
-                (keys[a], keys[b]) = (SelectF(swap, keys[b], keys[a]), SelectF(swap, keys[a], keys[b]));
+                // The GPURT sorting network; an invalid child always sinks.
+                (int, int)[] gpurtNetwork = [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)];
+                foreach (var (a, b) in gpurtNetwork)
+                {
+                    var bValid = _module.AddInstruction(SpirvOp.INotEqual, _boolType, sorted[b], UInt(InvalidNode));
+                    var aInvalid = _module.AddInstruction(SpirvOp.IEqual, _boolType, sorted[a], UInt(InvalidNode));
+                    var gpurtSwap = _module.AddInstruction(SpirvOp.LogicalOr, _boolType,
+                        LogicalAnd(bValid, FCompare(SpirvOp.FOrdLessThan, keys[b], keys[a])), aInvalid);
+                    (sorted[a], sorted[b]) = (SelectU(gpurtSwap, sorted[b], sorted[a]), SelectU(gpurtSwap, sorted[a], sorted[b]));
+                    (keys[a], keys[b]) = (SelectF(gpurtSwap, keys[b], keys[a]), SelectF(gpurtSwap, keys[a], keys[b]));
+                }
+            }
+            else
+            {
+                // Misses sort after finite hits. Equal depths do not swap.
+                (int, int)[] network = [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)];
+                foreach (var (a, b) in network)
+                {
+                    var swap = FCompare(SpirvOp.FOrdLessThan, keys[b], keys[a]);
+                    (sorted[a], sorted[b]) = (SelectU(swap, sorted[b], sorted[a]), SelectU(swap, sorted[a], sorted[b]));
+                    (keys[a], keys[b]) = (SelectF(swap, keys[b], keys[a]), SelectF(swap, keys[a], keys[b]));
+                }
             }
 
             for (var child = 0; child < 4; child++)
+            {
                 children[child] = SelectU(boxSort, sorted[child], children[child]);
+                _module.AddName(children[child], $"{label}Output{child}");
+            }
             return children;
         }
 
@@ -636,6 +839,16 @@ public static partial class Gen5SpirvTranslator
                 _module.AddInstruction(SpirvOp.IsNan, _boolType, left),
                 FCompare(SpirvOp.FOrdLessThan, left, right)), left, right);
 
+        private uint Any(params uint[] conditions)
+        {
+            var result = conditions[0];
+            for (var index = 1; index < conditions.Length; index++)
+                result = _module.AddInstruction(SpirvOp.LogicalOr, _boolType, result, conditions[index]);
+            return result;
+        }
+
+        private uint FCompare(SpirvOp op, uint left, uint right) => _module.AddInstruction(op, _boolType, left, right);
+        // [local] SHARPEMU_BVH_NODE_TEST=gpurt and the triangle probe.
         private uint[] Subtract(IReadOnlyList<uint> left, IReadOnlyList<uint> right) =>
             [FSub(left[0], right[0]), FSub(left[1], right[1]), FSub(left[2], right[2])];
 
@@ -649,20 +862,10 @@ public static partial class Gen5SpirvTranslator
         private uint Dot(IReadOnlyList<uint> a, IReadOnlyList<uint> b) =>
             FAdd(FAdd(FMul(a[0], b[0]), FMul(a[1], b[1])), FMul(a[2], b[2]));
 
-        private uint Any(params uint[] conditions)
-        {
-            var result = conditions[0];
-            for (var index = 1; index < conditions.Length; index++)
-                result = _module.AddInstruction(SpirvOp.LogicalOr, _boolType, result, conditions[index]);
-            return result;
-        }
-
-        private uint LogicalOr(uint left, uint right) => _module.AddInstruction(SpirvOp.LogicalOr, _boolType, left, right);
-        private uint FCompare(SpirvOp op, uint left, uint right) => _module.AddInstruction(op, _boolType, left, right);
         private uint FAdd(uint left, uint right) => _module.AddInstruction(SpirvOp.FAdd, _floatType, left, right);
+        private uint FDiv(uint left, uint right) => _module.AddInstruction(SpirvOp.FDiv, _floatType, left, right);
         private uint FSub(uint left, uint right) => _module.AddInstruction(SpirvOp.FSub, _floatType, left, right);
         private uint FMul(uint left, uint right) => _module.AddInstruction(SpirvOp.FMul, _floatType, left, right);
-        private uint FDiv(uint left, uint right) => _module.AddInstruction(SpirvOp.FDiv, _floatType, left, right);
         private uint SelectF(uint condition, uint whenTrue, uint whenFalse) =>
             _module.AddInstruction(SpirvOp.Select, _floatType, condition, whenTrue, whenFalse);
     }

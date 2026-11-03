@@ -121,7 +121,7 @@ public static partial class Gen5SpirvTranslator
                 return null;
             }
 
-            if (_program.Instructions[blocks[latch].EndIndex - 1].Pc != NativeTlasLatchPc ||
+            if (_request.Program.Instructions[blocks[latch].EndIndex - 1].Pc != NativeTlasLatchPc ||
                 latch + 1 >= blocks.Count || blocks[latch + 1].StartPc != NativeTlasExitPc)
             {
                 reason = "the loop does not end at 0x19C0 with its exit at 0x19C4";
@@ -138,7 +138,7 @@ public static partial class Gen5SpirvTranslator
             var signature = 0xCBF29CE484222325UL;
             for (var index = blocks[header].StartIndex; index < blocks[latch].EndIndex; index++)
             {
-                var instruction = _program.Instructions[index];
+                var instruction = _request.Program.Instructions[index];
                 instructions[instruction.Pc] = instruction;
                 if (instruction.Pc is >= NativeBlasHeaderPc and <= NativeBlasLatchPc)
                 {
@@ -162,8 +162,10 @@ public static partial class Gen5SpirvTranslator
 
         private bool NativeTlasSupported(out string reason)
         {
-            reason = !_emulateWave64 || _subgroupInvocationIdInput == 0
-                ? "the wave is not emulated as two 32-lane subgroups"
+            // [local] Its exchange meets at a workgroup barrier: one guest wave per workgroup only.
+            reason = _waveLowering is not EmulatedWave64Lowering || _subgroupInvocationIdInput == 0 ||
+                (ulong)_localSizeX * _localSizeY * _localSizeZ != 64 || _request.CooperativeWave64Workgroup
+                ? "the wave is not emulated as two 32-lane subgroups of a one-wave group"
                 : _lds == 0 || _ldsDwordMask + 1 < NativeTlasExchangeDwords
                     ? "no LDS for the exchange"
                     : string.Empty;
@@ -451,8 +453,8 @@ public static partial class Gen5SpirvTranslator
             if (_maxDispatcherSteps > 0)
             {
                 // The guest counts each TLAS iteration on the same (wave-uniform) budget.
-                var steps = IAdd(Load(_uintType, _iterationGuard), UInt(1));
-                Store(_iterationGuard, steps);
+                var steps = IAdd(Load(_uintType, IterationGuard()), UInt(1));
+                Store(IterationGuard(), steps);
                 var within = _module.AddInstruction(SpirvOp.ULessThan, _boolType, steps, UInt((uint)_maxDispatcherSteps));
                 Store(_tlasCapped, SelectU(LogicalAnd(again, LogicalNot(within)), UInt(1), UInt(0)));
                 again = LogicalAnd(again, within);
@@ -708,7 +710,7 @@ public static partial class Gen5SpirvTranslator
 
                 if (_maxDispatcherSteps > 0)
                 {
-                    _tlasVariableShadows.Add((_iterationGuard, NativeVariable("nativeTlasSavedSteps")));
+                    _tlasVariableShadows.Add((IterationGuard(), NativeVariable("nativeTlasSavedSteps")));
                 }
 
                 if (_bvhTestCount != 0)

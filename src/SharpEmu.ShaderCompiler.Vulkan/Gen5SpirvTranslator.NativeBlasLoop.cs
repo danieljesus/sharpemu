@@ -110,6 +110,10 @@ public static partial class Gen5SpirvTranslator
         private readonly List<(uint Register, bool Vector, uint Shadow)> _nativeShadows = [];
         private readonly List<(uint Flag, uint Shadow)> _nativeFlagShadows = [];
 
+        // The wave lowering of 0x8395 while its native loop is on (CompilationContext's constructor).
+        private static bool KeepsEmulatedWave64(ShaderCompileRequest request) =>
+            request.Hash == NativeBlasHash && request.WaveSize == 64 && ReadNativeBlasMode() != NativeBlasMode.Off;
+
         private NativeBlasPlan? PrepareNativeBlasLoop(IReadOnlyList<ShaderBlock> blocks)
         {
             if (_request.Hash != NativeBlasHash)
@@ -123,7 +127,9 @@ public static partial class Gen5SpirvTranslator
                 return null;
             }
 
-            var plan = TryBuildNativeBlasPlan(blocks, out var reason);
+            // One guest lane per invocation: the paired lowering holds two in each.
+            var reason = "the wave runs paired lanes";
+            var plan = _pairedLanes ? null : TryBuildNativeBlasPlan(blocks, out reason);
             Console.Error.WriteLine(plan is null
                 ? $"[NATIVE_BLAS] hash=0x{_request.Hash:X16} not applied: {reason}"
                 : $"[NATIVE_BLAS] hash=0x{_request.Hash:X16} mode={_nativeBlasMode} prepared: blocks={plan.Header}..{plan.Latch} exit={plan.Exit} instructions={plan.Instructions.Count}");
@@ -144,7 +150,7 @@ public static partial class Gen5SpirvTranslator
                 return null;
             }
 
-            if (_program.Instructions[blocks[latch].EndIndex - 1].Pc != NativeBlasLatchPc ||
+            if (_request.Program.Instructions[blocks[latch].EndIndex - 1].Pc != NativeBlasLatchPc ||
                 latch + 1 >= blocks.Count || blocks[latch + 1].StartPc != NativeBlasExitPc)
             {
                 reason = "the loop does not end at 0x15E4 with its exit at 0x15E8";
@@ -155,7 +161,7 @@ public static partial class Gen5SpirvTranslator
             var signature = 0xCBF29CE484222325UL;
             for (var index = blocks[header].StartIndex; index < blocks[latch].EndIndex; index++)
             {
-                var instruction = _program.Instructions[index];
+                var instruction = _request.Program.Instructions[index];
                 instructions[instruction.Pc] = instruction;
                 foreach (var character in $"{instruction.Pc:X4}:{instruction.Opcode};")
                 {
@@ -321,6 +327,12 @@ public static partial class Gen5SpirvTranslator
         // Needs one guest wave per workgroup: the slots are indexed by the lane within the wave.
         private static readonly bool RtSharedStacksSwitch = Environment.GetEnvironmentVariable("SHARPEMU_RT_SHARED_STACKS") != "0";
         private bool RtSharedStacks => RtSharedStacksSwitch && _waveLaneCount == 64 && Wave64WavesPerWorkgroup == 1;
+
+        // Guest waves in one compute workgroup (1 outside wave64 compute).
+        private uint Wave64WavesPerWorkgroup =>
+            _stage == Gen5SpirvStage.Compute && _waveLaneCount == 64
+                ? Math.Max(1u, (checked(_localSizeX * _localSizeY * _localSizeZ) + 63) / 64)
+                : 1u;
         private uint _workgroupUintPointer;
 
         private uint RtStackLane() => BitwiseAnd(GuestWaveLane(), UInt(63));
@@ -539,7 +551,11 @@ public static partial class Gen5SpirvTranslator
 
         private void EmitNativeBlasRegion(NativeBlasPlan plan)
         {
-            if (HalfMaskPlan() is { } halfMasks)
+            if (_waveLowering is EmulatedWave64Lowering && _subgroupInvocationIdInput != 0 &&
+                Ir.Gen5Wave64HalfMaskAnalysis.Analyze(_request.Program, _request.Memory.Entries
+                    .Where(static memory => memory.AddressSpace is FlatAddressSpace.Shared or FlatAddressSpace.SharedOrPrivate)
+                    .Select(static memory => memory.Pc)
+                    .ToHashSet()) is { } halfMasks)
             {
                 bool InLoop(uint pc) => pc is >= NativeBlasHeaderPc and <= NativeBlasLatchPc;
                 Console.Error.WriteLine($"[NATIVE_BLAS] hash=0x{_request.Hash:X16} mode={_nativeBlasMode} emitted; half-mask plan inside the loop:" +

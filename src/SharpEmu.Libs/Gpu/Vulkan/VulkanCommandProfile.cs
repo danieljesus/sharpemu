@@ -9,10 +9,13 @@ namespace SharpEmu.Libs.Gpu.Vulkan;
 internal sealed unsafe partial class VulkanCommandProfile : IDisposable
 {
     // [local] SHARPEMU_PROFILE_GPU_PASSES=1 (VulkanCommandProfile.Passes.cs): per-command markers, transfer markers and the
-    // pass breakdown; 4096 queries per buffer so that long buffers do not fold their last draws into the tail.
+    // pass breakdown. Upstream's 8192 queries per buffer already keep long buffers from folding their last draws into the
+    // tail (ours raised 512 to 4096 for the passes and SHARPEMU_FRAME_MISS_GPU).
     internal static readonly bool PassesEnabled = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_PASSES") == "1";
-    internal static readonly int QueryCapacity = PassesEnabled || Diagnostics.FrameGpuProbe.Enabled ? 4096 : 512; // [local] SHARPEMU_FRAME_MISS_GPU
-    private static readonly int BufferCapacity = Diagnostics.FrameGpuProbe.Enabled ? 512 : 64;
+    internal const int QueryCapacity = 8192;
+    private const int KeyCapacity = 4096;
+    private const int ReportedKeys = 20;
+    private static readonly int BufferCapacity = Diagnostics.FrameGpuProbe.Enabled ? 512 : 64; // [local] SHARPEMU_FRAME_MISS_GPU
     private readonly Vk _vulkan;
     private readonly Device _device;
     private readonly float _timestampPeriod;
@@ -23,14 +26,16 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
     private long _reportStart = Stopwatch.GetTimestamp();
     private ulong _skippedMarkers;
     private ulong _unavailableBuffers;
-    internal bool PerCommandMarkers { get; set; } = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_DRAWS") == "1" || PassesEnabled;
+    internal bool PerCommandMarkers { get; set; } = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_DRAWS") == "1" || PassesEnabled; // [local] PassesEnabled
+    private readonly List<(ulong Start, ulong End)> _spans = new();
+    private readonly ulong[] _values = new ulong[QueryCapacity * 2];
+    private Marker _heaviestMarker;
+    private double _heaviestMilliseconds;
 
     // [local] Created only for SlowModeProbe (no render profiler): records nothing until the probe arms it, then per-command
     // markers, and its interval lines name the pipelines through DescribePipeline.
     internal bool Dormant { get; init; }
     internal static Func<ulong, string>? DescribePipeline { get; set; }
-    private readonly List<(ulong Start, ulong End)> _spans = new();
-    private ulong[]? _values;
 
     // [local] SHARPEMU_PROFILE_GPU_RUN=<ms> (with GPU_PASSES): only the command buffers of the ticks a render-thread
     // readback of at least <ms> waited behind (completed tick + 1 .. waited tick) are accumulated, so the pass, pipeline
@@ -104,15 +109,19 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
     private static string TakeRunReport() =>
         $"[PERF][GPU_RUN] min_ms={RunMinMilliseconds} waits={Interlocked.Exchange(ref _runWaits, 0)} ticks={Interlocked.Exchange(ref _runTicks, 0)} buffers_in_run={Interlocked.Exchange(ref _runBuffers, 0)} buffers_skipped={Interlocked.Exchange(ref _otherBuffers, 0)}";
 
-    internal enum IntervalKind { Preparation, Draw, DrawIndexed, Dispatch, Tail, Overflow, Gap, CopyBuffer, FillBuffer, CopyImage, Blit, Resolve, Upload, Readback, Clear }
+    internal enum IntervalKind { Preparation, Draw, DrawIndexed, Dispatch, Tail, Overflow, MeshDraw, Gap, CopyBuffer, FillBuffer, CopyImage, Blit, Resolve, Upload, Readback, Clear } // [local] Gap..Clear
     private readonly record struct IntervalKey(IntervalKind Kind, ulong Pipeline);
-    private readonly record struct Marker(IntervalKey Key, uint First, uint Second, uint Third, ushort Mask = 0, ulong Pass = 0, int Site = 0);
+    internal readonly record struct MeshDrawState(uint Width, uint Height, float ViewportWidth, float ViewportHeight,
+        uint ScissorWidth, uint ScissorHeight, bool DepthTest, bool DepthWrite);
+    private readonly record struct Marker(IntervalKey Key, uint First, uint Second, uint Third, MeshDrawState MeshState = default,
+        ushort Mask = 0, ulong Pass = 0, int Site = 0); // [local] Mask, Pass, Site: SHARPEMU_PROFILE_GPU_PASSES
     private sealed class IntervalTotal
     {
         public ulong Count;
         public double Milliseconds;
         public double MaximumMilliseconds;
         public Marker MaximumMarker;
+        public double MeshGroups;
     }
 
     private sealed class BufferQueries(QueryPool pool, nint handle = 0)
@@ -181,7 +190,7 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdWriteTimestamp2(_vulkan, command, PipelineStageFlags2.TopOfPipeBit, queries.Pool, 0); // [local]
     }
 
-    public void WriteMarker(CommandBuffer command, IntervalKind kind, ulong pipeline = 0, uint first = 0, uint second = 0, uint third = 0)
+    public void WriteMarker(CommandBuffer command, IntervalKind kind, ulong pipeline = 0, uint first = 0, uint second = 0, uint third = 0, MeshDrawState meshState = default)
     {
         if (!PerCommandMarkers && kind != IntervalKind.Tail || Dormant && !SlowModeProbe.Armed && !Diagnostics.FrameGpuProbe.Enabled) // [local] SlowModeProbe, SHARPEMU_FRAME_MISS_GPU
         {
@@ -200,9 +209,9 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
         }
 
         var index = queries.Count++;
-        queries.Markers[index] = PassesEnabled
-            ? TakePassMarker(command, new IntervalKey(kind, pipeline), first, second, third)
-            : new Marker(new IntervalKey(kind, pipeline), first, second, third);
+        queries.Markers[index] = PassesEnabled // [local] SHARPEMU_PROFILE_GPU_PASSES
+            ? TakePassMarker(command, new IntervalKey(kind, pipeline), first, second, third) with { MeshState = meshState }
+            : new Marker(new IntervalKey(kind, pipeline), first, second, third, meshState);
         // Completion intervals do not isolate shader stages or eliminate overlap with later work.
         SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdWriteTimestamp2(_vulkan, command, PipelineStageFlags2.BottomOfPipeBit, queries.Pool, (uint)index); // [local]
     }
@@ -233,7 +242,7 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
 
             Interlocked.Increment(ref _runBuffers);
         }
-        var values = _values ??= new ulong[QueryCapacity * 2];
+        var values = _values;
         fixed (ulong* pointer = values)
         {
             var result = _vulkan.GetQueryPoolResults(_device, queries.Pool, 0, (uint)queries.Count,
@@ -266,15 +275,22 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
                 continue;
             var marker = queries.Markers[index];
             var key = marker.Key;
-            if (!_totals.ContainsKey(key) && _totals.Count >= 256)
+            if (!_totals.ContainsKey(key) && _totals.Count >= KeyCapacity)
                 key = new IntervalKey(IntervalKind.Overflow, 0);
             if (!_totals.TryGetValue(key, out var total))
                 _totals.Add(key, total = new IntervalTotal());
             var milliseconds = ElapsedTicks(values[(index - 1) * 2], values[index * 2], _timestampBits) * (double)_timestampPeriod / 1_000_000;
             total.Count++;
             total.Milliseconds += milliseconds;
-            if (PassesEnabled)
+            if (PassesEnabled) // [local]
                 AccumulatePass(in marker, milliseconds);
+            if (marker.Key.Kind == IntervalKind.MeshDraw)
+                total.MeshGroups += (double)marker.First * marker.Second * marker.Third;
+            if (milliseconds >= _heaviestMilliseconds)
+            {
+                _heaviestMilliseconds = milliseconds;
+                _heaviestMarker = marker;
+            }
             if (milliseconds >= total.MaximumMilliseconds)
             {
                 total.MaximumMilliseconds = milliseconds;
@@ -368,11 +384,23 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
         if (_totals.Count != 0 || _skippedMarkers != 0 || _unavailableBuffers != 0)
         {
             _write($"[PERF][GPU_INTERVAL] completed_ms={_totals.Values.Sum(total => total.Milliseconds):F3} intervals={_totals.Values.Sum(total => (long)total.Count)} skipped_markers={_skippedMarkers} unavailable_buffers={_unavailableBuffers}");
-            foreach (var (key, total) in _totals.OrderByDescending(pair => pair.Value.Milliseconds).Take(12))
-                _write($"[PERF][GPU_INTERVAL] kind={key.Kind} pipeline={key.Pipeline} count={total.Count} total_ms={total.Milliseconds:F3} max_ms={total.MaximumMilliseconds:F3} max_args={total.MaximumMarker.First},{total.MaximumMarker.Second},{total.MaximumMarker.Third}" +
+            _write($"[PERF][GPU_INTERVAL] heaviest kind={_heaviestMarker.Key.Kind} pipeline={_heaviestMarker.Key.Pipeline} ms={_heaviestMilliseconds:F3} args={_heaviestMarker.First},{_heaviestMarker.Second},{_heaviestMarker.Third} keys={_totals.Count}");
+            foreach (var (key, total) in _totals.OrderByDescending(pair => pair.Value.Milliseconds).Take(ReportedKeys))
+            {
+                _write($"[PERF][GPU_INTERVAL] kind={key.Kind} pipeline={key.Pipeline} count={total.Count} total_ms={total.Milliseconds:F3} avg_ms={total.Milliseconds / total.Count:F3} max_ms={total.MaximumMilliseconds:F3} max_args={total.MaximumMarker.First},{total.MaximumMarker.Second},{total.MaximumMarker.Third} mesh_groups={total.MeshGroups:F0}" +
                     (Dormant && DescribePipeline is { } describe && key.Pipeline != 0 ? $" {describe(key.Pipeline)}" : "")); // [local] SlowModeProbe
+                if (key.Kind == IntervalKind.MeshDraw)
+                {
+                    var state = total.MaximumMarker.MeshState;
+                    _write($"[PERF][GPU_MESH_MAX] pipeline={key.Pipeline} target={state.Width}x{state.Height} " +
+                        $"viewport={state.ViewportWidth}x{state.ViewportHeight} scissor={state.ScissorWidth}x{state.ScissorHeight} " +
+                        $"depth_test={state.DepthTest} depth_write={state.DepthWrite}");
+                }
+            }
         }
         _totals.Clear();
+        _heaviestMarker = default;
+        _heaviestMilliseconds = 0;
         _skippedMarkers = 0;
         _unavailableBuffers = 0;
         _reportStart = Stopwatch.GetTimestamp();

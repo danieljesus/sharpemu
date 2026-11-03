@@ -14,6 +14,9 @@ namespace SharpEmu.Libs.Gpu.Rendering;
 // so the draw reuses the image the previous lookup of the same words returned. DCC color targets always look up:
 // the host reads their guest metadata on every lookup. 1 (default) reuses; 2 verifies (always looks up, compares, reports
 // [PERF][TARGET_MEMO]); 0 off.
+// [local] After the upstream merge the executor only resolves targets (images stay ResourceSlotIdentifier.Invalid) and
+// RenderRecorder looks the images up (its InPlaceDraw keeps the found images of a repeated draw), so nothing calls
+// FindColorTargetImage/FindDepthTargetImage until they are ported onto RenderRecorder's lookup.
 public sealed partial class RenderExecutor
 {
     internal static readonly int TargetMemoMode =

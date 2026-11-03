@@ -131,7 +131,7 @@ internal sealed unsafe partial class VulkanCommandProfile
         var mask = t_current == command.Handle ? t_mask : (ushort)0;
         if (t_current == command.Handle)
             t_mask = 0;
-        var marker = new Marker(key, first, second, third, mask, t_current == command.Handle ? t_pass : 0, t_site);
+        var marker = new Marker(key, first, second, third, Mask: mask, Pass: t_current == command.Handle ? t_pass : 0, Site: t_site);
         if (SitesEnabled)
         {
             t_site = 0;

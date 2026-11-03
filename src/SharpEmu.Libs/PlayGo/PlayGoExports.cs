@@ -1,7 +1,8 @@
-﻿// Copyright (C) 2026 SharpEmu Emulator Project
+// Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.HLE.FileSystem;
 using System.Buffers.Binary;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
@@ -136,6 +137,7 @@ public static class PlayGoExports
 
             if (!_metadata.Available)
             {
+                TracePlayGo("open result=0x80B2000E metadata_unavailable");
                 return OrbisPlayGoErrorNotSupportPlayGo;
             }
 
@@ -770,9 +772,19 @@ public static class PlayGoExports
 
     private static PlayGoMetadata LoadPlayGoMetadata()
     {
+        var disableMetadataFallback = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_PLAYGO_DISABLE_METADATA_FALLBACK"),
+            "1",
+            StringComparison.Ordinal);
         var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
         if (string.IsNullOrWhiteSpace(app0Root))
         {
+            if (disableMetadataFallback)
+            {
+                TracePlayGo("metadata_unavailable app0_unset fallback_disabled=1");
+                return PlayGoMetadata.Empty;
+            }
+
             // No app0 override to probe for sidecar files: same fully-installed
             // single-chunk fallback as below, or scePlayGoOpen fails fatally.
             return CreateBaseChunkMetadata(PlayGoChunkIdKnowledge.Authoritative);
@@ -781,10 +793,17 @@ public static class PlayGoExports
         var playGoDat = Path.Combine(app0Root, "sce_sys", "playgo-chunk.dat");
         var scenarioJson = Path.Combine(app0Root, "sce_sys", "playgo-scenario.json");
         var chunkDefsXml = Path.Combine(app0Root, "playgo-chunkdefs.xml");
+        App0Archive.Extract(chunkDefsXml);
 
         var hasMetadata = File.Exists(playGoDat) || File.Exists(scenarioJson) || File.Exists(chunkDefsXml);
         if (!hasMetadata)
         {
+            if (disableMetadataFallback)
+            {
+                TracePlayGo("metadata_missing fallback_disabled=1");
+                return PlayGoMetadata.Empty;
+            }
+
             // No PlayGo sidecar: derive the installed chunk set from the pak files
             // actually present on disk. A locally dumped title has all of its data
             // installed, and a package that splits content across chunks names them
@@ -835,7 +854,7 @@ public static class PlayGoExports
         var ids = new SortedSet<ushort> { 0 };
         try
         {
-            foreach (var pakFile in Directory.EnumerateFiles(app0Root, "pakchunk*.pak", SearchOption.AllDirectories))
+            foreach (var pakFile in App0Archive.EnumerateFilesRecursive(app0Root, "pakchunk*.pak"))
             {
                 var name = Path.GetFileNameWithoutExtension(pakFile);
                 var digits = name.AsSpan("pakchunk".Length);

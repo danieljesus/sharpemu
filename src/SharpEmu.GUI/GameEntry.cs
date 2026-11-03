@@ -5,6 +5,7 @@ using System.ComponentModel;
 using Avalonia;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
+using Avalonia.Threading;
 
 namespace SharpEmu.GUI;
 
@@ -39,6 +40,7 @@ public sealed class GameEntry : LibraryTile, INotifyPropertyChanged
     private string _name;
     private string? _titleId;
     private string? _version;
+    private bool _compatibilityMode;
     private string? _coverPath;
     private string? _backgroundPath;
     private string _initials;
@@ -47,11 +49,12 @@ public sealed class GameEntry : LibraryTile, INotifyPropertyChanged
 
     public GameEntry(
         string name, string? titleId, string? version, string path, long sizeBytes,
-        string? coverPath, string? backgroundPath)
+        string? coverPath, string? backgroundPath, bool compatibilityMode = false)
     {
         _name = name;
         _titleId = titleId;
         _version = version;
+        _compatibilityMode = compatibilityMode;
         Path = path;
         _sizeBytes = sizeBytes;
         _coverPath = coverPath;
@@ -137,6 +140,8 @@ public sealed class GameEntry : LibraryTile, INotifyPropertyChanged
 
     public bool HasVersion => Version is not null;
 
+    public bool CompatibilityMode => _compatibilityMode;
+
     /// <summary>Formatted install size badge shown in the launch bar.</summary>
     public string SizeText => FormatSize(SizeBytes);
 
@@ -180,6 +185,13 @@ public sealed class GameEntry : LibraryTile, INotifyPropertyChanged
             changes |= GameEntryChanges.Metadata;
         }
 
+        if (_compatibilityMode != scanned.CompatibilityMode)
+        {
+            _compatibilityMode = scanned.CompatibilityMode;
+            RaisePropertyChanged(nameof(CompatibilityMode));
+            changes |= GameEntryChanges.Metadata;
+        }
+
         if (!string.Equals(_coverPath, scanned.CoverPath, StringComparison.Ordinal)
             || _coverStamp != scanned._coverStamp)
         {
@@ -187,7 +199,7 @@ public sealed class GameEntry : LibraryTile, INotifyPropertyChanged
             _coverStamp = scanned._coverStamp;
             var previousCover = Cover;
             Cover = null;
-            previousCover?.Dispose();
+            DisposeAfterRender(previousCover);
             changes |= GameEntryChanges.Cover;
         }
 
@@ -198,7 +210,7 @@ public sealed class GameEntry : LibraryTile, INotifyPropertyChanged
             _backgroundStamp = scanned._backgroundStamp;
             var previousBackground = Background;
             Background = null;
-            previousBackground?.Dispose();
+            DisposeAfterRender(previousBackground);
             changes |= GameEntryChanges.Background;
         }
 
@@ -241,7 +253,7 @@ public sealed class GameEntry : LibraryTile, INotifyPropertyChanged
         };
     }
 
-    private static string FormatSize(long bytes)
+    internal static string FormatSize(long bytes)
     {
         return bytes switch
         {
@@ -274,6 +286,16 @@ public sealed class GameEntry : LibraryTile, INotifyPropertyChanged
             {
                 return default;
             }
+        }
+    }
+
+    // The renderer can still draw a replaced image in the frame it is composing; freeing it
+    // at once threw ObjectDisposedException there. Free it once that frame is long gone.
+    private static void DisposeAfterRender(Bitmap? image)
+    {
+        if (image is not null)
+        {
+            DispatcherTimer.RunOnce(image.Dispose, TimeSpan.FromSeconds(1));
         }
     }
 }
