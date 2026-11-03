@@ -249,7 +249,9 @@ internal static unsafe partial class VulkanVideoPresenter
             if (LeanTexturePath && !ImageBindingMemoEnabled)
             {
                 // [local] One working copy of the request: the lookup adjusts its view in place.
+                var pureScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartPure); // [local] SHARPEMU_PARREC_PROBE
                 ref readonly var built = ref ImageRequestBuilders.TextureRef(words, ShapeOf(image));
+                pureScope.Dispose();
                 request = built.Request;
                 var exactFormat = built.ExactFormat;
                 viewFormat = built.ViewFormat;
@@ -522,6 +524,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             using var shaderDataScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingShaderData); // [local]
+            var pureShaderData = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartPure); // [local] SHARPEMU_PARREC_PROBE
             var shaderData = Scratch.ShaderData.Rent(checked((int)layout.ShaderDataDwordCount));
             prepared.ShaderData = shaderData;
             for (var index = 0; index < layout.UserDataRegisters.Count; index++)
@@ -543,6 +546,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             stage.WriteDispatchThreadLimits(shaderData);
+            pureShaderData.Dispose();
             prepared.ShaderData = shaderData;
             if (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null)
             {

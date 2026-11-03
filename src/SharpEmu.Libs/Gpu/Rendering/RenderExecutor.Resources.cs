@@ -300,6 +300,7 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x200);
         }
 
+        var emitScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartDrawEmit); // [local] SHARPEMU_PARREC_PROBE
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepBindVertex)) // [local]
             _host.BindVertexBuffers(vertexBuffers, vertexInput);
 
@@ -315,15 +316,19 @@ public sealed partial class RenderExecutor
             _host.BindIndexBuffer(indexBuffer.Binding, indexBuffer.Type);
         }
 
+        emitScope.Dispose();
         DynamicDrawState dynamicState;
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartPure)) // [local] SHARPEMU_PARREC_PROBE
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepDynamicState)) // [local]
             dynamicState = DynamicStateOf(context, ref state);
-        _host.SetDynamicState(dynamicState);
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartDrawEmit)) // [local] SHARPEMU_PARREC_PROBE
+            _host.SetDynamicState(dynamicState);
         if (setAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x400);
         }
 
+        var scopeEmit = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartScopeEmit); // [local] SHARPEMU_PARREC_PROBE
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepMemoryWrites)) // [local]
         if (DrawWritesMemory(vertexInput.Stage) || (pixelBindings is not null && DrawWritesMemory(pixelInput.Stage)))
         {
@@ -331,6 +336,8 @@ public sealed partial class RenderExecutor
         }
 
         _host.BeginRendering(in state.Rendering);
+        scopeEmit.Dispose();
+        var drawEmit = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartDrawEmit); // [local] SHARPEMU_PARREC_PROBE
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
         if (setAutoDebug)
         {
@@ -347,6 +354,7 @@ public sealed partial class RenderExecutor
         {
             EmitDraw(banks.UserConfig, vertexInput, in draw, in emission);
         }
+        drawEmit.Dispose();
         if (setAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x600);
@@ -366,6 +374,7 @@ public sealed partial class RenderExecutor
 
         if (writeStages != PipelineStageFlags.None)
         {
+            using var tailEmit = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartScopeEmit); // [local] SHARPEMU_PARREC_PROBE
             _host.EndRendering();
             _host.ShaderWriteBarrier(writeStages);
         }

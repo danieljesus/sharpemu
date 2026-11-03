@@ -171,6 +171,14 @@ internal static class RenderPhaseProfile
         DrawPrepIndexBind,
         DrawPrepMemoryWrites,
         DrawPrepTail,
+        // [local] SHARPEMU_PARREC_PROBE: the per-draw/dispatch work a second recorder could take. Emit = the command
+        // calls inside a rendering scope (binds, descriptor commit, dynamic state, draw); ScopeEmit = opening and closing
+        // scopes with their barriers; DispatchEmit = a dispatch's commit, barriers, bind and dispatch; Pure = work that
+        // reads only the snapshot and program metadata (dynamic state, shader data, texture request decode).
+        PartDrawEmit,
+        PartScopeEmit,
+        PartDispatchEmit,
+        PartPure,
         // [local] SHARPEMU_PROFILE_RESOLVE: the scope-cost calibration at each report (excluded from its lines).
         ProfilerCalibration,
         ProfilerCalibrationInner,

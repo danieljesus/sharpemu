@@ -158,9 +158,20 @@ internal static class FrameMissProbe
         RenderPhaseProfile.Phase.DrawPrepTail,
     ];
 
+    // [local] SHARPEMU_PARREC_PROBE=1: the parallel-recording partition (see RenderPhaseProfile.Phase.PartDrawEmit), always
+    // printed in [FRAME_ATTR]; with any probe mode.
+    internal static readonly bool Partition = Environment.GetEnvironmentVariable("SHARPEMU_PARREC_PROBE") == "1";
+
+    private static readonly RenderPhaseProfile.Phase[] PartitionPhases =
+    [
+        RenderPhaseProfile.Phase.PartDrawEmit,
+        RenderPhaseProfile.Phase.PartScopeEmit,
+        RenderPhaseProfile.Phase.PartDispatchEmit,
+        RenderPhaseProfile.Phase.PartPure,
+    ];
+
     // Static fields initialize in order: after the lists.
-    private static readonly RenderPhaseProfile.Phase[] TrackedPhases =
-        Fine ? [.. CoarsePhases, .. DetailPhases, .. FinePhases] : Detail ? [.. CoarsePhases, .. DetailPhases] : CoarsePhases;
+    private static readonly RenderPhaseProfile.Phase[] TrackedPhases = BuildTrackedPhases();
     private static readonly int[] PhaseSlot = BuildPhaseSlots();
     private static readonly int RoleCount = (int)Role.Count - 1;
     private static readonly int PhaseBase = (int)Counter.Count;
@@ -176,6 +187,12 @@ internal static class FrameMissProbe
 
     // When the render thread's back queue last went from empty to non-empty.
     internal static long LastWorkArrival;
+
+    private static RenderPhaseProfile.Phase[] BuildTrackedPhases()
+    {
+        RenderPhaseProfile.Phase[] phases = Fine ? [.. CoarsePhases, .. DetailPhases, .. FinePhases] : Detail ? [.. CoarsePhases, .. DetailPhases] : CoarsePhases;
+        return Partition ? [.. phases, .. PartitionPhases] : phases;
+    }
 
     private static int[] BuildPhaseSlots()
     {
@@ -570,7 +587,9 @@ internal sealed class FrameMissTracker
             .Where(entry => entry.Miss + entry.Before + entry.Normal > 0.01)
             .ToList();
         // The 40 timed counters that grew most on missed presentations, then every count.
-        var ranked = entries.Where(entry => !_isCount[entry.Index]).OrderByDescending(entry => entry.Miss - entry.Normal).Take(40)
+        var top = entries.Where(entry => !_isCount[entry.Index]).OrderByDescending(entry => entry.Miss - entry.Normal).Take(40).ToList();
+        var ranked = top
+            .Concat(entries.Where(entry => _names[entry.Index].StartsWith("Render.Part", StringComparison.Ordinal) && !top.Contains(entry))) // [local] SHARPEMU_PARREC_PROBE
             .Concat(entries.Where(entry => _isCount[entry.Index]));
         var builder = new StringBuilder(string.Create(CultureInfo.InvariantCulture,
             $"[FRAME_ATTR] miss_frames={MissFrames} normal_frames={NormalFrames} per_interval miss/before/normal:"));

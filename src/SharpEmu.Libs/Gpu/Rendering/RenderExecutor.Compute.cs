@@ -252,6 +252,7 @@ public sealed partial class RenderExecutor
 
             _host.BindResources(bindings);
             Span<IPreparedBindings> stages = [bindings];
+            var dispatchEmit = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.PartDispatchEmit); // [local] SHARPEMU_PARREC_PROBE
             _host.CommitBindings(PipelineBindPoint.Compute, in pipeline, stages);
             var hasStorageWrites = HasBufferWrites(input.Stage);
             foreach (var image in program.Images)
@@ -306,6 +307,7 @@ public sealed partial class RenderExecutor
             }
             if (DispatchBarriers)
                 _host.ShaderAccessBarrier();
+            dispatchEmit.Dispose();
             if (Gpu.Buffers.RangeDumpProbe.Enabled) Gpu.Buffers.RangeDumpProbe.AfterDispatch(program.Hash, input.Stage.Resources.UserData, input.Stage.Resources.Buffers); // [local] SHARPEMU_RANGE_DUMP
             if (Gpu.Buffers.WriteDiffProbe.Enabled) Gpu.Buffers.WriteDiffProbe.AfterDispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2], indirectArgumentsAddress, input.Stage.Resources.UserData); // [local]
             if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0 || (useThreadDimensions && _dimsLogs++ < 3000)) Console.Error.WriteLine($"[DISPATCH_DIMS] shader=0x{compute.Address:X} thread_dims={useThreadDimensions} dims={dimsX}x{dimsY}x{dimsZ} local={compute.ThreadsX}x{compute.ThreadsY}x{compute.ThreadsZ} indirect=0x{dimsIndirect:X} initiator=0x{dispatchInitiator:X} groups={physicalGroups[0]}x{physicalGroups[1]}x{physicalGroups[2]}"); // [local]
