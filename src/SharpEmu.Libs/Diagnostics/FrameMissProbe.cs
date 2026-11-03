@@ -65,6 +65,8 @@ internal static class FrameMissProbe
         ReadbackGuest,
         PresentLock,
         PresentCall,
+        // The render thread blocked on the present in flight (FinishAsyncPresent) after render work had arrived.
+        PresentWaitWithWork,
         // Counts: draws and dispatches the render thread translated, the program preparations and resource
         // materializations it did itself (and how many of those missed the materialization cache), the front's
         // preparations deferred, skipped or discarded (the render thread prepares those), managed KB allocated.
@@ -78,6 +80,7 @@ internal static class FrameMissProbe
         FrontSkippedPreps,
         FrontDiscardedPreps,
         AllocatedKB,
+        PresentWaitsWithWork,
         Count,
     }
 
@@ -171,6 +174,9 @@ internal static class FrameMissProbe
     // The front's guest submission being interpreted: when the guest queued it (its CommandSubmission.CreatedAt).
     internal static long FrontSubmissionCreatedAt;
 
+    // When the render thread's back queue last went from empty to non-empty.
+    internal static long LastWorkArrival;
+
     private static int[] BuildPhaseSlots()
     {
         var slots = new int[(int)RenderPhaseProfile.Phase.Count];
@@ -185,7 +191,7 @@ internal static class FrameMissProbe
         var counts = new bool[CounterCount];
         for (var index = 0; index < (int)Counter.Count; index++) names[index] = ((Counter)index).ToString();
         counts[(int)Counter.Gen0] = counts[(int)Counter.Gen1] = counts[(int)Counter.Gen2] = counts[(int)Counter.CompileCount] = true;
-        for (var index = (int)Counter.Draws; index <= (int)Counter.AllocatedKB; index++) counts[index] = true;
+        for (var index = (int)Counter.Draws; index <= (int)Counter.PresentWaitsWithWork; index++) counts[index] = true;
         for (var role = 1; role <= RoleCount; role++)
         for (var phase = 0; phase < TrackedPhases.Length; phase++)
             names[PhaseBase + (role - 1) * TrackedPhases.Length + phase] = $"{(Role)role}.{TrackedPhases[phase]}";

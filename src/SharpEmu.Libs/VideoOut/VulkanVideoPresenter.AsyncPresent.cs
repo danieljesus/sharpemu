@@ -86,9 +86,17 @@ internal static unsafe partial class VulkanVideoPresenter
 
             bool finished;
             int result;
+            var waitStarted = Diagnostics.FrameMissProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.QueuePresent))
             {
                 finished = queue.TryFinish(out _, out result);
+            }
+
+            // [local] SHARPEMU_FRAME_MISS_PROBE: how long the render thread stayed blocked after work had arrived.
+            if (waitStarted != 0 && Volatile.Read(ref Diagnostics.FrameMissProbe.LastWorkArrival) is var arrival && arrival > waitStarted)
+            {
+                Diagnostics.FrameMissProbe.Add(Diagnostics.FrameMissProbe.Counter.PresentWaitWithWork, System.Diagnostics.Stopwatch.GetTimestamp() - arrival);
+                Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.PresentWaitsWithWork);
             }
 
             queue.MaybeReport();

@@ -323,6 +323,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (wasEmpty)
             {
+                if (Diagnostics.FrameMissProbe.Enabled) Volatile.Write(ref Diagnostics.FrameMissProbe.LastWorkArrival, System.Diagnostics.Stopwatch.GetTimestamp()); // [local]
                 wake();
             }
         }
