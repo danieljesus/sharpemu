@@ -159,7 +159,10 @@ internal static class FrameMissProbe
     ];
 
     // [local] SHARPEMU_PARREC_PROBE=1: the parallel-recording partition (see RenderPhaseProfile.Phase.PartDrawEmit), always
-    // printed in [FRAME_ATTR]; with any probe mode.
+    // printed in [FRAME_ATTR]; with any probe mode. Measured 2026-11-03 (prA2, pan, 224 misses), ms per interval missed/normal:
+    // DrawEmit 2.95/2.13, ScopeEmit 0.39/0.29, DispatchEmit 0.66/0.48, Pure 1.13/0.72 against CommandStream 45.5/30.2.
+    // Everything a second recorder could take is ~5 ms gross on missed frames (+1.5 of the +15 ms gap) and less than par6's
+    // handoff cost: parallel recording was not pursued (kill criterion 2).
     internal static readonly bool Partition = Environment.GetEnvironmentVariable("SHARPEMU_PARREC_PROBE") == "1";
 
     private static readonly RenderPhaseProfile.Phase[] PartitionPhases =
