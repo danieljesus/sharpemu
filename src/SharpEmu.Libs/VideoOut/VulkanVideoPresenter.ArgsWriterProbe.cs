@@ -82,8 +82,12 @@ internal static unsafe partial class VulkanVideoPresenter
             var expectedEntry = 0UL;
             if (_bufferCache.RegisteredBufferAt(totalAddress, sizeof(uint)) is { } totalBuffer)
                 expectedEntry = totalBuffer.DeviceAddress + (((totalAddress >> PageOwnerTable.PageBits) << PageOwnerTable.PageBits) - totalBuffer.CpuAddress);
+            var backingHeader = new byte[ArgsWriterProbe.HeaderBytes];
+            var backingPrefix = new uint[words];
+            var backingRead = SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TryReadBacking(header + ArgsWriterProbe.HeaderBase, backingHeader) &&
+                (words == 0 || SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TryReadBacking(prefixAddress, System.Runtime.InteropServices.MemoryMarshal.AsBytes(backingPrefix.AsSpan())));
             var cpu = new ArgsWriterProbe.WriterCpu(header, sources[outputIndex].Descriptor.Address, threads, table[0], count, headerBytes, prefix,
-                expectedEntry, registered is not null);
+                expectedEntry, registered is not null, backingRead ? backingHeader : null, backingRead ? backingPrefix : null);
 
             ulong sequence;
             int slot;

@@ -105,6 +105,15 @@ public sealed class ArgsWriterProbeTests
     }
 
     [Fact]
+    public void ABackingUnlikeTheGuestViewIsReported()
+    {
+        uint[] prefix = [0, 154];
+        var cpu = Cpu(prefix, 390) with { BackingHeader = HeaderBytes(0x30B0, 390, 2), BackingPrefix = [0, 0] };
+        Assert.Equal(ArgsWriterProbe.Finding.BackingView, ArgsWriterProbe.Analyze(cpu, Gpu(prefix, 390)));
+        Assert.Equal(ArgsWriterProbe.Finding.None, ArgsWriterProbe.Analyze(cpu with { BackingPrefix = [0, 154] }, Gpu(prefix, 390)));
+    }
+
+    [Fact]
     public void LedgerReportsOnlyAnomaliesAndMatchesConsumersToTheirProducer()
     {
         var ledger = new ArgsWriterLedger();

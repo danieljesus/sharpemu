@@ -16,7 +16,7 @@ namespace SharpEmu.Libs.Gpu.Vulkan;
 // each layer saw: the CPU's view after the dispatch is recorded, the materialized table, the page-table entry and
 // the bytes behind it, P through the very view the shader read, and the outputs the shader stored; and for every
 // 0x8039D9800 dispatch, the 12 argument bytes it read against its producer's stored output. Only anomalies print
-// (plus a summary every 256 writers, and the latest records in a [GPU][STALL] report). ~1 writer and ~3 consumers
+// (plus a summary every 64 writers, and the latest records in a [GPU][STALL] report). ~1 writer and ~3 consumers
 // per frame in the BVH bursts, so the cost is a few small copies.
 internal static class ArgsWriterProbe
 {
@@ -56,11 +56,14 @@ internal static class ArgsWriterProbe
         // A stored count past BigCount: below DroppedCount it is the stall.
         Big = 1 << 6,
         Huge = 1 << 7,
+        // The backing (what uploads and stream copies read) differs from the guest view of the header or P.
+        BackingView = 1 << 8,
     }
 
-    // What the CPU saw when the writer was recorded; ExpectedEntry and HeaderCopied describe the copies recorded with it.
+    // What the CPU saw when the writer was recorded (guest view, and the backing when it could be read); ExpectedEntry
+    // and HeaderCopied describe the copies recorded with it.
     internal sealed record WriterCpu(ulong Header, ulong Output, uint Threads, uint TablePrefixOffset, uint TableCount, byte[] HeaderBytes, uint[] Prefix,
-        ulong ExpectedEntry = 0, bool HeaderCopied = false);
+        ulong ExpectedEntry = 0, bool HeaderCopied = false, byte[]? BackingHeader = null, uint[]? BackingPrefix = null);
 
     // What the GPU copied after the writer ran. PageTableEntry/ExpectedEntry are 0 when unknown; Header is null when the
     // registered buffer did not hold the whole window.
@@ -84,6 +87,9 @@ internal static class ArgsWriterProbe
             findings |= Finding.StaleTable;
         if (cpu.Threads != cpu.TableCount)
             findings |= Finding.ThreadsMismatch;
+        if ((cpu.BackingHeader is { } backingHeader && !backingHeader.AsSpan().SequenceEqual(cpu.HeaderBytes)) ||
+            (cpu.BackingPrefix is { } backingPrefix && !backingPrefix.AsSpan().SequenceEqual(cpu.Prefix)))
+            findings |= Finding.BackingView;
         if (gpu.ExpectedEntry != 0 && gpu.PageTableEntry != gpu.ExpectedEntry)
             findings |= Finding.PageTable;
         if (gpu.Header is { } header && !header.AsSpan().SequenceEqual(cpu.HeaderBytes))
@@ -116,6 +122,10 @@ internal static class ArgsWriterProbe
         builder.Append(CultureInfo.InvariantCulture,
             $"seq={sequence} tick={tick} submit={submit} findings={findings} header=0x{cpu.Header:X} out=0x{cpu.Output:X} threads={cpu.Threads} " +
             $"table=[{cpu.TablePrefixOffset},{cpu.TableCount}] cpu_hdr=[poff={Word(cpu.HeaderBytes, PrefixOffsetField)},total={Word(cpu.HeaderBytes, TotalField)},count={Word(cpu.HeaderBytes, CountField)}]");
+        if (cpu.BackingPrefix is { } backingPrefix && !backingPrefix.AsSpan().SequenceEqual(cpu.Prefix))
+            builder.Append(CultureInfo.InvariantCulture, $" backing_p=[{string.Join(",", backingPrefix.Take(16))}]");
+        if (cpu.BackingHeader is { } backingHeader && !backingHeader.AsSpan().SequenceEqual(cpu.HeaderBytes))
+            builder.Append(CultureInfo.InvariantCulture, $" backing_total={Word(backingHeader, TotalField)}");
         if (gpu is null)
         {
             builder.Append(" gpu=pending");
@@ -154,7 +164,7 @@ internal static class ArgsWriterProbe
 internal sealed class ArgsWriterLedger
 {
     private const int MaxLines = 200;
-    private const int SummaryEvery = 256;
+    private const int SummaryEvery = 64;
     private const int RecentProducers = 64;
 
     internal readonly record struct Pending(ulong Sequence, int Slot, ulong Tick, ulong Submit, ArgsWriterProbe.WriterCpu Cpu);
