@@ -177,6 +177,9 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     {
         if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
+        // Upstream reads ahead (and waits for a readback slot) always; ours only with SHARPEMU_EAGER_READBACK=1
+        // (and SHARPEMU_READBACK_SLOT_WAIT=1), off by default.
+        harness.Cache.ForceEagerReadbacks = true;
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
         var address = harness.MapBacked(0x10000, ReadWrite);
@@ -216,6 +219,9 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     {
         if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
+        // Upstream reads ahead (and waits for a readback slot) always; ours only with SHARPEMU_EAGER_READBACK=1
+        // (and SHARPEMU_READBACK_SLOT_WAIT=1), off by default.
+        harness.Cache.ForceEagerReadbacks = true;
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
         var address = harness.MapBacked(0x10000, ReadWrite);
@@ -243,6 +249,9 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     {
         if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
+        // Upstream reads ahead (and waits for a readback slot) always; ours only with SHARPEMU_EAGER_READBACK=1
+        // (and SHARPEMU_READBACK_SLOT_WAIT=1), off by default.
+        harness.Cache.ForceEagerReadbacks = true;
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
         var address = harness.MapBacked(0x10000, ReadWrite);
@@ -274,6 +283,9 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     {
         if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
+        // Upstream reads ahead (and waits for a readback slot) always; ours only with SHARPEMU_EAGER_READBACK=1
+        // (and SHARPEMU_READBACK_SLOT_WAIT=1), off by default.
+        harness.Cache.ForceEagerReadbacks = true;
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
         var address = harness.MapBacked(0x10000, ReadWrite);
@@ -296,6 +308,10 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
     {
         if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
         using var harness = new CacheHarness(_vulkan);
+        // Upstream reads ahead (and waits for a readback slot) always; ours only with SHARPEMU_EAGER_READBACK=1
+        // (and SHARPEMU_READBACK_SLOT_WAIT=1), off by default.
+        harness.Cache.ForceEagerReadbacks = true;
+        harness.Cache.ForceReadbackSlotWait = true;
         using var fatal = new FatalScope();
         Attach(harness, _vulkan);
         const ulong window = 0x80000;

@@ -236,7 +236,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     SType = StructureType.DebugUtilsLabelExt,
                     PLabelName = namePointer,
                 };
-                _cmdInsertDebugUtilsLabel(commandBuffer, &label);
+                SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdInsertDebugUtilsLabel(_cmdInsertDebugUtilsLabel, commandBuffer, &label); // [local]
             }
         }
 

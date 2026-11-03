@@ -232,6 +232,8 @@ public sealed class CompiledResourceTransactionTests
     [Fact]
     public void CacheKeepsFreshDependenciesAndPriorSnapshots()
     {
+        // [local] Override: upstream's counts assume no word patches; ours (always on) make the moved descriptor a hit that takes the new base word.
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
         var plan = CreatePlan(4, false);
         plan.CompileEvaluatorNow();
         Assert.NotNull(plan.CompiledTransaction);

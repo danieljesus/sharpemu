@@ -274,12 +274,28 @@ internal sealed class CompiledResourceTransaction
             return false;
         }
         Span<byte> bytes = stackalloc byte[count * 4];
-        using (ResourceMaterializationProfile.MeasureSampled(ResourceMaterializationProfile.Phase.CompiledGroupRead))
-            if (!reader(first, bytes, clean || inputs.ReadsClean))
-            {
-                ResourceMaterializationProfile.CountRead(ResourceMaterializationProfile.ReadCounter.GroupRefused);
-                return false;
-            }
+        // [local] As RuntimeValueEvaluator.ReadRawWord: the reads are reported with the user-data pair they are based on
+        // and their base address, so a recording cache can move them with that pointer (ResourceMaterializationCache:
+        // Entry.RangeBase, SHARPEMU_MATERIALIZATION_CONTENT_KEY; RangeReadBase, SHARPEMU_MATERIALIZE_REBASE). One read
+        // covers several nodes, so none is named: its words are not patchable.
+        var previousBase = RuntimeValueEvaluator.ExchangeReadBase(ReadBaseOf(nodes[0]));
+        var previousNode = RuntimeValueEvaluator.ExchangeReadNode(RuntimeValueEvaluator.NoReadNode);
+        var previousBaseAddress = RuntimeValueEvaluator.ExchangeReadBaseAddress(addressBase);
+        try
+        {
+            using (ResourceMaterializationProfile.MeasureSampled(ResourceMaterializationProfile.Phase.CompiledGroupRead))
+                if (!reader(first, bytes, clean || inputs.ReadsClean))
+                {
+                    ResourceMaterializationProfile.CountRead(ResourceMaterializationProfile.ReadCounter.GroupRefused);
+                    return false;
+                }
+        }
+        finally
+        {
+            RuntimeValueEvaluator.ExchangeReadBase(previousBase);
+            RuntimeValueEvaluator.ExchangeReadNode(previousNode);
+            RuntimeValueEvaluator.ExchangeReadBaseAddress(previousBaseAddress);
+        }
         ResourceMaterializationProfile.CountRead(ResourceMaterializationProfile.ReadCounter.GroupSucceeded);
         ResourceMaterializationProfile.CountRead(ResourceMaterializationProfile.ReadCounter.GroupWords, count);
         for (var index = 0; index < count; index++)
@@ -291,6 +307,11 @@ internal sealed class CompiledResourceTransaction
     }
 
     private static uint ReadGroupWord(ref ReadGroupWords words, int index) => words[index];
+
+    // [local] The user-data pair a raw read's handle is (UserDataUseAnalysis.BaseRegisterOf), UnknownBase when the node
+    // has no handle to tell.
+    private static int ReadBaseOf(ScalarValue node) =>
+        node.Operands.Length != 0 ? UserDataUseAnalysis.BaseRegisterOf(node.Operands[0]) : UserDataUseAnalysis.UnknownBase;
 
     private static bool ReadUserData(ResourceRuntimeInputs inputs, ulong index, out ulong value)
     {
@@ -312,9 +333,27 @@ internal sealed class CompiledResourceTransaction
         if (state == RuntimeValueEvaluator.RawAddress.Zero) return true;
         var reader = clean ? inputs.ReadCleanMemory : inputs.ReadMemory;
         uint word;
+        bool read;
+        // [local] Reported as RuntimeValueEvaluator.ReadRawWord reports its reads (see ReadGroup).
+        var previousBase = RuntimeValueEvaluator.ExchangeReadBase(ReadBaseOf(node));
+        var previousNode = RuntimeValueEvaluator.ExchangeReadNode(node.Id);
+        var previousBaseAddress = RuntimeValueEvaluator.ExchangeReadBaseAddress(addressBase);
+        try
+        {
+            using (ResourceMaterializationProfile.MeasureSampled(ResourceMaterializationProfile.Phase.CompiledWordRead))
+            {
+                word = 0;
+                read = reader is not null && reader(address, out word);
+            }
+        }
+        finally
+        {
+            RuntimeValueEvaluator.ExchangeReadBase(previousBase);
+            RuntimeValueEvaluator.ExchangeReadNode(previousNode);
+            RuntimeValueEvaluator.ExchangeReadBaseAddress(previousBaseAddress);
+        }
         // As in the evaluator: a null base, or an absolute address the shader carries that nothing maps, reads zero.
-        using (ResourceMaterializationProfile.MeasureSampled(ResourceMaterializationProfile.Phase.CompiledWordRead))
-            if (reader is null || !reader(address, out word)) return (addressBase & ~3UL) == 0 || (absolute && reader is not null && !clean && !inputs.ReadsClean);
+        if (!read) return (addressBase & ~3UL) == 0 || (absolute && reader is not null && !clean && !inputs.ReadsClean);
         value = word;
         ResourceMaterializationCache.RecordReadConsumer(plan, node, address);
         return true;

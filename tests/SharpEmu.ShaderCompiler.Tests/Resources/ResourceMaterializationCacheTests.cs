@@ -264,6 +264,35 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal((2, 1, 0), (cache.Hits, cache.Misses, cache.TableRefreshes));
     }
 
+    // Upstream's version of the test above: without word patches the changed word refreshes the table.
+    [Fact]
+    public void AChangedTableOnlyWordRefreshesOnlyTheTable()
+    {
+        // [local] Override: upstream's counts assume no word patches; ours (always on) make the changed table-only
+        // word a hit instead of a refresh (AChangedTableOnlyWordIsTakenByTheEntry).
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
+        var (plan, _, _) = Prepare(FlattenedReadReuseTests.RepeatedReadProgram(4), userDataCount: 9);
+        var memory = new TestWordMemory { Words = [11, 22, 33, 44] };
+        var cache = new ResourceMaterializationCache();
+        Assert.True(RunTable(cache, plan, memory, out var first));
+        Assert.Equal([11u, 22, 33, 44], first.FlattenedResourceTable);
+
+        memory.Words[2] = 99;
+        Assert.True(RunTable(cache, plan, memory, out var second));
+        Assert.Equal((0, 1, 1), (cache.Hits, cache.Misses, cache.TableRefreshes));
+        Assert.Equal([11u, 22, 99, 44], second.FlattenedResourceTable);
+        Assert.Same(first.Buffers, second.Buffers);
+
+        // The refreshed table matches an uncached full walk, and the refreshed entry is then a hit.
+        var reference = new ResourceSnapshot();
+        var referenceSpecialization = new ResourceSpecialization();
+        Assert.True(ResourceMaterializer.Materialize(plan, Inputs(TableUserData, memory.Read, memory.Read), ref reference, ref referenceSpecialization));
+        Assert.Equal(reference.FlattenedResourceTable, second.FlattenedResourceTable);
+        Assert.True(RunTable(cache, plan, memory, out var third));
+        Assert.Same(second, third);
+        Assert.Equal((1, 1, 1), (cache.Hits, cache.Misses, cache.TableRefreshes));
+    }
+
     [Fact]
     public void AnUnreadableTableWordFallsBackToAFullWalk()
     {
@@ -573,7 +602,7 @@ public sealed class ResourceMaterializationCacheTests
     }
 
     // Upstream's tests (#1082, #1130) beside ours.
-    [Fact(Skip = "Mip-statistics masked hits (upstream) are not ported to the merged cache: a changed statistics word is a miss")]
+    [Fact]
     public void ToggledMipStatisticsBitsReuseTheMaterializationWithTheCurrentSlot()
     {
         var plan = Plan();
@@ -661,9 +690,12 @@ public sealed class ResourceMaterializationCacheTests
 
     private static uint[] LinearConstants(int draw) => [0, 0, 0, 0, 0x10000u + (uint)draw * 0x100u, 0, 256, 0x2_0000];
 
-    [Fact(Skip = "Upstream AddressRebase (learned base words) is not ported; the merged cache rebases with SHARPEMU_MATERIALIZE_REBASE (TryShift)")]
+    [Fact]
     public void ALinearlyAllocatedBufferBaseStopsMissingOnceConfirmed()
     {
+        // [local] Override: upstream's counts assume upstream's key; SHARPEMU_MATERIALIZATION_CONTENT_KEY (on by default)
+        // makes every draw after the first a hit (the V# base is a buffer-dword register).
+        using var upstreamKey = LocalCacheSwitches.WithoutContentKey();
         var plan = DirectBufferPlan();
         var memory = new TestWordMemory();
         var cache = new ResourceMaterializationCache();
@@ -679,7 +711,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal((12, 4), (cache.Hits, cache.Misses));
     }
 
-    [Fact(Skip = "Upstream AddressRebase (learned base words) is not ported; the merged cache rebases with SHARPEMU_MATERIALIZE_REBASE (TryShift)")]
+    [Fact]
     public void InterleavedObjectsConfirmTheirOwnBases()
     {
         // Constants V# in s[4:7], a second buffer in s[8:11] whose size tells the two objects apart.
@@ -702,9 +734,14 @@ public sealed class ResourceMaterializationCacheTests
     // Pointer s[0:1] moves on every draw; the program loads four constants through it.
     private static uint[] PointerConstants(int draw) => [0x10000u + (uint)draw * 0x100u, 0, 0, 0, 0x30000, 0, 256, 0x2_0000, 0];
 
-    [Fact(Skip = "Upstream AddressRebase (learned base words) is not ported; the merged cache rebases with SHARPEMU_MATERIALIZE_REBASE (TryShift)")]
+    [Fact]
     public void AMovingScalarLoadPointerStopsMissingOnceConfirmed()
     {
+        // [local] Override: upstream's counts assume upstream's key; SHARPEMU_MATERIALIZATION_CONTENT_KEY (on by default)
+        // makes every draw after the first a hit (s[0:1] is only read through).
+        using var upstreamKey = LocalCacheSwitches.WithoutContentKey();
+        // [local] Override: and without word patches (always on) the changed constant behind the last pointer is a hit, not a fresh read.
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
         var (plan, _, _) = Prepare(FlattenedReadReuseTests.RepeatedReadProgram(4), userDataCount: 9);
         // The same four words repeat every 0x100 bytes, so every pointer finds the same constants.
         var memory = new TestWordMemory { Base = 0x10000, Words = Enumerable.Range(0, 0x1000).Select(index => (uint)(index % 64) * 3 + 1).ToArray() };
@@ -730,7 +767,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(12, cache.Hits);
     }
 
-    [Fact(Skip = "Upstream AddressRebase (learned base words) is not ported; the merged cache rebases with SHARPEMU_MATERIALIZE_REBASE (TryShift)")]
+    [Fact]
     public void ARebasedHitLeavesTheCachedSnapshotAlone()
     {
         var plan = DirectBufferPlan();
@@ -748,9 +785,14 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(0x10300u, again.Buffers[0][0]);
     }
 
-    [Fact(Skip = "Upstream AddressRebase (learned base words) is not ported; the merged cache rebases with SHARPEMU_MATERIALIZE_REBASE (TryShift)")]
+    [Fact]
     public void AReadThatMovesWithTheBaseAndKeepsItsBytesIsReused()
     {
+        // [local] Override: upstream's counts assume upstream's key; SHARPEMU_MATERIALIZATION_CONTENT_KEY (on by default)
+        // makes every draw after the first a hit (s[4:5] moves the read and the V# base).
+        using var upstreamKey = LocalCacheSwitches.WithoutContentKey();
+        // [local] Override: and without word patches (always on) the changed word at the moved base is a hit, not a refresh.
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
         var plan = SteeringBufferPlan();
         var memory = new TestWordMemory { Base = 0x10000, Words = Enumerable.Repeat(0x1234u, 0x1000).ToArray() };
         var cache = new ResourceMaterializationCache();
@@ -775,9 +817,14 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(12, cache.Hits);
     }
 
-    [Fact(Skip = "Upstream AddressRebase (learned base words) is not ported; the merged cache rebases with SHARPEMU_MATERIALIZE_REBASE (TryShift)")]
+    [Fact]
     public void MovedConstantsThatChangeEveryDrawAreReadAgain()
     {
+        // [local] Override: upstream's counts assume upstream's key; SHARPEMU_MATERIALIZATION_CONTENT_KEY (on by default)
+        // makes the moved draws hits that take the new constants.
+        using var upstreamKey = LocalCacheSwitches.WithoutContentKey();
+        // [local] Override: and without word patches (always on) the moved constants are hits that take the new words, not table refreshes.
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
         var plan = SteeringBufferPlan();
         var memory = new TestWordMemory { Base = 0x10000, Words = Enumerable.Range(0, 0x1000).Select(index => (uint)index * 7).ToArray() };
         var cache = new ResourceMaterializationCache();
@@ -815,9 +862,11 @@ public sealed class ResourceMaterializationCacheTests
             memory.At(bufferBase + word * 4) = (uint)draw * 10 + word;
     }
 
-    [Fact(Skip = "Upstream AddressRebase (learned base words) is not ported; the merged cache rebases with SHARPEMU_MATERIALIZE_REBASE (TryShift)")]
+    [Fact]
     public void ABaseRewrittenInGuestMemoryStopsMissingOnceConfirmed()
     {
+        // [local] Override: upstream's counts assume no word patches; ours (always on) make the resized draw a hit: its record count (dword 2) is a patchable word.
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
         var plan = MemoryDescriptorPlan();
         var memory = new TestWordMemory { Base = 0x1000, Words = new uint[0x8000] };
         var cache = new ResourceMaterializationCache();
@@ -854,7 +903,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(expected.FlattenedResourceTable, snapshot.FlattenedResourceTable);
     }
 
-    [Fact(Skip = "Upstream AddressRebase (learned base words) is not ported; the merged cache rebases with SHARPEMU_MATERIALIZE_REBASE (TryShift)")]
+    [Fact]
     public void ATableConstantBesideARewrittenBaseIsCopiedForTheDraw()
     {
         // The V# and a constant both come from the table at s[0:1]; the constant changes every draw.
@@ -875,7 +924,7 @@ public sealed class ResourceMaterializationCacheTests
         Assert.True(cache.Hits >= 10, $"hits={cache.Hits} misses={cache.Misses}");
     }
 
-    [Fact(Skip = "Upstream AddressRebase (learned base words) is not ported; the merged cache rebases with SHARPEMU_MATERIALIZE_REBASE (TryShift)")]
+    [Fact]
     public void AlternatingObjectsWithRewrittenBasesRebaseTheirOwnVariant()
     {
         // Two objects share the draw key and differ in their buffer size; both move their base.

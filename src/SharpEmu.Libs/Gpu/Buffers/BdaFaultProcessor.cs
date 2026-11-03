@@ -105,9 +105,14 @@ public sealed unsafe class BdaFaultProcessor : IDisposable
     // would serve it. GTA V (2026-10-29): 3 scans/frame, 150 -> 17 us of GPU each (0.47 -> 0.05 ms/frame), 0 lost in
     // static and panning. A first version that scanned only granules of GPU-registered spans left faults on never
     // mapped pages unserved: their invocations kept faulting and GTA V fell to 9 FPS.
-    internal static readonly int ScanMappedMode = DeviceAddressPaging.FaultSummaryEnabled
+    internal static readonly int ScanMappedModeDefault = DeviceAddressPaging.FaultSummaryEnabled
         ? (Environment.GetEnvironmentVariable("SHARPEMU_BDA_SCAN_MAPPED") == "2" ? 2 : 1)
         : 0;
+
+    // A test that writes the fault bitmap itself (no summary bit, as a shader would set) scans the whole bitmap: the
+    // mode is taken per processor, from this async-flow override when one is set.
+    internal static readonly AsyncLocal<int?> ScanMappedModeOverride = new();
+    private readonly int ScanMappedMode = ScanMappedModeOverride.Value ?? ScanMappedModeDefault;
     private readonly GpuBuffer? _verifyDownload;
     private readonly DescriptorSet[] _verifySets = new DescriptorSet[MaxPendingFaults];
     private readonly QueryPool _timestamps;

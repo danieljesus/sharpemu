@@ -30,9 +30,17 @@ public static partial class ResourceMaterializer
     // float textures of its material table). Graphics stages keep refusing the mix unless =3: there a case samples
     // with implicit derivatives, the Metal translator refuses mixed classes, and nothing has measured one. =2 (compute)
     // also counts, in the ray query area (needs SHARPEMU_RQ_MAP=1 or SHARPEMU_RT_RAYQUERY), the lanes that select a
-    // candidate of another class than the first case's ([GPU][INDIRECT_DIM]). Settable for tests.
-    public static int IndirectImageDimMode { get; set; } =
+    // candidate of another class than the first case's ([GPU][INDIRECT_DIM]). Settable for tests: a set only applies
+    // to the setter's async flow, so tests running in parallel do not see each other's mode.
+    public static int IndirectImageDimMode
+    {
+        get => IndirectImageDimOverride.Value ?? IndirectImageDimDefault;
+        set => IndirectImageDimOverride.Value = value;
+    }
+
+    private static readonly int IndirectImageDimDefault =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_DIM"), out var dimMode) ? dimMode : 1;
+    private static readonly AsyncLocal<int?> IndirectImageDimOverride = new();
 
     // [local] SHARPEMU_INDIRECT_IMAGE_PAD (=1 by default, =0 off): with a mixed table (SHARPEMU_INDIRECT_IMAGE_DIM), the
     // candidates after the root are ordered by the class their specialization takes (image type, numeric class,
@@ -43,9 +51,16 @@ public static partial class ResourceMaterializer
     // and 0xD44E stops compiling a new ~3 s permutation whenever its material table gains or loses a texture. A table
     // with one class and fewer than PaddedMinimumCandidates candidates is left as it was (grouped only).
     // =2 also checks, per key, that the padded mapping selects the same descriptor words as the unpadded one
-    // ([GPU][INDIRECT_PAD] checked/mismatches, every 256 tables). Settable for tests.
-    public static int IndirectImagePadMode { get; set; } =
+    // ([GPU][INDIRECT_PAD] checked/mismatches, every 256 tables). Settable for tests, per async flow like the above.
+    public static int IndirectImagePadMode
+    {
+        get => IndirectImagePadOverride.Value ?? IndirectImagePadDefault;
+        set => IndirectImagePadOverride.Value = value;
+    }
+
+    private static readonly int IndirectImagePadDefault =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_PAD"), out var padMode) ? padMode : 1;
+    private static readonly AsyncLocal<int?> IndirectImagePadOverride = new();
 
     private static long _padTables, _padChecked, _padMismatches, _padSkipped;
 

@@ -679,6 +679,9 @@ public static partial class Gen5SpirvTranslator
                 return _halfMaskPlan;
             }
 
+            // [local] The two halves of the emitting wave meet (the ordered returning LDS add).
+            internal void PairHalves() => Barrier();
+
             private void Barrier()
             {
                 if (_multiWave)

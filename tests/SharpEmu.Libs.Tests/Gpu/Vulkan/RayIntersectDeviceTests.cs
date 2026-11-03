@@ -33,6 +33,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
     private const uint ResultBase = 24;
     private const int Rounds = 300;
     private const int RoundsPerRunner = 25;
+    private const uint BvhDescriptorType = 8;
 
     private static readonly (string Name, string Unified, string Lean, string PageCache)[] Variants =
     [
@@ -49,11 +50,16 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
     // preserveNan: SignedZeroInfNanPreserve, as the game compiles with it on the RTX 5080. Without it the driver
     // folds the reference's NaN-propagating max3/min3 into a NaN-dropping max, so the lean slab test is compared
     // only on lanes without a NaN plane distance.
-    [InlineData(false, true)]
-    [InlineData(true, true)]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    public void SwitchedLowerings_MatchTheReference(bool bvh64, bool preserveNan)
+    // nodeTest: upstream's node test (null) or SHARPEMU_BVH_NODE_TEST=gpurt; the switches must be exact under both.
+    [InlineData(false, true, null)]
+    [InlineData(true, true, null)]
+    [InlineData(false, false, null)]
+    [InlineData(true, false, null)]
+    [InlineData(false, true, "gpurt")]
+    [InlineData(true, true, "gpurt")]
+    [InlineData(false, false, "gpurt")]
+    [InlineData(true, false, "gpurt")]
+    public void SwitchedLowerings_MatchTheReference(bool bvh64, bool preserveNan, string? nodeTest)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true))
@@ -72,7 +78,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                 ThreadCountX = Lanes,
                 ShaderSignedZeroInfNanPreserveFloat32Supported = preserveNan,
             };
-            var spirv = Compile(request, unified, lean, pageCache);
+            var spirv = Compile(request, nodeTest, unified, lean, pageCache);
             compiled.Add((name, request, spirv));
             if (Environment.GetEnvironmentVariable("LOCAL_SPV_OUT") is { Length: > 0 } directory)
             {
@@ -173,7 +179,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                 }
             }
 
-            output.WriteLine($"bvh64={bvh64} preserveNan={preserveNan} rounds={Rounds} lanes={Lanes}: {stats} on {vulkan.DeviceName}");
+            output.WriteLine($"bvh64={bvh64} preserveNan={preserveNan} nodeTest={nodeTest ?? "upstream"} rounds={Rounds} lanes={Lanes}: {stats} on {vulkan.DeviceName}");
             // The random scenes reach every path the switches change.
             Assert.True(stats.TriangleHits > 0 && stats.TriangleMisses > 0, stats.ToString());
             Assert.True(stats.BoxChildHits > 0 && stats.BoxChildMisses > 0, stats.ToString());
@@ -189,13 +195,18 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
     }
 
     // [local] SHARPEMU_BVH_TRI_DEGENERATE: =1 turns exactly the triangle hits at t_denom == 0 into misses; =2 also
-    // those with a NaN in i, j or t. Every other output dword matches the reference.
+    // those with a NaN in i, j or t. Every other output dword matches the reference. On upstream's node test (#1061)
+    // =1 is upstream's own rejection, which also drops a hit at a NaN t_num.
     [Theory]
-    [InlineData(false, "1")]
-    [InlineData(true, "1")]
-    [InlineData(false, "2")]
-    [InlineData(true, "2")]
-    public void DegenerateTriangleRejection_ChangesOnlyDegenerateHits(bool bvh64, string mode)
+    [InlineData(false, "1", null)]
+    [InlineData(true, "1", null)]
+    [InlineData(false, "2", null)]
+    [InlineData(true, "2", null)]
+    [InlineData(false, "1", "gpurt")]
+    [InlineData(true, "1", "gpurt")]
+    [InlineData(false, "2", "gpurt")]
+    [InlineData(true, "2", "gpurt")]
+    public void DegenerateTriangleRejection_ChangesOnlyDegenerateHits(bool bvh64, string mode, string? nodeTest)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true))
@@ -214,16 +225,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                 ThreadCountX = Lanes,
                 ShaderSignedZeroInfNanPreserveFloat32Supported = true,
             };
-            var previous = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRI_DEGENERATE");
-            try
-            {
-                Environment.SetEnvironmentVariable("SHARPEMU_BVH_TRI_DEGENERATE", value);
-                compiled.Add((request, Compile(request, "0", "0", "0")));
-            }
-            finally
-            {
-                Environment.SetEnvironmentVariable("SHARPEMU_BVH_TRI_DEGENERATE", previous);
-            }
+            compiled.Add((request, CompileWith(request, nodeTest, value, "0", "0", "0")));
         }
 
         using var harness = new ImageTestHarness(vulkan);
@@ -280,6 +282,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                     var triangle = scene.Types[lane] <= 3 && !reference.All(word => word == uint.MaxValue);
                     var referenceMiss = BitConverter.UInt32BitsToSingle(reference[0]) == float.PositiveInfinity && reference[1] == 0x3F80_0000;
                     var denomZero = (reference[1] & 0x7FFF_FFFF) == 0;
+                    var numNan = nodeTest is null && float.IsNaN(BitConverter.UInt32BitsToSingle(reference[0]));
                     var nonFinite = reference.Take(barycentrics ? 4 : 2).Any(word => !float.IsFinite(BitConverter.UInt32BitsToSingle(word)))
                         || float.IsNaN(BitConverter.UInt32BitsToSingle(reference[0]) / BitConverter.UInt32BitsToSingle(reference[1]));
                     if (!reference.SequenceEqual(actual))
@@ -287,7 +290,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                         Assert.True(triangle && !referenceMiss, $"round {round} lane {lane} type {scene.Types[lane]}: changed a non-hit");
                         Assert.True(BitConverter.UInt32BitsToSingle(actual[0]) == float.PositiveInfinity && actual[1] == 0x3F80_0000,
                             $"round {round} lane {lane}: a changed hit must become a miss");
-                        Assert.True(denomZero || mode == "2" && nonFinite,
+                        Assert.True(denomZero || numNan || mode == "2" && nonFinite,
                             $"round {round} lane {lane}: rejected a hit at t_num 0x{reference[0]:X8} / t_denom 0x{reference[1]:X8}");
                         if (denomZero)
                             rejectedZero++;
@@ -316,22 +319,34 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
         }
     }
 
-    private static readonly string[] SwitchNames = ["SHARPEMU_BVH_UNIFIED_FETCH", "SHARPEMU_BVH_LEAN_SLABS", "SHARPEMU_BVH_PAGE_CACHE"];
+    private static readonly string[] SwitchNames =
+        ["SHARPEMU_BVH_NODE_TEST", "SHARPEMU_BVH_TRI_DEGENERATE", "SHARPEMU_BVH_UNIFIED_FETCH", "SHARPEMU_BVH_LEAN_SLABS",
+            "SHARPEMU_BVH_PAGE_CACHE"];
 
-    private static byte[] Compile(ShaderCompileRequest request, params string[] values)
+    // The switches go to the translator's async-flow overrides, not the process environment that other tests'
+    // compiles (Gen5RayIntersectSpirvTests...) read at the same time; an unset one (null) is left to the environment.
+    private static byte[] Compile(ShaderCompileRequest request, string? nodeTest, params string[] switches) =>
+        CompileWith(request, nodeTest, null, switches);
+
+    private static byte[] CompileWith(ShaderCompileRequest request, string? nodeTest, string? triDegenerate, params string[] switches)
     {
-        var previous = SwitchNames.Select(Environment.GetEnvironmentVariable).ToArray();
+        string?[] values = [nodeTest, triDegenerate, .. switches];
+        var overrides = new Dictionary<string, string?>();
+        for (var index = 0; index < SwitchNames.Length; index++)
+        {
+            if (values[index] is not null) overrides[SwitchNames[index]] = values[index];
+        }
+
+        var previous = Gen5SpirvTranslator.BvhSwitchOverrides.Value;
+        Gen5SpirvTranslator.BvhSwitchOverrides.Value = overrides;
         try
         {
-            for (var index = 0; index < SwitchNames.Length; index++)
-                Environment.SetEnvironmentVariable(SwitchNames[index], values[index]);
             Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
             return shader.Spirv;
         }
         finally
         {
-            for (var index = 0; index < SwitchNames.Length; index++)
-                Environment.SetEnvironmentVariable(SwitchNames[index], previous[index]);
+            Gen5SpirvTranslator.BvhSwitchOverrides.Value = previous;
         }
     }
 
@@ -385,7 +400,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                     continue;
                 }
 
-                if (scene.Types[lane] <= 1)
+                if (scene.Types[lane] <= 3)
                 {
                     if (BitConverter.UInt32BitsToSingle(words[0]) == float.PositiveInfinity && words[1] == 0x3F80_0000)
                         TriangleMisses++;
@@ -487,7 +502,8 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                 (uint)baseUnits,
                 (uint)(baseUnits >> 32) & 0xFF | boxGrow << 23 | (boxSort ? 1u << 31 : 0),
                 LastNode,
-                barycentrics ? 1u << 24 : 0,
+                // type [127:124] = 8 (BVH): the lowering returns four invalid dwords for any other T# type.
+                BvhDescriptorType << 28 | (barycentrics ? 1u << 24 : 0),
             ];
             return new Scene { Pages = pages, Input = input, TSharp = tSharp, Types = types, NanPlanes = nanPlanes };
         }

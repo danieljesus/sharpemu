@@ -8,6 +8,10 @@ namespace SharpEmu.ShaderCompiler.Vulkan;
 // Each instruction tests one node. The guest shader controls traversal.
 public static partial class Gen5SpirvTranslator
 {
+    // [local] The BVH switches of the ray-intersect lowering are read per compile; a test sets them for its own async
+    // flow here instead of in the process environment, which tests compiling in parallel would see.
+    public static readonly AsyncLocal<IReadOnlyDictionary<string, string?>?> BvhSwitchOverrides = new();
+
     private sealed partial class CompilationContext
     {
         private const uint InvalidNode = 0xFFFF_FFFF;
@@ -37,13 +41,18 @@ public static partial class Gen5SpirvTranslator
         // dwords, which GTA V's 0x8395 loop takes as a candidate at t = NaN (counted by SHARPEMU_RT_RAYQUERY=2).
         private static readonly bool Triangle23 = Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRIANGLE23") != "0";
 
+        private static string? BvhSwitch(string name) =>
+            BvhSwitchOverrides.Value is { } overrides && overrides.TryGetValue(name, out var value)
+                ? value
+                : Environment.GetEnvironmentVariable(name);
+
         // [local] SHARPEMU_BVH_TRI_DEGENERATE (=1 by default, =0 off): a triangle whose t_denom is 0 (zero area, or a ray in its
         // plane) gives i = j = t = 0/0 = NaN, which none of the ordered compares rejects, so the test returned a hit at
         // t_num = 0 over t_denom = 0 and GTA V's 0x8395 loop committed t = NaN (0.8 % of its hits; every later candidate then
         // passes !(t > NaN)). The watertight test (Woop et al., JCGT 2013) misses on det == 0; =1 rejects t_denom == 0;
         // =2 writes the range test unordered, so a NaN in i, j or t misses too (a NaN vertex, an inactive primitive in Vulkan).
         // Read on every compile, so the translator tests can compare the lowerings in one process.
-        private static int TriDegenerate => Environment.GetEnvironmentVariable("SHARPEMU_BVH_TRI_DEGENERATE") switch
+        private static int TriDegenerate => BvhSwitch("SHARPEMU_BVH_TRI_DEGENERATE") switch
         {
             "0" => 0,
             "2" => 2,
@@ -206,7 +215,7 @@ public static partial class Gen5SpirvTranslator
         }
 
         // [local] Read on every compile, so the translator tests can compare both lowerings in one process.
-        private readonly int _bvhUnifiedFetch = Environment.GetEnvironmentVariable("SHARPEMU_BVH_UNIFIED_FETCH") switch
+        private readonly int _bvhUnifiedFetch = BvhSwitch("SHARPEMU_BVH_UNIFIED_FETCH") switch
         {
             "0" => 0,
             "1" => 1,
@@ -215,7 +224,7 @@ public static partial class Gen5SpirvTranslator
         };
         // =2 (verify, with SHARPEMU_BVH_TRI_PROBE=1 in 0x8395): both slab tests run, the lean one is kept and the box
         // nodes whose four (sorted) children differ are counted ([GPU][TRI_PROBE] lean_compared / lean_mismatches).
-        private readonly int _bvhLeanSlabsMode = Environment.GetEnvironmentVariable("SHARPEMU_BVH_LEAN_SLABS") switch
+        private readonly int _bvhLeanSlabsMode = BvhSwitch("SHARPEMU_BVH_LEAN_SLABS") switch
         {
             "1" => 1,
             "2" => 2,
@@ -410,7 +419,7 @@ public static partial class Gen5SpirvTranslator
             return new NodeUnit(IAdd64(entry, offset), valid);
         }
 
-        private readonly bool _bvhPageCache = Environment.GetEnvironmentVariable("SHARPEMU_BVH_PAGE_CACHE") == "1"; // [local] read per compile
+        private readonly bool _bvhPageCache = BvhSwitch("SHARPEMU_BVH_PAGE_CACHE") == "1"; // [local] read per compile
         private uint _bvhCachedPage, _bvhCachedEntry, _bvhCachedMapped;
 
         private void DeclareBvhPageCache()
@@ -447,7 +456,7 @@ public static partial class Gen5SpirvTranslator
         // upstream's (#1061: dominant-axis projection with a top-left rule, exit grown by ULPs). Both read the node
         // through NodeUnit (SHARPEMU_BVH_UNIFIED_FETCH / SHARPEMU_BVH_LEAN_SLABS apply to both). Read on every compile.
         private static bool GpurtNodeTest =>
-            string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_BVH_NODE_TEST"), "gpurt", StringComparison.OrdinalIgnoreCase);
+            string.Equals(BvhSwitch("SHARPEMU_BVH_NODE_TEST"), "gpurt", StringComparison.OrdinalIgnoreCase);
 
         private uint[] EmitRayTriangle(NodeUnit node, uint nodeType, uint barycentrics,
             IReadOnlyList<uint> origin, IReadOnlyList<uint> direction) =>

@@ -73,6 +73,8 @@ public sealed class GuestBufferSyncAllocationTests(HeadlessVulkanFixture fixture
         output.WriteLine($"written={written} texel={texel}: {perCall:F1} B per dirty obtain");
         harness.Shutdown();
         // A texel read defers its upload: the job and the two lists it takes to the upload worker (~320 B) stay.
-        Assert.True(perCall <= (texel ? 384 : 64), $"{perCall:F1} B per dirty obtain");
+        // A written obtain adds the range to upstream's GPU-modified AvlSpanSet, which republishes its read snapshot
+        // (152 B at upstream 514d7660 too).
+        Assert.True(perCall <= (texel ? 384 : written ? 160 : 64), $"{perCall:F1} B per dirty obtain");
     }
 }

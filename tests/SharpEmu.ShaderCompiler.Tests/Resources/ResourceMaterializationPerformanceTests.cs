@@ -57,6 +57,9 @@ public sealed class ResourceMaterializationPerformanceTests
     [InlineData(true)]
     public void UserDataStorageRejectsChangedWords(bool useArray)
     {
+        // [local] Override: upstream's counts assume upstream's key; SHARPEMU_MATERIALIZATION_CONTENT_KEY (on by default)
+        // makes the changed base word a hit with the new base (s[0] only builds a buffer dword).
+        using var upstreamKey = LocalCacheSwitches.WithoutContentKey();
         var plan = Extract(Program(BufferLoad(0, 0), EndProgram(8)));
         uint[] words = [0x1000, 0, 256, 0];
         IReadOnlyList<uint> userData = useArray ? words : Array.AsReadOnly(words);
@@ -79,6 +82,8 @@ public sealed class ResourceMaterializationPerformanceTests
     [InlineData(1u)]
     public void StructuredRefreshPreservesActivityAndRejectsChangedPredicate(uint predicate)
     {
+        // [local] Override: upstream's counts assume no word patches; ours (always on) make the changed table-only word a hit instead of a refresh.
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
         var plan = Extract(Program(ScalarLoad(0, 12, 8),
             ScalarLoad(8, 12, 16, immediateOffset: 4), MoveVectorFromScalar(16, 4, 16),
             Sopc(20, "SCmpEqU32", Gen5Operand.Scalar(8), Operand(1)),
@@ -124,6 +129,8 @@ public sealed class ResourceMaterializationPerformanceTests
     [InlineData(4)]
     public void OlderDescriptorVariantRefreshesItsTableAndPreservesOtherVariants(int variantCount)
     {
+        // [local] Override: upstream's counts assume no word patches; ours (always on) make the changed table-only word a hit instead of a refresh.
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
         var program = Program(
             ScalarLoad(0, 0, 4, 8),
             ScalarLoad(8, 0, 16, immediateOffset: 32),
@@ -474,6 +481,8 @@ public sealed class ResourceMaterializationPerformanceTests
     [Fact]
     public void AChangedTableOnlyWordRefreshesOnlyTheTable()
     {
+        // [local] Override: upstream's counts assume no word patches; ours (always on) make the changed table-only word a hit instead of a refresh.
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
         var (plan, _, _) = Prepare(FlattenedReadReuseTests.RepeatedReadProgram(4), userDataCount: 9);
         var memory = new TestWordMemory { Words = [11, 22, 33, 44] };
         var cache = new ResourceMaterializationCache();
@@ -545,6 +554,8 @@ public sealed class ResourceMaterializationPerformanceTests
     [Fact]
     public void RefreshReusesScratchBeforeReadingAndRejectsChangedEvaluation()
     {
+        // [local] Override: upstream's counts assume no word patches; ours (always on) make the changed table-only word a hit instead of a refresh.
+        using var upstreamPatches = LocalCacheSwitches.WithoutWordPatches();
         var (plan, _, _) = Prepare(FlattenedReadReuseTests.RepeatedReadProgram(4), userDataCount: 9);
         var memory = new TestWordMemory { Words = [11, 22, 33, 44] };
         var cache = new ResourceMaterializationCache();

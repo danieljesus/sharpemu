@@ -2971,7 +2971,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 PendingDownload? pending = null;
                 var slotsBusy = false;
                 var markHot = attempt == 0 && slotWaits == 0 && !isWrite && EagerReadbacksOn; // [local] hot windows only feed the read-ahead
-                var waitForSlot = ReadbackSlotWait && slotWaits < MaxReadbackSlotWaits; // [local] SHARPEMU_READBACK_SLOT_WAIT
+                var waitForSlot = (ReadbackSlotWait || ForceReadbackSlotWait) && slotWaits < MaxReadbackSlotWaits; // [local] SHARPEMU_READBACK_SLOT_WAIT
                 var relayStarted = GuestReadSplit ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
                 long relayEntered = 0;
                 var beginPosted = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -3164,6 +3164,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     // Lets the read-ahead tests turn the feature on for one cache without the environment switch.
     internal bool ForceEagerReadbacks { get; set; }
+
+    // [local] Upstream's slot wait for tests that expect it (SHARPEMU_READBACK_SLOT_WAIT is off by default).
+    internal bool ForceReadbackSlotWait { get; set; }
 
     private bool EagerReadbacksOn => EagerReadbacks || ForceEagerReadbacks;
 

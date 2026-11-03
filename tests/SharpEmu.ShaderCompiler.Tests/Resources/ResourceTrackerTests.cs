@@ -189,6 +189,9 @@ public sealed class ResourceTrackerTests
     [Fact]
     public void ImageDescriptorLoadedAtALaneChosenIndexInCompute_IsStillRejected()
     {
+        // Our SHARPEMU_WATERFALL_NULL_IMAGE fallback (on by default) also nulls these; this upstream test checks the
+        // rejection upstream keeps without it.
+        ResourceTracker.WaterfallNullImageOverride.Value = false;
         var program = LaneIndexedImageProgram();
 
         var error = Assert.Throws<ResourcePlanException>(() => Extract(program, stage: ShaderStage.Compute));
@@ -199,6 +202,9 @@ public sealed class ResourceTrackerTests
     [Fact]
     public void SamplerLoadedAtALaneChosenIndex_IsStillRejected()
     {
+        // Our SHARPEMU_WATERFALL_NULL_IMAGE fallback (on by default) also nulls these; this upstream test checks the
+        // rejection upstream keeps without it.
+        ResourceTracker.WaterfallNullImageOverride.Value = false;
         var program = Program(
             MoveScalarRegister(0, 16, 0),
             MoveScalarRegister(4, 17, 1),

@@ -230,10 +230,13 @@ public sealed partial class ResourceTracker
     // the per-lane index of a waterfall loop, which the host cannot evaluate.
     // SHARPEMU_WATERFALL_NULL_IMAGE=0 restores the upstream rejection (read per call: only
     // reached once a descriptor dword is already invalid).
+    // A test can turn the fallback off for its own async flow (tests run in parallel).
+    internal static readonly AsyncLocal<bool?> WaterfallNullImageOverride = new();
+
     private static bool IsWaterfallTableWord(ScalarValue value)
     {
         if (value.Kind != ScalarValueKind.ScalarBufferWord || value.Operands.Length < 2 ||
-            Environment.GetEnvironmentVariable("SHARPEMU_WATERFALL_NULL_IMAGE") == "0")
+            !(WaterfallNullImageOverride.Value ?? Environment.GetEnvironmentVariable("SHARPEMU_WATERFALL_NULL_IMAGE") != "0"))
         {
             return false;
         }

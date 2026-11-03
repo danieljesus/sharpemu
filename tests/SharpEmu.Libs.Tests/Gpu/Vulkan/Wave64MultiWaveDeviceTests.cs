@@ -39,7 +39,7 @@ public sealed class Wave64MultiWaveDeviceTests(HeadlessVulkanFixture fixture) : 
 
     private bool Ready() => GatePrerequisites.Ready(fixture.Vulkan, shaderInt64: true);
 
-    private uint[] Run(uint threads, uint? dispatchedThreads = null)
+    private uint[] Run(uint threads, uint? dispatchedThreads = null, bool hostSubgroup32 = false)
     {
         Add(Vop2(0, "VLshlrevB32", 5, Operand(2), Gen5Operand.Vector(0)));
         Add(BufferAccess(0, "BufferStoreDword", 4, vectorData: 4, offsetEnabled: true, vectorAddress: 5));
@@ -49,6 +49,8 @@ public sealed class Wave64MultiWaveDeviceTests(HeadlessVulkanFixture fixture) : 
         {
             LocalSizeX = threads, ThreadCountX = dispatchedThreads ?? threads, WaveSize = 64,
             EmulateMultiWaveWave64 = true,
+            // A 32-lane host subgroup takes the paired lowering (SHARPEMU_WAVE64_PAIRED), as on the RTX 5080.
+            HostComputeSubgroup32 = hostSubgroup32,
         };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         Assert.NotNull(fixture.Vulkan);
@@ -137,11 +139,14 @@ public sealed class Wave64MultiWaveDeviceTests(HeadlessVulkanFixture fixture) : 
     }
 
     // A returning LDS add counts in lane order on the guest: the lower half of a wave64 before
-    // the upper one, and inside a half from the lowest lane. A radix sort's ranks rely on it.
+    // the upper one, and inside a half from the lowest lane. A radix sort's ranks rely on it. Under the emulated
+    // lowering and under the paired one.
     [Theory]
-    [InlineData(64u)]
-    [InlineData(256u)]
-    public void AReturningLdsAdd_RanksLanesInOrder(uint threads)
+    [InlineData(64u, false)]
+    [InlineData(256u, false)]
+    [InlineData(64u, true)]
+    [InlineData(256u, true)]
+    public void AReturningLdsAdd_RanksLanesInOrder(uint threads, bool paired)
     {
         if (!Ready()) return;
         // v2 = lane in wave, v3 = 4 * (lane % 4) (the LDS word), v6 = 1 << (8 * wave), v7 = 8 * wave.
@@ -157,7 +162,7 @@ public sealed class Wave64MultiWaveDeviceTests(HeadlessVulkanFixture fixture) : 
         Add(DataShare(0, "DsAddRtnU32", false, [Gen5Operand.Vector(3), Gen5Operand.Vector(6)], [9]));
         Add(Vop3(0, "VBfeU32", 4, Gen5Operand.Vector(9), Gen5Operand.Vector(7), Operand(8)));
 
-        var values = Run(threads);
+        var values = Run(threads, hostSubgroup32: paired);
         for (uint thread = 0; thread < threads; thread++)
         {
             Assert.True(((thread & 63) >> 2) == values[thread], $"thread {thread}: rank {values[thread]}; wave 0: {string.Join(",", values.Take(64))}");

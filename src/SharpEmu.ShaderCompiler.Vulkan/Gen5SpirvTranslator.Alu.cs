@@ -4600,8 +4600,7 @@ public static partial class Gen5SpirvTranslator
                 lane);
             if (!_pairedMeshLanes)
             {
-                // [local] DPP never crosses a 32-lane half, so an emulated wave64 shuffles within its host subgroup.
-                safeTarget = BitwiseAnd(safeTarget, UInt(DppLaneMask));
+                safeTarget = BitwiseAnd(safeTarget, UInt(NativeLaneMask));
             }
             var shuffled = _pairedMeshLanes
                 ? ShufflePairedValue(_pairedDppSources[0], _pairedDppSources[1], safeTarget)
@@ -5740,9 +5739,6 @@ public static partial class Gen5SpirvTranslator
         private uint NativeLaneMask => _waveLaneCount == 64 &&
             (_stage != Gen5SpirvStage.Mesh || _request.Mesh?.DeviceSubgroupLaneCount == 64) ? 63u : 31u;
 
-        // [local] DPP and PERMLANE16 targets of an emulated wave64 stay in the lane's own 32-lane host subgroup.
-        private uint DppLaneMask => _waveLowering is EmulatedWave64Lowering ? 31u : NativeLaneMask;
-
         private uint EmitPermlane16(
             Gen5ShaderInstruction instruction,
             bool exchangeRows)
@@ -5795,7 +5791,7 @@ public static partial class Gen5SpirvTranslator
 
             var targetLane = IAdd(rowBase, selector);
             // [local] PERMLANE16 stays within a 32-lane half, so an emulated wave64 shuffles within its host subgroup.
-            targetLane = BitwiseAnd(targetLane, UInt(DppLaneMask));
+            targetLane = BitwiseAnd(targetLane, UInt(NativeLaneMask));
             var shuffled = ShuffleLane(value, targetLane);
             var fetchInactive = (control.OperandSelect & 1) != 0;
             if (fetchInactive)

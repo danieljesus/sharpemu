@@ -53,7 +53,6 @@ public sealed unsafe class SharedBackingTransferTests
         using var mapping = new TransferMappings();
         const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
         var access = typeof(SharedBackingViews).GetMethod("TryAccessSingleView", flags)!;
-        var active = typeof(SharedBackingViews).GetField("_activeAccesses", flags)!;
         var blocked = typeof(SharedBackingViews).GetField("_copyAccessBlocked", flags)!;
         Assert.True(aliasAccess ? mapping.Store.TryEnterAliasAccess() :
             (bool)access.Invoke(mapping.Store, [mapping.Address, 8UL, 0UL])!);
@@ -81,8 +80,10 @@ public sealed unsafe class SharedBackingTransferTests
         finally
         {
             // Release the private access lease held by this test. No other lease can enter.
+            // [local] With SHARPEMU_STRIPED_ACCESS_COUNT (on by default) the count lives in per-thread stripes, so the
+            // lease is ended the way an access ends it, on this thread.
             if (aliasAccess) mapping.Store.ExitAliasAccess();
-            else active.SetValue(mapping.Store, 0);
+            else typeof(SharedBackingViews).GetMethod("ExitAccess", flags)!.Invoke(mapping.Store, null);
             Assert.True(transfer.Join(TimeSpan.FromSeconds(10)));
         }
         Assert.Null(failure);

@@ -1113,9 +1113,13 @@ public static partial class Gen5SpirvTranslator
             });
         }
 
+        // [local] The out-of-range store record is off (its slot is reserved for site 10); while it is, the stores emit
+        // no empty conditional for it.
+        private bool OutOfRangeStoreRecords => false;
+
         private void EmitOutOfRangeStoreRecord(int binding, uint dwordAddress, uint site)
         {
-            if (!_request.TraceDeviceAddressFaults || _faultBuffer == 0 || true) return; // [local] slot reserved for site 10
+            if (!OutOfRangeStoreRecords || !_request.TraceDeviceAddressFaults || _faultBuffer == 0) return;
             // The second record of the trace area (claim 1), shared with upstream's unlinked-call record (claim 2).
             var length = _module.AddInstruction(SpirvOp.ArrayLength, _uintType, _faultBuffer, 0);
             var recordStart = _module.AddInstruction(SpirvOp.ISub, _uintType, length, UInt(8));

@@ -3690,8 +3690,8 @@ public static partial class Gen5SpirvTranslator
                 return true;
             }
 
-            if (instruction.Opcode == "DsAddRtnU32" && OrderedLdsAdds && _subgroupInvocationIdInput != 0 &&
-                instruction.Destinations.Count > 0 && (_waveLaneCount == 32 || OneEmulatedWave64))
+            if (instruction.Opcode == "DsAddRtnU32" && OrderedLdsAdds && !_ldsPrivate && _subgroupInvocationIdInput != 0 &&
+                instruction.Destinations.Count > 0 && (_waveLaneCount == 32 || _pairedLanes || OrderedEmulatedWave64))
             {
                 EmitOrderedDataShareAdd(instruction, control);
                 return true;
@@ -3751,10 +3751,9 @@ public static partial class Gen5SpirvTranslator
         // from the lower lanes of its host subgroup, one leader per word adds the subgroup's
         // total, and an emulated wave64's lower half adds before its upper half. Radix sorts
         // rank their keys this way; an unordered rank reorders equal keys between passes.
-        // [local] An emulated wave64 alone in its workgroup: a workgroup barrier pairs its two halves (several waves
-        // meet at the lowering's own rendezvous, which this does not reach).
-        private bool OneEmulatedWave64 => _waveLowering is EmulatedWave64Lowering && !_request.CooperativeWave64Workgroup &&
-            (ulong)_localSizeX * _localSizeY * _localSizeZ <= 64;
+        // [local] An emulated wave64 pairs its halves through the lowering (a workgroup barrier for one wave, each
+        // wave's own rendezvous for several). A paired wave64 runs its lower half's pass before its upper half's.
+        private bool OrderedEmulatedWave64 => _waveLowering is EmulatedWave64Lowering && !_request.CooperativeWave64Workgroup;
 
         private void EmitOrderedDataShareAdd(Gen5ShaderInstruction instruction, Gen5DataShareControl control)
         {
@@ -3795,11 +3794,11 @@ public static partial class Gen5SpirvTranslator
             Store(_orderedAddOld, UInt(0));
             void Add(uint condition) => EmitConditional(condition, () =>
                 Store(_orderedAddOld, _module.AddInstruction(SpirvOp.AtomicIAdd, _uintType, pointer, UInt(2), UInt(0x108), total)));
-            if (OneEmulatedWave64)
+            if (_waveLowering is EmulatedWave64Lowering emulated)
             {
                 var lowerHalf = _module.AddInstruction(SpirvOp.IEqual, _boolType, ShiftRightLogical(GuestWaveLane(), UInt(5)), UInt(0));
                 Add(LogicalAnd(isLeader, lowerHalf));
-                EmitWave64Barrier();
+                emulated.PairHalves();
                 Add(LogicalAnd(isLeader, LogicalNot(lowerHalf)));
             }
             else
@@ -4424,7 +4423,7 @@ public static partial class Gen5SpirvTranslator
                 EmitExecConditional(() =>
                 {
                     var inRange = IsBufferWordInRange(bindingIndex, dwordAddress);
-                    EmitConditional(LogicalNot(inRange), () => EmitOutOfRangeStoreRecord(bindingIndex, dwordAddress, 2));
+                    if (OutOfRangeStoreRecords) EmitConditional(LogicalNot(inRange), () => EmitOutOfRangeStoreRecord(bindingIndex, dwordAddress, 2));
                     EmitBufferAtomicInRange(inRange, control.Glc, control.VectorData, 1, () =>
                     {
                         var original = EmitAtomic(
@@ -9285,7 +9284,7 @@ public static partial class Gen5SpirvTranslator
         {
             var inRange = IsBufferWordInRange(binding, dwordAddress);
             EmitConditional(inRange, () => Store(BufferWordPointer(binding, dwordAddress), value));
-            EmitConditional(LogicalNot(inRange), () => EmitOutOfRangeStoreRecord(binding, dwordAddress, 1));
+            if (OutOfRangeStoreRecords) EmitConditional(LogicalNot(inRange), () => EmitOutOfRangeStoreRecord(binding, dwordAddress, 1));
         }
 
         // A GLC DWORDX2 access: one 64-bit access when it is aligned and inside the pair view, else two dword accesses.

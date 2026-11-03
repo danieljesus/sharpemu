@@ -81,7 +81,9 @@ public sealed class GpuCommandInterpreterWindowTests
 
         Assert.Equal(SubmissionProgress.Complete, progress);
         Assert.Equal(2u, runner.Interpreter.InstanceCount);
-        Assert.Equal([Command, nested], StreamReads(runner));
+        // The nested buffer's window is one read; upstream's ReadBehindEarlierWork adds an operand read of its
+        // first dword before it is entered (completing earlier work that may write it). The parent's window stays.
+        Assert.Equal([Command, nested, nested], StreamReads(runner));
     }
 
     [Fact]

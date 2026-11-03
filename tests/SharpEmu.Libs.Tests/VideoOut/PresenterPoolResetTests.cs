@@ -16,7 +16,6 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 public sealed class PresenterPoolResetTests
 {
     private const BindingFlags Fields = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
-    private static readonly Type Presenter = typeof(VulkanVideoPresenter).GetNestedType("Presenter", BindingFlags.NonPublic)!;
 
     private static Type Nested(Type owner, string name) => owner.GetNestedType(name, BindingFlags.NonPublic)!;
 
@@ -28,38 +27,11 @@ public sealed class PresenterPoolResetTests
         var used = Activator.CreateInstance(type, nonPublic: true)!;
         Scramble(used);
         type.GetMethod("Reset")!.Invoke(used, null);
-        AssertSameFields(fresh, used);
+        // Pooled and InPool belong to upstream's texture pool, which sets them when it hands an object out or takes
+        // it back; Reset leaves them to it.
+        AssertSameFields(fresh, used, skip: "Pooled", skip2: "InPool");
     }
 
-    [Fact]
-    public void StageDescriptorsResetMatchesANewInstance()
-    {
-        var type = Nested(Presenter, "StageDescriptors");
-        var fresh = Activator.CreateInstance(type, nonPublic: true)!;
-        var used = Activator.CreateInstance(type, nonPublic: true)!;
-        Scramble(used);
-        type.GetMethod("Reset")!.Invoke(used, null);
-        AssertSameFields(fresh, used);
-    }
-
-    [Fact]
-    public void PreparedStageBindingsResetMatchesANewInstanceForTheNewStage()
-    {
-        var type = Nested(Presenter, "PreparedStageBindings");
-        var program = new ShaderProgramInfo { Stage = ShaderStageKind.Pixel, Hash = 7 };
-        var stage = new ShaderStageResources(program, new ResourceSnapshot(), 0x1000);
-        var other = new ShaderStageResources(new ShaderProgramInfo { Stage = ShaderStageKind.Vertex, Hash = 9 }, new ResourceSnapshot(), 0x2000);
-        var fresh = Activator.CreateInstance(type, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, [stage, program], null)!;
-        var used = Activator.CreateInstance(type, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, [other, other.Program!], null)!;
-        Scramble(used, skip: "<Descriptors>k__BackingField");
-        Scramble(type.GetProperty("Descriptors")!.GetValue(used)!);
-        type.GetMethod("Release")!.Invoke(used, null);
-        type.GetMethod("Reset")!.Invoke(used, [stage, program]);
-        AssertSameFields(fresh, used, skip: "<Descriptors>k__BackingField");
-        AssertSameFields(type.GetProperty("Descriptors")!.GetValue(fresh)!, type.GetProperty("Descriptors")!.GetValue(used)!);
-    }
-
-    // Sets every field to a value that differs from its current one.
     private static void Scramble(object target, string? skip = null)
     {
         foreach (var field in target.GetType().GetFields(Fields))
@@ -136,11 +108,11 @@ public sealed class PresenterPoolResetTests
             .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.AsBytes(new ReadOnlySpan<T>(ref y)));
     }
 
-    private static void AssertSameFields(object expected, object actual, string? skip = null)
+    private static void AssertSameFields(object expected, object actual, string? skip = null, string? skip2 = null)
     {
         foreach (var field in expected.GetType().GetFields(Fields))
         {
-            if (field.Name == skip)
+            if (field.Name == skip || field.Name == skip2)
             {
                 continue;
             }

@@ -18,7 +18,9 @@ public sealed class Gen5NonTessellationSpirvStabilityTests
     [InlineData("lds-readback", ShaderStage.Pixel, 64u, "D576CD6C4222535C")]
     [InlineData("lds-readback", ShaderStage.Pixel, 32u, "CB5C1CDED8103BC2")]
     [InlineData("lds-readback", ShaderStage.Compute, 64u, "51DC6ACDCA96B659")]
-    [InlineData("lds-readback", ShaderStage.Compute, 32u, "7461E219AEAFAC53")]
+    // [local] Our compute EXEC mask (EmitComputeExecMask) drops the lanes past the thread limit on the native lowerings,
+    // which upstream (7461E219AEAFAC53) leaves in EXEC; this program writes and reads EXEC, so its module differs.
+    [InlineData("lds-readback", ShaderStage.Compute, 32u, "80F34718B95E607F")]
     [InlineData("lds-staging-export", ShaderStage.Vertex, 64u, "D6060044105BFC27")]
     [InlineData("lds-staging-export", ShaderStage.Vertex, 32u, "02D77B4078336EDC")]
     [InlineData("lds-barrier", ShaderStage.Compute, 64u, "6002AC8936414DF5")]

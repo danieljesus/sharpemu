@@ -65,8 +65,9 @@ public sealed class Gen5Float16ConversionTests
         Assert.Contains(((uint)SpirvExecutionMode.DenormPreserve, 16u), modes);
         Assert.Contains(((uint)SpirvExecutionMode.SignedZeroInfNanPreserve, 16u), modes);
         Assert.Contains(((uint)SpirvExecutionMode.RoundingModeRTE, 16u), modes);
-        // Four conversions of about forty instructions each become four of about four.
-        Assert.True(nativeOps.Count + 100 <= emulatedOps.Count, $"native={nativeOps.Count} emulated={emulatedOps.Count}");
+        // Four emulated conversions become four of about four instructions; upstream's SPIR-V optimizer (CSE,
+        // forwarding, dead-value removal) also shrinks the emulated ones, which narrows the gap (79 here).
+        Assert.True(nativeOps.Count + 60 <= emulatedOps.Count, $"native={nativeOps.Count} emulated={emulatedOps.Count}");
     }
 
     [Fact]

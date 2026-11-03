@@ -1052,6 +1052,18 @@ internal static unsafe class VkRecord
         function(command, label);
     }
 
+    // [local] Upstream's draw trace markers (trace only): the ring drains first, then the label goes to the driver.
+    public static void CmdInsertDebugUtilsLabel(delegate* unmanaged<CommandBuffer, DebugUtilsLabelEXT*, void> function, CommandBuffer command,
+        DebugUtilsLabelEXT* label)
+    {
+        if (Ring(command) is { } ring)
+        {
+            Fallback(ring, RingOp.BeginDebugLabel);
+        }
+
+        function(command, label);
+    }
+
     public static void CmdEndDebugUtilsLabel(delegate* unmanaged<CommandBuffer, void> function, CommandBuffer command)
     {
         if (Ring(command) is { } ring)

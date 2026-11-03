@@ -193,6 +193,7 @@ public sealed class LoopBindlessImageTests
     [InlineData(true)]
     public void LoopCounterSelector_BecomesAnIndirectImage(bool descriptorBeforeInnerLoop)
     {
+        UpstreamImageModes();
         var plan = Extract(LoopProgram(descriptorBeforeInnerLoop));
 
         Assert.Single(plan.Info.Images);
@@ -209,6 +210,7 @@ public sealed class LoopBindlessImageTests
     [InlineData(true)]
     public void LoopCounterSelector_MaterializesEveryHeapDescriptorTheTableNames(bool descriptorBeforeInnerLoop)
     {
+        UpstreamImageModes();
         var plan = Extract(LoopProgram(descriptorBeforeInnerLoop));
         var (userData, memory) = Inputs3D();
         var snapshot = new ResourceSnapshot();
@@ -236,6 +238,7 @@ public sealed class LoopBindlessImageTests
     [InlineData(true)]
     public void LoopCounterSelector_CompilesWithCandidateSelection(bool descriptorBeforeInnerLoop)
     {
+        UpstreamImageModes();
         var plan = Extract(LoopProgram(descriptorBeforeInnerLoop, storeResult: true));
         var (userData, memory) = Inputs3D();
         var snapshot = new ResourceSnapshot();
@@ -257,6 +260,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelector_ReadsADescriptorOfAnotherKindAsNull()
     {
+        UpstreamImageModes();
         var plan = Extract(LoopProgram(false));
         var (userData, memory) = Inputs3D();
         // The default heap entry is a plain 2D image: a 3D instruction cannot sample it.
@@ -279,6 +283,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelector_ReadsAsNullWhenNoDescriptorCanBeSampled()
     {
+        UpstreamImageModes();
         var plan = Extract(LoopProgram(false));
         var (userData, memory) = Inputs3D();
         foreach (var address in new ulong[] { 0x2000, 0x2020, 0x2040, 0x2060 })
@@ -300,6 +305,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelector_ReadsAsANullImageWhenTheTableCannotBeRead()
     {
+        UpstreamImageModes();
         var plan = Extract(LoopProgram(false));
         var (userData, memory) = Inputs3D();
         memory.FailAddress = 0x1000 + KeyOffset;
@@ -315,6 +321,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelector_ReadsOnlyTheKeysTheRecordsHold()
     {
+        UpstreamImageModes();
         var plan = Extract(LoopProgram(false));
         var (userData, memory) = Inputs3D();
         for (uint record = 0; record < Records; record++)
@@ -336,6 +343,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelector_KeepsEveryCandidateOfALargeTable()
     {
+        UpstreamImageModes();
         var plan = Extract(ManyImagesProgram(1));
         var (userData, memory) = ManyVolumes(records: 70, images: 1);
         var snapshot = new ResourceSnapshot();
@@ -352,6 +360,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelector_KeepsEveryVolumeOfAFrameThatNamesMoreThanEight()
     {
+        UpstreamImageModes();
         // A view whose volume list grows past eight records: a volume left out reads the first candidate, and its
         // light goes missing wherever that volume covers the view.
         var plan = Extract(ManyImagesProgram(1));
@@ -374,6 +383,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelector_KeepsTheSameLayoutForVolumeCountsOfOneSizeClass()
     {
+        UpstreamImageModes();
         var plan = Extract(ManyImagesProgram(1));
         var layouts = new List<(ResourceSpecialization Specialization, int Images, int Table)>();
         foreach (var records in new uint[] { 9, 12, 16 })
@@ -397,6 +407,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelector_KeepsTheLargestLayoutAProgramHasNeeded()
     {
+        UpstreamImageModes();
         var plan = Extract(ManyImagesProgram(1));
         var layouts = new List<(ResourceSpecialization Specialization, int Images, int Table)>();
         foreach (var records in new uint[] { 40, 3, 12 })
@@ -421,6 +432,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelector_KeepsEveryKeyWhenManyKeysReadTheSameVolume()
     {
+        UpstreamImageModes();
         var plan = Extract(ManyImagesProgram(1));
         var (userData, memory) = ManyVolumes(records: 40, images: 1, sameVolume: true);
         var snapshot = new ResourceSnapshot();
@@ -437,6 +449,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopCounterSelectors_AtTheImageLimitCompile()
     {
+        UpstreamImageModes();
         const uint images = 8;
         var plan = Extract(ManyImagesProgram(images));
         var (userData, memory) = ManyVolumes(20, images);
@@ -457,6 +470,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void UserDataSelector_KeepsTheDirectDescriptor()
     {
+        UpstreamImageModes();
         var plan = Extract(UserDataSelectorProgram());
 
         Assert.Single(plan.Info.Images);
@@ -467,6 +481,7 @@ public sealed class LoopBindlessImageTests
     [Fact]
     public void LoopWithoutAMaterialKey_StaysANullImage()
     {
+        UpstreamImageModes();
         var plan = Extract(LoopProgram(false, keyFromMaterialTable: false));
 
         Assert.Single(plan.Info.Images);
@@ -474,5 +489,13 @@ public sealed class LoopBindlessImageTests
         Assert.Null(source.IndirectImage);
         Assert.Empty(plan.IndirectImages);
         Assert.All(source.Dwords, dword => Assert.True(dword.IsConstant && dword.ConstantU32 == 0));
+    }
+
+    // Our SHARPEMU_INDIRECT_IMAGE_DIM/PAD (on by default) widen and pad the candidate tables these upstream tests count;
+    // they check upstream's layout, so they run with both off (an async-flow override, not a process-wide one).
+    private static void UpstreamImageModes()
+    {
+        ResourceMaterializer.IndirectImageDimMode = 0;
+        ResourceMaterializer.IndirectImagePadMode = 0;
     }
 }

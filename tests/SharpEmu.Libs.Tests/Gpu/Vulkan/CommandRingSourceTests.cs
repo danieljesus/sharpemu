@@ -23,6 +23,7 @@ public sealed class CommandRingSourceTests
     private static readonly Dictionary<string, string> AllowedPointers = new(StringComparer.OrdinalIgnoreCase)
     {
         ["VulkanVideoPresenter.Device.Setup.cs"] = "loads the debug-utils label commands and hands them to VkRecord",
+        ["VulkanVideoPresenter.MeshIndirect.cs"] = "declares upstream's mesh-indirect draw pointer, which VkRecord calls",
     };
 
     private static readonly Regex DirectCall = new(@"(?<!VkRecord)\.Cmd[A-Z]\w*\(", RegexOptions.Compiled);

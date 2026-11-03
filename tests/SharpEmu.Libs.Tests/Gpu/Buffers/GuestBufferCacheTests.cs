@@ -1820,6 +1820,9 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     public void ProcessFaultBuffer_BringsInTheWindowAroundAFaultedPage()
     {
         if (_vulkan is null) return;
+        // The test sets a fault bit directly, without the granule summary bit our fault writers also set
+        // (SHARPEMU_BDA_SCAN_MAPPED, on by default), so its processor scans the whole bitmap.
+        BdaFaultProcessor.ScanMappedModeOverride.Value = 0;
         using var harness = new CacheHarness(_vulkan);
         harness.Cache.GpuMemory = harness.Gpu;
         const ulong window = GuestBufferCache.DeviceAddressFaultWindow;
@@ -1881,6 +1884,9 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     public void ProcessFaultBuffer_KeepsAdjacentWindowsOfTwoMappingsApart()
     {
         if (_vulkan is null) return;
+        // The test sets a fault bit directly, without the granule summary bit our fault writers also set
+        // (SHARPEMU_BDA_SCAN_MAPPED, on by default), so its processor scans the whole bitmap.
+        BdaFaultProcessor.ScanMappedModeOverride.Value = 0;
         using var harness = new CacheHarness(_vulkan);
         using var fatal = new FatalScope();
         harness.Cache.GpuMemory = harness.Gpu;
