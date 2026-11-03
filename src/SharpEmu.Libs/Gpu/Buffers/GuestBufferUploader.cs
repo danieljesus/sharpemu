@@ -21,6 +21,7 @@ internal sealed class GuestBufferUploader(
             return null;
         }
 
+        SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.BufferUploads); // [local] SHARPEMU_COLDRES_PROBE
         if (staging.TryMap(totalSize, out var baseOffset, 4))
         {
             foreach (ref var copy in regions)

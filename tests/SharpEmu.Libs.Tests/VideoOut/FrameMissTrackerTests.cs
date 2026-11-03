@@ -119,4 +119,24 @@ public sealed class FrameMissTrackerTests
         Assert.Contains("misses=1 skipped_slots=1", report[1]);
         Assert.Contains("[FRAME_ATTR] miss_frames=1 normal_frames=1 per_interval miss/before/normal: Wait=28.00/2.00/2.00 Compiles=1.00/0.00/0.00", report[2]);
     }
+
+    [Fact]
+    public void TheNoGcAttributionLeavesOutIntervalsWithACollectionAndShownCountersAlwaysPrint()
+    {
+        var lines = new List<string>();
+        var tracker = new FrameMissTracker(Frequency, 0, 0, 1000, ["Wait", "Gen0", "Quiet"], [false, true, false], lines.Add,
+            [false, false, true], [1]);
+        tracker.Presented(At(Slot), 0, Slot, [0, 0, 0]);
+        tracker.Presented(At(2 * Slot), 0, Slot, [2_000, 0, 0]);
+        // A miss with a collection, then a miss and a normal presentation without one.
+        tracker.Presented(At(4 * Slot), 0, Slot, [30_000, 1, 0]);
+        tracker.Presented(At(6 * Slot), 0, Slot, [40_000, 1, 0]);
+        tracker.Presented(At(7 * Slot), 0, Slot, [44_000, 1, 0]);
+        Assert.Equal(2, tracker.MissFrames);
+        Assert.Equal(1, tracker.MissNoGcFrames);
+        Assert.Equal(2, tracker.NormalNoGcFrames);
+        Assert.Equal(10.0, tracker.MissNoGcSum[0], 3);
+        var report = tracker.Report(7 * Slot).ToList();
+        Assert.StartsWith("[FRAME_ATTR_NOGC] miss_frames=1 normal_frames=2 per_interval miss/normal: Wait=10.00/3.00", report[3]);
+    }
 }

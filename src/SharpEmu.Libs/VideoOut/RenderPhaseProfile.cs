@@ -179,6 +179,30 @@ internal static class RenderPhaseProfile
         PartScopeEmit,
         PartDispatchEmit,
         PartPure,
+        // [local] SHARPEMU_COLDRES_PROBE: a materialization that hit or missed the cache, the creations of image views,
+        // samplers, cache buffers, pipelines (the cache miss under the gate), program entries and permutations, and the
+        // waits for the image cache's and the page tracker's region locks and for the program cache's gate.
+        ColdMaterializeHit,
+        ColdMaterializeMiss,
+        ColdViewCreate,
+        ColdSamplerCreate,
+        ColdBufferCreate,
+        ColdPipelineMiss,
+        ColdEntryCreate,
+        ColdPermutationCompile,
+        ColdImageLockWait,
+        ColdTrackerLockWait,
+        ColdProgramGateWait,
+        // [local] SHARPEMU_COLDRES_PROBE: the readback waits inside a materialization that missed or hit, and the
+        // materialization cache's own split (MaterializeSplitProfile kinds, the big variants folded in).
+        ColdMaterializeMissWait,
+        ColdMaterializeHitWait,
+        ColdMatValidate,
+        ColdMatShift,
+        ColdMatRefresh,
+        ColdMatWalk,
+        ColdMatBuild,
+        ColdMatSort,
         // [local] SHARPEMU_PROFILE_RESOLVE: the scope-cost calibration at each report (excluded from its lines).
         ProfilerCalibration,
         ProfilerCalibrationInner,

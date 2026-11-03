@@ -450,11 +450,20 @@ internal sealed class ShaderProgramCache
             var waitTicksBefore = resolveStarted != 0 ? SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaitTicks : 0;
             bool materialized;
             ResourceMaterializationFailure materializationFailure;
+            var coldStarted = Diagnostics.FrameMissProbe.Cold ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_COLDRES_PROBE
+            var coldWaited = Diagnostics.FrameMissProbe.ThreadReadbackTicks;
             if (sharedForTables)
             {
                 SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
                 lock (_gate)
                 {
+                    if (coldStarted != 0) // [local] SHARPEMU_COLDRES_PROBE
+                    {
+                        var entered = System.Diagnostics.Stopwatch.GetTimestamp();
+                        Diagnostics.FrameMissProbe.AddPhase(RenderPhaseProfile.Phase.ColdProgramGateWait, entered - coldStarted);
+                        coldStarted = entered;
+                    }
+
                     SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.Materialize);
                     materialized = MaterializeWith(materializations, entry, inputs, ref snapshot, ref specialization, out materializationFailure, captureIndirectImageFailure);
                 }
@@ -464,6 +473,14 @@ internal sealed class ShaderProgramCache
                 materialized = MaterializeWith(materializations, entry, inputs, ref snapshot, ref specialization, out materializationFailure, captureIndirectImageFailure);
             }
 
+            if (coldStarted != 0) // [local] SHARPEMU_COLDRES_PROBE
+            {
+                var hit = materializations is not null && materializations.Hits != hitsBefore;
+                Diagnostics.FrameMissProbe.AddPhase(hit ? RenderPhaseProfile.Phase.ColdMaterializeHit : RenderPhaseProfile.Phase.ColdMaterializeMiss,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - coldStarted);
+                Diagnostics.FrameMissProbe.AddPhase(hit ? RenderPhaseProfile.Phase.ColdMaterializeHitWait : RenderPhaseProfile.Phase.ColdMaterializeMissWait,
+                    Diagnostics.FrameMissProbe.ThreadReadbackTicks - coldWaited);
+            }
             if (Diagnostics.FrameMissProbe.Enabled) // [local]
             {
                 Diagnostics.FrameMissProbe.CountOnRender(Diagnostics.FrameMissProbe.Counter.RenderMaterializations);
@@ -539,7 +556,12 @@ internal sealed class ShaderProgramCache
             }
 
             key ??= new ProgramKey(source.Stage, source.Hash, (uint)source.UserData.Length, source.CodeSize, staticState.ToArray());
-            var permutation = CompilePermutation(source, options, entry, specialization, pushDataCursor, key, sourceWasCached);
+            ProgramPermutation permutation;
+            using (var coldScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ColdPermutationCompile)) // [local] SHARPEMU_COLDRES_PROBE
+            {
+                SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.PermutationCompiles);
+                permutation = CompilePermutation(source, options, entry, specialization, pushDataCursor, key, sourceWasCached);
+            }
             entry.Permutations.Add(permutation);
             Volatile.Write(ref entry.Published, entry.Permutations.ToArray());
             ShaderCacheCounters.CountPermutation();
@@ -769,6 +791,8 @@ internal sealed class ShaderProgramCache
 
     private ProgramSourceEntry CreateEntry(ShaderSource source, StageCompileOptions options)
     {
+        using var coldScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ColdEntryCreate); // [local] SHARPEMU_COLDRES_PROBE
+        SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.EntryCreates);
         var program = Decode(source);
         var dumpPlanning = CompiledShaderDump.ShouldWrite(source.Address, source.Hash);
         if (dumpPlanning) ShaderPlanningDump.WriteInput(source, program);

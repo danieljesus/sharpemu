@@ -81,6 +81,18 @@ internal static class FrameMissProbe
         FrontDiscardedPreps,
         AllocatedKB,
         PresentWaitsWithWork,
+        // [local] SHARPEMU_COLDRES_PROBE: creations and first-time work on the render thread (see ColdPhases).
+        ImageInserts,
+        ViewCreates,
+        SamplerCreates,
+        BufferCreates,
+        PipelineCreates,
+        EntryCreates,
+        PermutationCompiles,
+        BufferUploads,
+        ImageUploads,
+        ImageLockWaits,
+        TrackerLockWaits,
         Count,
     }
 
@@ -165,6 +177,61 @@ internal static class FrameMissProbe
     // handoff cost: parallel recording was not pursued (kill criterion 2).
     internal static readonly bool Partition = Environment.GetEnvironmentVariable("SHARPEMU_PARREC_PROBE") == "1";
 
+    // [local] SHARPEMU_COLDRES_PROBE=1: the resolution of shared state split into lookups, creations, uploads,
+    // materialization hit/miss, program and pipeline preparation and the lock waits against the other threads, always
+    // printed in [FRAME_ATTR]; the times are inclusive (a parent contains its children).
+    internal static readonly bool Cold = Enabled && Environment.GetEnvironmentVariable("SHARPEMU_COLDRES_PROBE") == "1";
+
+    private static readonly RenderPhaseProfile.Phase[] ColdPhases =
+    [
+        RenderPhaseProfile.Phase.CommandDrawTranslation,
+        RenderPhaseProfile.Phase.CommandDispatchTranslation,
+        RenderPhaseProfile.Phase.DrawResourcePreparation,
+        RenderPhaseProfile.Phase.DescriptorPreparation,
+        RenderPhaseProfile.Phase.StageImagePreparation,
+        RenderPhaseProfile.Phase.ImageLookup,
+        RenderPhaseProfile.Phase.ImageLookupCore,
+        RenderPhaseProfile.Phase.ImageAcquire,
+        RenderPhaseProfile.Phase.ImageCreate,
+        RenderPhaseProfile.Phase.ImageRefresh,
+        RenderPhaseProfile.Phase.ImageUpload,
+        RenderPhaseProfile.Phase.ImageOverlap,
+        RenderPhaseProfile.Phase.ImageTracking,
+        RenderPhaseProfile.Phase.ImageTiling,
+        RenderPhaseProfile.Phase.ImageTransitions,
+        RenderPhaseProfile.Phase.BufferResources,
+        RenderPhaseProfile.Phase.BufferCacheLookup,
+        RenderPhaseProfile.Phase.BufferDirtySynchronization,
+        RenderPhaseProfile.Phase.BufferStagingUpload,
+        RenderPhaseProfile.Phase.BufferStreamUpload,
+        RenderPhaseProfile.Phase.ProgramPreparation,
+        RenderPhaseProfile.Phase.ProgramCacheLookup,
+        RenderPhaseProfile.Phase.ResourceMaterialization,
+        RenderPhaseProfile.Phase.ProgramPermutationLookup,
+        RenderPhaseProfile.Phase.ProgramResourceAssembly,
+        RenderPhaseProfile.Phase.PipelineCreation,
+        RenderPhaseProfile.Phase.ProgramCompile,
+        RenderPhaseProfile.Phase.ColdMaterializeHit,
+        RenderPhaseProfile.Phase.ColdMaterializeMiss,
+        RenderPhaseProfile.Phase.ColdViewCreate,
+        RenderPhaseProfile.Phase.ColdSamplerCreate,
+        RenderPhaseProfile.Phase.ColdBufferCreate,
+        RenderPhaseProfile.Phase.ColdPipelineMiss,
+        RenderPhaseProfile.Phase.ColdEntryCreate,
+        RenderPhaseProfile.Phase.ColdPermutationCompile,
+        RenderPhaseProfile.Phase.ColdImageLockWait,
+        RenderPhaseProfile.Phase.ColdTrackerLockWait,
+        RenderPhaseProfile.Phase.ColdProgramGateWait,
+        RenderPhaseProfile.Phase.ColdMaterializeMissWait,
+        RenderPhaseProfile.Phase.ColdMaterializeHitWait,
+        RenderPhaseProfile.Phase.ColdMatValidate,
+        RenderPhaseProfile.Phase.ColdMatShift,
+        RenderPhaseProfile.Phase.ColdMatRefresh,
+        RenderPhaseProfile.Phase.ColdMatWalk,
+        RenderPhaseProfile.Phase.ColdMatBuild,
+        RenderPhaseProfile.Phase.ColdMatSort,
+    ];
+
     private static readonly RenderPhaseProfile.Phase[] PartitionPhases =
     [
         RenderPhaseProfile.Phase.PartDrawEmit,
@@ -194,7 +261,8 @@ internal static class FrameMissProbe
     private static RenderPhaseProfile.Phase[] BuildTrackedPhases()
     {
         RenderPhaseProfile.Phase[] phases = Fine ? [.. CoarsePhases, .. DetailPhases, .. FinePhases] : Detail ? [.. CoarsePhases, .. DetailPhases] : CoarsePhases;
-        return Partition ? [.. phases, .. PartitionPhases] : phases;
+        if (Partition) phases = [.. phases, .. PartitionPhases];
+        return Cold ? [.. phases, .. ColdPhases.Where(phase => !phases.Contains(phase))] : phases;
     }
 
     private static int[] BuildPhaseSlots()
@@ -211,7 +279,7 @@ internal static class FrameMissProbe
         var counts = new bool[CounterCount];
         for (var index = 0; index < (int)Counter.Count; index++) names[index] = ((Counter)index).ToString();
         counts[(int)Counter.Gen0] = counts[(int)Counter.Gen1] = counts[(int)Counter.Gen2] = counts[(int)Counter.CompileCount] = true;
-        for (var index = (int)Counter.Draws; index <= (int)Counter.PresentWaitsWithWork; index++) counts[index] = true;
+        for (var index = (int)Counter.Draws; index < (int)Counter.Count; index++) counts[index] = true;
         for (var role = 1; role <= RoleCount; role++)
         for (var phase = 0; phase < TrackedPhases.Length; phase++)
             names[PhaseBase + (role - 1) * TrackedPhases.Length + phase] = $"{(Role)role}.{TrackedPhases[phase]}";
@@ -219,7 +287,41 @@ internal static class FrameMissProbe
             CultureInfo.InvariantCulture, out var seconds) ? seconds : 130;
         var startedAt = Process.GetCurrentProcess().StartTime;
         var startTicks = Stopwatch.GetTimestamp() - (long)((DateTime.Now - startedAt).TotalSeconds * Stopwatch.Frequency);
-        return new FrameMissTracker(Stopwatch.Frequency, startTicks, start, 30, names, counts, Console.Error.WriteLine);
+        var shown = new bool[CounterCount];
+        if (Cold)
+        {
+            foreach (var phase in ColdPhases)
+                shown[PhaseBase + ((int)Role.Render - 1) * TrackedPhases.Length + PhaseSlot[(int)phase]] = true;
+            SharpEmu.HLE.GpuMemory.RegionLock.ContendedWaitHook = NoteRegionLockWait;
+            SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.Hook = NoteMaterializeSplit;
+        }
+
+        return new FrameMissTracker(Stopwatch.Frequency, startTicks, start, 30, names, counts, Console.Error.WriteLine, shown,
+            [(int)Counter.Gen0, (int)Counter.Gen1, (int)Counter.Gen2]);
+    }
+
+    private static void NoteMaterializeSplit(SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.Kind kind, long ticks)
+    {
+        AddPhase(kind switch
+        {
+            SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.Kind.Validate => RenderPhaseProfile.Phase.ColdMatValidate,
+            SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.Kind.Shift => RenderPhaseProfile.Phase.ColdMatShift,
+            SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.Kind.Refresh => RenderPhaseProfile.Phase.ColdMatRefresh,
+            SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.Kind.Walk or SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.Kind.BigWalk => RenderPhaseProfile.Phase.ColdMatWalk,
+            SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.Kind.Build or SharpEmu.ShaderCompiler.Resources.MaterializeSplitProfile.Kind.BigBuild => RenderPhaseProfile.Phase.ColdMatBuild,
+            _ => RenderPhaseProfile.Phase.ColdMatSort,
+        }, ticks);
+    }
+
+    // This thread's readback waits so far (SHARPEMU_COLDRES_PROBE nests them in materializations).
+    [ThreadStatic] internal static long ThreadReadbackTicks;
+
+    // A contended region lock: the image cache's or the page tracker's, against the thread that held it.
+    private static void NoteRegionLockWait(SharpEmu.HLE.GpuMemory.RegionLock.Category category, long ticks)
+    {
+        var image = category == SharpEmu.HLE.GpuMemory.RegionLock.Category.ImageCache;
+        AddPhase(image ? RenderPhaseProfile.Phase.ColdImageLockWait : RenderPhaseProfile.Phase.ColdTrackerLockWait, ticks);
+        CountOnRender(image ? Counter.ImageLockWaits : Counter.TrackerLockWaits);
     }
 
     internal static Role CurrentRole
@@ -237,6 +339,7 @@ internal static class FrameMissProbe
                        name.StartsWith(".NET", StringComparison.Ordinal) => Role.Emulator,
                 _ => Role.Guest,
             };
+            if (Cold && _role is Role.Render or Role.Front) SharpEmu.HLE.GpuMemory.RegionLock.MarkHookThread(); // [local] SHARPEMU_COLDRES_PROBE
             return _role;
         }
     }
@@ -263,7 +366,13 @@ internal static class FrameMissProbe
 
     internal static void Add(Counter counter, long value) => Interlocked.Add(ref Cumulative[(int)counter], value);
 
-    internal static void AddReadbackWait(long ticks) => Add(CurrentRole switch
+    internal static void AddReadbackWait(long ticks)
+    {
+        if (Cold) ThreadReadbackTicks += ticks;
+        AddReadbackWaitByRole(ticks);
+    }
+
+    private static void AddReadbackWaitByRole(long ticks) => Add(CurrentRole switch
     {
         Role.Render => Counter.ReadbackRender,
         Role.Front => Counter.ReadbackFront,
@@ -373,10 +482,20 @@ internal sealed class FrameMissTracker
     internal long Presentations, Misses, SkippedSlots;
     internal readonly double[] MissSum, NormalSum, MissPreviousSum;
     internal long MissFrames, NormalFrames;
+    // [local] SHARPEMU_COLDRES_PROBE: the same sums over the intervals without a garbage collection (a pause lands in
+    // whichever phase was open), and the counters always shown in [FRAME_ATTR].
+    private readonly int[] _gcCounters;
+    private readonly bool[] _shown;
+    internal readonly double[] MissNoGcSum, NormalNoGcSum;
+    internal long MissNoGcFrames, NormalNoGcFrames;
 
     internal FrameMissTracker(long frequency, long startTicks, double startSeconds, double reportSeconds, string[] names,
-        bool[] isCount, Action<string> sink)
+        bool[] isCount, Action<string> sink, bool[]? shown = null, int[]? gcCounters = null)
     {
+        _shown = shown ?? new bool[names.Length];
+        _gcCounters = gcCounters ?? [];
+        MissNoGcSum = new double[names.Length];
+        NormalNoGcSum = new double[names.Length];
         _frequency = frequency;
         _originTicks = startTicks;
         _startTicks = startTicks + (long)(startSeconds * frequency);
@@ -456,6 +575,16 @@ internal sealed class FrameMissTracker
             if (record.Skipped == 0 && lastSlot >= 0 && flipInterval > 0)
                 SlackHistogram[Math.Clamp((int)Ms(openedAt + (lastSlot + 2) * flipInterval - (flip.Captured != 0 ? flip.Captured : flip.Presented)), 0, SlackHistogram.Length - 1)]++;
             var previous = _ringCount >= 2 ? _ring[(_ringCount - 2) % _ring.Length] : null;
+            var collected = false;
+            foreach (var gc in _gcCounters) collected |= record.Delta[gc] != 0;
+            if (_gcCounters.Length != 0 && !collected)
+            {
+                var sums = record.Skipped > 0 ? MissNoGcSum : NormalNoGcSum;
+                if (record.Skipped > 0) MissNoGcFrames++;
+                else NormalNoGcFrames++;
+                for (var index = 0; index < counters.Length; index++) sums[index] += Value(index, record.Delta[index]);
+            }
+
             if (record.Skipped > 0)
             {
                 Misses++;
@@ -592,12 +721,21 @@ internal sealed class FrameMissTracker
         // The 40 timed counters that grew most on missed presentations, then every count.
         var top = entries.Where(entry => !_isCount[entry.Index]).OrderByDescending(entry => entry.Miss - entry.Normal).Take(40).ToList();
         var ranked = top
-            .Concat(entries.Where(entry => _names[entry.Index].StartsWith("Render.Part", StringComparison.Ordinal) && !top.Contains(entry))) // [local] SHARPEMU_PARREC_PROBE
-            .Concat(entries.Where(entry => _isCount[entry.Index]));
+            .Concat(entries.Where(entry => (_names[entry.Index].StartsWith("Render.Part", StringComparison.Ordinal) || _shown[entry.Index]) && !top.Contains(entry))) // [local] SHARPEMU_PARREC_PROBE, SHARPEMU_COLDRES_PROBE
+            .Concat(entries.Where(entry => _isCount[entry.Index]))
+            .ToList();
         var builder = new StringBuilder(string.Create(CultureInfo.InvariantCulture,
             $"[FRAME_ATTR] miss_frames={MissFrames} normal_frames={NormalFrames} per_interval miss/before/normal:"));
         foreach (var entry in ranked)
             builder.Append(CultureInfo.InvariantCulture, $" {_names[entry.Index]}={entry.Miss:F2}/{entry.Before:F2}/{entry.Normal:F2}");
         yield return builder.ToString();
+        if (_gcCounters.Length == 0 || MissNoGcFrames == 0) yield break;
+        var noGc = new StringBuilder(string.Create(CultureInfo.InvariantCulture,
+            $"[FRAME_ATTR_NOGC] miss_frames={MissNoGcFrames} normal_frames={NormalNoGcFrames} per_interval miss/normal:"));
+        var normalNoGc = Math.Max(1, NormalNoGcFrames);
+        foreach (var entry in ranked)
+            noGc.Append(CultureInfo.InvariantCulture,
+                $" {_names[entry.Index]}={MissNoGcSum[entry.Index] / MissNoGcFrames:F2}/{NormalNoGcSum[entry.Index] / normalNoGc:F2}");
+        yield return noGc.ToString();
     }
 }

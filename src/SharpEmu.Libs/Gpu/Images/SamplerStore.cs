@@ -72,6 +72,8 @@ public sealed unsafe class SamplerStore : IDisposable
                 return existing;
             }
 
+            using var coldScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ColdSamplerCreate); // [local] SHARPEMU_COLDRES_PROBE
+            SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.SamplerCreates);
             var sampler = CreateSampler(words, integerView);
             _samplers[key] = sampler;
             return sampler;

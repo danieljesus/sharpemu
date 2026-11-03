@@ -602,6 +602,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 return cached;
             }
 
+            using var coldScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ColdPipelineMiss); // [local] SHARPEMU_COLDRES_PROBE
+            SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.PipelineCreates);
             var key = lookup.Clone();
             var description = new GraphicsPipelineDescription
             {
@@ -868,6 +870,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 RenderTrace.Write($"PipelineCache create compute program=0x{program.Id:X16} hash=0x{stage.Hash:X16}");
             }
 
+            using var coldScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ColdPipelineMiss); // [local] SHARPEMU_COLDRES_PROBE
+            SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.PipelineCreates);
             var created = _host.CreateComputePipeline(new ComputePipelineDescription { Input = input, Program = program, Stage = stage });
             _computePipelines[key] = created;
             ShaderCacheCounters.CountComputePipeline();
@@ -900,6 +904,8 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 return true;
             }
 
+            using var coldScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ColdPipelineMiss); // [local] SHARPEMU_COLDRES_PROBE
+            SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.PipelineCreates);
             if (!_host.TryCreateComputePipeline(
                     new ComputePipelineDescription { Input = input, Program = program, Stage = stage },
                     out var created))

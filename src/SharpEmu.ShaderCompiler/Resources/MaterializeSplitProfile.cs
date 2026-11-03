@@ -38,11 +38,17 @@ public static class MaterializeSplitProfile
         }
     }
 
-    public static long Start() => Enabled ? Stopwatch.GetTimestamp() : 0;
+    // [local] SHARPEMU_COLDRES_PROBE: told of every split with its ticks, on the materializing thread.
+    public static Action<Kind, long>? Hook;
+
+    public static long Start() => Enabled || Hook is not null ? Stopwatch.GetTimestamp() : 0;
 
     public static void Note(Kind kind, long started)
     {
         if (started == 0)
+            return;
+        Hook?.Invoke(kind, Stopwatch.GetTimestamp() - started);
+        if (!Enabled)
             return;
         var counters = Mine;
         Interlocked.Add(ref counters.Ticks[(int)kind], Stopwatch.GetTimestamp() - started);

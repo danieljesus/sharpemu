@@ -728,6 +728,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ResourceSlotIdentifier InsertImage(in ImageDescription description)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
+        SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.ImageInserts); // [local] SHARPEMU_COLDRES_PROBE
         var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description, _backingPool));
         if (!ImageDescription.IsEmptyRange(description.Data))
         {

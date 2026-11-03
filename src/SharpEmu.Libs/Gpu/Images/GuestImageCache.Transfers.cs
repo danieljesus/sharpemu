@@ -358,6 +358,8 @@ public sealed unsafe partial class GuestImageCache
             return;
         }
 
+        SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.ImageUploads); // [local] SHARPEMU_COLDRES_PROBE
+
         var measureUpload = RenderPhaseProfile.ImageUploadDetailsEnabled;
         var watchStarted = measureUpload ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         WatchImage(imageIdentifier);

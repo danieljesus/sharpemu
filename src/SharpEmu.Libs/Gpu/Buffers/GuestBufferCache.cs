@@ -4126,6 +4126,8 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     private ResourceSlotIdentifier CreateBuffer(ulong guestAddress, ulong size)
     {
+        using var coldScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ColdBufferCreate); // [local] SHARPEMU_COLDRES_PROBE
+        SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.BufferCreates);
         if (_scheduler.Current.IsInvalid)
         {
             throw SubmissionScheduler.Fatal("Buffer creation requires a command buffer that is recording.");

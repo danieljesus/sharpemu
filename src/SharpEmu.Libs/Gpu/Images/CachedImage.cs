@@ -608,6 +608,8 @@ public sealed unsafe partial class CachedImage : IDisposable
             }
         }
 
+        using var coldScope = SharpEmu.Libs.VideoOut.RenderPhaseProfile.MeasureDetail(SharpEmu.Libs.VideoOut.RenderPhaseProfile.Phase.ColdViewCreate); // [local] SHARPEMU_COLDRES_PROBE
+        SharpEmu.Libs.Diagnostics.FrameMissProbe.CountOnRender(SharpEmu.Libs.Diagnostics.FrameMissProbe.Counter.ViewCreates);
         var minLod = new ImageViewMinLodCreateInfoEXT
         {
             SType = StructureType.ImageViewMinLodCreateInfoExt,

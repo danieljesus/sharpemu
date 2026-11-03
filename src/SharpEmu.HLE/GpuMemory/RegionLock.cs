@@ -31,6 +31,12 @@ public sealed class RegionLock
 
     public static void MarkProbeThread() => t_probeThread = true;
 
+    // [local] SHARPEMU_COLDRES_PROBE: told of every contended wait, on the waiting thread.
+    public static Action<Category, long>? ContendedWaitHook;
+    [ThreadStatic] private static bool t_hookThread;
+
+    public static void MarkHookThread() => t_hookThread = true;
+
     private static void RecordProbeWait(Category category, long ticks)
     {
         var slot = (int)category * 2 + (t_probeThread ? 0 : 1);
@@ -74,7 +80,8 @@ public sealed class RegionLock
 
         if (Interlocked.CompareExchange(ref _held, 1, 0) != 0)
         {
-            var waitStarted = GpuMemoryAccessProfile.Enabled || WaitProbe ? Stopwatch.GetTimestamp() : 0;
+            var hook = ContendedWaitHook;
+            var waitStarted = GpuMemoryAccessProfile.Enabled || WaitProbe || hook is not null ? Stopwatch.GetTimestamp() : 0;
             do
             {
                 Thread.SpinWait(1);
@@ -84,6 +91,7 @@ public sealed class RegionLock
                 GpuMemoryAccessProfile.RecordLockWait(_category, Stopwatch.GetTimestamp() - waitStarted);
             if (WaitProbe)
                 RecordProbeWait(_category, Stopwatch.GetTimestamp() - waitStarted);
+            if (hook is not null && t_hookThread) hook(_category, Stopwatch.GetTimestamp() - waitStarted);
         }
 
         Volatile.Write(ref _owner, thread);
