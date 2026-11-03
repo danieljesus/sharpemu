@@ -264,14 +264,16 @@ public sealed class Gen5MeshShaderTests
     [InlineData(64u, 64u, 63u, "dpp8")]
     [InlineData(64u, 64u, 63u, "VPermlane16B32")]
     [InlineData(64u, 64u, 63u, "VPermlanex16B32")]
+    // [local] A wave64 compute without a 64-lane host subgroup runs emulated as two 32-lane subgroups: our DPP and
+    // PERMLANE16 targets stay in the lane's own subgroup (31), where upstream masks to 63, a shuffle index past it.
     [InlineData(32u, 0u, 31u, "dpp", ShaderStage.Compute)]
-    [InlineData(64u, 0u, 63u, "dpp", ShaderStage.Compute)]
+    [InlineData(64u, 0u, 31u, "dpp", ShaderStage.Compute)]
     [InlineData(32u, 0u, 31u, "dpp8", ShaderStage.Compute)]
     [InlineData(64u, 0u, 63u, "dpp8", ShaderStage.Compute)]
     [InlineData(32u, 0u, 31u, "VPermlane16B32", ShaderStage.Compute)]
-    [InlineData(64u, 0u, 63u, "VPermlane16B32", ShaderStage.Compute)]
+    [InlineData(64u, 0u, 31u, "VPermlane16B32", ShaderStage.Compute)]
     [InlineData(32u, 0u, 31u, "VPermlanex16B32", ShaderStage.Compute)]
-    [InlineData(64u, 0u, 63u, "VPermlanex16B32", ShaderStage.Compute)]
+    [InlineData(64u, 0u, 31u, "VPermlanex16B32", ShaderStage.Compute)]
     public void DppShufflePreservesTheNativeSubgroupLaneRange(uint waveSize, uint hostSubgroupSize,
         uint expectedMask, string operation, ShaderStage stage = ShaderStage.Mesh)
     {
