@@ -72,6 +72,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 VulkanCommandProfile.DescribePipeline = id => _pipelineEntries.TryGetValue(id, out var entry)
                     ? (entry.ProfileComputeHash != 0 ? $"cs=0x{entry.ProfileComputeHash:X16}" : $"vs=0x{entry.ProfileVertexHash:X16},ps=0x{entry.ProfilePixelHash:X16}")
                     : "unknown";
+            if (Diagnostics.FrameGpuProbe.SpansOnly && _gpuCommandProfile is { Dormant: true }) // [local] SHARPEMU_FRAME_MISS_GPU=2
+                _gpuCommandProfile.PerCommandMarkers = false;
             if (Diagnostics.FrameGpuProbe.Enabled) // [local] SHARPEMU_FRAME_MISS_GPU: programs by shader hash
                 Diagnostics.FrameGpuProbe.ProgramName = id => _pipelineEntries.TryGetValue(id, out var entry)
                     ? (entry.ProfileComputeHash != 0 ? $"cs:{entry.ProfileComputeHash:X16}" : $"ps:{entry.ProfilePixelHash:X16}")

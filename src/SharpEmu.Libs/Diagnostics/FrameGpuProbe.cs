@@ -19,10 +19,13 @@ namespace SharpEmu.Libs.Diagnostics;
 // interval (the time from the previous command's completion to this one's, so overlap goes to the later command), the
 // render thread's GPU waits (count, ms, ticks behind, the GPU busy and the programs it ran meanwhile) and the front's.
 // [FRAME_GPU] every 30 s (with [FRAME_HIST]) and [FRAME_GPU_MISS] per missed presentation after
-// SHARPEMU_FRAME_MISS_START_S.
+// SHARPEMU_FRAME_MISS_START_S. =2 times whole buffers only (no per-command timestamps, one ~Tail interval per buffer):
+// busy and idle with less of the probe's own cost, no program split (and SlowModeProbe's interval lines lose theirs).
 internal static class FrameGpuProbe
 {
-    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_FRAME_MISS_GPU") == "1";
+    private static readonly string? Mode = Environment.GetEnvironmentVariable("SHARPEMU_FRAME_MISS_GPU");
+    internal static readonly bool Enabled = Mode is "1" or "2";
+    internal static readonly bool SpansOnly = Mode == "2";
 
     // Pipeline id -> program name; set by the presenter, called on the recording thread.
     internal static Func<ulong, string>? ProgramName { get; set; }
