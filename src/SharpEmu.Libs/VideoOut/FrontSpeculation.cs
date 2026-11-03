@@ -23,6 +23,13 @@ namespace SharpEmu.Libs.VideoOut;
 // instead. Mismatches count as empty front preparations, so a program whose bytes change every time stops being
 // speculated (SHARPEMU_FRONT_SKIP_DEFERRING). =2 also prepares every kept dispatch again on the render thread, compares
 // the two (FrontPrepVerify fingerprints) and executes the render thread's result; [PERF][FRONT_SPEC] counts it all.
+// Measured in GTA V panning (2026-11-03, 446014d0 base): verify 0 mismatches in 475,429 checks (dfv2c); ~88 of ~145
+// render-thread compute preparations a frame kept (0xAACC 66, 0xF43B 8, 0x5981 8; 0x5515 differs every time), render
+// preparations 147 -> 50 (191 -> 63 on missed frames), Render.ProgramPreparation 3.56 -> 0.90 ms (6.04 -> 2.49), the
+// front +1.0 ms. But the replayed reads still wait for the GPU writers of those tables, and the render thread now gets
+// there sooner: ReadbackRender 1.36 -> 1.94 ms (2.87 -> 6.17 on missed frames), so Render.CommandStream only 33.8 ->
+// 32.2 ms and unchanged on missed frames (45.5). A/B 6+2 pairs: pan 29.74 vs 29.71 (noise), static 30.12 vs 30.10.
+// Left off.
 internal static class FrontSpeculation
 {
     private static readonly int DefaultMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SPECULATE"), out var mode) && mode is 1 or 2 ? mode : 0;
