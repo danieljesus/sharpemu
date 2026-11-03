@@ -120,9 +120,11 @@ public sealed class TickTimeline
         }
 
         var probeStart = WaitProbe ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
-        var timelineStart = Diagnostics.LabelTimeline.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        var timelineStart = Diagnostics.LabelTimeline.Enabled || Diagnostics.FrameGpuProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        var completedAtStart = CompletedTick; // [local] SHARPEMU_FRAME_MISS_GPU
         var waited = _device.TryWaitTimeline(tick, out var failure);
-        if (timelineStart != 0) Diagnostics.LabelTimeline.NoteWait(timelineStart, tick, 0, GpuWorkerRelay.OnAnyGpuQueueThread); // [local]
+        if (timelineStart != 0 && Diagnostics.FrameGpuProbe.Enabled) Diagnostics.FrameGpuProbe.NoteWait(tick, completedAtStart, timelineStart); // [local]
+        if (timelineStart != 0 && Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.NoteWait(timelineStart, tick, 0, GpuWorkerRelay.OnAnyGpuQueueThread); // [local]
         if (WaitProbe) RecordWait(tick, probeStart); // [local]
         if (!waited)
         {

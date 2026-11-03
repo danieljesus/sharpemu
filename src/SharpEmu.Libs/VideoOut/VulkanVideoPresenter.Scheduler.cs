@@ -65,13 +65,17 @@ internal static unsafe partial class VulkanVideoPresenter
         private void CreateScheduler()
         {
             var tickDevice = new VulkanTickDevice(_vk, _device, _queue, _queueFamilyIndex, _queueGate,
-                RenderPhaseProfile.Enabled || Gpu.Vulkan.SlowModeProbe.Enabled ? _physicalDevice : default, Gpu.Vulkan.CommandRing.Enabled,
+                RenderPhaseProfile.Enabled || Gpu.Vulkan.SlowModeProbe.Enabled || Diagnostics.FrameGpuProbe.Enabled ? _physicalDevice : default, Gpu.Vulkan.CommandRing.Enabled, // [local] SHARPEMU_FRAME_MISS_GPU
                 dormantProfile: !RenderPhaseProfile.Enabled); // [local]
             _gpuCommandProfile = tickDevice.CommandProfile;
             if (_gpuCommandProfile is { Dormant: true }) // [local] SlowModeProbe: interval lines name the shaders
                 VulkanCommandProfile.DescribePipeline = id => _pipelineEntries.TryGetValue(id, out var entry)
                     ? (entry.ProfileComputeHash != 0 ? $"cs=0x{entry.ProfileComputeHash:X16}" : $"vs=0x{entry.ProfileVertexHash:X16},ps=0x{entry.ProfilePixelHash:X16}")
                     : "unknown";
+            if (Diagnostics.FrameGpuProbe.Enabled) // [local] SHARPEMU_FRAME_MISS_GPU: programs by shader hash
+                Diagnostics.FrameGpuProbe.ProgramName = id => _pipelineEntries.TryGetValue(id, out var entry)
+                    ? (entry.ProfileComputeHash != 0 ? $"cs:{entry.ProfileComputeHash:X16}" : $"ps:{entry.ProfilePixelHash:X16}")
+                    : $"pipe{id}";
             _scheduler = new SubmissionScheduler(
                 tickDevice,
                 this,

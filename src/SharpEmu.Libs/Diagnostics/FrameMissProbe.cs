@@ -24,7 +24,7 @@ internal static class FrameMissProbe
 
     // =2 also times the render thread's coarse per-draw phases (two timestamps per scope, ~1300 draws a frame); =3 adds
     // their pieces (dispatch, program, binding and draw-preparation phases).
-    internal static readonly bool Enabled = Mode is "1" or "2" or "3";
+    internal static readonly bool Enabled = Mode is "1" or "2" or "3" || FrameGpuProbe.Enabled; // [local] SHARPEMU_FRAME_MISS_GPU rides it
     private static readonly bool Detail = Mode is "2" or "3";
     private static readonly bool Fine = Mode == "3";
 
@@ -268,7 +268,7 @@ internal static class FrameMissProbe
     }
 
     // Called under FlipLatencyProbe's gate, once per presented flip.
-    internal static void Presented(in FrameMissTracker.FlipTimes flip, long openedAt, long flipInterval)
+    internal static void Presented(in FrameMissTracker.FlipTimes flip, long openedAt, long flipInterval, ulong flipTick = 0)
     {
         if (Tracker is null) return;
         for (var index = 0; index < CounterCount; index++) Snapshot[index] = Volatile.Read(ref Cumulative[index]);
@@ -277,7 +277,8 @@ internal static class FrameMissProbe
         Snapshot[(int)Counter.Gen1] = GC.CollectionCount(1);
         Snapshot[(int)Counter.Gen2] = GC.CollectionCount(2);
         Snapshot[(int)Counter.AllocatedKB] = GC.GetTotalAllocatedBytes(false) >> 10;
-        Tracker.Presented(flip, openedAt, openedAt == 0 ? 0 : flipInterval, Snapshot);
+        var skipped = Tracker.Presented(flip, openedAt, openedAt == 0 ? 0 : flipInterval, Snapshot);
+        if (FrameGpuProbe.Enabled) FrameGpuProbe.Presented(flipTick, skipped); // [local] SHARPEMU_FRAME_MISS_GPU
     }
 }
 
@@ -383,7 +384,8 @@ internal sealed class FrameMissTracker
         return (slot, skipped);
     }
 
-    internal void Presented(in FlipTimes flip, long openedAt, long flipInterval, ReadOnlySpan<long> counters)
+    // Returns the slots this presentation skipped, or -1 when it is not counted (before the start).
+    internal int Presented(in FlipTimes flip, long openedAt, long flipInterval, ReadOnlySpan<long> counters)
     {
         var record = _ring[_ringCount++ % _ring.Length];
         if (record.Delta.Length != counters.Length) record.Delta = new long[counters.Length];
@@ -454,13 +456,15 @@ internal sealed class FrameMissTracker
 
         _previousFlip = flip;
         _hasPreviousFlip = true;
-        if (!counted) return;
+        if (!counted) return -1;
         if (_nextReport == 0) _nextReport = flip.Presented + (long)(_reportSeconds * _frequency);
         else if (flip.Presented >= _nextReport)
         {
             _nextReport = flip.Presented + (long)(_reportSeconds * _frequency);
             foreach (var line in Report(flip.Presented)) _sink(line);
         }
+
+        return record.Skipped;
     }
 
     private string FormatCounters(long[] delta)

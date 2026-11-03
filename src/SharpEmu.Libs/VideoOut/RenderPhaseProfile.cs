@@ -401,7 +401,12 @@ internal static class RenderPhaseProfile
         {
             if (!_active)
             {
-                if (_missStarted != 0) Diagnostics.FrameMissProbe.AddPhase(_phase, Stopwatch.GetTimestamp() - _missStarted); // [local]
+                if (_missStarted != 0)
+                {
+                    var missEnded = Stopwatch.GetTimestamp(); // [local]
+                    Diagnostics.FrameMissProbe.AddPhase(_phase, missEnded - _missStarted);
+                    if (Diagnostics.FrameGpuProbe.Enabled) Diagnostics.FrameGpuProbe.NoteRenderSpan(_phase, _missStarted, missEnded); // [local] SHARPEMU_FRAME_MISS_GPU
+                }
                 return;
             }
 

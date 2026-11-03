@@ -11,8 +11,8 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
     // [local] SHARPEMU_PROFILE_GPU_PASSES=1 (VulkanCommandProfile.Passes.cs): per-command markers, transfer markers and the
     // pass breakdown; 4096 queries per buffer so that long buffers do not fold their last draws into the tail.
     internal static readonly bool PassesEnabled = Environment.GetEnvironmentVariable("SHARPEMU_PROFILE_GPU_PASSES") == "1";
-    internal static readonly int QueryCapacity = PassesEnabled ? 4096 : 512;
-    private const int BufferCapacity = 64;
+    internal static readonly int QueryCapacity = PassesEnabled || Diagnostics.FrameGpuProbe.Enabled ? 4096 : 512; // [local] SHARPEMU_FRAME_MISS_GPU
+    private static readonly int BufferCapacity = Diagnostics.FrameGpuProbe.Enabled ? 512 : 64;
     private readonly Vk _vulkan;
     private readonly Device _device;
     private readonly float _timestampPeriod;
@@ -44,7 +44,7 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
 
     internal static void NoteSealed(nint buffer, ulong tick)
     {
-        if (RunEnabled)
+        if (RunEnabled || Diagnostics.FrameGpuProbe.Enabled) // [local] SHARPEMU_FRAME_MISS_GPU
             _sealedTicks[buffer] = tick;
     }
 
@@ -115,9 +115,10 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
         public Marker MaximumMarker;
     }
 
-    private sealed class BufferQueries(QueryPool pool)
+    private sealed class BufferQueries(QueryPool pool, nint handle = 0)
     {
         public readonly QueryPool Pool = pool;
+        public readonly nint Handle = handle; // [local] SHARPEMU_FRAME_MISS_GPU
         public readonly Marker[] Markers = new Marker[QueryCapacity];
         public int Count;
         public bool Submitted;
@@ -145,12 +146,15 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
 
     public void BeginBuffer(CommandBuffer command)
     {
-        if (!Supported || Dormant && !SlowModeProbe.Armed) // [local] SlowModeProbe
+        if (!Supported || Dormant && !SlowModeProbe.Armed && !Diagnostics.FrameGpuProbe.Enabled) // [local] SlowModeProbe, SHARPEMU_FRAME_MISS_GPU
             return;
         if (!_buffers.TryGetValue(command.Handle, out var queries))
         {
             if (_buffers.Count == BufferCapacity)
+            {
+                Diagnostics.FrameGpuProbe.NoteUnprofiled(); // [local]
                 return;
+            }
             var createInfo = new QueryPoolCreateInfo
             {
                 SType = StructureType.QueryPoolCreateInfo,
@@ -163,7 +167,7 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
                 _write($"[PERF][GPU_INTERVAL] query_pool_failed={result}");
                 return;
             }
-            queries = new BufferQueries(pool);
+            queries = new BufferQueries(pool, command.Handle);
             _buffers.Add(command.Handle, queries);
         }
 
@@ -179,7 +183,7 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
 
     public void WriteMarker(CommandBuffer command, IntervalKind kind, ulong pipeline = 0, uint first = 0, uint second = 0, uint third = 0)
     {
-        if (!PerCommandMarkers && kind != IntervalKind.Tail || Dormant && !SlowModeProbe.Armed) // [local] SlowModeProbe
+        if (!PerCommandMarkers && kind != IntervalKind.Tail || Dormant && !SlowModeProbe.Armed && !Diagnostics.FrameGpuProbe.Enabled) // [local] SlowModeProbe, SHARPEMU_FRAME_MISS_GPU
         {
             return;
         }
@@ -243,6 +247,8 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
         }
 
         var last = queries.Count - 1;
+        if (Diagnostics.FrameGpuProbe.Enabled && last > 0 && values[1] != 0) // [local] SHARPEMU_FRAME_MISS_GPU
+            NoteFrameGpu(queries, values);
         if (last > 0 && values[1] != 0 && values[last * 2 + 1] != 0)
         {
             _spans.Add((values[0], values[last * 2]));
@@ -278,6 +284,31 @@ internal sealed unsafe partial class VulkanCommandProfile : IDisposable
         }
         if (Stopwatch.GetElapsedTime(_reportStart).TotalSeconds >= 5)
             Report();
+    }
+
+    // [local] SHARPEMU_FRAME_MISS_GPU: the buffer's first timestamp and its completion intervals, by program, to the tick
+    // it was sealed with. An unavailable timestamp ends the list (the rest of the buffer folds into nothing).
+    private (int Program, double Ms)[]? _frameIntervals;
+    private readonly Dictionary<IntervalKey, int> _framePrograms = new();
+
+    private void NoteFrameGpu(BufferQueries queries, ulong[] values)
+    {
+        if (!_sealedTicks.TryRemove(queries.Handle, out var tick))
+            return;
+        var intervals = _frameIntervals ??= new (int, double)[QueryCapacity];
+        var count = 0;
+        for (var index = 1; index < queries.Count; index++)
+        {
+            if (values[index * 2 + 1] == 0)
+                break;
+            var key = queries.Markers[index].Key;
+            if (!_framePrograms.TryGetValue(key, out var program))
+                _framePrograms.Add(key, program = Diagnostics.FrameGpuProbe.ProgramOf(key.Pipeline, key.Kind.ToString()));
+            var ms = ElapsedTicks(values[(index - 1) * 2], values[index * 2], _timestampBits) * (double)_timestampPeriod / 1_000_000;
+            intervals[count++] = (program, ms);
+        }
+
+        Diagnostics.FrameGpuProbe.NoteBuffer(tick, (long)(values[0] * (double)_timestampPeriod), intervals.AsSpan(0, count));
     }
 
     internal static (ulong Busy, ulong Longest) MergeSpans(List<(ulong Start, ulong End)> spans)

@@ -252,6 +252,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         }
 
         var missStarted = Diagnostics.FrameMissProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        var gpuCompleted = Diagnostics.FrameGpuProbe.Enabled ? _scheduler.Timeline.CompletedTick : 0; // [local] SHARPEMU_FRAME_MISS_GPU
         try
         {
             var vk = _device.Vk;
@@ -325,6 +326,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             Scheduling.GpuStarveProbe.ExitGpuWait(starveEntered);
             if (guestWait) Scheduling.RunaheadBound.ExitGuestWait();
             if (missStarted != 0) Diagnostics.FrameMissProbe.AddReadbackWait(System.Diagnostics.Stopwatch.GetTimestamp() - missStarted); // [local]
+            if (missStarted != 0 && Diagnostics.FrameGpuProbe.Enabled) Diagnostics.FrameGpuProbe.NoteWait(ticket.WaitTick, gpuCompleted, missStarted); // [local]
             if (originStarted != 0)
                 Diagnostics.ReadbackOriginProbe.NoteWait(ticket.Origin, ticket.WaitTick, originCompleted, originSubmitted, originCurrent,
                     System.Diagnostics.Stopwatch.GetTimestamp() - originStarted);

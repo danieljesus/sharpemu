@@ -131,7 +131,7 @@ internal static class FlipLatencyProbe
                     FlipCompleted = flip.T6,
                     Presented = flip.T7,
                 };
-                FrameMissProbe.Presented(times, openedAt, flipInterval);
+                FrameMissProbe.Presented(times, openedAt, flipInterval, flip.Tick);
             }
 
             Report(flip.T7);
@@ -143,6 +143,7 @@ internal static class FlipLatencyProbe
         var slot = (int)(tick & (TickRing - 1));
         SubmittedAt[slot] = Stopwatch.GetTimestamp();
         Volatile.Write(ref SubmittedTick[slot], tick);
+        if (FrameGpuProbe.Enabled) FrameGpuProbe.NoteSubmitted(tick); // [local] SHARPEMU_FRAME_MISS_GPU
     }
 
     public static void NoteCompleted(ulong counter)

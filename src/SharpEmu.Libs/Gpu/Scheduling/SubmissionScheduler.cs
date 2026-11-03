@@ -593,6 +593,12 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             lock (_device.QueueGate)
             {
                 tick = _timeline.ReserveTick();
+                if (Diagnostics.FrameGpuProbe.Enabled) // [local] SHARPEMU_FRAME_MISS_GPU: the inline path seals at submit
+                {
+                    Vulkan.VulkanCommandProfile.NoteSealed(buffer, tick);
+                    Diagnostics.FrameGpuProbe.NoteSealed(tick);
+                }
+
                 submit.AddSignal(_timeline.Handle, tick);
                 submitted = _device.TrySubmit(buffer, submit, out failure);
             }
@@ -638,6 +644,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             var tick = _timeline.ReserveTick();
             if (VideoOut.LabelTrace.Enabled) VideoOut.LabelTrace.Note(VideoOut.LabelTrace.Kind.Seal, -1, 0, tick); // [local]
             Vulkan.VulkanCommandProfile.NoteSealed(buffer, tick); // [local] SHARPEMU_PROFILE_GPU_RUN
+            if (Diagnostics.FrameGpuProbe.Enabled) Diagnostics.FrameGpuProbe.NoteSealed(tick); // [local] SHARPEMU_FRAME_MISS_GPU
             if (Buffers.CpWriteDeferProbe.Enabled) Buffers.CpWriteDeferProbe.OnOtherOp(); // [local] a seal ends the scope
             submit.AddSignal(_timeline.Handle, tick);
             item = new SealedSubmit(buffer, submit, tick, target, new SubmissionTraceEntry(tick, _command.DebugOp,
