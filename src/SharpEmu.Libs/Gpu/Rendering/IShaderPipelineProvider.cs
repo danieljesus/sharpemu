@@ -49,6 +49,10 @@ public sealed class ComputeProgram
 
     // True when the provider ran the kernel itself; the executor records nothing.
     public bool Consumed { get; init; }
+
+    // [local] SHARPEMU_FRONT_SPECULATE: set on a front preparation made from speculated reads. The executor calls it where
+    // it would prepare the dispatch itself; it returns the program to use, or null to prepare there as usual.
+    internal Func<ComputeProgram?>? Accept { get; set; }
 }
 
 // The shader and pipeline caches behind the executor.

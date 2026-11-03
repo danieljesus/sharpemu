@@ -521,7 +521,9 @@ internal static unsafe partial class VulkanVideoPresenter
             if (SkipFrontPreparation(key))
                 return null;
             var result = TryPrepareComputeOnFront(prepare);
-            NoteFrontPreparation(key, result is null);
+            // [local] SHARPEMU_FRONT_SPECULATE: a speculated one counts when the render thread has replayed its reads.
+            if (result is null || !FrontSpeculation.Pending)
+                NoteFrontPreparation(key, result is null);
             return result;
         }
 
@@ -559,6 +561,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             _preparingOnFront = true;
             if (!_onPrepWorker) FrontPrepReads.Begin(); // [local] SHARPEMU_FRONT_PREP_RANGES
+            if (!_onPrepWorker && FrontSpeculation.Enabled) FrontSpeculation.Begin(); // [local] SHARPEMU_FRONT_SPECULATE
             var started = FrontProfile.LoopEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             try
             {
@@ -577,10 +580,130 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             finally
             {
+                if (FrontSpeculation.Active) FrontSpeculation.End(); // [local] SHARPEMU_FRONT_SPECULATE
                 _preparingOnFront = false;
                 FrontPrepReads.Release(_lastPrepPages); // [local] SHARPEMU_FRONT_PREP_RANGES: a previous one nobody took
                 _lastPrepPages = FrontPrepReads.End();
             }
+        }
+
+        // [local] SHARPEMU_FRONT_SPECULATE: where RunBackRead would defer the front's preparation, it reads on instead.
+        private bool Speculating => FrontSpeculation.Active && !_onPrepWorker && DeferFrontPreparation && _preparingOnFront &&
+            !(_backReadForPendingWrite && PendingWriteOverlay.Mode == 2);
+
+        private bool SpeculateWord(FrontSpeculation.Kind kind, ulong address, out uint word)
+        {
+            Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            var ok = SpeculateBytes(kind, address, bytes);
+            word = ok ? System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes) : 0;
+            return ok;
+        }
+
+        // Guest memory as it is now, with the stream writes the front queued ahead of it, noted for the replay.
+        private bool SpeculateBytes(FrontSpeculation.Kind kind, ulong address, Span<byte> destination)
+        {
+            var size = (ulong)destination.Length;
+            var ok = size != 0 && _guestMemory.CanRead(address, size) && _guestMemory.TryRead(address, destination);
+            if (!ok)
+                destination.Clear();
+            else if (!FrontOverlay.IsEmpty)
+                FrontOverlay.Apply(address, destination);
+            FrontSpeculation.Note(kind, address, destination, ok, Gpu.Buffers.ConservativeRecords.CurrentReader,
+                SharpEmu.ShaderCompiler.Resources.SrtReadProbe.CurrentBaseAddress);
+            return ok;
+        }
+
+        private sealed class SpeculationReplay(Presenter presenter) : FrontSpeculation.IReplay
+        {
+            public bool ReadWord(ulong address, out uint word) => presenter.TryReadGuestWord(address, out word);
+
+            public bool ReadCleanWord(ulong address, out uint word) => presenter.TryReadCleanGuestWord(address, out word);
+
+            public bool ReadResident(ulong address, Span<byte> destination, bool clean) => presenter.TryReadResidentGuestBytes(address, destination, clean);
+
+            public (ulong Reader, ulong BaseAddress) Enter(ulong reader, ulong baseAddress)
+            {
+                var previousReader = Gpu.Buffers.ConservativeRecords.CurrentReader;
+                Gpu.Buffers.ConservativeRecords.CurrentReader = reader;
+                return (previousReader, SharpEmu.ShaderCompiler.Resources.SrtReadProbe.ExchangeBaseAddress(baseAddress));
+            }
+
+            public void Leave((ulong Reader, ulong BaseAddress) previous)
+            {
+                Gpu.Buffers.ConservativeRecords.CurrentReader = previous.Reader;
+                SharpEmu.ShaderCompiler.Resources.SrtReadProbe.ExchangeBaseAddress(previous.BaseAddress);
+            }
+        }
+
+        private SpeculationReplay? _speculationReplay;
+
+        // [local] SHARPEMU_FRONT_SPECULATE: arms a front preparation made from speculated reads; the executor replays
+        // them on the render thread where it would prepare the dispatch (FrontSpeculation). Takes `reads`.
+        internal ComputeProgram? ArmSpeculation(ulong key, ComputeProgram? prepared, FrontSpeculation.Reads? reads, Func<ComputeProgram?> prepare)
+        {
+            if (reads is null)
+                return prepared;
+            if (prepared is null || !prepared.Available || prepared.Consumed)
+            {
+                // An unavailable program may come from stale bytes: the render thread decides again. A consumed one
+                // ran already (its kernel is chosen from the registers alone).
+                FrontSpeculation.Release(reads);
+                return prepared is { Consumed: true } ? prepared : null;
+            }
+
+            Interlocked.Increment(ref FrontSpeculation.SpeculatedPreps);
+            prepared.Accept = () =>
+            {
+                prepared.Accept = null;
+                var started = System.Diagnostics.Stopwatch.GetTimestamp();
+                FrontSpeculation.Outcome outcome;
+                try
+                {
+                    outcome = FrontSpeculation.Validate(reads, _speculationReplay ??= new SpeculationReplay(this));
+                }
+                finally
+                {
+                    Interlocked.Add(ref FrontSpeculation.ValidateTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                }
+
+                var count = reads.Items.Count;
+                FrontSpeculation.Release(reads);
+                NoteFrontPreparation(key, empty: outcome != FrontSpeculation.Outcome.Same);
+                if (outcome != FrontSpeculation.Outcome.Same)
+                {
+                    if (outcome == FrontSpeculation.Outcome.Value) Interlocked.Increment(ref FrontSpeculation.ValueMismatches);
+                    else Interlocked.Increment(ref FrontSpeculation.SuccessMismatches);
+                    return null;
+                }
+
+                Interlocked.Increment(ref FrontSpeculation.Kept);
+                if (!FrontSpeculation.Verify)
+                    return prepared;
+                var renderProgram = prepare();
+                if (renderProgram is null)
+                {
+                    Interlocked.Increment(ref FrontSpeculation.VerifyRenderEmpty);
+                    return null;
+                }
+
+                Span<ulong> aheadParts = stackalloc ulong[FrontPrepVerify.Parts];
+                Span<ulong> renderParts = stackalloc ulong[FrontPrepVerify.Parts];
+                FrontPrepVerify.Fingerprint(prepared, aheadParts);
+                FrontPrepVerify.Fingerprint(renderProgram, renderParts);
+                Interlocked.Increment(ref FrontSpeculation.VerifyChecked);
+                if (!aheadParts.SequenceEqual(renderParts))
+                {
+                    var mismatches = Interlocked.Increment(ref FrontSpeculation.VerifyMismatched);
+                    if (mismatches <= 40)
+                    {
+                        Console.Error.WriteLine($"[FRONT_SPEC_MISMATCH] hash=0x{prepared.Input.Stage.Program?.Hash ?? 0:X16} reads={count}");
+                        FrontPrepVerify.DumpStageDifference("speculated-dispatch", prepared.Input.Stage.Program?.Hash ?? 0, prepared.Input.Stage, renderProgram.Input.Stage);
+                    }
+                }
+
+                return renderProgram;
+            };
+            return prepared;
         }
 
         private T RunBackRead<T>(Func<T> read)
@@ -735,6 +858,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (NeedsBackRead(address, sizeof(uint)))
                 {
+                    if (Speculating) // [local] SHARPEMU_FRONT_SPECULATE
+                        return SpeculateWord(FrontSpeculation.Kind.Word, address, out word);
                     var (ok, value) = BackReadWord(address);
                     word = value;
                     if (conservativeVerify && ok) Gpu.Buffers.ConservativeRecords.Verify(word); // [local]
@@ -984,6 +1109,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (NeedsBackRead(address, sizeof(uint)))
                 {
+                    if (Speculating) // [local] SHARPEMU_FRONT_SPECULATE
+                        return SpeculateWord(FrontSpeculation.Kind.CleanWord, address, out word);
                     var (ok, value) = BackReadWord(address); // the front always answered clean reads; now with the synced value
                     word = value;
                     return ok;
@@ -1033,6 +1160,8 @@ internal static unsafe partial class VulkanVideoPresenter
             using var frontProfile = FrontProfile.Measure(FrontProfile.Phase.ResidentRead);
             if (OnFrontThread && NeedsBackRead(address, size))
             {
+                if (Speculating) // [local] SHARPEMU_FRONT_SPECULATE
+                    return SpeculateBytes(clean ? FrontSpeculation.Kind.ResidentClean : FrontSpeculation.Kind.Resident, address, destination);
                 return BackReadResidentBytes(address, destination);
             }
 

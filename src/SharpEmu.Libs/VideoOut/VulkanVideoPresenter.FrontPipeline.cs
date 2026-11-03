@@ -761,10 +761,13 @@ internal static unsafe partial class VulkanVideoPresenter
             Func<ComputeProgram?> prepareOnFront = () => presenter.Translation.PrepareComputeProgram(snapshot, groupsX, groupsY, groupsZ, dispatchInitiator);
             var timelineQueue = Diagnostics.LabelTimeline.FrontQueue; // [local] SHARPEMU_LABEL_TIMELINE
             var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
-            var prepared = indirectArgumentsAddress == 0
+            // [local] SHARPEMU_FRONT_SPECULATE: the indirect ones too, with the counts the render thread prepares them with.
+            var frontPrepares = indirectArgumentsAddress == 0 || FrontSpeculation.Enabled;
+            var prepared = frontPrepares
                 ? presenter.TryPrepareComputeOnFront(snapshot.Shader.Compute.Address, prepareOnFront)
                 : null;
-            var prepPages = indirectArgumentsAddress == 0 ? Presenter.TakePrepPages() : null; // [local] SHARPEMU_FRONT_PREP_RANGES
+            var prepPages = frontPrepares ? Presenter.TakePrepPages() : null; // [local] SHARPEMU_FRONT_PREP_RANGES
+            var speculated = frontPrepares ? FrontSpeculation.Take() : null; // [local]
             tableMark = Presenter.EndTableMark(tableMark);
             computeScope.Dispose();
             queue.Enqueue(() =>
@@ -778,6 +781,12 @@ internal static unsafe partial class VulkanVideoPresenter
                         prepared = null;
                     if (prepared is not null && (FrontPrepVerify.Enabled || rangesVerify)) // [local] SHARPEMU_FRONT_PREP_VERIFY
                         prepared = Presenter.VerifyCompute(prepared, prepareOnFront, rangesVerify);
+                    if (speculated is not null) // [local] SHARPEMU_FRONT_SPECULATE
+                    {
+                        if (prepared is null) Interlocked.Increment(ref FrontSpeculation.Invalidated);
+                        prepared = presenter.ArmSpeculation(snapshot.Shader.Compute.Address, prepared, speculated, prepareOnFront);
+                        speculated = null;
+                    }
                     Diagnostics.LabelTimeline.RenderQueue = timelineQueue; // [local]
                     presenter.ExecuteQueuedDispatch(submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, prepared);
                     Diagnostics.LabelTimeline.RenderQueue = -1; // [local]
@@ -969,7 +978,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var frontLines = string.Join("\n", FrontProfile.TakeReport(RenderPhaseProfile.LastReportFrames));
             var wake = _commandStream.TakeWakeReport(); // [local] SHARPEMU_FRONT_WAKE / wake-latency probe
             return (frontLines.Length != 0 ? frontLines + "\n" : string.Empty) + FormattableString.Invariant(
-                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth} deferred_preps={Interlocked.Exchange(ref DeferredPreparations, 0)} skipped_preps={Interlocked.Exchange(ref SkippedPreparations, 0)} discarded_preps={Interlocked.Exchange(ref DiscardedFrontPreparations, 0)}{FrontPrepReads.TakeReport()} front_stale_reads={Interlocked.Exchange(ref FrontStaleReads, 0)} front_stale_pages={Interlocked.Exchange(ref FrontStalePages, 0)} indirect_direct={Interlocked.Exchange(ref IndirectDirect, 0)} indirect_deferred={Interlocked.Exchange(ref IndirectDeferred, 0)} write_wakes={wake.Wakes} write_notices={wake.Notices} wake_race_retries={wake.RaceRetries} wake_lat_n={wake.Count} wake_lat_first_ms={wake.FirstMs:F3} wake_lat_last_ms={wake.LastMs:F3}");
+                $"[PERF][FRONT] overlay_bytes={FrontOverlay.Count} overlay_patched_reads={Interlocked.Exchange(ref PendingWriteOverlay.ChangedReads, 0)} busy_ms={busy * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} work_ms={work * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} cpu_ms={cpu / 10000.0:F1} wait_full_ms={wait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} wait_sync_ms={syncWait * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} slices={slices} max_queue_depth={depth} deferred_preps={Interlocked.Exchange(ref DeferredPreparations, 0)} skipped_preps={Interlocked.Exchange(ref SkippedPreparations, 0)} discarded_preps={Interlocked.Exchange(ref DiscardedFrontPreparations, 0)}{FrontPrepReads.TakeReport()} front_stale_reads={Interlocked.Exchange(ref FrontStaleReads, 0)} front_stale_pages={Interlocked.Exchange(ref FrontStalePages, 0)} indirect_direct={Interlocked.Exchange(ref IndirectDirect, 0)} indirect_deferred={Interlocked.Exchange(ref IndirectDeferred, 0)} write_wakes={wake.Wakes} write_notices={wake.Notices} wake_race_retries={wake.RaceRetries} wake_lat_n={wake.Count} wake_lat_first_ms={wake.FirstMs:F3} wake_lat_last_ms={wake.LastMs:F3}{FrontSpeculation.TakeReport()}");
         }
 
         internal ICpuMemory GuestMemory => _guestMemory;

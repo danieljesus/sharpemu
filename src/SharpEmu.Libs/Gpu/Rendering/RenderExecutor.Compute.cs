@@ -88,7 +88,8 @@ public sealed partial class RenderExecutor
 
         ComputeProgram computeProgram;
         using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchProgram)) // [local]
-            computeProgram = preparedProgram ?? _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+            computeProgram = (preparedProgram is { Accept: { } accept } ? accept() : preparedProgram) // [local] SHARPEMU_FRONT_SPECULATE
+                ?? _pipelines.GetComputeProgram(compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
         if (gpuThreadIndirect && computeProgram.Available && !computeProgram.Consumed &&
             !CanDispatchThreadsOnGpu(computeProgram.Input))
         {

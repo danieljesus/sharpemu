@@ -127,6 +127,12 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     // Report the fatal error, then return an exception to stop the caller.
     internal static Exception Fatal(string message)
     {
+        if (VideoOut.FrontSpeculation.AbandonsFatal) // [local] SHARPEMU_FRONT_SPECULATE: stale bytes, not a broken stream
+        {
+            Interlocked.Increment(ref VideoOut.FrontSpeculation.Abandoned);
+            throw new VideoOut.FrontSpeculation.AbandonException(message);
+        }
+
         Console.Error.WriteLine($"[GPU][FATAL] {message}");
         OnFatal(message);
         return new InvalidOperationException(message);

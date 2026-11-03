@@ -26,6 +26,9 @@ public static class SrtReadProbe
 
     public static int CurrentBaseRegister => RuntimeValueEvaluator.CurrentReadBase;
 
+    // [local] SHARPEMU_FRONT_SPECULATE: a replayed read runs under the base address it was made under.
+    public static ulong ExchangeBaseAddress(ulong baseAddress) => RuntimeValueEvaluator.ExchangeReadBaseAddress(baseAddress);
+
     public static string Describe()
     {
         var plan = CurrentPlan;
