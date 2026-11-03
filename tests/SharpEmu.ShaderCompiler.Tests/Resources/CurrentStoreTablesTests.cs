@@ -295,4 +295,123 @@ public sealed class CurrentStoreTablesTests
             DeviceStoreTablePlanner.DiffMode = previous;
         }
     }
+
+    // [local] SHARPEMU_STORE_TABLE_COMPARE: the resident reader's copies and the in-place compares of one memory; words
+    // listed in Owned are refused by both, as GPU-owned bytes are.
+    private sealed class ComparedMemory
+    {
+        public readonly Memory Backing = new();
+        public readonly HashSet<ulong> Owned = new();
+        public int Copies, Compares;
+
+        private bool Refused(ulong address, int length) => Owned.Any(owned => owned >= address && owned < address + (ulong)length);
+
+        public bool ReadResident(ulong address, Span<byte> destination, bool clean)
+        {
+            if (Refused(address, destination.Length))
+                return false;
+            Copies++;
+            return Backing.ReadResident(address, destination, clean);
+        }
+
+        public bool Compare(ulong address, ReadOnlySpan<byte> expected, bool clean, out bool equal)
+        {
+            equal = false;
+            if (Refused(address, expected.Length))
+                return false;
+            Compares++;
+            var bytes = new byte[expected.Length];
+            if (!Backing.ReadResident(address, bytes, clean))
+                return false;
+            equal = expected.SequenceEqual(bytes);
+            return true;
+        }
+
+        public bool Read(ulong address, out uint word) => Backing.Read(address, out word);
+    }
+
+    private const int CompareEntries = 3 * 4096; // three chunks of the bulk read
+
+    private static (ComparedMemory Memory, ResourceRuntimeInputs Inputs) ComparedTable(ulong table, bool comparer)
+    {
+        var memory = new ComparedMemory();
+        for (var entry = 0; entry < CompareEntries; entry++)
+            memory.Backing.SetEntry(table + (ulong)entry * 16, 0, 0);
+        memory.Backing.SetEntry(table, 0x10000, 0x100);
+        memory.Backing.SetEntry(table + 5000 * 16, 0x20000, 0x40);
+        var inputs = new ResourceRuntimeInputs
+        {
+            UserData = [unchecked((uint)table), (uint)(table >> 32), CompareEntries * 16, 0],
+            ReadMemory = memory.Read,
+            ReadCleanMemory = memory.Read,
+            ReadResidentMemory = memory.ReadResident,
+            CompareResidentMemory = comparer ? memory.Compare : null,
+        };
+        return (memory, inputs);
+    }
+
+    private static List<DeviceAddressRange> Rescan(ShaderResourcePlan plan, ulong table, ResourceRuntimeInputs inputs)
+    {
+        DeviceStoreTablePlanner.InvalidateTables(table + 16, 8, DeviceStoreTablePlanner.InvalidationSource.CpuFault);
+        var ranges = new List<DeviceAddressRange>();
+        DeviceStoreTablePlanner.Evaluate(plan, inputs, ranges);
+        return ranges;
+    }
+
+    private static IEnumerable<DeviceAddressRange> Unhandled(List<DeviceAddressRange> ranges) => ranges.Select(range => range with { Handle = 0 });
+
+    [Fact]
+    public void ARescanComparedInPlaceCopiesNoChunkOfAnUnchangedTable()
+    {
+        if (DeviceStoreTablePlanner.DiffMode != 1)
+            return;
+        const ulong table = 0x7E6000000;
+        var plan = Plan();
+        DeviceStoreTablePlanner.CompareMode = 1;
+        var (memory, inputs) = ComparedTable(table, comparer: true);
+        var first = new List<DeviceAddressRange>();
+        DeviceStoreTablePlanner.Evaluate(plan, inputs, first);
+        Assert.True(DeviceStoreTablePlanner.TryGetCached(table, CompareEntries * 16, out var scan));
+        var copies = memory.Copies;
+
+        var again = Rescan(plan, table, inputs);
+
+        Assert.True(DeviceStoreTablePlanner.TryGetCached(table, CompareEntries * 16, out var rescanned));
+        Assert.Same(scan, rescanned);
+        Assert.Equal(copies, memory.Copies);
+        Assert.Equal(3, memory.Compares);
+        Assert.Equal(Unhandled(first), Unhandled(again));
+    }
+
+    [Fact]
+    public void ARescanComparedInPlaceDecodesWhatTheCopyingRescanDecodes()
+    {
+        if (DeviceStoreTablePlanner.DiffMode != 1)
+            return;
+        var plan = Plan();
+        foreach (var (changed, owned) in new[] { (false, false), (true, false), (true, true), (false, true) })
+        {
+            var results = new List<List<DeviceAddressRange>>();
+            foreach (var (mode, comparer) in new[] { (0, false), (1, true), (2, true) })
+            {
+                DeviceStoreTablePlanner.CompareMode = mode;
+                var table = 0x7E7000000UL + (ulong)results.Count * 0x100000 + (changed ? 0x1000000UL : 0) + (owned ? 0x2000000UL : 0);
+                var (memory, inputs) = ComparedTable(table, comparer);
+                DeviceStoreTablePlanner.Evaluate(plan, inputs, []);
+                if (changed)
+                    memory.Backing.SetEntry(table + 9000 * 16, 0x900000, 0x80);
+                if (owned)
+                    memory.Owned.Add(table + 4100 * 16); // the second chunk is GPU-owned: refused by both readers
+                results.Add(Rescan(plan, table, inputs));
+                if (comparer && !owned)
+                    Assert.True(memory.Compares > 0);
+            }
+
+            Assert.Equal(Unhandled(results[0]), Unhandled(results[1]));
+            Assert.Equal(Unhandled(results[0]), Unhandled(results[2]));
+            Assert.Equal(changed, results[0].Exists(range => range.Base == 0x900000 && range.Size == 0x80));
+        }
+
+        Assert.Equal(0, DeviceStoreTablePlanner.CompareCounts.Mismatches);
+    }
 }

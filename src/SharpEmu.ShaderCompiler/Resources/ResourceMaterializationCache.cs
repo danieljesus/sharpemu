@@ -410,6 +410,8 @@ public sealed class ResourceMaterializationCache
                 ReadCleanMemory = recorder.Wrap(inputs.ReadCleanMemory, clean: true),
                 ReadResidentMemory = recorder.WrapResident(inputs.ReadResidentMemory),
                 SynchronizeTableRange = inputs.SynchronizeTableRange, // [local] SHARPEMU_STORE_TABLE_SYNC
+                // [local] SHARPEMU_STORE_TABLE_COMPARE: only when the walk's table scans bypass the recorder (GATE_TABLES=3).
+                CompareResidentMemory = stamps && current ? inputs.CompareResidentMemory : null,
                 ReadsClean = inputs.ReadsClean,
                 ComputeState = inputs.ComputeState,
                 TablePhase = recorder.TablePhase,

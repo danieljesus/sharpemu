@@ -47,6 +47,83 @@ public static class DeviceStoreTablePlanner
     // counts the differences.
     internal static int DiffMode = int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_DIFF"), out var diffMode) ? diffMode : 1;
 
+    // [local] SHARPEMU_STORE_TABLE_COMPARE (=0 off, the default, =1 on, =2 verify; with SHARPEMU_STORE_TABLE_DIFF=1): the
+    // rescan of a dropped table compares each chunk with the last scan's bytes where the resident reader would read
+    // them (the in-place comparer: same ownership checks, same backing bytes) instead of copying the chunk out first
+    // and comparing the copy. A chunk the comparer finds equal is the chunk the copy would have found equal; a chunk it
+    // finds different, or cannot compare (GPU-owned, the front thread, several backing views), takes the copy path as
+    // before, so the bytes the decode sees and the synchronizations are the same. GTA: a 2 MB table the CPU rewrites
+    // with identical bytes every frame, 0.3-1 ms of copies per presentation interval on the render thread. =2 also
+    // copies every chunk found equal and counts the copies that differ (a second compare that agrees with the copy
+    // means a write raced the two reads).
+    public static readonly int CompareModeConfigured =
+        int.TryParse(System.Environment.GetEnvironmentVariable("SHARPEMU_STORE_TABLE_COMPARE"), out var compareMode) ? compareMode : 0;
+
+    private static readonly AsyncLocal<int?> CompareModeOverride = new();
+
+    internal static int CompareMode
+    {
+        get => CompareModeOverride.Value ?? CompareModeConfigured;
+        set => CompareModeOverride.Value = value;
+    }
+
+    private static long _compareEqual, _compareDiffer, _compareRefused, _compareChecked, _compareMismatches, _compareRaces;
+    private static int _compareMismatchLogs;
+
+    internal static (long Equal, long Differ, long Refused, long Checked, long Mismatches, long Races) CompareCounts =>
+        (Interlocked.Read(ref _compareEqual), Interlocked.Read(ref _compareDiffer), Interlocked.Read(ref _compareRefused),
+            Interlocked.Read(ref _compareChecked), Interlocked.Read(ref _compareMismatches), Interlocked.Read(ref _compareRaces));
+
+    // [local] SHARPEMU_STORE_TABLE_COMPARE: true when the chunk was compared in place and equals the previous scan's bytes.
+    private static bool ChunkEqualInPlace(ResidentGuestBytesComparer? compare, ResourceRuntimeInputs inputs, ResidentGuestBytesReader bulk,
+        GuestWordReader read, ulong address, ReadOnlySpan<byte> previous, Span<byte> probe)
+    {
+        var mode = CompareMode;
+        if (mode == 0 || compare is null)
+            return false;
+        if (!compare(address, previous, false, out var equal))
+        {
+            Interlocked.Increment(ref _compareRefused);
+            return false;
+        }
+
+        if (!equal)
+        {
+            Interlocked.Increment(ref _compareDiffer);
+            return false;
+        }
+
+        Interlocked.Increment(ref _compareEqual);
+        if (mode != 2)
+            return true;
+        var checkedCount = Interlocked.Increment(ref _compareChecked);
+        if ((checkedCount & 0x3FF) == 0)
+        {
+            var counts = CompareCounts;
+            System.Console.Error.WriteLine($"[STORE_TABLE_COMPARE] equal={counts.Equal} differ={counts.Differ} refused={counts.Refused} checked={counts.Checked} mismatches={counts.Mismatches} races={counts.Races}");
+        }
+
+        // The copy decides, as without the compare.
+        if (!ReadTableChunk(inputs, bulk, read, address, probe))
+        {
+            Interlocked.Increment(ref _compareMismatches);
+            return false;
+        }
+
+        if (probe.SequenceEqual(previous))
+            return true;
+        if (compare(address, probe, false, out var again) && again)
+            Interlocked.Increment(ref _compareRaces);
+        else
+        {
+            Interlocked.Increment(ref _compareMismatches);
+            if (Interlocked.Increment(ref _compareMismatchLogs) <= 20)
+                System.Console.Error.WriteLine($"[STORE_TABLE_COMPARE_MISMATCH] chunk=0x{address:X} bytes=0x{previous.Length:X}");
+        }
+
+        return false;
+    }
+
     // [local] SHARPEMU_STORE_TABLE_SYNC (=1 on, the default, =0 off, =2 verify): a chunk the resident reader refuses
     // because the GPU may own some of its bytes is synchronized whole and read again through the resident reader,
     // instead of word by word. The word reader synchronizes each GPU-dirty word before reading the backing, one
@@ -586,6 +663,9 @@ public static class DeviceStoreTablePlanner
                     {
                         var count = System.Math.Min(BulkChunkEntries, entries - first);
                         var bytes = probe.AsSpan(0, count * 16);
+                        if (ChunkEqualInPlace(inputs.CompareResidentMemory, inputs, bulk, read, tableBase + (ulong)first * 16,
+                                previous!.AsSpan(first * 16, count * 16), bytes)) // [local] SHARPEMU_STORE_TABLE_COMPARE
+                            continue;
                         if (!ReadTableChunk(inputs, bulk, read, tableBase + (ulong)first * 16, bytes))
                         {
                             refused = true;
