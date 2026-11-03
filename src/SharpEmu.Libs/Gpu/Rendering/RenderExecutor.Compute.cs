@@ -294,6 +294,11 @@ public sealed partial class RenderExecutor
             if (DispatchExecLog && physicalGroups[0] == 1 && physicalGroups[1] == 1 && physicalGroups[2] == 1 && _hdrDispatchLogs++ < 600) Console.Error.WriteLine($"[DISPATCH_EXEC] shader=0x{compute.Address:X} groups=1,1,1 indirect=0x{indirectArgumentsAddress:X}"); // [local]
             if (Gpu.Buffers.WriteDiffProbe.Enabled) Gpu.Buffers.WriteDiffProbe.BeforeDispatch(); // [local]
             if (Gpu.Vulkan.IndirectArgsProbe.Enabled) Gpu.Vulkan.IndirectArgsProbe.CurrentShader = compute.Address; // [local]
+            if (Gpu.Vulkan.ArgsWriterProbe.Enabled) // [local] SHARPEMU_ARGS_WRITER_PROBE
+            {
+                Gpu.Vulkan.ArgsWriterProbe.CurrentProgram = program.Hash;
+                _host.BeforeArgsWriterDispatch(program.Hash, compute.UserScalars.Values.AsSpan(0, (int)compute.UserScalars.Count));
+            }
             if (gpuThreadIndirect)
             {
                 if (!_host.TryDispatchIndirectThreads(indirectArgumentsAddress, bindings))
@@ -308,6 +313,11 @@ public sealed partial class RenderExecutor
             if (DispatchBarriers)
                 _host.ShaderAccessBarrier();
             dispatchEmit.Dispose();
+            if (Gpu.Vulkan.ArgsWriterProbe.Enabled) // [local] SHARPEMU_ARGS_WRITER_PROBE
+            {
+                Gpu.Vulkan.ArgsWriterProbe.CurrentProgram = 0;
+                _host.NoteArgsWriterRecorded(program.Hash, bindings, compute.UserScalars.Values.AsSpan(0, (int)compute.UserScalars.Count), submitId, dimsX);
+            }
             if (Gpu.Buffers.RangeDumpProbe.Enabled) Gpu.Buffers.RangeDumpProbe.AfterDispatch(program.Hash, input.Stage.Resources.UserData, input.Stage.Resources.Buffers); // [local] SHARPEMU_RANGE_DUMP
             if (Gpu.Buffers.WriteDiffProbe.Enabled) Gpu.Buffers.WriteDiffProbe.AfterDispatch(physicalGroups[0], physicalGroups[1], physicalGroups[2], indirectArgumentsAddress, input.Stage.Resources.UserData); // [local]
             if (Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Count != 0 || (useThreadDimensions && _dimsLogs++ < 3000)) Console.Error.WriteLine($"[DISPATCH_DIMS] shader=0x{compute.Address:X} thread_dims={useThreadDimensions} dims={dimsX}x{dimsY}x{dimsZ} local={compute.ThreadsX}x{compute.ThreadsY}x{compute.ThreadsZ} indirect=0x{dimsIndirect:X} initiator=0x{dispatchInitiator:X} groups={physicalGroups[0]}x{physicalGroups[1]}x{physicalGroups[2]}"); // [local]

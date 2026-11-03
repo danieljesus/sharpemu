@@ -106,6 +106,16 @@ public interface IRenderHost
     {
     }
 
+    // [local] SHARPEMU_ARGS_WRITER_INJECT: called right before a dispatch is recorded.
+    void BeforeArgsWriterDispatch(ulong shaderHash, ReadOnlySpan<uint> userScalars)
+    {
+    }
+
+    // [local] SHARPEMU_ARGS_WRITER_PROBE: a dispatch was recorded with these bindings (still bound).
+    void NoteArgsWriterRecorded(ulong shaderHash, IPreparedBindings bindings, ReadOnlySpan<uint> userScalars, ulong submitId, uint threads)
+    {
+    }
+
     // The part of the range that is mapped from its start; zero when the start is unmapped.
     ulong ClampMappedSize(ulong address, ulong size);
 

@@ -1855,6 +1855,13 @@ public sealed unsafe class GuestBufferCache : IGuestBufferStore, IDisposable
 
     public bool HasGpuDirtyBytes(ulong guestAddress, ulong size) => _gpuModifiedRanges.Overlaps(guestAddress, size);
 
+    // [local] SHARPEMU_ARGS_WRITER_PROBE: the registered buffer holding the range, without synchronizing it (null when none).
+    internal GpuBuffer? RegisteredBufferAt(ulong guestAddress, ulong size)
+    {
+        var identifier = _registry.FindContainingBuffer(guestAddress, size);
+        return identifier.IsValid ? _registry.TryGetRegisteredBuffer(identifier) : null;
+    }
+
     public long GpuModifiedVersion => Volatile.Read(ref _gpuModifiedVersion);
 
     public bool HasCpuDirtyPages(ulong guestAddress, ulong size) => _tracker.HasCpuDirtyPages(guestAddress, size);

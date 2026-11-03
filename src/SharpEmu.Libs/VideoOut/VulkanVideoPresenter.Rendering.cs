@@ -1591,6 +1591,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 Size = 3u * sizeof(uint),
             };
             VulkanSynchronization.PipelineBarrier(_vk,command, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.DrawIndirectBit, 0, 0, null, 1, &barrier, 0, null);
+            if (ArgsWriterProbe.Enabled && ArgsWriterProbe.CurrentProgram == ArgsWriterProbe.ConsumerHash) // [local]
+                RecordArgsConsumerProbe(command, buffer.Handle, offset, argumentsAddress);
             var (argumentsBuffer, argumentsOffset) = IndirectArgsProbe.Enabled // [local] SHARPEMU_INDIRECT_ARGS_PROBE
                 ? RecordIndirectArgsProbe(command, buffer.Handle, offset, argumentsAddress, threadUnits: false)
                 : (buffer.Handle, offset);
@@ -1669,6 +1671,8 @@ internal static unsafe partial class VulkanVideoPresenter
             var vkProbe1260 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(_vk, command, &afterInfo); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe1260); // [local]
+            if (ArgsWriterProbe.Enabled && ArgsWriterProbe.CurrentProgram == ArgsWriterProbe.ConsumerHash) // [local]
+                RecordArgsConsumerProbe(command, buffer.Handle, offset, argumentsAddress);
             var (threadsBuffer, threadsOffset) = IndirectArgsProbe.Enabled // [local] SHARPEMU_INDIRECT_ARGS_PROBE
                 ? RecordIndirectArgsProbe(command, buffer.Handle, offset, argumentsAddress, threadUnits: true)
                 : (buffer.Handle, offset);
