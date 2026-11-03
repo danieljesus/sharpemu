@@ -10,6 +10,10 @@ namespace SharpEmu.ShaderCompiler.Vulkan;
 // descriptor index from the memory table, user data from push data.
 public static partial class Gen5SpirvTranslator
 {
+    // [local] SHARPEMU_WAVE64_PAIRED for one async flow (null: the environment's): compute wave64 on 32-lane hosts runs
+    // emulated unless the paired lowering is asked for.
+    public static readonly AsyncLocal<bool?> PairedComputeWave64Override = new();
+
     public const int DeviceAddressPageBits = DeviceAddressPaging.PageBits;
     public const ulong DeviceAddressPageSize = DeviceAddressPaging.PageSize;
 
@@ -289,6 +293,13 @@ public static partial class Gen5SpirvTranslator
             else if (_pairedMeshLanes)
             {
                 _waveLowering = new NativeWave32Lowering(this);
+            }
+            else if (_stage == Gen5SpirvStage.Compute && request.HostComputeSubgroup32 && !PairedComputeWave64)
+            {
+                // [local] SHARPEMU_WAVE64_PAIRED=1 opts into upstream's paired lowering for compute; by default a compute
+                // wave64 runs emulated as two 32-lane subgroups, as this branch measured GTA V with. The paired lowering
+                // gave GTA V's BVH builders garbage trees, and the 0x8395 walk spun to its step guard on them (bx01-bx22).
+                _waveLowering = new EmulatedWave64Lowering(this);
             }
             else if (_stage == Gen5SpirvStage.Compute &&
                      request.HostComputeSubgroup32 &&
@@ -1649,6 +1660,10 @@ public static partial class Gen5SpirvTranslator
             var insideEnd = ULessThanEqual64(ISub64(masked, rangeBase), ISub64(rangeSize, width));
             return LogicalAnd(fits, LogicalAnd(aboveBase, insideEnd));
         }
+
+        // [local] Read per compile; a test sets PairedComputeWave64Override for its own async flow.
+        private static bool PairedComputeWave64 => PairedComputeWave64Override.Value ??
+            string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_WAVE64_PAIRED"), "1", StringComparison.Ordinal);
 
         // ---- scalar memory ----
 

@@ -71,7 +71,11 @@ public class Wave64HalfMaskDeviceTests(HeadlessVulkanFixture fixture) : IClassFi
             LocalSizeX = sizeX, LocalSizeY = sizeY, ThreadCountX = fixedThreadsX ?? sizeX, ThreadCountY = fixedThreadsY ?? sizeY,
             WaveSize = 64, LocalDataShareDwords = localDataShareDwords, HostComputeSubgroup32 = HostSubgroup32,
         };
+        // [local] The 32-lane host rows check upstream's paired lowering, which compute takes only on request.
+        var previousPaired = Gen5SpirvTranslator.PairedComputeWave64Override.Value;
+        Gen5SpirvTranslator.PairedComputeWave64Override.Value = HostSubgroup32 ? true : previousPaired;
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Gen5SpirvTranslator.PairedComputeWave64Override.Value = previousPaired;
         if (HostSubgroup32 && laneLocal is { } oneLanePerInvocation)
         {
             var halfWavesEnabled = Environment.GetEnvironmentVariable("SHARPEMU_WAVE64_LANE_LOCAL") == "1";

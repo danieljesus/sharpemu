@@ -278,7 +278,11 @@ public sealed class WaveLaneTransferDeviceTests(HeadlessVulkanFixture fixture) :
             WaveSize = waveSize,
             HostComputeSubgroup32 = pairedLanes, HostWave64Supported = false,
         };
+        // [local] Compute takes upstream's paired lowering only on request.
+        var previousPaired = Gen5SpirvTranslator.PairedComputeWave64Override.Value;
+        Gen5SpirvTranslator.PairedComputeWave64Override.Value = pairedLanes ? true : previousPaired;
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Gen5SpirvTranslator.PairedComputeWave64Override.Value = previousPaired;
         if (pairedLanes)
         {
             var found = false;
