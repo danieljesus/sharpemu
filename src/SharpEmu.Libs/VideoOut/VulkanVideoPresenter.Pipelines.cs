@@ -1264,6 +1264,26 @@ internal static unsafe partial class VulkanVideoPresenter
             return _guestMemory.TryCompare(address, expected, out equal);
         }
 
+        // [local] SHARPEMU_STORE_TABLE_COMPARE: TryReadResidentGuestBytes (not clean) with the copy replaced by an in-place
+        // compare: Refused exactly when the render thread's resident read returns false at its ownership checks; the front
+        // and prep worker read through other paths, so they are Uncompared and copy as before.
+        public SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableChunkCompare CompareResidentTableChunk(ulong address, ReadOnlySpan<byte> expected)
+        {
+            if (OnFrontThread || expected.IsEmpty)
+                return SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableChunkCompare.Uncompared;
+            if (!LazyBackReads) AllocateEagerClosure(this, address); // [local]
+            if (!ResidentReadAllowed(address, (ulong)expected.Length, clean: false))
+                return SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableChunkCompare.Refused;
+            bool equal;
+            if (TryGetAliasPointer(address, (ulong)expected.Length, out var alias))
+                equal = new ReadOnlySpan<byte>(alias, expected.Length).SequenceEqual(expected);
+            else if (!_guestMemory.TryCompare(address, expected, out equal))
+                return SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableChunkCompare.Uncompared;
+            return equal
+                ? SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableChunkCompare.Equal
+                : SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableChunkCompare.Different;
+        }
+
         // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: on the render thread, the GPU-owned ranges among these are
         // synchronized as TryReadGuestWord would one word at a time, in one readback; the front never synchronizes.
         private readonly List<(ulong Address, ulong Size)> _syncRanges = new();

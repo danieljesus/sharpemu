@@ -241,7 +241,7 @@ internal sealed class ShaderProgramCache
             ReadResidentMemory = _prefetchResidentGuestBytes,
             SynchronizeRanges = synchronizeRanges,
             SynchronizeTableRange = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableSyncMode != 0 ? host.TrySynchronizeTableRange : null, // [local]
-            CompareResidentMemory = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.CompareModeConfigured != 0 ? host.TryCompareResidentGuestBytes : null, // [local] SHARPEMU_STORE_TABLE_COMPARE
+            CompareTableChunk = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.CompareModeConfigured != 0 ? host.CompareResidentTableChunk : null, // [local] SHARPEMU_STORE_TABLE_COMPARE
         }));
         _threadMaterializations = LockFree && _materializations is not null
             ? new ThreadLocal<ResourceMaterializationCache>(static () => new(stampStoreTables: StoreTableMode == 1, currentStoreTables: StoreTableMode == 3))

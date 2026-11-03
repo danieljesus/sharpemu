@@ -31,7 +31,7 @@ public sealed class ResourceRuntimeInputs
 
     // [local] SHARPEMU_STORE_TABLE_COMPARE: what ReadResidentMemory would read, compared in place. Only on inputs whose
     // resident reads are not recorded (or whose store-table scans bypass the recorder), since a compare records nothing.
-    public ResidentGuestBytesComparer? CompareResidentMemory { get; init; }
+    public ResidentTableChunkComparer? CompareTableChunk { get; init; }
 
     public bool ReadsClean { get; init; }
 

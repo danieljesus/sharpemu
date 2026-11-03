@@ -80,6 +80,10 @@ internal interface IShaderPipelineHost
         return false;
     }
 
+    // [local] SHARPEMU_STORE_TABLE_COMPARE: TryReadResidentGuestBytes's bytes (not clean) compared in place, or why not.
+    SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableChunkCompare CompareResidentTableChunk(ulong address, ReadOnlySpan<byte> expected) =>
+        SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableChunkCompare.Uncompared;
+
     // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: GPU-owned ranges brought back in one readback; true when the first is.
     bool TrySynchronizeGuestRanges(ReadOnlySpan<(ulong Address, int Length)> ranges) => false;
 

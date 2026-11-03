@@ -13,6 +13,11 @@ public delegate bool ResidentGuestBytesReader(ulong address, Span<byte> destinat
 // [local] SHARPEMU_VALIDATE_IN_PLACE: the reader's bytes compared with expected in place; false when not compared.
 public delegate bool ResidentGuestBytesComparer(ulong address, ReadOnlySpan<byte> expected, bool clean, out bool equal);
 
+// [local] SHARPEMU_STORE_TABLE_COMPARE: Equal or Different when the resident reader would read the range and it was compared
+// in place; Refused when the resident reader would refuse it (the GPU may own it); Uncompared when it could not be
+// compared here (the caller copies it through the resident reader, which decides).
+public delegate DeviceStoreTablePlanner.TableChunkCompare ResidentTableChunkComparer(ulong address, ReadOnlySpan<byte> expected);
+
 // Materialization is a pure function of the plan, the draw's user data, the shader
 // base, the compute state and the guest words it reads. This cache records exactly
 // those words and reuses the result while every one of them is unchanged, so a draw
@@ -411,7 +416,7 @@ public sealed class ResourceMaterializationCache
                 ReadResidentMemory = recorder.WrapResident(inputs.ReadResidentMemory),
                 SynchronizeTableRange = inputs.SynchronizeTableRange, // [local] SHARPEMU_STORE_TABLE_SYNC
                 // [local] SHARPEMU_STORE_TABLE_COMPARE: only when the walk's table scans bypass the recorder (GATE_TABLES=3).
-                CompareResidentMemory = stamps && current ? inputs.CompareResidentMemory : null,
+                CompareTableChunk = stamps && current ? inputs.CompareTableChunk : null,
                 ReadsClean = inputs.ReadsClean,
                 ComputeState = inputs.ComputeState,
                 TablePhase = recorder.TablePhase,

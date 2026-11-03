@@ -302,7 +302,7 @@ public sealed class CurrentStoreTablesTests
     {
         public readonly Memory Backing = new();
         public readonly HashSet<ulong> Owned = new();
-        public int Copies, Compares;
+        public int Copies, Compares, Syncs;
 
         private bool Refused(ulong address, int length) => Owned.Any(owned => owned >= address && owned < address + (ulong)length);
 
@@ -314,16 +314,23 @@ public sealed class CurrentStoreTablesTests
             return Backing.ReadResident(address, destination, clean);
         }
 
-        public bool Compare(ulong address, ReadOnlySpan<byte> expected, bool clean, out bool equal)
+        public DeviceStoreTablePlanner.TableChunkCompare Compare(ulong address, ReadOnlySpan<byte> expected)
         {
-            equal = false;
             if (Refused(address, expected.Length))
-                return false;
+                return DeviceStoreTablePlanner.TableChunkCompare.Refused;
             Compares++;
             var bytes = new byte[expected.Length];
-            if (!Backing.ReadResident(address, bytes, clean))
-                return false;
-            equal = expected.SequenceEqual(bytes);
+            if (!Backing.ReadResident(address, bytes, false))
+                return DeviceStoreTablePlanner.TableChunkCompare.Uncompared;
+            return expected.SequenceEqual(bytes) ? DeviceStoreTablePlanner.TableChunkCompare.Equal : DeviceStoreTablePlanner.TableChunkCompare.Different;
+        }
+
+        // The GPU-owned words of the range reach the backing.
+        public bool Synchronize(ReadOnlySpan<(ulong Address, int Length)> ranges)
+        {
+            Syncs++;
+            var (address, length) = ranges[0];
+            Owned.RemoveWhere(owned => owned >= address && owned < address + (ulong)length);
             return true;
         }
 
@@ -332,7 +339,7 @@ public sealed class CurrentStoreTablesTests
 
     private const int CompareEntries = 3 * 4096; // three chunks of the bulk read
 
-    private static (ComparedMemory Memory, ResourceRuntimeInputs Inputs) ComparedTable(ulong table, bool comparer)
+    private static (ComparedMemory Memory, ResourceRuntimeInputs Inputs) ComparedTable(ulong table, bool comparer, bool synchronizer = false)
     {
         var memory = new ComparedMemory();
         for (var entry = 0; entry < CompareEntries; entry++)
@@ -345,7 +352,8 @@ public sealed class CurrentStoreTablesTests
             ReadMemory = memory.Read,
             ReadCleanMemory = memory.Read,
             ReadResidentMemory = memory.ReadResident,
-            CompareResidentMemory = comparer ? memory.Compare : null,
+            CompareTableChunk = comparer ? memory.Compare : null,
+            SynchronizeTableRange = synchronizer ? memory.Synchronize : null,
         };
         return (memory, inputs);
     }
@@ -389,22 +397,27 @@ public sealed class CurrentStoreTablesTests
         if (DeviceStoreTablePlanner.DiffMode != 1)
             return;
         var plan = Plan();
-        foreach (var (changed, owned) in new[] { (false, false), (true, false), (true, true), (false, true) })
+        foreach (var (changed, owned, synchronizer) in new[]
+                 { (false, false, false), (true, false, false), (true, true, false), (false, true, false), (false, true, true), (true, true, true) })
         {
+            if (synchronizer && DeviceStoreTablePlanner.TableSyncMode != 1)
+                continue;
             var results = new List<List<DeviceAddressRange>>();
             foreach (var (mode, comparer) in new[] { (0, false), (1, true), (2, true) })
             {
                 DeviceStoreTablePlanner.CompareMode = mode;
-                var table = 0x7E7000000UL + (ulong)results.Count * 0x100000 + (changed ? 0x1000000UL : 0) + (owned ? 0x2000000UL : 0);
-                var (memory, inputs) = ComparedTable(table, comparer);
+                var table = 0x7E7000000UL + (ulong)results.Count * 0x100000 + (changed ? 0x1000000UL : 0) + (owned ? 0x2000000UL : 0) + (synchronizer ? 0x4000000UL : 0);
+                var (memory, inputs) = ComparedTable(table, comparer, synchronizer);
                 DeviceStoreTablePlanner.Evaluate(plan, inputs, []);
                 if (changed)
                     memory.Backing.SetEntry(table + 9000 * 16, 0x900000, 0x80);
                 if (owned)
                     memory.Owned.Add(table + 4100 * 16); // the second chunk is GPU-owned: refused by both readers
                 results.Add(Rescan(plan, table, inputs));
-                if (comparer && !owned)
+                if (comparer && (!owned || synchronizer))
                     Assert.True(memory.Compares > 0);
+                if (synchronizer)
+                    Assert.Equal(1, memory.Syncs);
             }
 
             Assert.Equal(Unhandled(results[0]), Unhandled(results[1]));
@@ -413,5 +426,26 @@ public sealed class CurrentStoreTablesTests
         }
 
         Assert.Equal(0, DeviceStoreTablePlanner.CompareCounts.Mismatches);
+    }
+
+    [Fact]
+    public void AGpuOwnedChunkSynchronizedForTheCompareIsNotCopied()
+    {
+        if (DeviceStoreTablePlanner.DiffMode != 1 || DeviceStoreTablePlanner.TableSyncMode != 1)
+            return;
+        const ulong table = 0x7EC000000;
+        var plan = Plan();
+        DeviceStoreTablePlanner.CompareMode = 1;
+        var (memory, inputs) = ComparedTable(table, comparer: true, synchronizer: true);
+        DeviceStoreTablePlanner.Evaluate(plan, inputs, []);
+        Assert.True(DeviceStoreTablePlanner.TryGetCached(table, CompareEntries * 16, out var scan));
+        memory.Owned.Add(table + 4100 * 16);
+        var copies = memory.Copies;
+
+        Rescan(plan, table, inputs);
+
+        Assert.True(DeviceStoreTablePlanner.TryGetCached(table, CompareEntries * 16, out var rescanned));
+        Assert.Same(scan, rescanned);
+        Assert.Equal((copies, 1), (memory.Copies, memory.Syncs));
     }
 }
