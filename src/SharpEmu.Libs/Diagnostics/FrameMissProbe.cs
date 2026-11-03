@@ -179,7 +179,13 @@ internal static class FrameMissProbe
 
     // [local] SHARPEMU_COLDRES_PROBE=1: the resolution of shared state split into lookups, creations, uploads,
     // materialization hit/miss, program and pipeline preparation and the lock waits against the other threads, always
-    // printed in [FRAME_ATTR]; the times are inclusive (a parent contains its children).
+    // printed in [FRAME_ATTR]; the times are inclusive (a parent contains its children). Measured 2026-11-03 (crA1/A2/B1/B2,
+    // pan, 254-350 misses; the probe perturbs, compare deltas), CommandStream gap without GC intervals +10.5..+12.9 ms:
+    // volume (draws +16-24 %, dispatches +24-31 %) at the normal per-item cost ~7-8 ms; materialization misses +2.1..+2.9,
+    // of which readback waits for GPU-written inputs +1.6..+1.8 (2.4-2.6 ms of the render's 2.5-2.7 ms of readback waits sit
+    // in them); pipeline creation misses +0.3..+0.5; image/view/buffer/entry creations <0.3 together; lock waits ~0; the
+    // rest spread +8-9 % per draw (ImageLookup, Overlap, BufferDirtySync, DescriptorPreparation). GC pauses +0.9..+1.6 more.
+    // No exact lever of >=2 ms: the waits are a true GPU->CPU dependency (FRONT_SPECULATE moved them, not removed them).
     internal static readonly bool Cold = Enabled && Environment.GetEnvironmentVariable("SHARPEMU_COLDRES_PROBE") == "1";
 
     private static readonly RenderPhaseProfile.Phase[] ColdPhases =
