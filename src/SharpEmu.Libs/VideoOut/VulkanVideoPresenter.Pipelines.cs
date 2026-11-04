@@ -23,6 +23,9 @@ internal static unsafe partial class VulkanVideoPresenter
 {
     private const string PushDescriptorExtensionName = "VK_KHR_push_descriptor";
 
+    // [local] A test that needs upstream's table-block layout sets it for its own async flow (see TableBlocksEnabled).
+    internal static readonly AsyncLocal<bool?> TableBlocksOverride = new();
+
     // One created pipeline with the layout it binds and the description its rectangle-list variants derive from.
     private sealed class RenderPipelineEntry
     {
@@ -73,12 +76,12 @@ internal static unsafe partial class VulkanVideoPresenter
 
         bool IShaderPipelineHost.TryCopyImage(in ImageRequest source, in ImageRequest destination) =>
             _imageCache.TryCopyImage(source, destination);
-        // [local] SHARPEMU_TABLE_BLOCKS=0 lays the buffer descriptors out as before upstream #1130's table block. With the table
-        // block GTA V's dynamic BLAS build breaks (every tree guarded by BLAS_CYCLE from frame 1, refit 0x5981 spinning, 4.6 FPS);
-        // without it the trees build correctly (guarded=0, 22.6 FPS with probes). Default kept at upstream's until the table-block
-        // path is fixed or the prewarm identity (ShaderPrewarmPresenterTests) follows the switch.
-        private static readonly bool TableBlocksEnabled = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_BLOCKS") != "0";
-        bool IShaderPipelineHost.TableBlocks => TableBlocksEnabled;
+        // [local] Upstream #1130's table-block descriptor layout breaks GTA V's dynamic BLAS build (every tree guarded by
+        // BLAS_CYCLE from frame 1, refit 0x5981 spinning, 4.6 FPS); the pre-table layout builds them correctly (guarded=0).
+        // Off by default (as in 3368666f); SHARPEMU_TABLE_BLOCKS=1 restores upstream's layout. Tests that need the table block
+        // set TableBlocksOverride for their scope.
+        private static readonly bool TableBlocksEnabled = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_BLOCKS") == "1";
+        bool IShaderPipelineHost.TableBlocks => TableBlocksOverride.Value ?? TableBlocksEnabled;
 
         uint[] IShaderPipelineHost.NormalizeImageDescriptor(IShaderFrontend frontend, ReadOnlySpan<uint> words,
             ShaderStage stage, ulong shaderHash, string source)

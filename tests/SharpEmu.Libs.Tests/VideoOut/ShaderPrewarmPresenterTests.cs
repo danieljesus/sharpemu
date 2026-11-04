@@ -44,6 +44,22 @@ public sealed class ShaderPrewarmPresenterTests(HeadlessVulkanFixture fixture) :
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan)) return;
 
+        // [local] The presenter lays the descriptors out without the table block by default; the prewarm identity must
+        // match the guest's, which compiles with it.
+        var previousTableBlocks = SharpEmu.Libs.VideoOut.VulkanVideoPresenter.TableBlocksOverride.Value;
+        SharpEmu.Libs.VideoOut.VulkanVideoPresenter.TableBlocksOverride.Value = true;
+        try
+        {
+            PrewarmRecordBuildsTheDevicePipeline(vulkan);
+        }
+        finally
+        {
+            SharpEmu.Libs.VideoOut.VulkanVideoPresenter.TableBlocksOverride.Value = previousTableBlocks;
+        }
+    }
+
+    private void PrewarmRecordBuildsTheDevicePipeline(HeadlessVulkan vulkan)
+    {
         byte[] runtime;
         using (var list = ShaderPrewarmList.Open(_directory)!)
         {
