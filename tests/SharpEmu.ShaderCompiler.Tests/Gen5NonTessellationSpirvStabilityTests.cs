@@ -39,8 +39,18 @@ public sealed class Gen5NonTessellationSpirvStabilityTests
             WaveSize = waveSize,
             LocalSizeX = stage == ShaderStage.Compute ? 128u : 0u,
         };
-        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
-        Assert.Equal(expected, Convert.ToHexString(SHA256.HashData(shader.Spirv), 0, 8));
+        // [local] The hashes are upstream's SPIR-V, with the exec-select elimination on (off by default here).
+        var previous = Gen5SpirvTranslator.ExecSelectEliminationOverride.Value;
+        Gen5SpirvTranslator.ExecSelectEliminationOverride.Value = true;
+        try
+        {
+            Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+            Assert.Equal(expected, Convert.ToHexString(SHA256.HashData(shader.Spirv), 0, 8));
+        }
+        finally
+        {
+            Gen5SpirvTranslator.ExecSelectEliminationOverride.Value = previous;
+        }
     }
 
     private static readonly Dictionary<string, Func<Gen5ShaderProgram>> Programs = new()

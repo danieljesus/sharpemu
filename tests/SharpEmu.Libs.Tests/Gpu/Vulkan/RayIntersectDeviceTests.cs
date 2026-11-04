@@ -50,11 +50,11 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
     // preserveNan: SignedZeroInfNanPreserve, as the game compiles with it on the RTX 5080. Without it the driver
     // folds the reference's NaN-propagating max3/min3 into a NaN-dropping max, so the lean slab test is compared
     // only on lanes without a NaN plane distance.
-    // nodeTest: upstream's node test (null) or SHARPEMU_BVH_NODE_TEST=gpurt; the switches must be exact under both.
-    [InlineData(false, true, null)]
-    [InlineData(true, true, null)]
-    [InlineData(false, false, null)]
-    [InlineData(true, false, null)]
+    // nodeTest: SHARPEMU_BVH_NODE_TEST=upstream or gpurt (the default); the switches must be exact under both. [local]
+    [InlineData(false, true, "upstream")]
+    [InlineData(true, true, "upstream")]
+    [InlineData(false, false, "upstream")]
+    [InlineData(true, false, "upstream")]
     [InlineData(false, true, "gpurt")]
     [InlineData(true, true, "gpurt")]
     [InlineData(false, false, "gpurt")]
@@ -198,10 +198,10 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
     // those with a NaN in i, j or t. Every other output dword matches the reference. On upstream's node test (#1061)
     // =1 is upstream's own rejection, which also drops a hit at a NaN t_num.
     [Theory]
-    [InlineData(false, "1", null)]
-    [InlineData(true, "1", null)]
-    [InlineData(false, "2", null)]
-    [InlineData(true, "2", null)]
+    [InlineData(false, "1", "upstream")]
+    [InlineData(true, "1", "upstream")]
+    [InlineData(false, "2", "upstream")]
+    [InlineData(true, "2", "upstream")]
     [InlineData(false, "1", "gpurt")]
     [InlineData(true, "1", "gpurt")]
     [InlineData(false, "2", "gpurt")]
@@ -282,7 +282,7 @@ public sealed class RayIntersectDeviceTests(HeadlessVulkanFixture fixture, ITest
                     var triangle = scene.Types[lane] <= 3 && !reference.All(word => word == uint.MaxValue);
                     var referenceMiss = BitConverter.UInt32BitsToSingle(reference[0]) == float.PositiveInfinity && reference[1] == 0x3F80_0000;
                     var denomZero = (reference[1] & 0x7FFF_FFFF) == 0;
-                    var numNan = nodeTest is null && float.IsNaN(BitConverter.UInt32BitsToSingle(reference[0]));
+                    var numNan = nodeTest != "gpurt" && float.IsNaN(BitConverter.UInt32BitsToSingle(reference[0]));
                     var nonFinite = reference.Take(barycentrics ? 4 : 2).Any(word => !float.IsFinite(BitConverter.UInt32BitsToSingle(word)))
                         || float.IsNaN(BitConverter.UInt32BitsToSingle(reference[0]) / BitConverter.UInt32BitsToSingle(reference[1]));
                     if (!reference.SequenceEqual(actual))

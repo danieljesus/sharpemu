@@ -388,11 +388,11 @@ internal sealed class ShaderProgramCache
 
     // On a host that reads call records at run time (descriptor set 1), a linked program keeps one copy of each callee per
     // call site and reads its records' images and samplers at run time, so tables that gain or lose records, or move their
-    // arguments, link to the same program; only a new callee links a new one. SHARPEMU_RUNTIME_CALL_RECORDS=0 links a copy
-    // per record instead.
-    private static readonly bool RuntimeCallRecordsDisabled = Environment.GetEnvironmentVariable("SHARPEMU_RUNTIME_CALL_RECORDS") == "0";
+    // arguments, link to the same program; only a new callee links a new one. [local] SHARPEMU_RUNTIME_CALL_RECORDS=1 turns
+    // that on; off by default (a copy per record, as in 3368666f).
+    private static readonly bool RuntimeCallRecordsEnabled = Environment.GetEnvironmentVariable("SHARPEMU_RUNTIME_CALL_RECORDS") == "1";
 
-    private bool RuntimeCallRecords => _host.RuntimeCallRecordsSupported && !RuntimeCallRecordsDisabled;
+    private bool RuntimeCallRecords => _host.RuntimeCallRecordsSupported && RuntimeCallRecordsEnabled;
 
     public ShaderProgramCache(CpuContext context, IGuestGpuBackend compiler, IShaderPipelineHost host, object? gate = null, bool? lockFree = null)
     {

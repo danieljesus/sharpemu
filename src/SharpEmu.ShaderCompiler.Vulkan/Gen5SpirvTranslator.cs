@@ -77,8 +77,9 @@ public static partial class Gen5SpirvTranslator
         private readonly bool _usesPixelValidMask;
         private readonly bool _pixelExecExcludesHelpers;
 
-        private static readonly bool PixelLiveExec = !string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_PS_LIVE_EXEC"), "0", StringComparison.Ordinal);
+        // [local] SHARPEMU_PS_LIVE_EXEC=1: upstream's live-exec mask for pixel shaders. Off by default, as in 3368666f.
+        private static readonly bool PixelLiveExec = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_PS_LIVE_EXEC"), "1", StringComparison.Ordinal);
         private readonly bool _enableGraphicsSubgroupOperations;
         private readonly uint _waveLaneCount;
         private readonly IWaveLowering _waveLowering;
@@ -9769,8 +9770,12 @@ public static partial class Gen5SpirvTranslator
             return _execFullPcs.Contains(pc);
         }
 
-        private static readonly bool ExecSelectElimination = !string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_EXEC_SELECT_ELIMINATION"), "0", StringComparison.Ordinal);
+        // [local] SHARPEMU_EXEC_SELECT_ELIMINATION=1: upstream's elimination of exec selects on unobserved writes. Off by
+        // default, as in 3368666f (which had no such pass).
+        private static readonly bool ExecSelectEliminationEnabled = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_EXEC_SELECT_ELIMINATION"), "1", StringComparison.Ordinal);
+        // [local] Read per compile; a test pinned to upstream's SPIR-V sets ExecSelectEliminationOverride (outer class) for its flow.
+        private static bool ExecSelectElimination => ExecSelectEliminationOverride.Value ?? ExecSelectEliminationEnabled;
 
         private Ir.VectorRegisterSet _unobservedWrites;
         private Ir.Gen5VectorObservationPlan? _observationPlan;

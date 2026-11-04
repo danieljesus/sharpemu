@@ -2136,8 +2136,9 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        // [local] SHARPEMU_BATCH_BARRIERS=1: upstream's batching of the global barriers. Off by default, as in 3368666f.
         internal static readonly bool BatchBarriers =
-            Environment.GetEnvironmentVariable("SHARPEMU_BATCH_BARRIERS") != "0";
+            Environment.GetEnvironmentVariable("SHARPEMU_BATCH_BARRIERS") == "1";
 
         internal static readonly MemoryBarrierRequest GlobalMemoryBarrier = new(
             PipelineStageFlags.AllCommandsBit,

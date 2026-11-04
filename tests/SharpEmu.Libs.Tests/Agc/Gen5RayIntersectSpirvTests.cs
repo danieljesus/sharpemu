@@ -12,6 +12,10 @@ namespace SharpEmu.Libs.Tests.Agc;
 
 public sealed class Gen5RayIntersectSpirvTests
 {
+    // [local] These tests pin upstream's node test (#1061); the translator defaults to the GPURT one, as in 3368666f.
+    public Gen5RayIntersectSpirvTests() =>
+        Gen5SpirvTranslator.BvhSwitchOverrides.Value = new Dictionary<string, string?> { ["SHARPEMU_BVH_NODE_TEST"] = "upstream" };
+
     private static readonly Lazy<byte[]> NumericalModule = new(() => Compile(true, false));
 
     [Theory]

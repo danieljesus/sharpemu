@@ -508,7 +508,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         _download = new GpuRingBuffer(device, scheduler, GpuBufferUsage.Download, 64 * MiB);
         _deviceRing = new GpuRingBuffer(device, scheduler, GpuBufferUsage.DeviceLocal, 128 * MiB);
         StreamOffsetAlignment = device.MinUniformBufferOffsetAlignment;
-        MappedBudget = RenderDocCapture.IsAvailable || Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_BUFFERS") == "0" ? 0 : device.MappedDeviceLocalBudget; // [local] SHARPEMU_MAPPED_BUFFERS=0: no mapped device-local guest buffers (A/B)
+        // [local] SHARPEMU_MAPPED_BUFFERS=1: upstream's mapped device-local guest buffers under ReBAR. Off by default, as in 3368666f.
+        MappedBudget = !RenderDocCapture.IsAvailable && Environment.GetEnvironmentVariable("SHARPEMU_MAPPED_BUFFERS") == "1" ? device.MappedDeviceLocalBudget : 0;
         AllocatesMappedBuffers = device.ResizableBar && MappedBudget != 0;
         _gds.Mapped.Clear();
         _gds.Flush(0, _gds.Size);

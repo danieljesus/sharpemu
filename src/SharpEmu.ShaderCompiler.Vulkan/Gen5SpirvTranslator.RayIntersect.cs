@@ -451,12 +451,13 @@ public static partial class Gen5SpirvTranslator
         private uint LoadNodeFloat(NodeUnit first, NodeUnit second, uint dword) =>
             Bitcast(_floatType, LoadNodeDword(first, second, dword));
 
-        // [local] SHARPEMU_BVH_NODE_TEST=gpurt runs the node test this branch measured GTA V with (AMD GPURT's software
-        // fallback: fast_intersect_triangle and fast_intersect_bbox, IntersectCommon.hlsl). Unset, the node test is
-        // upstream's (#1061: dominant-axis projection with a top-left rule, exit grown by ULPs). Both read the node
-        // through NodeUnit (SHARPEMU_BVH_UNIFIED_FETCH / SHARPEMU_BVH_LEAN_SLABS apply to both). Read on every compile.
+        // [local] SHARPEMU_BVH_NODE_TEST: unset or gpurt (the default, as in 3368666f) runs the node test this branch
+        // measured GTA V with (AMD GPURT's software fallback: fast_intersect_triangle and fast_intersect_bbox,
+        // IntersectCommon.hlsl); =upstream runs upstream's (#1061: dominant-axis projection with a top-left rule, exit
+        // grown by ULPs). Both read the node through NodeUnit (SHARPEMU_BVH_UNIFIED_FETCH / SHARPEMU_BVH_LEAN_SLABS apply
+        // to both). Read on every compile; a test chooses through BvhSwitchOverrides.
         private static bool GpurtNodeTest =>
-            string.Equals(BvhSwitch("SHARPEMU_BVH_NODE_TEST"), "gpurt", StringComparison.OrdinalIgnoreCase);
+            !string.Equals(BvhSwitch("SHARPEMU_BVH_NODE_TEST"), "upstream", StringComparison.OrdinalIgnoreCase);
 
         private uint[] EmitRayTriangle(NodeUnit node, uint nodeType, uint barycentrics,
             IReadOnlyList<uint> origin, IReadOnlyList<uint> direction) =>

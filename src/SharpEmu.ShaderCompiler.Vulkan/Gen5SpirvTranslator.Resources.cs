@@ -13,6 +13,8 @@ public static partial class Gen5SpirvTranslator
     // [local] SHARPEMU_WAVE64_PAIRED for one async flow (null: the environment's): compute wave64 on 32-lane hosts runs
     // emulated unless the paired lowering is asked for.
     public static readonly AsyncLocal<bool?> PairedComputeWave64Override = new();
+    // [local] A test pinned to upstream's SPIR-V turns the exec-select elimination on for its own async flow.
+    public static readonly AsyncLocal<bool?> ExecSelectEliminationOverride = new();
 
     public const int DeviceAddressPageBits = DeviceAddressPaging.PageBits;
     public const ulong DeviceAddressPageSize = DeviceAddressPaging.PageSize;
