@@ -73,7 +73,12 @@ internal static unsafe partial class VulkanVideoPresenter
 
         bool IShaderPipelineHost.TryCopyImage(in ImageRequest source, in ImageRequest destination) =>
             _imageCache.TryCopyImage(source, destination);
-        bool IShaderPipelineHost.TableBlocks => true;
+        // [local] SHARPEMU_TABLE_BLOCKS=0 lays the buffer descriptors out as before upstream #1130's table block. With the table
+        // block GTA V's dynamic BLAS build breaks (every tree guarded by BLAS_CYCLE from frame 1, refit 0x5981 spinning, 4.6 FPS);
+        // without it the trees build correctly (guarded=0, 22.6 FPS with probes). Default kept at upstream's until the table-block
+        // path is fixed or the prewarm identity (ShaderPrewarmPresenterTests) follows the switch.
+        private static readonly bool TableBlocksEnabled = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_BLOCKS") != "0";
+        bool IShaderPipelineHost.TableBlocks => TableBlocksEnabled;
 
         uint[] IShaderPipelineHost.NormalizeImageDescriptor(IShaderFrontend frontend, ReadOnlySpan<uint> words,
             ShaderStage stage, ulong shaderHash, string source)
