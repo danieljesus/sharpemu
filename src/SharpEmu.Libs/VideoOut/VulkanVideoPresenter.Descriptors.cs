@@ -2155,6 +2155,38 @@ internal static unsafe partial class VulkanVideoPresenter
         // the same memory with layouts one cached image cannot hold at once, where the guest reads
         // two views of one memory. The stale bindings are found again until none is left; one still
         // losing its image after MaxRebindPasses reads as a null image. Returns how many did.
+        // [local] The same loop with an explicit state, so the hot caller (BindImages, every stage of every draw) passes
+        // static lambdas and allocates no closure: ~270 KB per frame in GTA V (gz08).
+        internal static int RefindStaleBindingsOf<TState>(int count, TState state, Func<TState, int, bool> isStale, Action<TState, int, bool> findAgain)
+        {
+            var nulled = 0;
+            for (var pass = 0; ; pass++)
+            {
+                var refound = false;
+                for (var index = 0; index < count; index++)
+                {
+                    if (!isStale(state, index))
+                    {
+                        continue;
+                    }
+
+                    if (pass > MaxRebindPasses)
+                    {
+                        throw SubmissionScheduler.Fatal($"An image binding is stale after it was bound as a null image: image={index}.");
+                    }
+
+                    nulled += pass == MaxRebindPasses ? 1 : 0;
+                    findAgain(state, index, pass == MaxRebindPasses);
+                    refound = true;
+                }
+
+                if (!refound)
+                {
+                    return nulled;
+                }
+            }
+        }
+
         internal static int RefindStaleBindings(int count, Func<int, bool> isStale, Action<int, bool> findAgain)
         {
             var nulled = 0;
@@ -2192,18 +2224,20 @@ internal static unsafe partial class VulkanVideoPresenter
             var info = prepared.Resources.Info;
             var snapshot = prepared.Stage.Resources;
             var images = prepared.Descriptors.Images;
-            var nulled = RefindStaleBindings(
+            var nulled = RefindStaleBindingsOf(
                 images.Length,
-                index => !images[index].IsHostMovie && IsStaleImage(images[index].ImageIdentifier, out _),
-                (index, asNull) =>
+                (Host: this, Prepared: prepared, Images: images),
+                static (s, index) => !s.Images[index].IsHostMovie && s.Host.IsStaleImage(s.Images[index].ImageIdentifier, out _),
+                static (s, index, asNull) =>
                 {
-                    if (_imageCache.TryGetImage(images[index].ImageIdentifier, out var stale))
+                    if (s.Host._imageCache.TryGetImage(s.Images[index].ImageIdentifier, out var stale))
                     {
-                        BindingOf(stale) = default;
+                        s.Host.BindingOf(stale) = default;
                     }
 
-                    images[index] = ResolveImageBinding(info.Images[index], asNull ? NullImageWords : snapshot.Images[index], program, index);
-                    prepared.Memo?.Invalidate();
+                    s.Images[index] = s.Host.ResolveImageBinding(s.Prepared.Resources.Info.Images[index],
+                        asNull ? NullImageWords : s.Prepared.Stage.Resources.Images[index], s.Prepared.Program, index);
+                    s.Prepared.Memo?.Invalidate();
                 });
             if (nulled != 0 && Interlocked.Increment(ref _nullRebindReports) <= 32)
             {
