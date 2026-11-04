@@ -5816,8 +5816,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return true;
 	}
 
+	// [local] SHARPEMU_GUEST_PRIORITY=upstream: upstream's mapping of the guest priorities (Normal for the guest's high
+	// band, BelowNormal for the rest). Default = legacy, as in 3368666f (Highest / Normal).
 	private static readonly bool LegacyGuestPriorities =
-		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_PRIORITY"), "legacy", StringComparison.OrdinalIgnoreCase);
+		!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_GUEST_PRIORITY"), "upstream", StringComparison.OrdinalIgnoreCase);
 
 	private static ThreadPriority MapGuestThreadPriority(int priority)
 	{

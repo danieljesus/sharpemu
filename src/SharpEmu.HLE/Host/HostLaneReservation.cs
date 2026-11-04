@@ -40,7 +40,7 @@ public static unsafe class HostLaneReservation
 
         var cores = ReadCores();
         var render = SelectCore(cores);
-        var front = lanes >= LanesForTwoCores ? SelectCore(cores.FindAll(core => core.Mask != render)) : 0;
+        var front = FrontEndCoreRequested && lanes >= LanesForTwoCores ? SelectCore(cores.FindAll(core => core.Mask != render)) : 0;
         var reserved = render | front;
         var all = lanes == 64 ? ulong.MaxValue : (1UL << lanes) - 1;
         if (render == 0 || (reserved & ~all) != 0 || (all & ~reserved) == 0)
@@ -63,6 +63,11 @@ public static unsafe class HostLaneReservation
             }
         }
     }
+
+    // [local] SHARPEMU_FRONT_END_CORE=1: upstream's reservation of a second core (LanesForTwoCores lanes or more) for its
+    // command-stream thread. Off by default, as in 3368666f: with SHARPEMU_RENDER_PIPELINE=1 that thread does not run, the
+    // front runs on its helper core, and the guest keeps the lanes (GTA V on 16 lanes: guest 0x3FF instead of 0xFF).
+    public static readonly bool FrontEndCoreRequested = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_END_CORE") == "1";
 
     public static bool Active => ReservedMask != 0;
 
@@ -102,7 +107,9 @@ public static unsafe class HostLaneReservation
         }
     }
 
-    private static readonly bool HostWorkersRaised = Environment.GetEnvironmentVariable("SHARPEMU_HOST_WORKER_PRIORITY") != "0";
+    // [local] SHARPEMU_HOST_WORKER_PRIORITY=1: upstream's AboveNormal priority and guest-plus-front-end affinity for its
+    // host worker threads (resolve pool, parallel guest copies, render workers). Off by default, as in 3368666f.
+    private static readonly bool HostWorkersRaised = Environment.GetEnvironmentVariable("SHARPEMU_HOST_WORKER_PRIORITY") == "1";
 
     public static void ApplyToHostWorkerThread()
     {

@@ -23,10 +23,11 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
     private static readonly long InputPollTicks = Stopwatch.Frequency / 250;
     private const uint OutputDurationMs = 5_000;
 
-    // [local] SHARPEMU_SDL_POLL_MS=N (0 or unset = upstream's InputPollTicks, 4 ms): events and the gamepad are
-    // polled at most once per N ms. SHARPEMU_SDL_AUTO_JOYSTICKS=0: SDL_PollEvent no longer updates the joysticks
-    // (SDL_HINT_AUTO_UPDATE_JOYSTICKS=0); each poll calls SDL_UpdateJoysticks once while no gamepad is open (with one,
-    // SDL_UpdateGamepads does it), so hot-plug still works. R1 of plan-estructural-2026-10-14.md.
+    // [local] SHARPEMU_SDL_POLL_MS=N: events and the gamepad are polled at most once per N ms (4 = upstream's
+    // InputPollTicks); 0 or unset polls every window loop turn, as in 3368666f. SHARPEMU_SDL_AUTO_JOYSTICKS=0:
+    // SDL_PollEvent no longer updates the joysticks (SDL_HINT_AUTO_UPDATE_JOYSTICKS=0); each poll calls SDL_UpdateJoysticks
+    // once while no gamepad is open (with one, SDL_UpdateGamepads does it), so hot-plug still works. R1 of
+    // plan-estructural-2026-10-14.md.
     private static readonly long PollIntervalTicks =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SDL_POLL_MS"), out var pollMs) && pollMs > 0 ? pollMs * Stopwatch.Frequency / 1000 : 0;
     private static readonly bool AutoUpdateJoysticks = Environment.GetEnvironmentVariable("SHARPEMU_SDL_AUTO_JOYSTICKS") != "0";
@@ -360,8 +361,8 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
             {
                 using var windowScope = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.WindowLoop);
                 var pollTimestamp = Stopwatch.GetTimestamp();
-                // [local] SHARPEMU_SDL_POLL_MS overrides upstream's input poll interval.
-                if (pollTimestamp - polledAt >= (PollIntervalTicks != 0 ? PollIntervalTicks : InputPollTicks))
+                // [local] SHARPEMU_SDL_POLL_MS=N polls at most every N ms; unset or 0 polls every turn, as in 3368666f.
+                if (PollIntervalTicks == 0 || pollTimestamp - polledAt >= PollIntervalTicks)
                 {
                     polledAt = pollTimestamp;
                     using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.WindowEvents))

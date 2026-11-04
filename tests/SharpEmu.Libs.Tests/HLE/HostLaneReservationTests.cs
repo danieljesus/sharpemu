@@ -28,6 +28,6 @@ public sealed class HostLaneReservationTests
         Assert.Equal(all, HostLaneReservation.ReservedMask | HostLaneReservation.FrontEndMask | HostLaneReservation.GuestMask |
             HostLaneReservation.RingMask | HostLaneReservation.FrontMask);
         Assert.InRange(BitOperations.PopCount(HostLaneReservation.ReservedMask), 1, 2);
-        Assert.InRange(BitOperations.PopCount(HostLaneReservation.FrontEndMask), lanes >= 12 ? 1 : 0, 2);
+        Assert.InRange(BitOperations.PopCount(HostLaneReservation.FrontEndMask), lanes >= 12 && HostLaneReservation.FrontEndCoreRequested ? 1 : 0, 2); // [local]
     }
 }
