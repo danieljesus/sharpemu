@@ -173,8 +173,21 @@ public static partial class Gen5SpirvTranslator
             public void StartWithRunningLanes(uint running)
             {
                 var context = _context;
-                if (!_canBePartial || !UsesExchange || context._subgroupInvocationIdInput == 0)
+                if (context._subgroupInvocationIdInput == 0 || _cooperative)
                 {
+                    return;
+                }
+
+                // [local] As before the merge (EmitComputeExecMask + EmitWave64ExchangeReset): EXEC starts as the
+                // running lanes even without an exchange area, and the exchange words of each half are reset at entry
+                // for every group, not only for one that can be partial.
+                if (!UsesExchange)
+                {
+                    if (_canBePartial)
+                    {
+                        context.StoreS64(126, BothHalvesOfOwnBallot(running));
+                    }
+
                     return;
                 }
 

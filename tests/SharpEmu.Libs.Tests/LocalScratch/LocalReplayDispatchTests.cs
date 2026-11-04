@@ -200,13 +200,47 @@ public sealed class LocalReplayDispatchTests(HeadlessVulkanFixture fixture, ITes
             ShaderResourcePlan plan;
             SpecializedResourceInfo resources;
             BindingLayout layout;
+            // LOCAL_REPLAY_JSON_DIR: the game's variant dump (SHARPEMU_DUMP_SPIRV) of the hash gives the specialization,
+            // the user data count, the group size, the wave size and the thread-limit use.
+            uint userDataCount = 16, localX = 64, localY = 1, localZ = 1, waveSize = 64, scratch = 0;
+            var usesLimits = false;
+            System.Text.Json.JsonElement? variant = null;
+            var jsonDirectory = Environment.GetEnvironmentVariable("LOCAL_REPLAY_JSON_DIR");
+            if (!string.IsNullOrEmpty(jsonDirectory))
+            {
+                var json = Directory.GetFiles(jsonDirectory, $"*-{hash:X16}.compute.*variant*.json").OrderBy(name => name).FirstOrDefault();
+                if (json is not null)
+                {
+                    variant = System.Text.Json.JsonDocument.Parse(File.ReadAllText(json)).RootElement;
+                    var v = variant.Value;
+                    userDataCount = v.GetProperty("UserDataCount").GetUInt32();
+                    localX = v.GetProperty("LocalSizeX").GetUInt32(); localY = v.GetProperty("LocalSizeY").GetUInt32(); localZ = v.GetProperty("LocalSizeZ").GetUInt32();
+                    waveSize = v.GetProperty("WaveSize").GetUInt32(); scratch = v.GetProperty("ScratchDwords").GetUInt32();
+                    usesLimits = v.GetProperty("UsesDispatchThreadLimits").GetBoolean();
+                }
+            }
+
             try
             {
-                plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, hash, 0, 16, waveSize: 64);
-                resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
-                layout = BindingLayout.Allocate(resources.Info, BindingLayout.CollectUserDataRegisters(program, 0, 16),
+                plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, hash, 0, userDataCount, waveSize: waveSize);
+                var specialization = ResourceSpecialization.Default(plan.Info);
+                if (variant is { } element)
+                {
+                    var buffers = element.GetProperty("Specialization").GetProperty("Buffers");
+                    var index = 0;
+                    foreach (var buffer in buffers.EnumerateArray())
+                    {
+                        if (index >= specialization.Buffers.Count) break;
+                        specialization.Buffers[index] = new BufferSpecialization(buffer.GetProperty("PackedStride").GetUInt32(),
+                            buffer.GetProperty("DescriptorFormat").GetUInt32(), buffer.GetProperty("DescriptorSwizzle").GetUInt32());
+                        index++;
+                    }
+                }
+
+                resources = ResourceMaterializer.ApplyTo(plan, specialization);
+                layout = BindingLayout.Allocate(resources.Info, BindingLayout.CollectUserDataRegisters(program, 0, userDataCount),
                     BindingLayout.UsesGlobalDataShare(program), ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
-                    BindingLayout.ReadsShaderBase(program), 0, usesDispatchThreadLimits: false, limitsInShaderData: false);
+                    BindingLayout.ReadsShaderBase(program), 0, usesDispatchThreadLimits: usesLimits, limitsInShaderData: false);
             }
             catch (Exception e)
             {
@@ -215,10 +249,11 @@ public sealed class LocalReplayDispatchTests(HeadlessVulkanFixture fixture, ITes
             }
             var request = new ShaderCompileRequest(plan, resources, layout)
             {
-                WaveSize = 64, EnableExecGuardElision = true, SupportsSharedInt64Atomics = true, SupportsBufferInt64Atomics = true,
-                SupportsFloat16Conversions = true, ShaderSignedZeroInfNanPreserveFloat32Supported = true, LocalSizeX = 64,
-                LocalDataShareDwords = 4096,
-                ComputeSystemRegisters = new Gen5ComputeSystemRegisters(16, null, null, null),
+                WaveSize = waveSize, EnableExecGuardElision = true, SupportsSharedInt64Atomics = true, SupportsBufferInt64Atomics = true,
+                SupportsFloat16Conversions = true, ShaderSignedZeroInfNanPreserveFloat32Supported = true,
+                LocalSizeX = localX, LocalSizeY = localY, LocalSizeZ = localZ, ScratchDwords = scratch,
+                LocalDataShareDwords = 8192,
+                ComputeSystemRegisters = new Gen5ComputeSystemRegisters(userDataCount, null, null, null),
                 HostComputeSubgroup32 = true,
             };
             if (!Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out error))
@@ -228,7 +263,8 @@ public sealed class LocalReplayDispatchTests(HeadlessVulkanFixture fixture, ITes
             }
 
             File.WriteAllBytes(Path.Combine(outDirectory, $"{hash:X16}.spv"), shader.Spirv);
-            output.WriteLine($"{hash:X16}: {program.Instructions.Count} instructions, {shader.Spirv.Length} bytes");
+            output.WriteLine($"{hash:X16}: {program.Instructions.Count} instructions, {shader.Spirv.Length} bytes wave={waveSize} local={localX}x{localY}x{localZ} user_data={userDataCount} limits={usesLimits} " +
+                $"layout: shader_data={layout.ShaderDataDwordCount} push={layout.PushDataStartDword} memory_offset={layout.MemoryOffsetDword} buffers={resources.Info.Buffers.Count} descriptors={string.Join(",", layout.Descriptors.Select(d => d.Kind + ":" + d.Resources.Count))} flattened={plan.FlattenedSlotByMemoryIndex.Count}");
         }
     }
 }

@@ -21,18 +21,30 @@ public sealed class ComputePartialWaveExecDeviceTests(HeadlessVulkanFixture fixt
     private const uint WaveSize = 64;
 
     [Theory]
-    [InlineData(2u)]
-    [InlineData(24u)]
-    [InlineData(40u)]
-    [InlineData(64u)]
-    public void ExecAndCompareMasksCountOnlyDispatchedLanes(uint threads)
+    [InlineData(2u, false)]
+    [InlineData(24u, false)]
+    [InlineData(40u, false)]
+    [InlineData(64u, false)]
+    [InlineData(2u, true)]
+    [InlineData(24u, true)]
+    [InlineData(40u, true)]
+    [InlineData(64u, true)]
+    public void ExecAndCompareMasksCountOnlyDispatchedLanes(uint threads, bool runtimeLimits)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
-        var (plan, resources, layout) = Prepare(CreateProgram());
+        // [local] runtimeLimits: the thread count arrives in the shader data at dispatch time (a thread-count dispatch of
+        // the game, UsesDispatchThreadLimits), not in the compile request.
+        var program = CreateProgram();
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, 0x1234, 0, 16, waveSize: WaveSize);
+        var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
+        var layout = BindingLayout.Allocate(resources.Info, BindingLayout.CollectUserDataRegisters(program, 0, 16),
+            BindingLayout.UsesGlobalDataShare(program), ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
+            BindingLayout.ReadsShaderBase(program), 0, usesDispatchThreadLimits: runtimeLimits, limitsInShaderData: false);
         var request = new ShaderCompileRequest(plan, resources, layout)
         {
-            LocalSizeX = WaveSize, ThreadCountX = threads, WaveSize = WaveSize,
+            LocalSizeX = WaveSize, ThreadCountX = runtimeLimits ? ShaderCompileRequest.UnboundedThreadCount : threads, WaveSize = WaveSize,
+            HostComputeSubgroup32 = true,
         };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         using var harness = new ImageTestHarness(vulkan);
@@ -41,7 +53,8 @@ public sealed class ComputePartialWaveExecDeviceTests(HeadlessVulkanFixture fixt
         var registers = new uint[256];
         registers[6] = 512;
         harness.Run(() => runner.Dispatch(registers,
-            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [result] }, 1));
+            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [result] }, 1,
+            dispatchThreadLimits: runtimeLimits ? [threads, 1, 1] : null));
         var actual = runner.ReadBack(result, 0, 512);
         for (var lane = 0; lane < WaveSize; lane++)
         {
