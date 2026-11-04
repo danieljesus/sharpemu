@@ -41,6 +41,7 @@ internal sealed partial class RenderRecorder
 
     private void RecordDispatch(ResolvedDispatch record)
     {
+        using var setupScope = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchRecordSetup); // [local]
         if (!_host.IsRecording)
         {
             throw _host.Fatal("A dispatch has no recording command buffer.");
@@ -123,7 +124,8 @@ internal sealed partial class RenderRecorder
             }
         }
 
-        _host.EndRendering();
+        using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchEndRendering)) // [local]
+            _host.EndRendering();
         using (_host.BeginPreparation())
         {
             PipelineHandle pipeline;
@@ -160,12 +162,15 @@ internal sealed partial class RenderRecorder
 
             if (Buffers.WriteDiffProbe.Enabled) Buffers.WriteDiffProbe.Arm(program.Hash); // [local] SHARPEMU_WRITE_DIFF
             var bindings = PrepareBindings(input.Stage);
+            var bindScope = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchBind); // [local]
             if (program.UsesDeviceAddresses)
             {
-                _host.PrepareDeviceAddresses();
+                using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchBda)) // [local]
+                    _host.PrepareDeviceAddresses();
             }
 
             _host.BindResources(bindings);
+            bindScope.Dispose();
             Span<IPreparedBindings> stages = [bindings];
             var dispatchEmit = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.PartDispatchEmit); // [local] SHARPEMU_PARREC_PROBE
             _host.CommitBindings(PipelineBindPoint.Compute, in pipeline, stages);

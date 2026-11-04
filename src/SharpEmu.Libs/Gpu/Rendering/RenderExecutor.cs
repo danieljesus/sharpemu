@@ -350,7 +350,10 @@ public sealed partial class RenderExecutor
         }
 
         ResolveShaderPrograms(banks, ref state, indexed: true);
-        if (!ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, true, arguments, default), record))
+        var adaptScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecAdaptations); // [local]
+        var adapted = ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, true, arguments, default), record);
+        adaptScope.Dispose();
+        if (!adapted)
         {
             TraceDisposition("adapted");
             record.ResetBindings = true;
@@ -371,9 +374,11 @@ public sealed partial class RenderExecutor
             arguments.IndirectArgumentsAddress);
         record.IndexedTrace = traceSample;
         record.PacketAddress = tracePacket;
-        FillDraw(record, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart, setBindDebug: true, setAutoDebug: false);
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecFill)) // [local]
+            FillDraw(record, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart, setBindDebug: true, setAutoDebug: false);
         TraceDisposition("recorded");
-        Record(record);
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecRecord)) // [local]
+            Record(record);
     }
 
     public void DrawAuto(ulong submitId, RegisterBanks banks, in DrawAutoArguments arguments)

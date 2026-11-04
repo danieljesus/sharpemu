@@ -425,6 +425,7 @@ internal static unsafe partial class VulkanVideoPresenter
             memo.Textures.CopyTo(descriptors.Images, 0);
             descriptors.Samplers = Scratch.Samplers.Rent(memo.SamplerHandles.Length);
             memo.SamplerHandles.CopyTo(descriptors.Samplers, 0);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemoImages)) // [local]
             foreach (var texture in memo.Textures)
             {
                 CompleteOverlappingPublications(texture.Request.Description.Data.Address,
@@ -436,13 +437,18 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var layout = program.Bindings!;
-            prepared.ShaderData = AssembleShaderData(stage, program, layout);
-            if (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null)
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingShaderData)) // [local]
             {
-                descriptors.GlobalDataShare = new BufferView(_bufferCache.GdsBuffer.Handle, 0, Vk.WholeSize);
+                prepared.ShaderData = AssembleShaderData(stage, program, layout);
+                if (layout.Find(DescriptorBindingKind.GlobalDataShare) is not null)
+                {
+                    descriptors.GlobalDataShare = new BufferView(_bufferCache.GdsBuffer.Handle, 0, Vk.WholeSize);
+                }
             }
 
-            FindDeviceAddressBuffers(prepared);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingDeviceRanges)) // [local]
+                FindDeviceAddressBuffers(prepared);
+            using var buffersScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemoBuffers); // [local]
             var spans = GuestGpuMemoryHook.Current?.SpanVersion ?? 0;
             var sameBuffers = memo.Spans == spans && SameWords(memo.Buffers, stage.Resources.Buffers);
             if (sameBuffers)
@@ -877,10 +883,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw Serial("host movie");
             }
 
-            if (frontendReady && !movieActive && !Gpu.Images.ImageClearTrace.Enabled && !MeshDrawTrace.Active &&
-                TryFindStagePreparation(preparations, snapshot, stage.ShaderBase, out var memo))
+            StagePreparationMemo? memo = null;
+            var memoScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemo); // [local]
+            var memoFound = frontendReady && !movieActive && !Gpu.Images.ImageClearTrace.Enabled && !MeshDrawTrace.Active &&
+                TryFindStagePreparation(preparations, snapshot, stage.ShaderBase, out memo);
+            memoScope.Dispose();
+            if (memoFound)
             {
-                return ReuseStagePreparation(preparation, stage, program, memo);
+                return ReuseStagePreparation(preparation, stage, program, memo!);
             }
 
             Interlocked.Increment(ref _stageMemoMisses);

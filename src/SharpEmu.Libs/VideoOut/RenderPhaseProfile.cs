@@ -198,6 +198,21 @@ internal static class RenderPhaseProfile
         PartScopeEmit,
         PartDispatchEmit,
         PartPure,
+        // [local] Pieces of DescriptorPreparation on the stage-memo path (the memo lookup with its freshness check and
+        // the per-texture loop of the reuse) and of DrawExecutor and CommandDispatchTranslation outside the nested
+        // phases (upstream's resolve/record split: the adaptations, the record fill, the hand-over to the recorder and
+        // the dispatch resolution and its recording set-up).
+        BindingMemo,
+        BindingMemoImages,
+        ExecAdaptations,
+        ExecFill,
+        ExecRecord,
+        ExecDispatchResolve,
+        DispatchRecordSetup,
+        BindingMemoBuffers,
+        DispatchEndRendering,
+        DispatchBind,
+        DispatchBda,
         // [local] SHARPEMU_COLDRES_PROBE: a materialization that hit or missed the cache, the creations of image views,
         // samplers, cache buffers, pipelines (the cache miss under the gate), program entries and permutations, and the
         // waits for the image cache's and the page tracker's region locks and for the program cache's gate.

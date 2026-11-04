@@ -52,6 +52,7 @@ public sealed partial class RenderExecutor
         ComputeProgram? preparedProgram = null)
     {
         var compute = banks.Shader.Compute;
+        using var resolveScope = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.ExecDispatchResolve); // [local]
         var record = _pool.RentDispatch();
         record.Debug = new DebugInformation(RecordedOperation.DispatchDirect, submitId, groupsX, groupsY, groupsZ, dispatchInitiator, compute.Address);
         record.Skipped = true;
