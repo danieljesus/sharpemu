@@ -603,6 +603,18 @@ public sealed partial class GuestImageCache
 
     // DCC metadata of a bound target, or the range of a DCC fill seen before its target: both are
     // filled on the host, which keeps them CPU-readable instead of GPU-written.
+    // [local] SHARPEMU_PENDING_METADATA_FILLS: upstream (#1130) lets a fill over a pending DCC entry (a fill seen before
+    // the color target it belongs to) count as a metadata fill, so FillBuffer writes the pattern to the guest backing
+    // and drops the range's GPU ownership. GTA V clears every face of its shadow cubemaps with 512 KB fills that
+    // TryAbsorbDccFill records as pending entries: with that rule each face fill left the cubemap without a GPU-dirty
+    // source, so every refresh staged the whole 3 MB image from guest memory (five times per frame, 1.8 GB per 5 s,
+    // ImageUpload 1.2 ms/frame) instead of adopting the owning buffer once, as in 3368666f. Off by default: a pending
+    // entry does not count (registered DCC metadata and natively cleared metadata do). =1 restores upstream's rule.
+    // Tests pin it through PendingMetadataFillsOverride before they construct the cache.
+    internal static readonly AsyncLocal<bool?> PendingMetadataFillsOverride = new();
+    private static readonly bool PendingMetadataFillsEnabled = Environment.GetEnvironmentVariable("SHARPEMU_PENDING_METADATA_FILLS") == "1";
+    private readonly bool _pendingMetadataFills = PendingMetadataFillsOverride.Value ?? PendingMetadataFillsEnabled;
+
     public bool OverlapsDccMetadata(ulong address, ulong size)
     {
         using var held = _lock.Read();
@@ -615,7 +627,7 @@ public sealed partial class GuestImageCache
             var extent = metadata.Kind switch
             {
                 SurfaceMetadataKind.Dcc => metadata.Size,
-                SurfaceMetadataKind.PendingDcc => metadata.FillSize,
+                SurfaceMetadataKind.PendingDcc => _pendingMetadataFills ? metadata.FillSize : 0UL,
                 _ => metadata.NativeColorClear ? metadata.Size : 0UL,
             };
             if (extent != 0 && address < start + extent && start < address + size)

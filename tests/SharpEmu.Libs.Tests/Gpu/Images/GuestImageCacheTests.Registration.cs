@@ -24,6 +24,8 @@ public sealed partial class GuestImageCacheTests : IClassFixture<HeadlessVulkanF
         _vulkan = fixture.Vulkan;
         // [local] Upstream's image-cache tests exercise its publication of GPU-written images (off by default here).
         GuestImageCache.ImagePublicationOverride.Value = true;
+        // [local] ... and its pending-DCC fill rule (SHARPEMU_PENDING_METADATA_FILLS, off by default here).
+        GuestImageCache.PendingMetadataFillsOverride.Value = true;
     }
 
     private static ImageRequest Sampled(ulong address)
