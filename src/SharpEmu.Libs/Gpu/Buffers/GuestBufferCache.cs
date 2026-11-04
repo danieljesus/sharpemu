@@ -2237,18 +2237,22 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // drops stores until the fault is processed, so a fault brings in the aligned window around the page,
     // clipped to its registered span. A window the guest cannot read in one piece keeps the single page.
     internal const ulong DeviceAddressFaultWindow = 2 * MiB;
-    // [local] SHARPEMU_BDA_FAULT_WINDOW_BYTES=<n>: the window a device-address fault brings in (default upstream's 2 MiB;
-    // 4096 = the faulted page alone, as before the merge). A/B switch.
-    private static readonly ulong FaultWindowBytes = ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_FAULT_WINDOW_BYTES"), out var faultWindow) && faultWindow >= 4096
-        ? faultWindow : DeviceAddressFaultWindow;
+    // [local] SHARPEMU_BDA_FAULT_WINDOW_BYTES=<n> (a power of two): the window a device-address fault brings in. Default
+    // 4096 = the faulted page alone, as in 3368666f; 2097152 restores upstream's DeviceAddressFaultWindow above. A test
+    // sets FaultWindowOverride before it constructs the cache.
+    internal static readonly AsyncLocal<ulong?> FaultWindowOverride = new();
+    private static readonly ulong FaultWindowBytesDefault =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_FAULT_WINDOW_BYTES"), out var faultWindow) && faultWindow >= 4096 &&
+        (faultWindow & (faultWindow - 1)) == 0 ? faultWindow : 4096;
+    private readonly ulong _faultWindowBytes = FaultWindowOverride.Value ?? FaultWindowBytesDefault;
 
     internal GuestSpan DeviceAddressFaultRange(ulong pageAddress, ulong pageSize)
     {
-        if (FaultWindowBytes > pageSize && GpuMemory is { } memory && memory.TryGetSpan(pageAddress, out var spanStart, out var spanEnd))
+        if (_faultWindowBytes > pageSize && GpuMemory is { } memory && memory.TryGetSpan(pageAddress, out var spanStart, out var spanEnd))
         {
-            var windowStart = pageAddress & ~(FaultWindowBytes - 1);
+            var windowStart = pageAddress & ~(_faultWindowBytes - 1);
             var start = Math.Max(windowStart, spanStart);
-            var end = Math.Min(windowStart + FaultWindowBytes, spanEnd);
+            var end = Math.Min(windowStart + _faultWindowBytes, spanEnd);
             if (pageAddress + pageSize <= end && _guest.CanRead(start, end - start))
             {
                 return new GuestSpan(start, end - start);

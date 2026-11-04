@@ -1823,7 +1823,9 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         // The test sets a fault bit directly, without the granule summary bit our fault writers also set
         // (SHARPEMU_BDA_SCAN_MAPPED, on by default), so its processor scans the whole bitmap.
         BdaFaultProcessor.ScanMappedModeOverride.Value = 0;
+        GuestBufferCache.FaultWindowOverride.Value = GuestBufferCache.DeviceAddressFaultWindow; // [local] the cache defaults to one page
         using var harness = new CacheHarness(_vulkan);
+        GuestBufferCache.FaultWindowOverride.Value = null;
         harness.Cache.GpuMemory = harness.Gpu;
         const ulong window = GuestBufferCache.DeviceAddressFaultWindow;
         var address = harness.MapBacked(3 * window, ReadWrite);
@@ -1849,7 +1851,9 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     public void DeviceAddressFaultRange_StaysInsideTheRegisteredSpan()
     {
         if (_vulkan is null) return;
+        GuestBufferCache.FaultWindowOverride.Value = GuestBufferCache.DeviceAddressFaultWindow; // [local] the cache defaults to one page
         using var harness = new CacheHarness(_vulkan);
+        GuestBufferCache.FaultWindowOverride.Value = null;
         harness.Cache.GpuMemory = harness.Gpu;
         var address = harness.MapBacked(0x40000, ReadWrite);
 
@@ -1887,7 +1891,9 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         // The test sets a fault bit directly, without the granule summary bit our fault writers also set
         // (SHARPEMU_BDA_SCAN_MAPPED, on by default), so its processor scans the whole bitmap.
         BdaFaultProcessor.ScanMappedModeOverride.Value = 0;
+        GuestBufferCache.FaultWindowOverride.Value = GuestBufferCache.DeviceAddressFaultWindow; // [local] the cache defaults to one page
         using var harness = new CacheHarness(_vulkan);
+        GuestBufferCache.FaultWindowOverride.Value = null;
         using var fatal = new FatalScope();
         harness.Cache.GpuMemory = harness.Gpu;
         const ulong window = GuestBufferCache.DeviceAddressFaultWindow;

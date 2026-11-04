@@ -418,7 +418,9 @@ public sealed class GpuCommandInterpreterLabelTests
     [InlineData(1u << 26, 0u)]
     public void WrappedAcquireMemoryWithACacheAction_EmitsOneBarrier(uint cbDbOperation, uint gcrControl)
     {
+        GpuCommandInterpreter.AcquireBarrierOverride.Value = true; // [local] acquires emit no barrier by default
         var runner = new StreamRunner();
+        GpuCommandInterpreter.AcquireBarrierOverride.Value = null;
 
         runner.Run(StreamRunner.CustomPacket(Nop, PacketCustomCode.AcquireMemory, cbDbOperation, 0, 0, 0, 0, 10, gcrControl));
 
@@ -434,7 +436,9 @@ public sealed class GpuCommandInterpreterLabelTests
     [InlineData(1u << 29)]
     public void NativeAcquireMemoryWithACacheAction_EmitsOneBarrier(uint coherControl)
     {
+        GpuCommandInterpreter.AcquireBarrierOverride.Value = true; // [local] acquires emit no barrier by default
         var runner = new StreamRunner();
+        GpuCommandInterpreter.AcquireBarrierOverride.Value = null;
 
         runner.Run(StreamRunner.Packet(PacketOpcode.AcquireMemory, coherControl, 0, 0, 0, 0, 10));
 
@@ -445,7 +449,9 @@ public sealed class GpuCommandInterpreterLabelTests
     public void AcquireMemoryReport_CountsPacketsAndBarriers()
     {
         GpuCommandInterpreter.TakeAcquireMemoryReport();
+        GpuCommandInterpreter.AcquireBarrierOverride.Value = true; // [local] acquires emit no barrier by default
         var runner = new StreamRunner();
+        GpuCommandInterpreter.AcquireBarrierOverride.Value = null;
 
         runner.Run(
             StreamRunner.CustomPacket(Nop, PacketCustomCode.AcquireMemory, 0, 0, 0, 0, 0, 0, 0),
