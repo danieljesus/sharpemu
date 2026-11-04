@@ -27,14 +27,33 @@ public sealed class ComputeWaveAppendDeviceTests(HeadlessVulkanFixture fixture) 
     [InlineData(16u, 1024u)]
     [InlineData(200u, 12800u)]
     [InlineData(200u, 12777u)]
-    public void EveryLaneClaimsOneDistinctSlot(uint groups, uint threads)
+    public void EveryLaneClaimsOneDistinctSlot(uint groups, uint threads) => Run(groups, threads, runtimeLimits: false);
+
+    // [local] The game's thread-count dispatches: the limit arrives in the shader data at dispatch time
+    // (UsesDispatchThreadLimits) and the indirect path dispatches the thread count as the group count, so whole groups
+    // past the limit run and must claim nothing.
+    [Theory]
+    [InlineData(1u, 37u)]
+    [InlineData(200u, 12777u)]
+    [InlineData(37u, 37u)]
+    [InlineData(1000u, 1000u)]
+    [InlineData(12777u, 12777u)]
+    public void EveryLaneClaimsOneDistinctSlot_RuntimeLimits(uint groups, uint threads) => Run(groups, threads, runtimeLimits: true);
+
+    private void Run(uint groups, uint threads, bool runtimeLimits)
     {
         var vulkan = fixture.Vulkan;
         if (!GatePrerequisites.Ready(vulkan, shaderInt64: true)) return;
-        var (plan, resources, layout) = Prepare(CreateProgram());
+        var program = CreateProgram();
+        var plan = ShaderResourcePlan.Extract(program, ShaderStage.Compute, 0x1234, 0, 16, waveSize: WaveSize);
+        var resources = ResourceMaterializer.ApplyTo(plan, ResourceSpecialization.Default(plan.Info));
+        var layout = BindingLayout.Allocate(resources.Info, BindingLayout.CollectUserDataRegisters(program, 0, 16),
+            BindingLayout.UsesGlobalDataShare(program), ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
+            BindingLayout.ReadsShaderBase(program), 0, usesDispatchThreadLimits: runtimeLimits, limitsInShaderData: false);
         var request = new ShaderCompileRequest(plan, resources, layout)
         {
-            LocalSizeX = WaveSize, ThreadCountX = threads, WaveSize = WaveSize,
+            LocalSizeX = WaveSize, ThreadCountX = runtimeLimits ? ShaderCompileRequest.UnboundedThreadCount : threads, WaveSize = WaveSize,
+            HostComputeSubgroup32 = true,
         };
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
         using var harness = new ImageTestHarness(vulkan);
@@ -47,7 +66,8 @@ public sealed class ComputeWaveAppendDeviceTests(HeadlessVulkanFixture fixture) 
         var registers = new uint[256];
         registers[6] = listBytes + 64;
         harness.Run(() => runner.Dispatch(registers,
-            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [list] }, groups));
+            new Dictionary<DescriptorBindingKind, GpuBuffer[]> { [DescriptorBindingKind.Buffers] = [list] }, groups,
+            dispatchThreadLimits: runtimeLimits ? [threads, 1, 1] : null));
         var whole = runner.ReadBack(list, 0, listBytes + 64);
         var total = BinaryPrimitives.ReadUInt32LittleEndian(whole.AsSpan(0, 4));
         Assert.Equal(threads, total);
