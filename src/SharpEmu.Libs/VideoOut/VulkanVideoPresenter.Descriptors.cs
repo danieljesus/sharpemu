@@ -1199,6 +1199,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     IsUnmappedBufferStart(prepared, index, descriptor.Address))
                 {
                     if (ResolveProfile.Enabled && !_worker) ResolveProfile.CountNullBuffer(); // [local]
+                    if (program.Hash == 0xFADBE3FB13E9DCFF && Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1") // [local] why a leaf-writer binding binds as a null buffer
+                        Console.Error.WriteLine($"[FADB_NULL] b{index} address=0x{descriptor.Address:X} requested=0x{requested:X} stride={descriptor.Stride} records={descriptor.RecordCount} readable={_guestMemory.CanRead(descriptor.Address, 1)} prt={Kernel.KernelRuntimeCompatExports.ContainsPrtRange(descriptor.Address, 1)} tick={_scheduler.CurrentTick} words=[{string.Join(",", words.Select(w => $"{w:X8}"))}]");
                     sources[index] = (descriptor, default, 0);
                     continue;
                 }
@@ -1408,10 +1410,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 var postHash = hash; var postIndex = index; var postAddress = descriptor.Address; var postSize = size; var postTick = _scheduler.CurrentTick;
                 Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Add(() => { try { _bufferCache.DumpDeviceRange(postAddress, postSize, $"C:/Users/danyy/AppData/Local/Temp/gta/post_{postHash:X16}_b{postIndex}_{postAddress:X}_{postSize:X}_{postTick}.gpu.bin"); } catch (Exception e) { Console.Error.WriteLine($"[BVH_HDRWRITE] post dump failed: {e.Message}"); } });
             }
-            if (Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1" && hash == 0xFADBE3FB13E9DCFF && _preDumps < 600 && size <= 0x80000UL) // [local] every bound buffer of the leaf writer before its dispatch
+            if (Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1" && hash == 0xFADBE3FB13E9DCFF && _preDumps < 1500) // [local] every bound buffer of the leaf writer before its dispatch (no size cap)
             {
                 _preDumps++;
                 try { _bufferCache.DumpDeviceRange(descriptor.Address, size, $"C:/Users/danyy/AppData/Local/Temp/gta/pre_{hash:X16}_b{index}_{descriptor.Address:X}_{size:X}_{_scheduler.CurrentTick}.gpu.bin"); } catch (Exception e) { Console.Error.WriteLine($"[BVH_HDRWRITE] pre dump failed: {e.Message}"); }
+                // [local] the CPU-side bytes of the inputs and the constant block (s[2:3] -> V#s + matrix; s4 = record base) at prepare time
+                if (index is 0 or 1) try { _bufferCache.DumpGuestRange(descriptor.Address, size, $"C:/Users/danyy/AppData/Local/Temp/gta/guest_{hash:X16}_b{index}_{descriptor.Address:X}_{size:X}_{_scheduler.CurrentTick}.gpu.bin"); } catch (Exception e) { Console.Error.WriteLine($"[BVH_HDRWRITE] guest dump failed: {e.Message}"); }
+                if (index == 0)
+                {
+                    var ud = prepared.Stage.Resources.UserData;
+                    var blockAddress = ud.Length > 3 ? ud[2] | ((ulong)ud[3] << 32) : 0;
+                    try { if (blockAddress != 0) _bufferCache.DumpGuestRange(blockAddress, 256, $"C:/Users/danyy/AppData/Local/Temp/gta/guestblk_{hash:X16}_{descriptor.Address:X}_{string.Join("-", ud.Skip(4).Take(6).Select(w => w.ToString("X")))}_{_scheduler.CurrentTick}.gpu.bin"); } catch (Exception e) { Console.Error.WriteLine($"[BVH_HDRWRITE] guest block dump failed: {e.Message}"); }
+                }
             }
             if (Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1") // [local] build stages of three dynamic BLASes: full blob after the root init (260F, slot 2) and after the root writer (F6F2, slot 3); F6F2 inputs before its dispatch
             {

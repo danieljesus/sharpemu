@@ -60,10 +60,15 @@ public sealed class LocalReplayDispatchTests(HeadlessVulkanFixture fixture, ITes
         var specialization = ResourceSpecialization.Default(plan.Info);
         var strides = (Environment.GetEnvironmentVariable("LOCAL_REPLAY_STRIDES") ?? "")
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(stride => uint.Parse(stride, CultureInfo.InvariantCulture)).ToArray();
+            .ToArray();
         for (var index = 0; index < Math.Min(strides.Length, specialization.Buffers.Count); index++)
         {
-            specialization.Buffers[index] = specialization.Buffers[index] with { PackedStride = strides[index] };
+            // stride[/format/swizzle]: the descriptor format and swizzle of a formatted load (74/940 = 32_32_32_FLOAT xyz)
+            var parts = strides[index].Split('/');
+            var entry = specialization.Buffers[index] with { PackedStride = uint.Parse(parts[0], CultureInfo.InvariantCulture) };
+            if (parts.Length > 1) entry = entry with { DescriptorFormat = uint.Parse(parts[1], CultureInfo.InvariantCulture) };
+            if (parts.Length > 2) entry = entry with { DescriptorSwizzle = uint.Parse(parts[2], CultureInfo.InvariantCulture) };
+            specialization.Buffers[index] = entry;
         }
 
         var resources = ResourceMaterializer.ApplyTo(plan, specialization);
