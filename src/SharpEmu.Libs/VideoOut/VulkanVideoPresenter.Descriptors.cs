@@ -1342,6 +1342,7 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         private int _postDumps; // [local] SHARPEMU_TRACK_BUILD post-dispatch dumps
+        private int _preDumps; // [local] SHARPEMU_TRACK_BUILD pre-dispatch dumps of 0xFADB
         private int _hdrPrePost; // [local]
         private int _hdrAfterDumps; // [local]
         private int _refitInDumps; // [local]
@@ -1406,6 +1407,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 _postDumps++;
                 var postHash = hash; var postIndex = index; var postAddress = descriptor.Address; var postSize = size; var postTick = _scheduler.CurrentTick;
                 Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Add(() => { try { _bufferCache.DumpDeviceRange(postAddress, postSize, $"C:/Users/danyy/AppData/Local/Temp/gta/post_{postHash:X16}_b{postIndex}_{postAddress:X}_{postSize:X}_{postTick}.gpu.bin"); } catch (Exception e) { Console.Error.WriteLine($"[BVH_HDRWRITE] post dump failed: {e.Message}"); } });
+            }
+            if (Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1" && hash == 0xFADBE3FB13E9DCFF && _preDumps < 600 && size <= 0x80000UL) // [local] every bound buffer of the leaf writer before its dispatch
+            {
+                _preDumps++;
+                try { _bufferCache.DumpDeviceRange(descriptor.Address, size, $"C:/Users/danyy/AppData/Local/Temp/gta/pre_{hash:X16}_b{index}_{descriptor.Address:X}_{size:X}_{_scheduler.CurrentTick}.gpu.bin"); } catch (Exception e) { Console.Error.WriteLine($"[BVH_HDRWRITE] pre dump failed: {e.Message}"); }
             }
             if (Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1") // [local] build stages of three dynamic BLASes: full blob after the root init (260F, slot 2) and after the root writer (F6F2, slot 3); F6F2 inputs before its dispatch
             {
