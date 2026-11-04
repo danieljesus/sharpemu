@@ -18,6 +18,11 @@ public sealed partial class RenderExecutor
         stage.Program is { } program &&
         (program.UsesDeviceAddresses || WritesStorageImage(program) || HasBufferWrites(stage));
 
+    // [local] With the stage's HasBufferWrites already evaluated by the caller.
+    private static bool DrawWritesMemory(ShaderStageResources stage, bool bufferWrites) =>
+        stage.Program is { } program &&
+        (program.UsesDeviceAddresses || WritesStorageImage(program) || bufferWrites);
+
     private bool HasBufferWrites(ShaderStageResources stage)
     {
         var program = stage.Program ?? throw _host.Fatal("A shader stage has no program.");

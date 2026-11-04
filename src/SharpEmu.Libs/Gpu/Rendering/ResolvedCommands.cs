@@ -112,6 +112,10 @@ internal sealed class ResolvedDraw
 
     public void Reset()
     {
+        // [local] The multisample-resolve and depth/stencil-copy requests (four image requests, some 2.5 KB) are only
+        // written for their kinds (TryResolveMultisampleColor, TryResolveDepthStencilCopy) and only read for them
+        // (RenderRecorder, MarkPendingWrites): a draw record no longer zeroes them on every return to the pool.
+        var kind = Kind;
         Sequence = 0;
         Kind = ResolvedDrawKind.Skipped;
         Announce = false;
@@ -141,14 +145,21 @@ internal sealed class ResolvedDraw
         IndexedTrace = null;
         PacketAddress = 0;
         Clear = default;
-        ResolveSource = default;
-        ResolveDestination = default;
-        CopyRead = default;
-        CopyWrite = default;
-        CopyReadFormat = default;
-        CopyWriteFormat = default;
-        CopyExtent = default;
-        CopyAspects = default;
+        if (kind == ResolvedDrawKind.MultisampleResolve)
+        {
+            ResolveSource = default;
+            ResolveDestination = default;
+        }
+
+        if (kind == ResolvedDrawKind.DepthStencilCopy)
+        {
+            CopyRead = default;
+            CopyWrite = default;
+            CopyReadFormat = default;
+            CopyWriteFormat = default;
+            CopyExtent = default;
+            CopyAspects = default;
+        }
     }
 }
 

@@ -582,14 +582,18 @@ public sealed partial class RenderExecutor
         var vertexInput = state.Programs.VertexInput;
         var pixelInput = state.Programs.PixelInput;
         var pixelProgram = state.PixelActive ? pixelInput.Stage.Program : null;
+        // [local] HasBufferWrites decodes every written buffer descriptor of the stage: once per stage, shared with
+        // WritesMemory below (it ran up to four times per draw).
+        var vertexBufferWrites = HasBufferWrites(vertexInput.Stage);
+        var pixelBufferWrites = state.PixelActive && HasBufferWrites(pixelInput.Stage);
         var writeStages = PipelineStageFlags.None;
-        if (HasBufferWrites(vertexInput.Stage))
+        if (vertexBufferWrites)
         {
             writeStages |= state.Programs.MeshInput is not null ? PipelineStageFlags.MeshShaderBitExt
                 : vertexInput.Tessellation is not null ? PipelineStageFlags.TessellationEvaluationShaderBit : PipelineStageFlags.VertexShaderBit;
         }
 
-        if (state.PixelActive && HasBufferWrites(pixelInput.Stage))
+        if (pixelBufferWrites)
         {
             writeStages |= PipelineStageFlags.FragmentShaderBit;
         }
@@ -605,7 +609,7 @@ public sealed partial class RenderExecutor
         record.DynamicStamp = banks.Stamp(RegisterStamp.ContextDynamic);
         record.TargetVersion = _drawResolution.TargetVersion;
         record.Dynamic = ResolveDynamicState(banks, in state, WrittenColorTargets(context, in state, pixelProgram), record.SubmitId, record.PacketAddress);
-        record.WritesMemory = DrawWritesMemory(vertexInput.Stage) || (state.PixelActive && DrawWritesMemory(pixelInput.Stage));
+        record.WritesMemory = DrawWritesMemory(vertexInput.Stage, vertexBufferWrites) || (state.PixelActive && DrawWritesMemory(pixelInput.Stage, pixelBufferWrites));
         record.WriteStages = writeStages;
         record.SetBindDebug = setBindDebug;
         record.SetAutoDebug = setAutoDebug;
