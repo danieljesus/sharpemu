@@ -38,11 +38,15 @@ internal static unsafe partial class VulkanVideoPresenter
     private static long _stageMemoAcquireReuses;
     private static long _stageMemoContentHits;
     private static long _stageMemoEvictions;
+    // [local] Reuses that ran FindBuffers again: the same descriptors after a registration (refinds) or new ones (changes).
+    private static long _stageMemoBufferRefinds;
+    private static long _stageMemoBufferChanges;
 
     internal static string TakeStagePreparationReport() =>
         FormattableString.Invariant($"[PERF][STAGE_MEMO] hits={Interlocked.Exchange(ref _stageMemoHits, 0)} misses={Interlocked.Exchange(ref _stageMemoMisses, 0)} captures={Interlocked.Exchange(ref _stageMemoCaptures, 0)} ") +
         FormattableString.Invariant($"stale={Interlocked.Exchange(ref _stageMemoStale, 0)} invalidations={Interlocked.Exchange(ref _stageMemoInvalidations, 0)} acquire_reuses={Interlocked.Exchange(ref _stageMemoAcquireReuses, 0)} ") +
-        FormattableString.Invariant($"content_hits={Interlocked.Exchange(ref _stageMemoContentHits, 0)} evictions={Interlocked.Exchange(ref _stageMemoEvictions, 0)}");
+        FormattableString.Invariant($"content_hits={Interlocked.Exchange(ref _stageMemoContentHits, 0)} evictions={Interlocked.Exchange(ref _stageMemoEvictions, 0)} ") +
+        FormattableString.Invariant($"buffer_refinds={Interlocked.Exchange(ref _stageMemoBufferRefinds, 0)} buffer_changes={Interlocked.Exchange(ref _stageMemoBufferChanges, 0)}"); // [local]
 
     private sealed class StagePreparationSet
     {
@@ -465,6 +469,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (!sameBuffers || memo.RegistrationSerial != _bufferCache.RegistrationSerial)
             {
+                Interlocked.Increment(ref sameBuffers ? ref _stageMemoBufferRefinds : ref _stageMemoBufferChanges); // [local]
                 FindBuffers(prepared);
                 prepared.BufferSources.CopyTo(memo.Sources, 0);
                 memo.Buffers = stage.Resources.Buffers;
@@ -810,6 +815,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (MeshDrawTrace.Active) MeshDrawTrace.Write("stage-binding", $"stage={stage.Program?.Stage} hash=0x{stage.Program?.Hash:X16} shaderBase=0x{stage.ShaderBase:X16} userData={string.Join(",", stage.Resources.UserData.Select(value => value.ToString("X8")))}");
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DescriptorPreparation);
+            var preludeScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingPrelude); // [local]
             var program = RequireProgram(stage);
             if (_worker && program.Frontend is { RequiresOrderedImagePreparation: true } orderedFrontend)
             {
@@ -884,6 +890,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             StagePreparationMemo? memo = null;
+            preludeScope.Dispose();
             var memoScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemo); // [local]
             var memoFound = frontendReady && !movieActive && !Gpu.Images.ImageClearTrace.Enabled && !MeshDrawTrace.Active &&
                 TryFindStagePreparation(preparations, snapshot, stage.ShaderBase, out memo);
@@ -1674,6 +1681,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Uploads every mapped range into the cache before a device-address draw; the fault pass follows.
         public void PrepareDeviceAddresses()
         {
+            var preludeScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DispatchBdaPrelude); // [local]
             var preparation = RequirePreparation();
             ulong vertexProgramHash = 0, pixelProgramHash = 0, computeProgramHash = 0;
             if (BufferUploadProfile.Enabled)
@@ -1713,6 +1721,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 Requests.NeedsBdaSweep = true;
                 Requests.BdaSpans = spans;
                 Requests.BdaMapping = _bdaSpanMapping;
+                preludeScope.Dispose();
                 return;
             }
 
@@ -1730,9 +1739,15 @@ internal static unsafe partial class VulkanVideoPresenter
             // writes belong to the next submission, so a second sweep inside one only re-protects.
             var submitId = _currentSubmitId;
             if (BdaSweepPerSubmit && submitId != 0 && submitId == _bdaSweepSubmitId && _bdaSpanMapping == _bdaSweepSubmitMapping)
+            {
+                Interlocked.Increment(ref GuestBufferCache.BdaPreparationsRepeated); // [local]
+                preludeScope.Dispose();
                 return;
+            }
+
             _bdaSweepSubmitId = submitId;
             _bdaSweepSubmitMapping = _bdaSpanMapping;
+            preludeScope.Dispose();
             _bufferCache.PrepareBda(spans, _bdaSpanMapping);
         }
 
@@ -2032,6 +2047,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal($"The prepared bindings are stale: hash=0x{program.Hash:X16}.");
             }
 
+            var viewsScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingBufferViews); // [local]
             if (layout.UsesTableBlock)
             {
                 WriteTableBlock(prepared, shaderData);
@@ -2041,6 +2057,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 BindBufferViews(prepared, shaderData);
             }
 
+            viewsScope.Dispose();
             if (layout.MipStatisticsCount != 0)
             {
                 if (_worker && _presenter._lodStatistics is null)
@@ -2052,6 +2069,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 _presenter.WriteMipStatisticsFields(shaderData, layout, info, snapshot.Images, snapshot.MipStatistics);
             }
 
+            using var uploadsScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingUploads); // [local]
             if (layout.Find(DescriptorBindingKind.FlattenedResourceTable) is not null)
             {
                 prepared.Descriptors.FlattenedTable = UploadDwords(snapshot.FlattenedResourceTable, "flattened resource table", program, byIdentity: true);

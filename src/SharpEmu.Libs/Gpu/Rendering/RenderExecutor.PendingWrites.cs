@@ -16,7 +16,8 @@ public sealed partial class RenderExecutor
         record.Sequence = _recorder.NextSequence();
         if (record.Sequence != 0)
         {
-            MarkPendingWrites(record);
+            using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.ExecMark)) // [local]
+                MarkPendingWrites(record);
         }
 
         _recorder.Record(record);

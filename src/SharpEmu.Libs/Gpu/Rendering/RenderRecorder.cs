@@ -186,6 +186,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         }
         finally
         {
+            using var returnScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecReturn); // [local]
             _pendingWrites?.Release(record.Sequence);
             if (_returnsRecords)
             {
@@ -256,6 +257,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 break;
             case ResolvedDrawKind.Draw:
             {
+                var targetsScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecTargets); // [local]
                 var inPlace = RepeatsPreviousTargets(record, in state, _host.DrawScope);
                 if (inPlace)
                 {
@@ -263,11 +265,13 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 }
                 else
                 {
+                    using var findScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecTargetsFind); // [local]
                     _inPlace.Valid = false;
                     FindTargets(ref state);
                     NoteFoundTargets(ref state);
                 }
 
+                targetsScope.Dispose();
                 RecordDrawCommands(record, ref state, inPlace);
                 break;
             }
@@ -506,7 +510,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         var pixelProgram = pixelBindings is null ? null : pixelInput.Stage.Program ?? throw _host.Fatal("The pixel stage has no program.");
         if (vertexProgram.UsesDeviceAddresses || (pixelProgram?.UsesDeviceAddresses ?? false))
         {
-            _host.PrepareDeviceAddresses();
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawBda)) // [local]
+                _host.PrepareDeviceAddresses();
         }
 
         _host.BindResources(vertexBindings);

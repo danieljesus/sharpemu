@@ -2344,15 +2344,18 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         {
             if (_retirementPolicy.CurrentTick != _bdaTouchTick || mapping != _bdaTouchMapping)
             {
+                using var touchScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DispatchBdaTouch); // [local]
                 for (var index = 0; index < spans.Count; index++)
                     TouchBuffersInRange(spans[index].Address, spans[index].Size);
                 _bdaTouchTick = _retirementPolicy.CurrentTick;
                 _bdaTouchMapping = mapping;
+                Interlocked.Increment(ref BdaTouches);
             }
 
             var epoch = _tracker.CpuDirtyEpoch;
             if (mapping != _bdaSweepMapping || (epoch != _bdaSweepEpoch && (!ObservationGated || _observation != _bdaSweepObservation)))
             {
+                var walkScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DispatchBdaWalk); // [local]
                 if (!_bdaSweepPlanBuilt || mapping != _bdaSweepPlanMapping)
                 {
                     _bdaSweepPlan = GuestPageTracker.PlanSweep(spans);
@@ -2367,6 +2370,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 {
                     if (_bdaSweepPlan is { } plan && _bufferPages.Complete)
                     {
+                        Interlocked.Increment(ref BdaSweepsPlanned);
                         _handleWindows.Sort();
                         // Only a registered buffer has anything to upload, so only the pages buffers cover are looked at.
                         _tracker.ForEachCoveredCpuDirtyPageRun(plan, _bufferPages, _uploadClearedRun ??= UploadClearedRun,
@@ -2381,6 +2385,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 }
                 finally
                 {
+                    walkScope.Dispose();
+                    using var closeScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DispatchBdaClose); // [local]
                     DiscardClearedRuns();
                     _sweepActive = false;
                     try
@@ -2550,6 +2556,10 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     private long _observation;
     public static long BdaSweeps;
     public static long BdaSweepsSkipped;
+    // [local] Preparations the per-submission gate answered, recency touches run, and sweeps that walked the page plan.
+    public static long BdaPreparationsRepeated;
+    public static long BdaTouches;
+    public static long BdaSweepsPlanned;
 
     // With the command stream on its own thread, guest CPU writes reach the GPU at the stream's
     // order points (a submission, a label, a write or copy the stream performs); a device-address

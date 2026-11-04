@@ -213,6 +213,24 @@ internal static class RenderPhaseProfile
         DispatchEndRendering,
         DispatchBind,
         DispatchBda,
+        // [local] Pieces of the executor's hand-over (the pending-write marks, the recorder's target lookup and the
+        // record's return to the pool) and of the device-address preparation (the presenter's prelude before the
+        // cache, the recency touch, the dirty walk and the sweep's close), plus the draw path's preparation.
+        ExecMark,
+        ExecTargets,
+        ExecReturn,
+        DrawBda,
+        DispatchBdaPrelude,
+        DispatchBdaTouch,
+        DispatchBdaWalk,
+        DispatchBdaClose,
+        // [local] Pieces of BindBuffers: the storage buffer views and the transient uploads (shader data, tables).
+        BindingBufferViews,
+        BindingUploads,
+        // [local] The recorder's target lookup when the draw does not repeat the previous targets, and the part of
+        // PrepareBindings before the stage memo is consulted.
+        ExecTargetsFind,
+        BindingPrelude,
         // [local] SHARPEMU_COLDRES_PROBE: a materialization that hit or missed the cache, the creations of image views,
         // samplers, cache buffers, pipelines (the cache miss under the gate), program entries and permutations, and the
         // waits for the image cache's and the page tracker's region locks and for the program cache's gate.
