@@ -236,7 +236,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             case ResolvedDrawKind.Skipped:
                 if (record.TargetsResolved)
                 {
-                    FindTargets(ref state);
+                    FindTargets(record, ref state);
                 }
 
                 break;
@@ -247,12 +247,12 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 CopyDepthStencil(record);
                 break;
             case ResolvedDrawKind.Tessellation:
-                FindTargets(ref state);
+                FindTargets(record, ref state);
                 RecordTessellation(record, ref state);
                 _inPlace.Valid = false;
                 break;
             case ResolvedDrawKind.ClearColorTargets:
-                FindTargets(ref state);
+                FindTargets(record, ref state);
                 _host.ClearColorTargets(DrawState.BoundColors(ref state), record.Clear);
                 break;
             case ResolvedDrawKind.Draw:
@@ -267,7 +267,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 {
                     using var findScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecTargetsFind); // [local]
                     _inPlace.Valid = false;
-                    FindTargets(ref state);
+                    FindTargets(record, ref state);
                     NoteFoundTargets(ref state);
                 }
 
@@ -286,12 +286,14 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
     private void SetDebugInformation(in DebugInformation debug) =>
         _host.SetDebugInformation(debug.Operation, debug.SubmitId, debug.Argument0, debug.Argument1, debug.Argument2, debug.Argument3, debug.Argument4);
 
-    private void FindTargets(ref DrawState state)
+    private void FindTargets(ResolvedDraw record, ref DrawState state)
     {
+        // [local] SHARPEMU_TARGET_MEMO: a draw's registers are only on a Draw record (FillDraw).
+        var context = record.Kind == ResolvedDrawKind.Draw ? record.Context : null;
         for (var index = 0; index < state.ColorCount; index++)
         {
             var request = state.Colors[index].Resolution.Request;
-            var image = _host.FindImage(ref request, exactFormat: false);
+            var image = FindColorTargetImage(context, state.Colors[index].Slot, ref request);
             _host.BindRenderTarget(image);
             state.Colors[index].Image = image;
         }
@@ -299,7 +301,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         if (state.DepthResolved)
         {
             var request = state.Depth.Target.Target.Request;
-            var image = _host.FindImage(ref request, exactFormat: false);
+            var image = FindDepthTargetImage(context, ref request);
             _host.BindRenderTarget(image);
             state.Depth.Image = image;
         }

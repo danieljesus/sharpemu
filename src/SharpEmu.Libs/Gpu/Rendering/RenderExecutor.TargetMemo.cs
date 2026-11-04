@@ -37,7 +37,8 @@ public sealed partial class RenderExecutor
     private ResourceSlotIdentifier _depthTargetMemoImage;
     private TargetLookupStamp _targetMemoStamp;
 
-    private static long _memoHits, _memoMisses, _memoDcc, _memoMismatches, _memoStampChanges;
+    // [local] Shared with RenderRecorder's memo (the one that runs after the upstream merge).
+    internal static long _memoHits, _memoMisses, _memoDcc, _memoMismatches, _memoStampChanges;
 
     public static string? TakeTargetMemoReport()
     {
@@ -155,7 +156,7 @@ public sealed partial class RenderExecutor
 
     private static int _memoMismatchReports;
 
-    private static void ReportTargetMemoMismatch(string what)
+    internal static void ReportTargetMemoMismatch(string what)
     {
         if (Interlocked.Increment(ref _memoMismatchReports) <= 16)
         {
