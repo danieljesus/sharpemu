@@ -107,6 +107,17 @@ public sealed unsafe partial class GuestImageCache
             format = role == ImageRole.ColorTarget ? ImageDescription.RenderTargetTransferFormat(info.BytesPerBlock) : info.GuestFormat;
             allowDepthTile = role is ImageRole.StorageImage or ImageRole.ColorTarget;
             plan.SwapBgra16 = info.Bgra16;
+            // [local] A Texture-role image in the depth tile mode has no download layout (TextureTransferLayout.Compute
+            // would stop the GPU, fz34): the download is refused and the caller keeps the image or loses its bytes as for
+            // any other image it cannot read back.
+            if (info.TileMode == GuestTileMode.Depth && !allowDepthTile)
+            {
+                if (Interlocked.Increment(ref _depthTileDownloadsRefused) <= 16)
+                    Console.Error.WriteLine($"[GPU][WARN] An image in the depth tile mode has no readback layout: role={role} format={(uint)format} " +
+                        $"extent={info.Extent.Width}x{info.Extent.Height} layers={layers} size=0x{info.Data.Size:X} address=0x{info.Data.Address:X16} " +
+                        $"gpu_modified={image.IsGpuModified} render_target={image.Uses.RenderTarget} storage={image.Uses.Storage}.");
+                return plan;
+            }
         }
 
         var rowPitch = direction == TransferDirection.Upload && role == ImageRole.Texture ? info.Pitch : 0u;
@@ -173,6 +184,8 @@ public sealed unsafe partial class GuestImageCache
 
         plan.Tiles.RemoveAll(tile => !offsets.Contains(tile.LinearOffset));
     }
+
+    private static int _depthTileDownloadsRefused; // [local]
 
     private static Exception InvalidAttachmentUpload(in ImageDescription info, CachedImage image) =>
         SubmissionScheduler.Fatal(

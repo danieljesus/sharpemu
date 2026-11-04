@@ -435,7 +435,9 @@ public sealed unsafe partial class RenderHostDeviceTests : IClassFixture<Headles
     public void PrepareBindings_FormattedWriteOverAWholeGpuImageKeepsTheBytesItDoesNotWrite(bool shaderWritesPart)
     {
         if (!Ready()) return;
+        GuestImageCache.ImagePublicationOverride.Value = true; // [local] upstream's publication of GPU-written images, off by default
         using var presenter = new PresenterUnderTest(_vulkan!);
+        GuestImageCache.ImagePublicationOverride.Value = null;
         presenter.SetField("_minStorageBufferOffsetAlignment", 256UL);
         presenter.LoadRenderingCommands();
         var harness = presenter.Harness;

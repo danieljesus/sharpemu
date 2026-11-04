@@ -801,6 +801,11 @@ public sealed partial class GuestImageCache
     // well. The buffer is obtained outside the lock; contents that cannot be copied are lost as before.
     private bool PublishPartlyWrittenImages(ulong address, ulong size, bool wholeImages = false, bool exactImages = false)
     {
+        if (!_imagePublication)
+        {
+            return false;
+        }
+
         var published = false;
         List<ResourceSlotIdentifier>? partlyWritten = null;
         using (var held = _lock.Hold())
@@ -914,6 +919,16 @@ public sealed partial class GuestImageCache
             PublishPartlyWrittenImages(address, size, wholeImages: true);
         }
     }
+
+    // [local] SHARPEMU_IMAGE_PUBLICATION=1: upstream's publication of GPU-written images into the buffer over their range
+    // before a buffer write or read over part of them, or a new image of another shape over them (#1079/#1130). Off by
+    // default, as in 3368666f, which had no such path: the bytes a buffer write leaves of a GPU-written image come from
+    // guest memory, as before. In GTA V the publication read back a Texture-role image in the depth tile mode (format 11,
+    // 512x512, 6 layers), which the transfer layout cannot plan (fz34: FATAL under a RECORD_FILLS fill). A test sets
+    // ImagePublicationOverride before it constructs the cache.
+    internal static readonly AsyncLocal<bool?> ImagePublicationOverride = new();
+    private static readonly bool ImagePublicationEnabled = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_PUBLICATION") == "1";
+    private readonly bool _imagePublication = ImagePublicationOverride.Value ?? ImagePublicationEnabled;
 
     public void PublishImagesUnderRead(ulong address, ulong size)
     {

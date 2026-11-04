@@ -19,7 +19,12 @@ public sealed partial class GuestImageCacheTests : IClassFixture<HeadlessVulkanF
 {
     private readonly HeadlessVulkan? _vulkan;
 
-    public GuestImageCacheTests(HeadlessVulkanFixture fixture) => _vulkan = fixture.Vulkan;
+    public GuestImageCacheTests(HeadlessVulkanFixture fixture)
+    {
+        _vulkan = fixture.Vulkan;
+        // [local] Upstream's image-cache tests exercise its publication of GPU-written images (off by default here).
+        GuestImageCache.ImagePublicationOverride.Value = true;
+    }
 
     private static ImageRequest Sampled(ulong address)
     {

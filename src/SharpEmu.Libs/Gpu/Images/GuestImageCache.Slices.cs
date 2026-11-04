@@ -625,7 +625,7 @@ public sealed partial class GuestImageCache
     // Whether TryClearImageFromBuffer would select an image for the fill without recording anything.
     public bool WouldPublishImagesUnderWrite(ulong address, ulong size, bool wholeImages)
     {
-        if (!IsValidRange(address, size))
+        if (!_imagePublication || !IsValidRange(address, size)) // [local]
         {
             return false;
         }
