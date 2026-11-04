@@ -539,7 +539,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 _inPlaceRefused.Increment();
             }
 
-            state.Rendering = AcquireAttachments(ref state);
+            state.Rendering = AcquireOrRepeatAttachments(ref state); // [local] SHARPEMU_ATTACH_REPEAT
         }
         if (attachStarted != 0)
             AttachProbe.Note(sameAttachments, System.Diagnostics.Stopwatch.GetTimestamp() - attachStarted);
