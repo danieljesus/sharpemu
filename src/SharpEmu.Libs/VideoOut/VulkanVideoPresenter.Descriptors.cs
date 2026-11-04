@@ -1305,10 +1305,16 @@ internal static unsafe partial class VulkanVideoPresenter
             try { _bufferCache.DumpDeviceRange(slotAddress, slotSize, $"C:/Users/danyy/AppData/Local/Temp/gta/slot_{hash:X16}_s{index}_pre_{slotAddress:X}_{slotSize:X}_{tick}.gpu.bin"); } catch (Exception e) { Console.Error.WriteLine($"[SLOT_DUMP] {e.Message}"); }
         }
 
+        // [local] More BVH build shaders whose written buffers are dumped in the rebuild window (SHARPEMU_BVH_WRITER_HASHES, ';'-separated).
+        private static readonly HashSet<ulong> BvhWriterExtraHashes = (Environment.GetEnvironmentVariable("SHARPEMU_BVH_WRITER_HASHES") ?? "")
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(h => Convert.ToUInt64(h.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? h[2..] : h, 16)).ToHashSet();
+
         private void ProbeBvhWriter(PreparedStageBindings prepared, int index, BufferDescriptorWords descriptor, ulong requested)
         {
             if (!BvhProbes) return; // [local]
-            var listProducer = prepared.Program.Hash is 0xF6F2D6298F2771AD or 0x35B85620669D35A4 or 0x4F1F0F92FE39EC8B or 0x4505F72A09CC1B12 or 0xF05BBF883D986FC9 or 0xCA99120EAF300BFD;
+            var listProducer = prepared.Program.Hash is 0xF6F2D6298F2771AD or 0x35B85620669D35A4 or 0x4F1F0F92FE39EC8B or 0x4505F72A09CC1B12 or 0xF05BBF883D986FC9 or 0xCA99120EAF300BFD ||
+                BvhWriterExtraHashes.Contains(prepared.Program.Hash); // [local] SHARPEMU_BVH_WRITER_HASHES=<hex;hex;...>
             if (prepared.Program.Hash is 0x5981037B07E391D5 or 0xAACC3636B355E928 or 0xF43B5FF6DD312D34 || _bvhWriterCount >= 40000 || (!listProducer && !InBvhBlob(descriptor.Address))) return;
             _bvhWriterCount++;
             var seq = _bvhSeq++;
@@ -1335,6 +1341,7 @@ internal static unsafe partial class VulkanVideoPresenter
             Console.Error.WriteLine($"[BVH_DUMP] {kind} address=0x{descriptor.Address:X} size=0x{size:X}");
         }
 
+        private int _postDumps; // [local] SHARPEMU_TRACK_BUILD post-dispatch dumps
         private int _hdrPrePost; // [local]
         private int _hdrAfterDumps; // [local]
         private int _refitInDumps; // [local]
@@ -1392,6 +1399,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 lock (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.ExtraPages) SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.ExtraPages.Clear();
             }
             if (_hdrAges.Count != 0 && index == 0) DumpHeaderAges(); // [local]
+            if (Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1" && _postDumps < 400 &&
+                hash is 0xB728F324C95A202C or 0xCA99120EAF300BFD or 0x4505F72A09CC1B12 or 0x4F1F0F92FE39EC8B or 0xF05BBF883D986FC9 or 0x35B85620669D35A4 or 0xFADBE3FB13E9DCFF or 0x260F2884A4A5E7C0 &&
+                size <= 0x40000UL) // [local] every bound buffer of the build stages after the dispatch (post_<hash>_b<i>_...)
+            {
+                _postDumps++;
+                var postHash = hash; var postIndex = index; var postAddress = descriptor.Address; var postSize = size; var postTick = _scheduler.CurrentTick;
+                Gpu.Buffers.GuestBufferCache.PostDispatchHooks.Add(() => { try { _bufferCache.DumpDeviceRange(postAddress, postSize, $"C:/Users/danyy/AppData/Local/Temp/gta/post_{postHash:X16}_b{postIndex}_{postAddress:X}_{postSize:X}_{postTick}.gpu.bin"); } catch (Exception e) { Console.Error.WriteLine($"[BVH_HDRWRITE] post dump failed: {e.Message}"); } });
+            }
             if (Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1") // [local] build stages of three dynamic BLASes: full blob after the root init (260F, slot 2) and after the root writer (F6F2, slot 3); F6F2 inputs before its dispatch
             {
                 var tick = _scheduler.CurrentTick;
