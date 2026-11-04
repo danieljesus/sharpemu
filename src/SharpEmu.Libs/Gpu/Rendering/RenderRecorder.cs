@@ -209,7 +209,22 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             SetDebugInformation(in record.Debug);
         }
 
-        var state = record.State;
+        if (OnWorker)
+        {
+            // A worker's record can be recorded again on the render thread: its state is left as resolved.
+            var copy = record.State;
+            RecordResolved(record, ref copy);
+        }
+        else
+        {
+            // [local] The render thread's record is reset as soon as it is recorded: no copy of the draw state (eight
+            // colour targets with their requests, some 6 KB) per draw.
+            RecordResolved(record, ref record.State);
+        }
+    }
+
+    private void RecordResolved(ResolvedDraw record, ref DrawState state)
+    {
         if (record.Kind != ResolvedDrawKind.Draw)
         {
             _inPlace.Valid = false;
