@@ -148,7 +148,6 @@ internal static class RenderPhaseProfile
         ProgramPlanning,
         ProgramLayoutRequest,
         ProgramTranslation,
-        VulkanCommands,
         DispatchConsume,
         DispatchPipeline,
         CommandPacketRead,
@@ -162,6 +161,9 @@ internal static class RenderPhaseProfile
         StageImagePreparation,
         // [local] Pieces of DescriptorPreparation.
         BindingSetup,
+        // [local] Upstream's scope around every vkCmd* (97 sites, ~13000 per frame in GTA V): fine, as its cost is the
+        // profiler's own (1,6 ms/frame in gz11, 0 without the profile); it does not exist in 3368666f.
+        VulkanCommands,
         BindingTextureDecode,
         BindingSamplers,
         BindingShaderData,
