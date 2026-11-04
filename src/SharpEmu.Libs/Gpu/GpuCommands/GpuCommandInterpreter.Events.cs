@@ -167,10 +167,14 @@ public sealed partial class GpuCommandInterpreter
         throw _host.Fatal($"The acquire-memory header is not supported: header=0x{packet.Header:X8} address=0x{packet.PacketAddress:X16}.");
     }
 
+    // [local] SHARPEMU_ACQUIRE_BARRIER=0: an ACQUIRE_MEM with cache actions emits no global barrier (as before the merge,
+    // where only SHARPEMU_DISPATCH_BARRIERS=0 made acquires emit one). A/B switch.
+    private static readonly bool AcquireBarrier = Environment.GetEnvironmentVariable("SHARPEMU_ACQUIRE_BARRIER") != "0";
+
     private void AcquireMemory(bool cacheAction)
     {
         _acquireMemoryPackets.Increment();
-        if (cacheAction)
+        if (cacheAction && (AcquireBarrier || !Rendering.RenderExecutor.DispatchBarriers))
         {
             _acquireMemoryBarriers.Increment();
             Diagnostics.DispatchRunTally.NoteSync();

@@ -2237,14 +2237,18 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // drops stores until the fault is processed, so a fault brings in the aligned window around the page,
     // clipped to its registered span. A window the guest cannot read in one piece keeps the single page.
     internal const ulong DeviceAddressFaultWindow = 2 * MiB;
+    // [local] SHARPEMU_BDA_FAULT_WINDOW_BYTES=<n>: the window a device-address fault brings in (default upstream's 2 MiB;
+    // 4096 = the faulted page alone, as before the merge). A/B switch.
+    private static readonly ulong FaultWindowBytes = ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_FAULT_WINDOW_BYTES"), out var faultWindow) && faultWindow >= 4096
+        ? faultWindow : DeviceAddressFaultWindow;
 
     internal GuestSpan DeviceAddressFaultRange(ulong pageAddress, ulong pageSize)
     {
-        if (GpuMemory is { } memory && memory.TryGetSpan(pageAddress, out var spanStart, out var spanEnd))
+        if (FaultWindowBytes > pageSize && GpuMemory is { } memory && memory.TryGetSpan(pageAddress, out var spanStart, out var spanEnd))
         {
-            var windowStart = pageAddress & ~(DeviceAddressFaultWindow - 1);
+            var windowStart = pageAddress & ~(FaultWindowBytes - 1);
             var start = Math.Max(windowStart, spanStart);
-            var end = Math.Min(windowStart + DeviceAddressFaultWindow, spanEnd);
+            var end = Math.Min(windowStart + FaultWindowBytes, spanEnd);
             if (pageAddress + pageSize <= end && _guest.CanRead(start, end - start))
             {
                 return new GuestSpan(start, end - start);
