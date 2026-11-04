@@ -417,6 +417,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     }
 
     private SpanSnapshot _gpuModifiedSnapshot = SpanSnapshot.Empty;
+    // [local] The lock-free snapshot is rebuilt on the first HasGpuDirtyBytes after a change, not after every change:
+    // upstream rebuilt it (O(n): a pair of UInt64[]) on each add and removal, ~580 KB per frame in GTA V (gz08).
+    private volatile bool _gpuModifiedSnapshotStale;
 
     private GpuModifiedWrite WriteGpuModified()
     {
@@ -428,8 +431,37 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     {
         public void Dispose()
         {
-            Volatile.Write(ref cache._gpuModifiedSnapshot, cache._gpuModifiedRanges.Snapshot());
+            cache._gpuModifiedSnapshotStale = true;
             cache._gpuModifiedGate.ExitWriteLock();
+        }
+    }
+
+    // [local] The snapshot of the GPU-modified set as of the last change; rebuilt under the read lock when stale.
+    private SpanSnapshot GpuModifiedSnapshot()
+    {
+        if (!_gpuModifiedSnapshotStale)
+        {
+            return Volatile.Read(ref _gpuModifiedSnapshot);
+        }
+
+        if (_gpuModifiedGate.IsWriteLockHeld)
+        {
+            var current = _gpuModifiedRanges.Snapshot();
+            Volatile.Write(ref _gpuModifiedSnapshot, current);
+            return current;
+        }
+
+        _gpuModifiedGate.EnterReadLock();
+        try
+        {
+            _gpuModifiedSnapshotStale = false;
+            var snapshot = _gpuModifiedRanges.Snapshot();
+            Volatile.Write(ref _gpuModifiedSnapshot, snapshot);
+            return snapshot;
+        }
+        finally
+        {
+            _gpuModifiedGate.ExitReadLock();
         }
     }
     private const int ObtainMemoSlots = 4096;
@@ -2190,7 +2222,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             Environment.FailFast($"The address range is invalid: 0x{guestAddress:X16}, 0x{size:X16}.");
         }
 
-        return Volatile.Read(ref _gpuModifiedSnapshot).Overlaps(guestAddress, size);
+        return GpuModifiedSnapshot().Overlaps(guestAddress, size); // [local]
     }
 
     public bool EverGpuWritten(ulong guestAddress, ulong size) => _tracker.MayHaveGpuWrittenPages(guestAddress, size);
