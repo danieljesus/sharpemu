@@ -229,7 +229,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private const int ImageBindingMemoCapacity = 1 << 16;
         private Dictionary<ImageBindingKey, ImageBindingMemo>? _imageBindingMemos;
 
-        private readonly record struct BufferSourceMemo(ulong Address, ulong Requested, long RegionStamp, long Spans, ResourceSlotIdentifier Buffer, ulong Size);
+        private readonly record struct BufferSourceMemo(ulong Address, ulong Requested, long RegionStamp, long Spans, long Mapping, ResourceSlotIdentifier Buffer, ulong Size);
         private Dictionary<ShaderProgramInfo, BufferSourceMemo[]>? _bufferSourceMemos;
         private ShaderProgramInfo? _lastBufferMemoProgram;
         private BufferSourceMemo[] _lastBufferMemos = [];
@@ -1194,6 +1194,7 @@ internal static unsafe partial class VulkanVideoPresenter
             prepared.BufferSources = sources;
             var memos = BufferSourceMemosOf(program, sources.Length);
             var spans = GuestGpuMemoryHook.Current?.SpanVersion ?? 0;
+            var mapping = _guestMemory.MappingGeneration; // [local]
             for (var index = 0; index < sources.Length; index++)
             {
                 var words = snapshot.Buffers[index];
@@ -1205,8 +1206,16 @@ internal static unsafe partial class VulkanVideoPresenter
                 var descriptor = BufferDescriptorWords.From(words);
                 var requested = descriptor.Footprint() ?? throw SubmissionScheduler.Fatal(
                     $"A storage buffer descriptor footprint overflows: buffer={index} stride={descriptor.Stride} records={descriptor.RecordCount} hash=0x{program.Hash:X16}.");
-                if (descriptor.Address == 0 || requested == 0 || IsUnresidentPrtPage(descriptor.Address) ||
-                    IsUnmappedBufferStart(prepared, index, descriptor.Address))
+                ref var memo = ref memos[index];
+                // [local] A binding the memo remembers (same descriptor, footprint and guest spans, and no mapping change
+                // since: readability only moves with the mapping generation) was readable when it was noted: the
+                // readability checks are for new or changed bindings, and one page lookup answers both (each check
+                // repeats it only for its warning).
+                var known = mapping != long.MinValue && memo.Mapping == mapping &&
+                    memo.Address == descriptor.Address && memo.Requested == requested && memo.Spans == spans;
+                if (descriptor.Address == 0 || requested == 0 ||
+                    (!known && !_guestMemory.CanRead(descriptor.Address, 1) &&
+                     (IsUnresidentPrtPage(descriptor.Address) || IsUnmappedBufferStart(prepared, index, descriptor.Address))))
                 {
                     if (ResolveProfile.Enabled && !_worker) ResolveProfile.CountNullBuffer(); // [local]
                     if (program.Hash == 0xFADBE3FB13E9DCFF && Environment.GetEnvironmentVariable("SHARPEMU_TRACK_BUILD") == "1") // [local] why a leaf-writer binding binds as a null buffer
@@ -1218,8 +1227,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (Gpu.Buffers.ConservativeRecords.Mode == 2 && Gpu.Buffers.ConservativeRecords.IsVerifiedProgram(program.Hash)) // [local]
                     Gpu.Buffers.ConservativeRecords.VerifyBinding(index, descriptor.RecordCount, requested, _bufferCache.ContainingBufferExtent(descriptor.Address, ulong.MaxValue, 0));
                 requested = ConservativeRequested(program.Hash, descriptor, requested); // [local] SHARPEMU_CONSERVATIVE_RECORDS
-                ref var memo = ref memos[index];
-                var remembered = memo.Address == descriptor.Address && memo.Requested == requested && memo.Spans == spans;
+                var remembered = known || (memo.Address == descriptor.Address && memo.Requested == requested && memo.Spans == spans);
                 var size = remembered ? memo.Size : ClampMappedSize(descriptor.Address, requested, prepared, index);
                 PublishImagesUnderWrite(prepared.Resources.Info.Buffers[index], descriptor.Address, size);
                 if (remembered && memo.RegionStamp == _bufferCache.RegionStamp(descriptor.Address, requested))
@@ -1230,7 +1238,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     var buffer = FindBuffer(descriptor.Address, size);
                     sources[index] = (descriptor, buffer, size);
-                    memo = new BufferSourceMemo(descriptor.Address, requested, _bufferCache.RegionStamp(descriptor.Address, requested), spans, buffer, size);
+                    memo = new BufferSourceMemo(descriptor.Address, requested, _bufferCache.RegionStamp(descriptor.Address, requested), spans, mapping, buffer, size);
                 }
 
                 if (Gpu.Buffers.RayQueryHle.Instance is { } rayQuery && prepared.Resources.Info.Buffers[index].Written) // [local] SHARPEMU_RQ_MAP
