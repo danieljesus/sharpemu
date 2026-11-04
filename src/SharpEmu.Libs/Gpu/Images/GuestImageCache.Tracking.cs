@@ -946,6 +946,13 @@ public sealed partial class GuestImageCache
             return;
         }
 
+        // [local] Every written storage buffer of every draw and dispatch comes here: pages no image ever owned have
+        // nothing to mark, so the lock and the page walk are for ranges that may (the trace still records every one).
+        if (!ImageClearTrace.Enabled && !_pageOwners.MayHaveOwners(address, size))
+        {
+            return;
+        }
+
         using var held = _lock.Hold();
         RecordResourceHistory("gpu-buffer-write-notification", address, size);
         foreach (var imageIdentifier in FindImagesInRange(address, size, pageOverlap: true, includeParked: true))
