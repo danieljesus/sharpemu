@@ -2356,7 +2356,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             if (mapping != _bdaSweepMapping || (epoch != _bdaSweepEpoch && (!ObservationGated || _observation != _bdaSweepObservation)))
             {
                 var walkScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DispatchBdaWalk); // [local]
-                if (!_bdaSweepPlanBuilt || mapping != _bdaSweepPlanMapping)
+                if (BdaSweepPlan && (!_bdaSweepPlanBuilt || mapping != _bdaSweepPlanMapping))
                 {
                     _bdaSweepPlan = GuestPageTracker.PlanSweep(spans);
                     _bdaSweepPlanMapping = mapping;
@@ -2368,7 +2368,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 _inDeviceAddressSweep = true;
                 try
                 {
-                    if (_bdaSweepPlan is { } plan && _bufferPages.Complete)
+                    if (BdaSweepPlan && _bdaSweepPlan is { } plan && _bufferPages.Complete)
                     {
                         Interlocked.Increment(ref BdaSweepsPlanned);
                         _handleWindows.Sort();
@@ -2550,6 +2550,14 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         };
         VulkanSynchronization.PipelineBarrier(_device.Vk, native, sourceStages, destinationStages, 0, 1, &barrier, 0, null, 0, null, BarrierSource.Sweep);
     }
+
+    // [local] SHARPEMU_BDA_SWEEP_PLAN=1: upstream's per-page sweep plan (the covered dirty page runs, visited block by
+    // block under each region's lock). Off by default, as in 3368666f: the sweep walks each mapped span's possibly
+    // dirty block runs and uploads the registered buffers in them (upstream's own path when the coverage is incomplete).
+    // A test sets BdaSweepPlanOverride before it constructs the cache.
+    internal static readonly AsyncLocal<bool?> BdaSweepPlanOverride = new();
+    private static readonly bool BdaSweepPlanDefault = Environment.GetEnvironmentVariable("SHARPEMU_BDA_SWEEP_PLAN") == "1";
+    private readonly bool BdaSweepPlan = BdaSweepPlanOverride.Value ?? BdaSweepPlanDefault;
 
     private long _bdaSweepEpoch = -1;
     private long _bdaSweepObservation = -1;

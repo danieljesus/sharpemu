@@ -1109,7 +1109,9 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     public void DeviceAddressSweep_CountsTheSweptPagesInsideTheHandleWindows()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
+        GuestBufferCache.BdaSweepPlanOverride.Value = true; // [local] the planned sweep counts its pages; the cache defaults to the span walk
         using var harness = new CacheHarness(_vulkan);
+        GuestBufferCache.BdaSweepPlanOverride.Value = null;
         var address = harness.MapBacked(0x40000, ReadWrite);
         _ = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, 0x40000, isWritten: false));
         Assert.True(harness.Store.MarkCpuWrite(address + 0x1000, 8));
