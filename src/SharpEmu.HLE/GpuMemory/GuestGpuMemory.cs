@@ -105,7 +105,7 @@ public sealed class GuestGpuMemory : IDisposable
         if (kind == FaultKind.Write)
         {
             var groupAddress = address & ~(GuestWriteGranule - 1);
-            var (markAddress, markSize) = CoversWrites(groupAddress, GuestWriteGranule) && GuestPermits(kind, groupAddress) && GuestPermits(kind, groupAddress + GuestWriteGranule - 1)
+            var (markAddress, markSize) = FaultWriteGranule && CoversWrites(groupAddress, GuestWriteGranule) && GuestPermits(kind, groupAddress) && GuestPermits(kind, groupAddress + GuestWriteGranule - 1) // [local]
                 ? (groupAddress, GuestWriteGranule)
                 : (address, faultSize);
             handled = (buffers?.MarkCpuWrite(markAddress, markSize) ?? false) | (images?.MarkCpuWrite(address, faultSize) ?? false);
@@ -208,6 +208,15 @@ public sealed class GuestGpuMemory : IDisposable
     }
 
     private const ulong GuestWriteGranule = 0x4000;
+
+    // [local] SHARPEMU_FAULT_WRITE_GRANULE (off by default; =1 upstream #1130): a write fault marks the whole 16 KB
+    // granule around the faulting byte as CPU-written, so the granule's other pages do not fault later. In GTA V that
+    // dropped every table-word memo entry in the granule (270 drops per 5 s window, ten times the front's precise
+    // readbacks, the dropped values unchanged), which 3368666f never saw: off, the fault marks its own bytes, as there.
+    // A test opts in through FaultWriteGranuleOverride.
+    internal static readonly AsyncLocal<bool?> FaultWriteGranuleOverride = new();
+    private static readonly bool FaultWriteGranuleEnabled = Environment.GetEnvironmentVariable("SHARPEMU_FAULT_WRITE_GRANULE") == "1";
+    private static bool FaultWriteGranule => FaultWriteGranuleOverride.Value ?? FaultWriteGranuleEnabled;
 
 
     public bool MarkCpuWrite(ulong address, ulong size)

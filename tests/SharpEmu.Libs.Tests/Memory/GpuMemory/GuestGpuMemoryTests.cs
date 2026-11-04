@@ -240,6 +240,7 @@ public sealed class GuestGpuMemoryTests
     [Fact]
     public void RegisterLazyRange_CoversWritesAndFaultsWithoutRegisteringSpans()
     {
+        GuestGpuMemory.FaultWriteGranuleOverride.Value = true; // [local] upstream's 16 KB fault granule
         _memory.RegisterLazyRange(0x100000, 0x10000);
 
         Assert.False(_memory.Covers(0x104000, 0x2000));
