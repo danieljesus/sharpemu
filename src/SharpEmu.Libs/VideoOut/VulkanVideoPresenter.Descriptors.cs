@@ -1828,7 +1828,9 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             memoryOffset = 0;
             var address = descriptor.Address;
-            if (address == 0 || size == 0 || IsUnresidentPrtPage(address) || !_guestMemory.CanRead(address, 1))
+            // [local] FindBuffers bound an unreadable or unresident start as a null source (size 0) in this same
+            // preparation: no second pair of page lookups per buffer here.
+            if (address == 0 || size == 0)
             {
                 return NullStorageBuffer();
             }
