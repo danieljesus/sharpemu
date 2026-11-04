@@ -4616,15 +4616,18 @@ public static partial class Gen5SpirvTranslator
                 }
             }
 
-            if (instruction.Opcode == "BufferLoadDwordx2" && control.Glc && _globalBufferPairs != 0)
-            {
-                LoadBufferPair(bindingIndex, dwordAddress, control.VectorData);
-                return true;
-            }
-
+            // [local] A GLC load of two or more dwords reads each aligned pair as one 64-bit device-scope atomic load
+            // (EmitWideGlcBufferLoad), which pairs with the 64-bit BUFFER_ATOMIC_*_X2 of a look-back's status words;
+            // upstream's pair view (a plain uvec2 load) only applies without the 64-bit view.
             if (_volatileBufferLoads && _globalBuffers64 != 0 && control.DwordCount >= 2)
             {
                 EmitWideGlcBufferLoad(bindingIndex, dwordAddress, control);
+                return true;
+            }
+
+            if (instruction.Opcode == "BufferLoadDwordx2" && control.Glc && _globalBufferPairs != 0)
+            {
+                LoadBufferPair(bindingIndex, dwordAddress, control.VectorData);
                 return true;
             }
 
