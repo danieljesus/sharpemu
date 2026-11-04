@@ -231,6 +231,15 @@ internal static class RenderPhaseProfile
         // PrepareBindings before the stage memo is consulted.
         ExecTargetsFind,
         BindingPrelude,
+        // [local] The target layout of DrawTargetResolution, and the parts of the host's FindImage (the metadata
+        // synchronization, the cache lookup, the native colour clear).
+        DrawTargetLayout,
+        TargetSync,
+        TargetLookup,
+        TargetClear,
+        // [local] The stage rent and scratch copies of a memo reuse, and BindResources' upload batch (the sweep barrier).
+        BindingMemoRent,
+        BindingUploadBatch,
         // [local] SHARPEMU_COLDRES_PROBE: a materialization that hit or missed the cache, the creations of image views,
         // samplers, cache buffers, pipelines (the cache miss under the gate), program entries and permutations, and the
         // waits for the image cache's and the page tracker's region locks and for the program cache's gate.

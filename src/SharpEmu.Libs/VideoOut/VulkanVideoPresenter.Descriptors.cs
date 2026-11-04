@@ -46,7 +46,11 @@ internal static unsafe partial class VulkanVideoPresenter
         FormattableString.Invariant($"[PERF][STAGE_MEMO] hits={Interlocked.Exchange(ref _stageMemoHits, 0)} misses={Interlocked.Exchange(ref _stageMemoMisses, 0)} captures={Interlocked.Exchange(ref _stageMemoCaptures, 0)} ") +
         FormattableString.Invariant($"stale={Interlocked.Exchange(ref _stageMemoStale, 0)} invalidations={Interlocked.Exchange(ref _stageMemoInvalidations, 0)} acquire_reuses={Interlocked.Exchange(ref _stageMemoAcquireReuses, 0)} ") +
         FormattableString.Invariant($"content_hits={Interlocked.Exchange(ref _stageMemoContentHits, 0)} evictions={Interlocked.Exchange(ref _stageMemoEvictions, 0)} ") +
-        FormattableString.Invariant($"buffer_refinds={Interlocked.Exchange(ref _stageMemoBufferRefinds, 0)} buffer_changes={Interlocked.Exchange(ref _stageMemoBufferChanges, 0)}"); // [local]
+        FormattableString.Invariant($"buffer_refinds={Interlocked.Exchange(ref _stageMemoBufferRefinds, 0)} buffer_changes={Interlocked.Exchange(ref _stageMemoBufferChanges, 0)} ") +
+        (PublicationsReport?.Invoke() ?? ""); // [local]
+
+    // [local] The pending guest publications at the report: what every ObtainBuffer's publication check scans.
+    internal static Func<string>? PublicationsReport;
 
     private sealed class StagePreparationSet
     {
@@ -420,6 +424,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private PreparedStageBindings ReuseStagePreparation(RenderPreparation preparation, ShaderStageResources stage, ShaderProgramInfo program,
             StagePreparationMemo memo)
         {
+            var rentScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemoRent); // [local]
             var prepared = RentStage(stage, program);
             prepared.Memoized = true;
             prepared.Memo = memo;
@@ -429,6 +434,7 @@ internal static unsafe partial class VulkanVideoPresenter
             memo.Textures.CopyTo(descriptors.Images, 0);
             descriptors.Samplers = Scratch.Samplers.Rent(memo.SamplerHandles.Length);
             memo.SamplerHandles.CopyTo(descriptors.Samplers, 0);
+            rentScope.Dispose();
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemoImages)) // [local]
             foreach (var texture in memo.Textures)
             {
@@ -1807,7 +1813,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (!_worker)
                 {
-                    _bufferCache.EndUploadBatch();
+                    using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingUploadBatch)) // [local]
+                        _bufferCache.EndUploadBatch();
                 }
             }
 

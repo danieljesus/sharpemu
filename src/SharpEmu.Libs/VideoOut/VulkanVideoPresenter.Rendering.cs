@@ -536,11 +536,13 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat)
         {
+            var syncScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.TargetSync); // [local]
             _imageCache.TraceNativeColorMetadata(request);
             _imageCache.TraceTextureMetadata(request);
             SynchronizeColorMetadata(request);
             if (_worker)
             {
+                syncScope.Dispose();
                 return LookUpImage(ref request, exactFormat);
             }
 
@@ -552,8 +554,12 @@ internal static unsafe partial class VulkanVideoPresenter
                     request.View.BaseLayer, request.View.LayerCount);
             }
 
-            var imageIdentifier = _imageCache.FindImage(ref request, exactFormat);
-            ApplyNativeColorClear(imageIdentifier, request);
+            syncScope.Dispose();
+            ResourceSlotIdentifier imageIdentifier;
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.TargetLookup)) // [local]
+                imageIdentifier = _imageCache.FindImage(ref request, exactFormat);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.TargetClear)) // [local]
+                ApplyNativeColorClear(imageIdentifier, request);
             return imageIdentifier;
         }
 

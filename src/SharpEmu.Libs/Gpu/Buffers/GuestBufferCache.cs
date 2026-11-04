@@ -1233,6 +1233,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     private static readonly long[] _obtainCounts = new long[(int)ObtainOutcome.Count];
 
+    // [local] Image sources served by their owning buffer or copied through the staging ring.
+    private static long _imageSourceOwner, _imageSourceStaging, _imageSourceStagingBytes;
+
     public static string TakeObtainReport()
     {
         var counts = new long[(int)ObtainOutcome.Count];
@@ -1245,6 +1248,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             $"[PERF][BUFFER_OBTAIN] stream={counts[0]} stream_prefound={counts[1]} stream_failed={counts[2]} cached_prefound={counts[3]} cached_lookup={counts[4]} cached_stream_candidate={counts[5]} ") +
             FormattableString.Invariant($"written={counts[6]} written_memo_hits={counts[7]} written_memo_verified={counts[8]} written_memo_mismatches={counts[9]} written_memo_mismatches_total={Interlocked.Read(ref _writtenMemoMismatchTotal)}") +
             FormattableString.Invariant($" cp_writes={Interlocked.Exchange(ref _cpWrites, 0)} cp_bytes={Interlocked.Exchange(ref _cpBytes, 0)} cp_consecutive={Interlocked.Exchange(ref _cpConsecutive, 0)} cp_adjacent={Interlocked.Exchange(ref _cpAdjacent, 0)} cp_same_range={Interlocked.Exchange(ref _cpSameRange, 0)} cp_same_range_any={Interlocked.Exchange(ref _cpSameRangeAny, 0)}") +
+            FormattableString.Invariant($" image_owner={Interlocked.Exchange(ref _imageSourceOwner, 0)} image_staging={Interlocked.Exchange(ref _imageSourceStaging, 0)} image_staging_bytes={Interlocked.Exchange(ref _imageSourceStagingBytes, 0)}") + // [local]
             " " + TakeTexelCleanReport();
     }
 
@@ -1642,6 +1646,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
         if (owner != null && !cpuModified && (!gpuModified || hasDirtyBufferSource))
         {
+            Interlocked.Increment(ref _imageSourceOwner); // [local]
             TouchBuffer(owner);
             return (owner, owner.Offset(guestAddress));
         }
@@ -1650,6 +1655,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         {
             throw SubmissionScheduler.Fatal("Cannot find the device buffer that owns the GPU-dirty image source.");
         }
+
+        Interlocked.Increment(ref _imageSourceStaging); // [local]
+        Interlocked.Add(ref _imageSourceStagingBytes, (long)size);
 
         if (!_staging.TryMap(size, out var stageOffset, 16))
         {

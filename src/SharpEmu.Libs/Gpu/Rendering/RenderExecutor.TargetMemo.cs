@@ -39,6 +39,8 @@ public sealed partial class RenderExecutor
 
     // [local] Shared with RenderRecorder's memo (the one that runs after the upstream merge).
     internal static long _memoHits, _memoMisses, _memoDcc, _memoMismatches, _memoStampChanges;
+    // [local] How often ResolveTargetLayout rebuilt the layout (its stamps moved).
+    internal static long _layoutResolves;
 
     public static string? TakeTargetMemoReport()
     {
@@ -50,7 +52,7 @@ public sealed partial class RenderExecutor
         return string.Create(CultureInfo.InvariantCulture,
             $"[PERF][TARGET_MEMO] mode={TargetMemoMode} hits={Interlocked.Exchange(ref _memoHits, 0)} misses={Interlocked.Exchange(ref _memoMisses, 0)} " +
             $"dcc_excluded={Interlocked.Exchange(ref _memoDcc, 0)} mismatches={Interlocked.Exchange(ref _memoMismatches, 0)} " +
-            $"stamp_changes={Interlocked.Exchange(ref _memoStampChanges, 0)}");
+            $"stamp_changes={Interlocked.Exchange(ref _memoStampChanges, 0)} layout_resolves={Interlocked.Exchange(ref _layoutResolves, 0)}");
     }
 
     // Drops every remembered target when the stamp moved since they were taken.

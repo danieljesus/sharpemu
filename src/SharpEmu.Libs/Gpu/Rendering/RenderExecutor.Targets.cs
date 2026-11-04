@@ -45,7 +45,9 @@ public sealed partial class RenderExecutor
             return false;
         }
 
-        var layout = ResolveTargetLayout(banks);
+        DrawResolution layout;
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawTargetLayout)) // [local]
+            layout = ResolveTargetLayout(banks);
         for (var index = 0; index < layout.ColorCount; index++)
         {
             ref readonly var resolution = ref layout.Colors[index];
@@ -128,6 +130,7 @@ public sealed partial class RenderExecutor
         resolution.TargetContextStamp = contextStamp;
         resolution.TargetProgramsStamp = programsStamp;
         resolution.TargetVersion = (uint)Interlocked.Increment(ref _targetVersions);
+        Interlocked.Increment(ref _layoutResolves); // [local]
         return resolution;
     }
 
