@@ -2016,6 +2016,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private const uint TableBlockAlignment = 16;
 
+        // [local] SHARPEMU_CONTENT_UPLOADS=1: upstream's content-addressed arena for the shader data and the resource
+        // tables (a hash or identity lookup per upload, the bytes shared between stages that repeat them). Off by
+        // default, as in 3368666f: every stage's dwords go to the transient ring.
+        private static readonly bool ContentUploads = Environment.GetEnvironmentVariable("SHARPEMU_CONTENT_UPLOADS") == "1";
+
         private BufferView UploadDwords(uint[] data, string label, ShaderProgramInfo program, bool byIdentity)
         {
             if (data.Length == 0)
@@ -2025,7 +2030,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes<uint>(data);
             var alignment = Math.Max(TransientDataAlignment, (uint)_presenter._minStorageBufferOffsetAlignment);
-            if (!_worker && _contentUploads is { } arena &&
+            if (ContentUploads && !_worker && _contentUploads is { } arena &&
                 (byIdentity ? arena.TryUpload(data, alignment, out var arenaBuffer, out var arenaOffset) : arena.TryUpload(bytes, alignment, out arenaBuffer, out arenaOffset)))
             {
                 return new BufferView(arenaBuffer, arenaOffset, (ulong)bytes.Length);
