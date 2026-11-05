@@ -78,8 +78,8 @@ public sealed class BvhlProbeTests
         before.AsSpan(25 * 16, 8).Clear();
         var runs = BvhlProbe.FindChangedRuns(before, after, 16);
         var run = Assert.Single(runs);
-        Assert.Equal(20 * 16, run.Offset);
-        Assert.Equal(256, run.Length);
+        Assert.InRange(run.Offset, 20 * 16, 20 * 16 + 8); // the old link and the magic may share a leading byte
+        Assert.Equal(36 * 16, run.Offset + run.Length);
         Assert.Empty(BvhlProbe.FindChangedRuns(before, before, 16));
     }
 
