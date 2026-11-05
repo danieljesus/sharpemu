@@ -135,7 +135,12 @@ public sealed class ModuleManager : IModuleManager
             }
         }
 
-        Parallel.ForEach(methods, new ParallelOptions { MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8) }, member =>
+        // [local] SHARPEMU_HLE_WARM_PARALLEL=1 opts into upstream's parallel JIT of the HLE methods (294fb81f, up to 8
+        // threads); by default they are compiled one after another, as before that merge.
+        var warmThreads = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_HLE_WARM_PARALLEL"), "1", StringComparison.Ordinal)
+            ? Math.Min(Environment.ProcessorCount, 8)
+            : 1;
+        Parallel.ForEach(methods, new ParallelOptions { MaxDegreeOfParallelism = warmThreads }, member =>
         {
             try
             {

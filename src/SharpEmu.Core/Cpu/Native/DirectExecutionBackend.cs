@@ -3500,8 +3500,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			$"across {scannedRanges} executable range(s), bytes=0x{scannedBytes:X}, reused={reusedRanges}");
 	}
 
+	// [local] SHARPEMU_TLS_SCAN_BATCH=1 opts into upstream's batched TLS scan (294fb81f: the whole range's executable
+	// regions are made writable once and every patch is a plain copy); by default each patch unprotects, writes and
+	// restores its own page under the gate, as before that merge.
+	private static readonly bool _tlsScanBatch =
+		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_TLS_SCAN_BATCH"), "1", StringComparison.Ordinal);
+
 	private unsafe TlsPatchCounts PatchTlsPatternsInRange(ulong rangeStart, ulong rangeEnd)
 	{
+		if (!_tlsScanBatch)
+		{
+			return ScanTlsPatternsInRange(rangeStart, rangeEnd);
+		}
+
 		lock (ImportStubPatchGate)
 		{
 			var protections = new List<(ulong Start, ulong Size, uint Protection)>();

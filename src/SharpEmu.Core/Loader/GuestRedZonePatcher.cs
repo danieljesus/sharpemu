@@ -13,6 +13,10 @@ namespace SharpEmu.Core.Loader;
 internal static partial class GuestRedZonePatcher
 {
     private const int GuestRedZoneBytes = 128;
+
+    // [local] SHARPEMU_REDZONE_CACHE=1: cache the patch plan on disk (upstream 294fb81f); off by default.
+    private static readonly bool RedZoneCacheEnabled =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_REDZONE_CACHE"), "1", StringComparison.Ordinal);
     private const int MinimumJumpBytes = 5;
     private const int MaximumGroupedBytes = 128;
     private const ulong PageSize = 0x1000;
@@ -99,7 +103,11 @@ internal static partial class GuestRedZonePatcher
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var executableBytes = ExecutableBytes(programHeaders);
         var large = executableBytes >= LargeExecutableBytes;
-        var cachePath = imageData.IsEmpty ? null : PatchCachePath(imageData, appliedPatchIds, protectRedZone, cacheDirectory);
+        // [local] SHARPEMU_REDZONE_CACHE=1 opts into upstream's on-disk cache of the patch plan (294fb81f); by default
+        // every load scans the image, as before that merge (a caller that names the directory, as the tests do, still caches).
+        var cachePath = imageData.IsEmpty || (!RedZoneCacheEnabled && cacheDirectory is null)
+            ? null
+            : PatchCachePath(imageData, appliedPatchIds, protectRedZone, cacheDirectory);
         List<PatchSite> sites = [];
         var scan = default(PatchResult);
         var cached = cachePath is not null && TryReadPatchCache(cachePath, memory, programHeaders, imageBase, imageSize, out sites, out scan);
