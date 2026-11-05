@@ -28,7 +28,7 @@ public static class BvhlProbe
     public const ulong Magic = 0x4C4856425F525350; // "PSR_BVHL"
     public const ulong Globals = 0x8052A69F8;
     private const int GlobalsBytes = 0x40;
-    private const int ScanMs = 50;
+    private const int ScanMs = 10;
     private const int RingSize = 512;
     private const int HeaderWriteMinimum = 256;
     private const int MagicReports = 50;
@@ -54,6 +54,11 @@ public static class BvhlProbe
     private static long _ringNext;
     private static readonly Entry[] HeaderRing = new Entry[64];
     private static long _headerNext;
+
+    // The scanner's last snapshot of the block and of the globals, for the dump at a native exception.
+    private static byte[]? _snapshot, _snapshotGlobals;
+    private static ulong _snapshotBase;
+    private static long _snapshotMs;
 
     static BvhlProbe()
     {
@@ -334,6 +339,17 @@ public static class BvhlProbe
 
                 previous ??= new byte[bytes];
                 current.AsSpan().CopyTo(previous);
+                lock (Gate)
+                {
+                    if (_snapshot is null || _snapshot.Length != bytes)
+                        _snapshot = new byte[bytes];
+                    current.AsSpan().CopyTo(_snapshot);
+                    _snapshotGlobals ??= new byte[GlobalsBytes];
+                    globals.AsSpan().CopyTo(_snapshotGlobals);
+                    _snapshotBase = poolBase;
+                    _snapshotMs = Ms;
+                }
+
                 if (Ms - lastHeartbeat >= 60_000)
                 {
                     lastHeartbeat = Ms;
@@ -349,6 +365,162 @@ public static class BvhlProbe
     }
 
     public readonly record struct FreeWalk(int Steps, string? Problem, ulong BadNode);
+
+    // Runs of changed bytes between two images of the block, of at least minRun bytes (offset, length).
+    public static List<(int Offset, int Length)> FindChangedRuns(ReadOnlySpan<byte> before, ReadOnlySpan<byte> after, int minRun)
+    {
+        var runs = new List<(int, int)>();
+        var index = 0;
+        var length = Math.Min(before.Length, after.Length);
+        while (index < length)
+        {
+            if (before[index] == after[index])
+            {
+                index++;
+                continue;
+            }
+
+            var start = index;
+            var lastChanged = index;
+            // A run tolerates up to 15 equal bytes inside it (a clobber that happens to match).
+            while (index < length && index - lastChanged <= 15)
+            {
+                if (before[index] != after[index])
+                    lastChanged = index;
+                index++;
+            }
+
+            if (lastChanged - start + 1 >= minRun)
+                runs.Add((start, lastChanged - start + 1));
+        }
+
+        return runs;
+    }
+
+    // At a native exception: the pool now against the scanner's last snapshot (the runs that changed since, the
+    // first nodes of the free list as it was), the globals and the rings. Called on the faulting thread.
+    public static void DumpOnCrash(ulong rbx)
+    {
+        if (!Enabled)
+            return;
+        try
+        {
+            var memory = _memory;
+            byte[]? snapshot, snapshotGlobals;
+            ulong snapshotBase;
+            long snapshotMs;
+            lock (Gate)
+            {
+                snapshot = _snapshot;
+                snapshotGlobals = _snapshotGlobals;
+                snapshotBase = _snapshotBase;
+                snapshotMs = _snapshotMs;
+            }
+
+            var text = new StringBuilder();
+            text.Append($"[BVHL] CRASH ms={Ms} rbx=0x{rbx:X} snapshot_ms={snapshotMs} snapshot_base=0x{snapshotBase:X}");
+            text.AppendLine();
+            if (memory is null || snapshot is null || snapshotGlobals is null)
+            {
+                text.Append("[BVHL] no snapshot");
+                text.AppendLine();
+                Console.Error.Write(text.ToString());
+                Console.Error.Flush();
+                return;
+            }
+
+            var globals = new byte[GlobalsBytes];
+            if (memory.TryRead(Globals, globals))
+                text.Append($"[BVHL] globals now: base=0x{BinaryPrimitives.ReadUInt64LittleEndian(globals):X} head=0x{BinaryPrimitives.ReadUInt64LittleEndian(globals.AsSpan(8)):X} used={BinaryPrimitives.ReadUInt32LittleEndian(globals.AsSpan(0x18))} peak={BinaryPrimitives.ReadUInt32LittleEndian(globals.AsSpan(0x1C))}; snapshot: head=0x{BinaryPrimitives.ReadUInt64LittleEndian(snapshotGlobals.AsSpan(8)):X} used={BinaryPrimitives.ReadUInt32LittleEndian(snapshotGlobals.AsSpan(0x18))}");
+            else
+                text.Append("[BVHL] globals unreadable");
+            text.AppendLine();
+            var current = new byte[snapshot.Length];
+            if (!memory.TryRead(snapshotBase, current))
+            {
+                text.Append("[BVHL] block unreadable");
+                text.AppendLine();
+                Console.Error.Write(text.ToString());
+                Console.Error.Flush();
+                return;
+            }
+
+            if (rbx >= snapshotBase && rbx < snapshotBase + (ulong)snapshot.Length)
+                text.Append($"[BVHL] rbx is slot {(rbx - snapshotBase) / 16} of the pool");
+            else
+                text.Append("[BVHL] rbx is not in the pool");
+            text.AppendLine();
+            var magicNow = FindMagic(current);
+            var magicBefore = FindMagic(snapshot);
+            text.Append($"[BVHL] magic now at {(magicNow >= 0 ? "0x" + (snapshotBase + (ulong)magicNow).ToString("X", CultureInfo.InvariantCulture) : "none")}, in the snapshot at {(magicBefore >= 0 ? "0x" + (snapshotBase + (ulong)magicBefore).ToString("X", CultureInfo.InvariantCulture) : "none")}");
+            text.AppendLine();
+            var runs = FindChangedRuns(snapshot, current, 16);
+            text.Append($"[BVHL] changed runs since the snapshot (>=16 bytes): {runs.Count}");
+            text.AppendLine();
+            var shown = 0;
+            foreach (var (offset, length) in runs)
+            {
+                if (++shown > 40)
+                    break;
+                var count = Math.Min(length, 288);
+                text.Append($"[BVHL] run 0x{snapshotBase + (ulong)offset:X}+0x{length:X} slot={offset / 16} now={Convert.ToHexString(current, offset, count)}");
+                text.AppendLine();
+                if (shown <= 12)
+                {
+                    text.Append($"[BVHL]     before={Convert.ToHexString(snapshot, offset, count)}");
+                    text.AppendLine();
+                }
+            }
+
+            // The free list as the snapshot had it: the nodes the game was about to pop.
+            var node = BinaryPrimitives.ReadUInt64LittleEndian(snapshotGlobals.AsSpan(8));
+            text.Append("[BVHL] free list of the snapshot (first 32 nodes: address, before, now):");
+            text.AppendLine();
+            for (var step = 0; step < 32 && node != 0; step++)
+            {
+                if (node < snapshotBase || node >= snapshotBase + (ulong)snapshot.Length || (node & 15) != 0)
+                {
+                    text.Append($"  #{step} 0x{node:X} outside the block");
+                    text.AppendLine();
+                    break;
+                }
+
+                var at = (int)(node - snapshotBase);
+                var before = snapshot.AsSpan(at, 16);
+                var now = current.AsSpan(at, 16);
+                text.Append($"  #{step} 0x{node:X} before={Convert.ToHexString(before)} now={Convert.ToHexString(now)}{(before.SequenceEqual(now) ? "" : " CHANGED")}");
+                text.AppendLine();
+                node = BinaryPrimitives.ReadUInt64LittleEndian(before);
+            }
+
+            text.Append($"[BVHL] host writes over the pool (last {RingSize}, newest last):");
+            text.AppendLine();
+            var next = Interlocked.Read(ref _ringNext);
+            for (var index = Math.Max(0, next - RingSize); index < next; index++)
+            {
+                var entry = Ring[index % RingSize];
+                text.Append($"  ms={entry.Ms} site={entry.Site} addr=0x{entry.Address:X}+0x{entry.Size:X} thread={entry.Thread} magic_offset={entry.MagicOffset} changed={entry.Changed} reverted_links={entry.Reverted} first_changed=0x{entry.FirstChanged:X}");
+                text.AppendLine();
+            }
+
+            text.Append($"[BVHL] header-shaped host writes (last {HeaderRing.Length}):");
+            text.AppendLine();
+            var headerNext = Interlocked.Read(ref _headerNext);
+            for (var index = Math.Max(0, headerNext - HeaderRing.Length); index < headerNext; index++)
+            {
+                var entry = HeaderRing[index % HeaderRing.Length];
+                text.Append($"  ms={entry.Ms} site={entry.Site} addr=0x{entry.Address:X}+0x{entry.Size:X} thread={entry.Thread}");
+                text.AppendLine();
+            }
+
+            Console.Error.Write(text.ToString());
+            Console.Error.Flush();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[BVHL] crash dump failed: {exception.GetType().Name}: {exception.Message}");
+        }
+    }
 
     // Follows the free list inside the block: every node 16-aligned and inside, no more steps than nodes.
     public static FreeWalk WalkFreeList(ReadOnlySpan<byte> block, ulong poolBase, ulong head, uint capacity)

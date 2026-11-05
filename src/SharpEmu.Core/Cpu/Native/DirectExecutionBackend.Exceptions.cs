@@ -209,6 +209,7 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine("[LOADER][INFO] =========================================");
 			Console.Error.WriteLine("[LOADER][INFO] NATIVE EXCEPTION CAUGHT!");
             _nativeFunctionTrace?.DumpRecentSerialization();
+			SharpEmu.HLE.GuestMemory.BvhlProbe.DumpOnCrash(rbx); // [local] SHARPEMU_BVHL_PROBE (no-op unless armed)
 			Console.Error.WriteLine($"[LOADER][INFO]   Code: 0x{exceptionCode:X8}");
 			Console.Error.WriteLine($"[LOADER][INFO]   Exception Address: 0x{exceptionAddress:X16}");
 			Console.Error.WriteLine($"[LOADER][INFO]   RIP: 0x{rip:X16}");

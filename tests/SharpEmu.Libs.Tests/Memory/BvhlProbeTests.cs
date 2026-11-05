@@ -66,6 +66,24 @@ public sealed class BvhlProbeTests
     }
 
     [Fact]
+    public void FindChangedRunsReportsAHeaderPastedOverFreeNodes()
+    {
+        var before = Block(64);
+        var after = (byte[])before.Clone();
+        // A 256-byte header lands on nodes 20..35; one of its qwords happens to equal the old link.
+        for (var index = 20 * 16; index < 36 * 16; index++)
+            after[index] = (byte)(0x40 + index % 7);
+        BinaryPrimitives.WriteUInt64LittleEndian(after.AsSpan(20 * 16), BvhlProbe.Magic);
+        after.AsSpan(25 * 16, 8).Clear();
+        before.AsSpan(25 * 16, 8).Clear();
+        var runs = BvhlProbe.FindChangedRuns(before, after, 16);
+        var run = Assert.Single(runs);
+        Assert.Equal(20 * 16, run.Offset);
+        Assert.Equal(256, run.Length);
+        Assert.Empty(BvhlProbe.FindChangedRuns(before, before, 16));
+    }
+
+    [Fact]
     public void ProbeIsOffByDefault()
     {
         Assert.False(BvhlProbe.Enabled);
