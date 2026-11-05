@@ -55,8 +55,9 @@ public static class EnvironmentSettings
         // Performance.
         Toggle("ShaderPrewarm", "SHARPEMU_SHADER_PREWARM", EnvironmentSettingGroup.Performance, enabled: true),
         Toggle("ShaderPrewarmWait", "SHARPEMU_SHADER_PREWARM_WAIT", EnvironmentSettingGroup.Performance, enabled: true),
-        // Unset persists the Vulkan pipeline cache file on Linux only; "1" also persists it on
-        // Windows and "0" turns every on-disk pipeline cache off.
+        // Unset persists the Vulkan pipeline cache file on every platform ([local]; the
+        // environment value "linux" keeps the upstream Linux-only default) and "0" turns every
+        // on-disk pipeline cache off.
         Choice("PipelineCache", "SHARPEMU_VK_PIPELINE_CACHE", EnvironmentSettingGroup.Performance, "auto",
             [new("auto"), new("1"), new("0")]),
         Toggle("NoFlipPacing", "SHARPEMU_NO_FLIP_PACING", EnvironmentSettingGroup.Performance, enabled: false),

@@ -1571,9 +1571,12 @@ internal static unsafe partial class VulkanVideoPresenter
             // seconds, so discarding a valid cache at every launch is
             // much more harmful than using Vulkan's normal persistence path.
             // Keep an explicit opt-out for diagnostics and read-only systems.
+            // [local] Windows persists too by default: GTA V's 244 SPIR-V variants of one
+            // pixel shader otherwise cost 100-180 synchronous creations per session.
+            // SHARPEMU_VK_PIPELINE_CACHE=linux restores the upstream Linux-only default.
             var persistentCacheEnabled =
                 !string.Equals(cacheMode, "0", StringComparison.Ordinal) &&
-                (useShards || !OperatingSystem.IsWindows() || cacheMode is "1" or "file");
+                (useShards || !OperatingSystem.IsWindows() || cacheMode != "linux");
             _pipelineCachePath = persistentCacheEnabled ? GetPipelineCachePath() : null;
             _linkedPipelineCacheDirectory = cacheMode != "0"
                 ? VulkanPipelineCacheStorage.LinkedDirectory(VideoOutExports.GetApplicationTitleId(),
