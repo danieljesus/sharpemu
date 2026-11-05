@@ -170,6 +170,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 StartGuestWindowAudit();
             }
         }
+
+        SharpEmu.HLE.GuestMemory.BvhlProbe.Register(this); // [local] SHARPEMU_BVHL_PROBE (no-op unless armed)
     }
 
     private readonly bool _preReserveGuestAddressSpace;
@@ -2508,6 +2510,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         // their owners dirtied before the copy; guest addresses are
         // host-identical, matching the tracker's fault addresses.
         GuestImageWriteTracker.NotifyManagedWrite(virtualAddress, (ulong)source.Length);
+        if (SharpEmu.HLE.GuestMemory.BvhlProbe.Enabled) SharpEmu.HLE.GuestMemory.BvhlProbe.NoteWrite("pvm-write", virtualAddress, source); // [local] SHARPEMU_BVHL_PROBE
         if (SingleViewWrites && !source.IsEmpty && _backedSpace is { } backed && !_disposed) // [local] switch
         {
             GuestGpuMemoryHook.PrepareEmulatorWrite(virtualAddress, (ulong)source.Length);
@@ -2633,6 +2636,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             {
                 GuestGpuMemoryHook.NoteEmulatorWrite(destinationAddress, length);
                 NotifyBackedWriteWatch(destinationAddress, length);
+                if (SharpEmu.HLE.GuestMemory.BvhlProbe.Enabled) SharpEmu.HLE.GuestMemory.BvhlProbe.NoteCopy("pvm-copy-single", destinationAddress, length); // [local] SHARPEMU_BVHL_PROBE
                 return true;
             }
         }
@@ -2660,6 +2664,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 if (copied)
                 {
                     NotifyBackedWriteWatch(destinationAddress, length);
+                    if (SharpEmu.HLE.GuestMemory.BvhlProbe.Enabled) SharpEmu.HLE.GuestMemory.BvhlProbe.NoteCopy("pvm-copy-backed", destinationAddress, length); // [local] SHARPEMU_BVHL_PROBE
                 }
 
                 return copied;
@@ -2697,6 +2702,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             NotifyGuestWriteWatch(
                 destinationAddress,
                 new ReadOnlySpan<byte>((void*)destinationPointer, checked((int)length)));
+            if (SharpEmu.HLE.GuestMemory.BvhlProbe.Enabled) SharpEmu.HLE.GuestMemory.BvhlProbe.NoteCopy("pvm-copy-direct", destinationAddress, length); // [local] SHARPEMU_BVHL_PROBE
             return true;
         }
         finally

@@ -123,6 +123,7 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
         var written = TryWriteBackingCore(address, data);
         if (GpuMemory.BackingWriteLog.Enabled)
             GpuMemory.BackingWriteLog.Note(address, (ulong)data.Length);
+        if (written && BvhlProbe.Enabled) BvhlProbe.NoteWrite("backing-write", address, data); // [local] SHARPEMU_BVHL_PROBE
         return written;
     }
 
@@ -223,6 +224,7 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
         try
         {
             data.CopyTo(new Span<byte>((void*)target, data.Length));
+            if (BvhlProbe.Enabled) BvhlProbe.NoteWrite("backing-single", address, data); // [local] SHARPEMU_BVHL_PROBE
             return true;
         }
         finally
@@ -250,6 +252,7 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
             try
             {
                 Buffer.MemoryCopy((void*)from, (void*)to, size, size);
+                if (BvhlProbe.Enabled) BvhlProbe.NoteCopy("backing-copy-single", destination, size); // [local] SHARPEMU_BVHL_PROBE
                 return true;
             }
             finally
@@ -320,6 +323,7 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
             {
                 new ReadOnlySpan<byte>((void*)reservation.Source, (int)size)
                     .CopyTo(new Span<byte>((void*)reservation.Destination, (int)size));
+                if (BvhlProbe.Enabled) BvhlProbe.NoteCopy("backing-copy-reserved", destination, size); // [local] SHARPEMU_BVHL_PROBE
                 return true;
             }
         }
@@ -342,6 +346,7 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
                     // Use the backing alias so CopyTo can detect overlap between different guest views.
                     new ReadOnlySpan<byte>((void*)(AliasBase + sourceOffset), (int)size)
                         .CopyTo(new Span<byte>((void*)(AliasBase + destinationOffset), (int)size));
+                    if (BvhlProbe.Enabled) BvhlProbe.NoteCopy("backing-copy", destination, size); // [local] SHARPEMU_BVHL_PROBE
                     return true;
                 }
 
@@ -359,6 +364,7 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
                         Buffer.MemoryCopy((void*)fromPtr, (void*)toPtr, bytes, bytes);
                     }
 
+                    if (BvhlProbe.Enabled) BvhlProbe.NoteCopy("backing-copy-chunks", destination, size); // [local] SHARPEMU_BVHL_PROBE
                     return true;
                 }
 
