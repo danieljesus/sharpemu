@@ -1337,7 +1337,30 @@ public static partial class ResourceMaterializer
     // candidate is unreachable and is treated like any other unusable entry.
     private static bool UsableImageCandidate(ReadOnlySpan<uint> candidate, ImageResource image) =>
         UsableImageCandidate(candidate, image.R128) &&
-        !(image.Dimension == ImageDimension.Dim2D && GuestImageFormat.ImageTypeOf(candidate) == GuestImageFormat.ImageTypeCube);
+        !(image.Dimension == ImageDimension.Dim2D && GuestImageFormat.ImageTypeOf(candidate) == GuestImageFormat.ImageTypeCube) &&
+        !UnreachableMultisampledCandidate(candidate, image);
+
+    // [local] SHARPEMU_INDIRECT_IMAGE_MSAA (=1 by default, =0 off): a multisampled descriptor (type 14/15) is only
+    // addressable by an instruction whose DIM is itself multisampled (an image_load with a sample index), so from a
+    // plain sampled access it is as unreachable as a cube. GTA V's 0xD44E (the pass that shades the reflection hits
+    // 0x8395 lists, 32400 groups, material table at pc 0x2660) gets a 1x1 MSAA depth placeholder (key 0xf) in that
+    // table in some rooms; the mismatch failed the whole materialization with IncompatibleImageCandidates, the pass
+    // was skipped for the rest of the session and 0x8395's (1, 0, 1) "shade later" marker stayed on screen (the
+    // magenta walls, doors and glass). Settable for tests, per async flow like IndirectImageDimMode.
+    public static int IndirectImageMsaaMode
+    {
+        get => IndirectImageMsaaOverride.Value ?? IndirectImageMsaaDefault;
+        set => IndirectImageMsaaOverride.Value = value;
+    }
+
+    private static readonly int IndirectImageMsaaDefault =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_MSAA"), out var msaaMode) ? msaaMode : 1;
+    private static readonly AsyncLocal<int?> IndirectImageMsaaOverride = new();
+
+    private static bool UnreachableMultisampledCandidate(ReadOnlySpan<uint> candidate, ImageResource image) =>
+        IndirectImageMsaaMode != 0 &&
+        image.Dimension is not (ImageDimension.Dim2DMsaa or ImageDimension.Dim2DMsaaArray) &&
+        GuestImageFormat.ImageTypeOf(candidate) is GuestImageFormat.ImageType2DMsaa or GuestImageFormat.ImageType2DMsaaArray;
 
     // A call record's image the host can give a float view without a conversion in the shader: a valid sampled T# of a
     // float format. A freed T# (0xFEFEFEFE words) fails the reserved-bit check.

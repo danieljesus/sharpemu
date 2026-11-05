@@ -299,4 +299,56 @@ public sealed class IndirectImageDimensionTests
         });
         Assert.Equal(ResourceMaterializationFailure.IncompatibleImageCandidates, failure);
     }
+
+    // [local] SHARPEMU_INDIRECT_IMAGE_MSAA: GTA V's 0xD44E material table gains a 1x1 multisampled depth placeholder
+    // (type 14, key 0xf) in some rooms. A sampled 2D access cannot reach it, so it materializes as a null entry of the
+    // exemplar's class instead of failing the whole pass.
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, true)]
+    public void AMultisampledCandidateIn2DTableIsUnreachableWithTheSwitch(int msaaMode, bool accepted)
+    {
+        const uint ImageType2DMsaa = 14;
+        var plan = Extract(SpirvBindingDeclarationTests.IndirectImageAfterPlainImageProgram(indirectDimension: 1));
+        var (userData, memory) = SpirvBindingDeclarationTests.IndirectImageAfterPlainImageInputs(
+            64, false, firstImageType: ImageType2D, secondImageType: ImageType2DMsaa);
+        // A valid MSAA T# (the game's: fragments 3, max mip 3), so it is not dropped as malformed.
+        memory.At(0x202C) |= 3u << 16;
+        memory.At(0x2034) |= 3u << 4;
+        var previous = ResourceMaterializer.IndirectImageMsaaMode;
+        ResourceMaterializer.IndirectImageMsaaMode = msaaMode;
+        try
+        {
+            WithMode(1, () =>
+            {
+                var snapshot = new ResourceSnapshot();
+                var specialization = new ResourceSpecialization();
+                var success = ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read),
+                    ref snapshot, ref specialization, out var failure);
+                Assert.Equal(accepted, success);
+                if (!accepted)
+                {
+                    Assert.Equal(ResourceMaterializationFailure.IncompatibleImageCandidates, failure);
+                    return 0;
+                }
+
+                Assert.Equal(ImageDimension.Dim2D, specialization.Images[1].Dimension);
+                Assert.Equal(ImageDimension.Dim2D, specialization.Images[2].Dimension);
+                Assert.All(snapshot.Images[2], word => Assert.Equal(0u, word));
+                var resources = ResourceMaterializer.ApplyTo(plan, specialization);
+                var layout = BindingLayout.Allocate(
+                    resources.Info,
+                    BindingLayout.CollectUserDataRegisters(plan.Graph.Program, 0, 64),
+                    false,
+                    ShaderCompileRequest.RequiresFlattenedTable(plan, resources),
+                    false);
+                Assert.True(Gen5SpirvTranslator.TryCompileProgram(new ShaderCompileRequest(plan, resources, layout), out _, out var error), error);
+                return 0;
+            });
+        }
+        finally
+        {
+            ResourceMaterializer.IndirectImageMsaaMode = previous;
+        }
+    }
 }
