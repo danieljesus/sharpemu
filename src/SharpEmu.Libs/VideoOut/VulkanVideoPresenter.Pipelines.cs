@@ -21,6 +21,9 @@ using Silk.NET.Vulkan.Extensions.KHR;
 // This partial creates the graphics and compute pipelines of the shader cache and the presentation pipeline.
 internal static unsafe partial class VulkanVideoPresenter
 {
+    // [local] The presenter's compute pending-compile counters, for the FPS log.
+    internal static string? ComputePendingReport() => Presenter.ComputePendingReport();
+
     private const string PushDescriptorExtensionName = "VK_KHR_push_descriptor";
 
     // [local] A test that needs upstream's table-block layout sets it for its own async flow (see TableBlocksEnabled).
@@ -2768,6 +2771,36 @@ internal static unsafe partial class VulkanVideoPresenter
                 "0",
                 StringComparison.Ordinal);
 
+        // [local] SHARPEMU_COMPUTE_PENDING_WAIT=1: a request for a compute pipeline whose compile is still running waits
+        // for it here, under the pending-pipeline lock and the pipeline cache's gate, as upstream 8ddf6601 does for
+        // programs without call targets. By default every such request reports "not ready" instead, as before that
+        // merge: the render thread then waits on the compile's task outside the locks (RenderRecorder) and the GPU
+        // front skips the dispatch of a linked program (RenderExecutor).
+        private static readonly bool _computePendingWait =
+            Environment.GetEnvironmentVariable("SHARPEMU_COMPUTE_PENDING_WAIT") == "1";
+
+        // [local] Requests that found a compile still running: those that waited for it here and those told "not ready".
+        private static long _computePendingWaits;
+        private static long _computePendingWaitTicks;
+        private static long _computePendingNotReady;
+        private static long _computePendingReported;
+
+        // [local] A [PERF][COMPUTE_PENDING] line with the cumulative counters when they changed since the last report.
+        internal static string? ComputePendingReport()
+        {
+            var waits = Interlocked.Read(ref _computePendingWaits);
+            var notReady = Interlocked.Read(ref _computePendingNotReady);
+            var total = waits + notReady;
+            if (total == Interlocked.Exchange(ref _computePendingReported, total))
+            {
+                return null;
+            }
+
+            var ms = Interlocked.Read(ref _computePendingWaitTicks) * 1000.0 / Stopwatch.Frequency;
+            return FormattableString.Invariant(
+                $"[PERF][COMPUTE_PENDING] mode={(_computePendingWait ? "wait" : "not-ready")} waits={waits} wait_ms={ms:F1} not_ready={notReady}");
+        }
+
         public bool TryCreateComputePipeline(ComputePipelineDescription description, out PipelineHandle handle)
         {
             lock (_pendingComputePipelines)
@@ -2788,9 +2821,18 @@ internal static unsafe partial class VulkanVideoPresenter
             var key = description.Program.Id;
             if (_pendingComputePipelines.TryGetValue(key, out var pending))
             {
-                if (!pending.Compile.IsCompleted && description.Stage.Bindings is { CallTargetCount: not 0 })
+                if (!pending.Compile.IsCompleted)
                 {
-                    return false;
+                    if (!_computePendingWait || description.Stage.Bindings is { CallTargetCount: not 0 })
+                    {
+                        Interlocked.Increment(ref _computePendingNotReady);
+                        return false;
+                    }
+
+                    var waitStart = Stopwatch.GetTimestamp();
+                    pending.Compile.GetAwaiter().GetResult();
+                    Interlocked.Add(ref _computePendingWaitTicks, Stopwatch.GetTimestamp() - waitStart);
+                    Interlocked.Increment(ref _computePendingWaits);
                 }
 
                 var compiled = pending.Compile.GetAwaiter().GetResult();
