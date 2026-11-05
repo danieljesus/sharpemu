@@ -29,6 +29,7 @@ public static class RegisterWriteTable
     public static uint WriteContextPacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values)
     {
         banks.PrepareContextWrite();
+        if (RegisterBanks.StampProbe) banks.ProbeContextWrite(offset, values); // [local]
         var consumed = WritePacket(banks, in packet, offset, values, Context, ContextIndirect, "context", emptyIsHandled: true);
         banks.MarkWritten(RegisterStamps.ContextBitsFor(offset, consumed));
         if (Rendering.RenderTrace.Enabled)
@@ -46,6 +47,7 @@ public static class RegisterWriteTable
     public static uint WriteShaderPacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values)
     {
         banks.PrepareShaderWrite(offset, (uint)values.Length);
+        if (RegisterBanks.StampProbe) banks.ProbeShaderWrite(offset, values); // [local]
         var consumed = WritePacket(banks, in packet, offset, values, Shader, ShaderIndirect, "shader", emptyIsHandled: false);
         banks.MarkWritten(RegisterStamps.ShaderBitsFor(offset, consumed));
         if (Rendering.RenderTrace.Enabled)
@@ -67,6 +69,7 @@ public static class RegisterWriteTable
     public static void WriteContextEntry(RegisterBanks banks, uint offset, uint value, ulong tableAddress)
     {
         banks.PrepareContextWrite();
+        if (RegisterBanks.StampProbe) banks.ProbeContextWrite(offset, [value]); // [local]
         if (offset < ContextIndirect.Length && ContextIndirect[offset] is null)
         {
             // Keep unknown in-bank table values so a later renderer implementation can decode them.
@@ -100,6 +103,7 @@ public static class RegisterWriteTable
     public static void WriteShaderEntry(RegisterBanks banks, uint offset, uint value, ulong tableAddress)
     {
         banks.PrepareShaderWrite(offset, 1);
+        if (RegisterBanks.StampProbe) banks.ProbeShaderWrite(offset, [value]); // [local]
         WriteEntry(banks, offset, value, ShaderIndirect, "shader", tableAddress);
         banks.MarkWritten(RegisterStamps.ShaderBitsFor(offset, 1));
         if (Rendering.RenderTrace.Enabled)

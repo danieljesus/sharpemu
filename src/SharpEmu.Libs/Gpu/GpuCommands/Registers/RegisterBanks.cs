@@ -53,6 +53,74 @@ public sealed class RegisterBanks
             Math.Max(_stamps[(int)RegisterStamp.ColorTargets], _stamps[(int)RegisterStamp.DepthTargets]),
             Math.Max(_stamps[(int)RegisterStamp.ShaderInterface], _stamps[(int)RegisterStamp.PipelineState]));
 
+    // [local] SHARPEMU_STAMP_PROBE=1: how many context and shader register writes repeat the register's current raw
+    // value, per stamp group, to size a stamp that would only move when a value changes. Counting only: the stamps
+    // move on every write as before. Reported as [PERF][STAMP_PROBE] with the render profile.
+    internal static readonly bool StampProbe = Environment.GetEnvironmentVariable("SHARPEMU_STAMP_PROBE") == "1";
+    private uint[]? _probeContext, _probeShader;
+    private bool[]? _probeContextKnown, _probeShaderKnown;
+    private static readonly long[] _probeWrites = new long[RegisterStamps.Count], _probeUnchanged = new long[RegisterStamps.Count];
+
+    internal void ProbeContextWrite(uint offset, ReadOnlySpan<uint> values)
+    {
+        _probeContext ??= new uint[RegisterBankLayout.ContextRegisterCount];
+        _probeContextKnown ??= new bool[RegisterBankLayout.ContextRegisterCount];
+        for (var index = 0u; index < values.Length && offset + index < _probeContext.Length; index++)
+        {
+            var register = offset + index;
+            var stamp = (int)RegisterStamps.ContextStampOf(register);
+            Interlocked.Increment(ref _probeWrites[stamp]);
+            if (_probeContextKnown[register] && _probeContext[register] == values[(int)index])
+            {
+                Interlocked.Increment(ref _probeUnchanged[stamp]);
+            }
+
+            _probeContext[register] = values[(int)index];
+            _probeContextKnown[register] = true;
+        }
+    }
+
+    internal void ProbeShaderWrite(uint offset, ReadOnlySpan<uint> values)
+    {
+        _probeShader ??= new uint[RegisterBankLayout.ShaderRegisterCount];
+        _probeShaderKnown ??= new bool[RegisterBankLayout.ShaderRegisterCount];
+        for (var index = 0u; index < values.Length && offset + index < _probeShader.Length; index++)
+        {
+            var register = offset + index;
+            var stamp = (int)RegisterStamps.ShaderStampOf(register);
+            Interlocked.Increment(ref _probeWrites[stamp]);
+            if (_probeShaderKnown[register] && _probeShader[register] == values[(int)index])
+            {
+                Interlocked.Increment(ref _probeUnchanged[stamp]);
+            }
+
+            _probeShader[register] = values[(int)index];
+            _probeShaderKnown[register] = true;
+        }
+    }
+
+    private void ProbeForget()
+    {
+        if (_probeContextKnown is { } context) Array.Clear(context);
+        if (_probeShaderKnown is { } shader) Array.Clear(shader);
+    }
+
+    internal static string? TakeStampProbeReport()
+    {
+        if (!StampProbe)
+        {
+            return null;
+        }
+
+        var parts = new string[RegisterStamps.Count];
+        for (var index = 0; index < parts.Length; index++)
+        {
+            parts[index] = FormattableString.Invariant($"{(RegisterStamp)index}={Interlocked.Exchange(ref _probeWrites[index], 0)}/{Interlocked.Exchange(ref _probeUnchanged[index], 0)}");
+        }
+
+        return "[PERF][STAMP_PROBE] writes/unchanged " + string.Join(" ", parts);
+    }
+
     public void MarkWritten(uint stampBits)
     {
         while (stampBits != 0)
@@ -437,6 +505,7 @@ public sealed class RegisterBanks
         CompositeDepthSizeXy = null;
         UserDataMarker = UserScalarKind.Unknown;
         IndexTypeAndSize = 0;
+        if (StampProbe) ProbeForget(); // [local]
         MarkWritten(RegisterStamps.AllBits);
     }
 
@@ -472,6 +541,7 @@ public sealed class RegisterBanks
                 throw Fatal($"The context state operation is unknown: operation={(uint)operation}.");
         }
 
+        if (StampProbe) ProbeForget(); // [local]
         MarkWritten(RegisterStamps.ContextBits);
         if (Rendering.RenderTrace.Enabled)
         {

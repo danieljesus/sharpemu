@@ -301,8 +301,7 @@ internal static unsafe partial class VulkanVideoPresenter
             return IsStale(found);
         }
 
-        private static bool IsStale(CachedImage image) =>
-            ((!image.Registered || image.DepthOwner.IsValid) && !ImageDescription.IsEmptyRange(image.Description.Data)) || image.Binding.NeedsRebind;
+        private static bool IsStale(CachedImage image) => GuestImageCache.IsStaleBinding(image); // [local] shared with TryTouchRememberedImage
 
         // Final acquisition: the view, the attachment layout and a pending DCC clear.
         internal void AcquireColorAttachment(ColorAttachment target)

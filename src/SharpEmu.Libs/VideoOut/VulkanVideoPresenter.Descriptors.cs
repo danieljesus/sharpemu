@@ -62,6 +62,10 @@ internal static unsafe partial class VulkanVideoPresenter
     // as 3368666f did (the image-binding memo and the buffer-source memos still apply).
     internal static readonly bool StageMemoEnabled = Environment.GetEnvironmentVariable("SHARPEMU_STAGE_MEMO") != "0";
 
+    // [local] SHARPEMU_STAGE_MEMO_TOUCH (1 by default, 0 off): the render thread checks a remembered texture's freshness
+    // with one hold of the image cache lock (GuestImageCache.TryTouchRememberedImage) instead of two.
+    internal static readonly bool StageMemoTouch = Environment.GetEnvironmentVariable("SHARPEMU_STAGE_MEMO_TOUCH") != "0";
+
     internal static readonly int BufferSourceMemoMode =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BUFFER_SOURCE_MEMO"), out var sourceMemo) && sourceMemo is >= 0 and <= 2 ? sourceMemo : 1;
     private const int BufferSourceTableCapacity = 1 << 16;
@@ -397,6 +401,20 @@ internal static unsafe partial class VulkanVideoPresenter
                 var texture = memo.Textures[index];
                 var range = memo.TextureRanges[index];
                 var checkedGeneration = memo.LookupGeneration;
+                if (StageMemoTouch && !_worker) // [local] SHARPEMU_STAGE_MEMO_TOUCH: the same checks, one hold of the lock
+                {
+                    if (!_imageCache.TryTouchRememberedImage(texture.ImageIdentifier, ref checkedGeneration, range.Address, range.End,
+                            touch: !ImageDescription.IsEmptyRange(texture.Request.Description.Data), out var image) || IsStale(image!))
+                    {
+                        memo.Invalidate();
+                        Interlocked.Increment(ref _stageMemoStale);
+                        return false;
+                    }
+
+                    generation = checkedGeneration;
+                    continue;
+                }
+
                 if (IsStaleImage(texture.ImageIdentifier, out _) ||
                     !ImageDescription.IsEmptyRange(texture.Request.Description.Data) && !(_worker
                         ? _imageCache.TryRememberedForSlice(texture.ImageIdentifier, ref checkedGeneration, range.Address, range.End)

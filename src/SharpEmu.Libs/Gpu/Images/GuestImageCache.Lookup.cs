@@ -182,6 +182,42 @@ public sealed partial class GuestImageCache
         return true;
     }
 
+    // [local] SHARPEMU_STAGE_MEMO_TOUCH: the stage memo's freshness check for one remembered texture under a single
+    // hold of the lock (it held it twice per texture of every reused stage: TryGetImage, then TryTouchRemembered).
+    // False when the image is gone, or (touch) when a lookup of the range could answer differently now or the image is
+    // not a registered, unparked one; a stale binding (IsStaleBinding) is reported through image and is not touched,
+    // as before.
+    public bool TryTouchRememberedImage(ResourceSlotIdentifier imageIdentifier, ref ulong generation, ulong begin, ulong end, bool touch,
+        out CachedImage? image)
+    {
+        using var held = _lock.Hold();
+        image = _slots.TryGet(imageIdentifier);
+        if (image is null)
+        {
+            return false;
+        }
+
+        if (!touch || IsStaleBinding(image))
+        {
+            return true;
+        }
+
+        if (!LookupUnchangedSince(generation, begin, end) || image is not { Registered: true, Parked: false })
+        {
+            return false;
+        }
+
+        generation = _lookupGeneration;
+        image.LastAccessTick = _scheduler.CurrentTick;
+        TouchImage(image);
+        return true;
+    }
+
+    // [local] A bound image that must be found again: unregistered or owned by a depth image (unless it is the empty
+    // range) or flagged for a rebind. The recording host's IsStale.
+    public static bool IsStaleBinding(CachedImage image) =>
+        ((!image.Registered || image.DepthOwner.IsValid) && !ImageDescription.IsEmptyRange(image.Description.Data)) || image.Binding.NeedsRebind;
+
     public GuestSpan RememberedRange(ResourceSlotIdentifier imageIdentifier, in ImageRequest request)
     {
         using var held = _lock.Read();
