@@ -148,6 +148,11 @@ public interface IRenderHost
 
     ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat);
 
+    // [local] SHARPEMU_TARGET_MEMO_DCC: a remembered target lookup whose image is known does everything FindImage does
+    // around the lookup itself (metadata synchronization, publications, the DCC clear), without the lookup. The
+    // default looks the image up again, which is exact for any host.
+    ResourceSlotIdentifier FindImageRemembered(ResourceSlotIdentifier remembered, ref ImageRequest request) => FindImage(ref request, exactFormat: false);
+
     // [local] SHARPEMU_TARGET_MEMO: what a target lookup's result depends on besides its registers; the default never
     // lets a remembered lookup be reused.
     TargetLookupStamp TargetLookupStamp => default;

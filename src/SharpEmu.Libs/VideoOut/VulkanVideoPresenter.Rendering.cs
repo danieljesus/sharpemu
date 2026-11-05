@@ -563,6 +563,35 @@ internal static unsafe partial class VulkanVideoPresenter
             return imageIdentifier;
         }
 
+        // [local] SHARPEMU_TARGET_MEMO_DCC: FindImage for a target whose image the recorder remembers; only LookUpImage
+        // is skipped (render thread only: the recorder's memo is off on a worker).
+        public ResourceSlotIdentifier FindImageRemembered(ResourceSlotIdentifier remembered, ref ImageRequest request)
+        {
+            if (_worker)
+            {
+                return FindImage(ref request, exactFormat: false);
+            }
+
+            var syncScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.TargetSync);
+            _imageCache.TraceNativeColorMetadata(request);
+            _imageCache.TraceTextureMetadata(request);
+            SynchronizeColorMetadata(request);
+            EnsureBatchedGuestCommands();
+            if (request.Role == ImageRole.ColorTarget && !request.Description.Metadata.NativeColorClear &&
+                request.Description.DccSliceSize is var sliceSize and not 0)
+            {
+                _imageCache.SynchronizeGuestDccMetadata(request.Description.Metadata.Range.Address, sliceSize,
+                    request.View.BaseLayer, request.View.LayerCount);
+            }
+
+            syncScope.Dispose();
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.TargetLookup))
+                _imageCache.CompleteRememberedLookup(remembered, ref request);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.TargetClear))
+                ApplyNativeColorClear(remembered, request);
+            return remembered;
+        }
+
         private ResourceSlotIdentifier LookUpImage(ref ImageRequest request, bool exactFormat = false) =>
             _worker
                 ? _imageCache.TryFindImageForSlice(ref request, exactFormat, out var found) ? found : throw Serial("image lookup", resumable: true)

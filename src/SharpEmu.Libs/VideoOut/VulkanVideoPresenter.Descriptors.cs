@@ -47,7 +47,25 @@ internal static unsafe partial class VulkanVideoPresenter
         FormattableString.Invariant($"stale={Interlocked.Exchange(ref _stageMemoStale, 0)} invalidations={Interlocked.Exchange(ref _stageMemoInvalidations, 0)} acquire_reuses={Interlocked.Exchange(ref _stageMemoAcquireReuses, 0)} ") +
         FormattableString.Invariant($"content_hits={Interlocked.Exchange(ref _stageMemoContentHits, 0)} evictions={Interlocked.Exchange(ref _stageMemoEvictions, 0)} ") +
         FormattableString.Invariant($"buffer_refinds={Interlocked.Exchange(ref _stageMemoBufferRefinds, 0)} buffer_changes={Interlocked.Exchange(ref _stageMemoBufferChanges, 0)} ") +
+        FormattableString.Invariant($"source_table=hits:{Interlocked.Exchange(ref _bufferSourceTableHits, 0)},misses:{Interlocked.Exchange(ref _bufferSourceTableMisses, 0)},verified:{Interlocked.Exchange(ref _bufferSourceTableVerified, 0)},mismatches:{Interlocked.Exchange(ref _bufferSourceTableMismatches, 0)},clears:{Interlocked.Exchange(ref _bufferSourceTableClears, 0)} ") + // [local] SHARPEMU_BUFFER_SOURCE_MEMO
         (PublicationsReport?.Invoke() ?? ""); // [local]
+
+    // [local] SHARPEMU_BUFFER_SOURCE_MEMO (1 by default, =2 verify, =0 off): FindBuffers' memo per program slot only
+    // remembers the last descriptor each slot had, and GTA V binds another buffer in most slots from one draw of a
+    // program to the next ([PERF][STAGE_MEMO] buffer_changes close to hits), so the readability check, the clamp and
+    // the buffer lookup ran again for bindings the previous frame had resolved. A table keyed by the descriptor
+    // (program, slot, address, footprint) keeps those answers; a table hit is checked exactly as a slot hit is (same
+    // guest spans and mapping generation, then the region stamp before the buffer is reused). =2 looks the buffer up
+    // again on every table hit and counts the answers that differ.
+    // [local] SHARPEMU_STAGE_MEMO (1 by default, 0 off): upstream's memo of a stage's prepared textures, samplers and
+    // buffer sources by content (TryFindStagePreparation/ReuseStagePreparation). Off, every stage resolves its bindings
+    // as 3368666f did (the image-binding memo and the buffer-source memos still apply).
+    internal static readonly bool StageMemoEnabled = Environment.GetEnvironmentVariable("SHARPEMU_STAGE_MEMO") != "0";
+
+    internal static readonly int BufferSourceMemoMode =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BUFFER_SOURCE_MEMO"), out var sourceMemo) && sourceMemo is >= 0 and <= 2 ? sourceMemo : 1;
+    private const int BufferSourceTableCapacity = 1 << 16;
+    private static long _bufferSourceTableHits, _bufferSourceTableMisses, _bufferSourceTableVerified, _bufferSourceTableMismatches, _bufferSourceTableClears;
 
     // [local] The pending guest publications at the report: what every ObtainBuffer's publication check scans.
     internal static Func<string>? PublicationsReport;
@@ -238,9 +256,13 @@ internal static unsafe partial class VulkanVideoPresenter
         private Dictionary<ImageBindingKey, ImageBindingMemo>? _imageBindingMemos;
 
         private readonly record struct BufferSourceMemo(ulong Address, ulong Requested, long RegionStamp, long Spans, long Mapping, ResourceSlotIdentifier Buffer, ulong Size);
+        private readonly record struct BufferSourceKey(ulong Program, int Slot, ulong Address, ulong Requested); // [local] SHARPEMU_BUFFER_SOURCE_MEMO
+        private Dictionary<BufferSourceKey, BufferSourceMemo>? _bufferSourceTable;
         private Dictionary<ShaderProgramInfo, BufferSourceMemo[]>? _bufferSourceMemos;
         private ShaderProgramInfo? _lastBufferMemoProgram;
         private BufferSourceMemo[] _lastBufferMemos = [];
+
+        private static int _bufferSourceTableLogs; // [local] SHARPEMU_BUFFER_SOURCE_MEMO=2
 
         private BufferSourceMemo[] BufferSourceMemosOf(ShaderProgramInfo program, int count)
         {
@@ -898,7 +920,7 @@ internal static unsafe partial class VulkanVideoPresenter
             StagePreparationMemo? memo = null;
             preludeScope.Dispose();
             var memoScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemo); // [local]
-            var memoFound = frontendReady && !movieActive && !Gpu.Images.ImageClearTrace.Enabled && !MeshDrawTrace.Active &&
+            var memoFound = StageMemoEnabled && frontendReady && !movieActive && !Gpu.Images.ImageClearTrace.Enabled && !MeshDrawTrace.Active && // [local] SHARPEMU_STAGE_MEMO
                 TryFindStagePreparation(preparations, snapshot, stage.ShaderBase, out memo);
             memoScope.Dispose();
             if (memoFound)
@@ -973,7 +995,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ValidateImages, program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
                     ValidateDrawImageTypes(prepared);
             }
-            if (!movieActive && layout.CallTargetCount == 0 && layout.CallArgumentCount == 0 && !layout.UsesBindlessHeap)
+            if (StageMemoEnabled && !movieActive && layout.CallTargetCount == 0 && layout.CallArgumentCount == 0 && !layout.UsesBindlessHeap) // [local] SHARPEMU_STAGE_MEMO
             {
                 if (frontendReady)
                     NoteStagePreparation(preparations, prepared, snapshot, stage.ShaderBase);
@@ -1026,10 +1048,12 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private static IEnumerable<DeviceAddressRange> DeviceAddressRangesOf(PreparedStageBindings prepared) =>
+        // [local] An array, not an IEnumerable: the hot caller (ObtainDeviceAddressRanges, every stage of every draw)
+        // iterated a boxed enumerator per call; the concatenation only allocates for a stage with call records.
+        private static DeviceAddressRange[] DeviceAddressRangesOf(PreparedStageBindings prepared) =>
             prepared.CallRecordRanges.Length == 0
                 ? prepared.Stage.Resources.DeviceAddressRanges
-                : prepared.Stage.Resources.DeviceAddressRanges.Concat(prepared.CallRecordRanges);
+                : [.. prepared.Stage.Resources.DeviceAddressRanges, .. prepared.CallRecordRanges];
 
         private const int FoundRangeSetSlots = 16;
         private (DeviceAddressRange[]? Ranges, long RegionStamp, long Spans)[]? _foundRangeSets;
@@ -1226,6 +1250,23 @@ internal static unsafe partial class VulkanVideoPresenter
                 // repeats it only for its warning).
                 var known = mapping != long.MinValue && memo.Mapping == mapping &&
                     memo.Address == descriptor.Address && memo.Requested == requested && memo.Spans == spans;
+                var tabled = false;
+                if (!known && BufferSourceMemoMode != 0 && mapping != long.MinValue && descriptor.Address != 0 && requested != 0) // [local] SHARPEMU_BUFFER_SOURCE_MEMO
+                {
+                    if (_bufferSourceTable is { } table &&
+                        table.TryGetValue(new BufferSourceKey(program.Hash, index, descriptor.Address, requested), out var kept) &&
+                        kept.Mapping == mapping && kept.Spans == spans)
+                    {
+                        memo = kept;
+                        known = tabled = true;
+                        _bufferSourceTableHits++;
+                    }
+                    else
+                    {
+                        _bufferSourceTableMisses++;
+                    }
+                }
+
                 if (descriptor.Address == 0 || requested == 0 ||
                     (!known && !_guestMemory.CanRead(descriptor.Address, 1) &&
                      (IsUnresidentPrtPage(descriptor.Address) || IsUnmappedBufferStart(prepared, index, descriptor.Address))))
@@ -1243,6 +1284,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 PublishImagesUnderWrite(prepared.Resources.Info.Buffers[index], descriptor.Address, size);
                 if (remembered && memo.RegionStamp == _bufferCache.RegionStamp(descriptor.Address, requested))
                 {
+                    if (tabled && BufferSourceMemoMode == 2) // [local] SHARPEMU_BUFFER_SOURCE_MEMO=2: the table's answer against a fresh one
+                    {
+                        _bufferSourceTableVerified++;
+                        var checkedSize = ClampMappedSize(descriptor.Address, requested, prepared, index);
+                        var checkedBuffer = FindBuffer(descriptor.Address, checkedSize);
+                        if (checkedSize != memo.Size || checkedBuffer != memo.Buffer)
+                        {
+                            _bufferSourceTableMismatches++;
+                            if (_bufferSourceTableLogs++ < 20)
+                                Console.Error.WriteLine($"[BUFFER_SOURCE_MEMO_MISMATCH] hash=0x{program.Hash:X16} slot={index} address=0x{descriptor.Address:X} requested=0x{requested:X} table={memo.Buffer}/0x{memo.Size:X} now={checkedBuffer}/0x{checkedSize:X}");
+                        }
+                    }
+
                     sources[index] = (descriptor, memo.Buffer, memo.Size);
                 }
                 else
@@ -1250,6 +1304,17 @@ internal static unsafe partial class VulkanVideoPresenter
                     var buffer = FindBuffer(descriptor.Address, size);
                     sources[index] = (descriptor, buffer, size);
                     memo = new BufferSourceMemo(descriptor.Address, requested, _bufferCache.RegionStamp(descriptor.Address, requested), spans, mapping, buffer, size);
+                    if (BufferSourceMemoMode != 0 && mapping != long.MinValue) // [local] SHARPEMU_BUFFER_SOURCE_MEMO
+                    {
+                        var table = _bufferSourceTable ??= new Dictionary<BufferSourceKey, BufferSourceMemo>();
+                        if (table.Count >= BufferSourceTableCapacity)
+                        {
+                            table.Clear();
+                            _bufferSourceTableClears++;
+                        }
+
+                        table[new BufferSourceKey(program.Hash, index, descriptor.Address, memo.Requested)] = memo;
+                    }
                 }
 
                 if (Gpu.Buffers.RayQueryHle.Instance is { } rayQuery && prepared.Resources.Info.Buffers[index].Written) // [local] SHARPEMU_RQ_MAP

@@ -184,6 +184,34 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         return result;
     }
 
+    // [local] SHARPEMU_TARGET_MEMO_DCC: FindImage without LookUpImage, for a lookup whose result a caller remembers
+    // from the same lookup generation and tick: the publications, the hand-over check and CompleteLookup still run.
+    public void CompleteRememberedLookup(ResourceSlotIdentifier result, ref ImageRequest request)
+    {
+        if (SubmissionScheduler.ReadOnlyThread)
+        {
+            throw SubmissionScheduler.ReadOnlyViolation("image lookup");
+        }
+
+        _bufferCache.CompleteGuestPublications?.Invoke(request.Description.Data.Address, request.Description.Data.Size,
+            request.Role != ImageRole.Texture ? Buffers.GuestBufferCache.PublicationAccess.Write : Buffers.GuestBufferCache.PublicationAccess.Read);
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageLookup);
+        if (ResolveProfile.Enabled) ResolveProfile.CountFindImage(request.Role);
+        if (_scheduler.Current.IsInvalid)
+        {
+            throw SubmissionScheduler.Fatal("An image lookup needs a command buffer that is recording.");
+        }
+
+        ValidateRequest(request);
+        if (_insertedOverGpuImages == result)
+        {
+            _insertedOverGpuImages = ResourceSlotIdentifier.Invalid;
+            HandOverImagesToNewImage(result);
+        }
+
+        CompleteLookup(result, in request, request.View.BaseLayer);
+    }
+
     public void CompleteLookup(ResourceSlotIdentifier result, in ImageRequest request, uint metadataBaseLayer)
     {
         if (SubmissionScheduler.ReadOnlyThread)

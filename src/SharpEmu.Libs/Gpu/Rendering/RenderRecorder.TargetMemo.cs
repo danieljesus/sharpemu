@@ -11,8 +11,9 @@ namespace SharpEmu.Libs.Gpu.Rendering;
 // and the recorder looks their images up (FindTargets). A target's image lookup is a pure function of its register
 // words while no image is created, removed or replaced (the lookup generation), the scheduler tick and the image
 // cache's collection tick stay the same (IRenderHost.TargetLookupStamp), so a draw whose registers repeat the previous
-// lookup's reuses the image it found. DCC color targets always look up: the host reads their guest metadata on every
-// lookup. 1 (default) reuses; 2 verifies (always looks up, compares, reports [PERF][TARGET_MEMO]); 0 off.
+// lookup's reuses the image it found. A DCC target reuses its image too (SHARPEMU_TARGET_MEMO_DCC) and the host still
+// reads its guest metadata and resolves its clear on every draw (IRenderHost.FindImageRemembered). 1 (default) reuses;
+// 2 verifies (always looks up, compares, reports [PERF][TARGET_MEMO]); 0 off.
 internal sealed partial class RenderRecorder
 {
     private struct ColorTargetMemo
@@ -49,7 +50,8 @@ internal sealed partial class RenderRecorder
             return _host.FindImage(ref request, exactFormat: false);
         }
 
-        if (request.Description.Metadata.Kind == MetadataKind.Dcc)
+        var dcc = request.Description.Metadata.Kind == MetadataKind.Dcc;
+        if (dcc && !RenderExecutor.TargetMemoDcc)
         {
             RenderExecutor._memoDcc++;
             return _host.FindImage(ref request, exactFormat: false);
@@ -65,7 +67,13 @@ internal sealed partial class RenderRecorder
             RenderExecutor._memoHits++;
             if (RenderExecutor.TargetMemoMode == 1)
             {
-                return memo.Image;
+                if (!dcc)
+                {
+                    return memo.Image;
+                }
+
+                RenderExecutor._memoDccReused++;
+                return _host.FindImageRemembered(memo.Image, ref request); // [local] SHARPEMU_TARGET_MEMO_DCC
             }
         }
         else
@@ -92,7 +100,8 @@ internal sealed partial class RenderRecorder
             return _host.FindImage(ref request, exactFormat: false);
         }
 
-        if (request.Description.Metadata.Kind == MetadataKind.Dcc)
+        var dcc = request.Description.Metadata.Kind == MetadataKind.Dcc;
+        if (dcc && !RenderExecutor.TargetMemoDcc)
         {
             RenderExecutor._memoDcc++;
             return _host.FindImage(ref request, exactFormat: false);
@@ -106,7 +115,13 @@ internal sealed partial class RenderRecorder
             RenderExecutor._memoHits++;
             if (RenderExecutor.TargetMemoMode == 1)
             {
-                return _depthTargetMemoImage;
+                if (!dcc)
+                {
+                    return _depthTargetMemoImage;
+                }
+
+                RenderExecutor._memoDccReused++;
+                return _host.FindImageRemembered(_depthTargetMemoImage, ref request); // [local] SHARPEMU_TARGET_MEMO_DCC
             }
         }
         else

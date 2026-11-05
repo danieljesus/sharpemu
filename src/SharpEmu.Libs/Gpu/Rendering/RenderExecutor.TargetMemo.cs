@@ -37,8 +37,14 @@ public sealed partial class RenderExecutor
     private ResourceSlotIdentifier _depthTargetMemoImage;
     private TargetLookupStamp _targetMemoStamp;
 
+    // [local] SHARPEMU_TARGET_MEMO_DCC (1 by default, 0 off): a DCC color or depth target also reuses its remembered
+    // image. The host still synchronizes the guest metadata, completes the publications and resolves the DCC clear
+    // on every draw (IRenderHost.FindImageRemembered); only the image lookup is skipped, as for the other targets.
+    // The mode 2 of SHARPEMU_TARGET_MEMO verifies these too.
+    internal static readonly bool TargetMemoDcc = Environment.GetEnvironmentVariable("SHARPEMU_TARGET_MEMO_DCC") != "0";
+
     // [local] Shared with RenderRecorder's memo (the one that runs after the upstream merge).
-    internal static long _memoHits, _memoMisses, _memoDcc, _memoMismatches, _memoStampChanges;
+    internal static long _memoHits, _memoMisses, _memoDcc, _memoMismatches, _memoStampChanges, _memoDccReused;
     // [local] How often ResolveTargetLayout rebuilt the layout (its stamps moved).
     internal static long _layoutResolves;
 
@@ -51,7 +57,7 @@ public sealed partial class RenderExecutor
 
         return string.Create(CultureInfo.InvariantCulture,
             $"[PERF][TARGET_MEMO] mode={TargetMemoMode} hits={Interlocked.Exchange(ref _memoHits, 0)} misses={Interlocked.Exchange(ref _memoMisses, 0)} " +
-            $"dcc_excluded={Interlocked.Exchange(ref _memoDcc, 0)} mismatches={Interlocked.Exchange(ref _memoMismatches, 0)} " +
+            $"dcc_excluded={Interlocked.Exchange(ref _memoDcc, 0)} dcc_reused={Interlocked.Exchange(ref _memoDccReused, 0)} mismatches={Interlocked.Exchange(ref _memoMismatches, 0)} " +
             $"stamp_changes={Interlocked.Exchange(ref _memoStampChanges, 0)} layout_resolves={Interlocked.Exchange(ref _layoutResolves, 0)}");
     }
 
