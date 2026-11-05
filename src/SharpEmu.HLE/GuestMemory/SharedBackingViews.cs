@@ -120,10 +120,10 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
     // [local] SHARPEMU_DEFERRED_PROTECT_VERIFY: every backing write is logged after it lands (see BackingWriteLog).
     public bool TryWriteBacking(ulong address, ReadOnlySpan<byte> data)
     {
+        if (BvhlProbe.Enabled) BvhlProbe.NoteWrite("backing-write", address, data); // [local] SHARPEMU_BVHL_PROBE (before the write: what it changes)
         var written = TryWriteBackingCore(address, data);
         if (GpuMemory.BackingWriteLog.Enabled)
             GpuMemory.BackingWriteLog.Note(address, (ulong)data.Length);
-        if (written && BvhlProbe.Enabled) BvhlProbe.NoteWrite("backing-write", address, data); // [local] SHARPEMU_BVHL_PROBE
         return written;
     }
 
@@ -223,8 +223,8 @@ public sealed unsafe partial class SharedBackingViews : IDisposable
 
         try
         {
-            data.CopyTo(new Span<byte>((void*)target, data.Length));
             if (BvhlProbe.Enabled) BvhlProbe.NoteWrite("backing-single", address, data); // [local] SHARPEMU_BVHL_PROBE
+            data.CopyTo(new Span<byte>((void*)target, data.Length));
             return true;
         }
         finally

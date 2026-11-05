@@ -16,8 +16,10 @@ namespace SharpEmu.HLE.GuestMemory;
 // the free-list head at +8, the node size at +0x10, the capacity at +0x14, the nodes in use at +0x18 and the peak at
 // +0x1C). Two sides:
 //   host: every emulator write into guest memory (backing views, managed writes, copies) that overlaps the pool or
-//         its globals is logged with its site and kept in a ring, and the first qword of every write of 256 bytes or
-//         more is compared with the magic (a BVH header lands through the emulator: CP write, DMA, readback, file read).
+//         its globals is logged with its site and kept in a ring; for data writes the bytes about to land are compared
+//         with the guest's (how many change, how many free-list links are overwritten) and searched for the magic.
+//         The first qword of every write of 256 bytes or more is compared with the magic too (a BVH header lands
+//         through the emulator: CP write, DMA, readback, file read).
 //   guest: a thread reads the pool every 50 ms and reports the first node whose first qword is the magic, with the
 //         bytes that changed since the previous scan (the size of the clobber), the free-list walk and the ring.
 // SHARPEMU_BVHL_POOL=<hex base>+<hex bytes> watches a fixed range instead of the globals (other builds of the game).
@@ -29,6 +31,8 @@ public static class BvhlProbe
     private const int ScanMs = 50;
     private const int RingSize = 512;
     private const int HeaderWriteMinimum = 256;
+    private const int MagicReports = 50;
+    private const int WalkReports = 10;
 
     public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_BVHL_PROBE") == "1";
 
@@ -39,11 +43,12 @@ public static class BvhlProbe
     private static ulong _fixedBase, _fixedBytes;
 
     private static ulong _poolBase, _poolEnd;
-    private static long _writesPool, _writesGlobals, _headerWrites, _scans, _hits;
+    private static long _writesPool, _writesGlobals, _headerWrites, _scans, _magicHits, _walkHits, _changingWrites, _revertedLinks;
     private static readonly ConcurrentDictionary<string, long> SiteCounts = new();
+    private static readonly ConcurrentDictionary<string, long> ChangingSites = new();
     private static readonly ConcurrentDictionary<string, long> HeaderSites = new();
 
-    private readonly record struct Entry(long Ms, string Site, ulong Address, ulong Size, int Thread, int MagicOffset, string? Stack);
+    private readonly record struct Entry(long Ms, string Site, ulong Address, ulong Size, int Thread, int MagicOffset, int Changed, int Reverted, ulong FirstChanged);
 
     private static readonly Entry[] Ring = new Entry[RingSize];
     private static long _ringNext;
@@ -78,7 +83,8 @@ public static class BvhlProbe
         }
     }
 
-    // A host write of data at address: pool/global overlap and a header-shaped first qword.
+    // A host write of data about to land at address: pool/global overlap (what changes, which free-list links are
+    // overwritten, whether the magic lands) and a header-shaped first qword.
     public static void NoteWrite(string site, ulong address, ReadOnlySpan<byte> data)
     {
         if (!Enabled || data.IsEmpty)
@@ -89,17 +95,50 @@ public static class BvhlProbe
         var (begin, end) = Overlap(address, size);
         if (begin == end)
             return;
+        var fresh = data.Slice((int)(begin - address), (int)(end - begin));
         var magic = -1;
-        for (var offset = (int)(begin - address) & ~7; offset + 8 <= data.Length && address + (ulong)offset < end; offset += 8)
+        for (var offset = 0; offset + 8 <= fresh.Length; offset += 8)
         {
-            if (BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(offset, 8)) == Magic)
+            if (BinaryPrimitives.ReadUInt64LittleEndian(fresh.Slice(offset, 8)) == Magic)
             {
-                magic = offset;
+                magic = (int)(begin - address) + offset;
                 break;
             }
         }
 
-        Record(site, address, size, magic);
+        var changed = 0;
+        var reverted = 0;
+        ulong firstChanged = 0;
+        var memory = _memory;
+        if (memory is not null)
+        {
+            var old = new byte[fresh.Length];
+            if (memory.TryRead(begin, old))
+            {
+                var poolBase = Volatile.Read(ref _poolBase);
+                var poolEnd = Volatile.Read(ref _poolEnd);
+                for (var offset = 0; offset < old.Length; offset++)
+                {
+                    if (old[offset] != fresh[offset])
+                    {
+                        if (changed == 0)
+                            firstChanged = begin + (ulong)offset;
+                        changed++;
+                    }
+                }
+
+                // A 16-byte slot whose first qword was a link into the block and is overwritten with something else.
+                for (var slot = (int)((begin + 15 & ~15UL) - begin); slot + 8 <= old.Length; slot += 16)
+                {
+                    var link = BinaryPrimitives.ReadUInt64LittleEndian(old.AsSpan(slot, 8));
+                    var value = BinaryPrimitives.ReadUInt64LittleEndian(fresh.Slice(slot, 8));
+                    if (link != value && link >= poolBase && link < poolEnd && (link & 15) == 0)
+                        reverted++;
+                }
+            }
+        }
+
+        Record(site, address, size, magic, changed, reverted, firstChanged);
     }
 
     // A host copy that already landed at address (the bytes are read back from the guest).
@@ -130,7 +169,7 @@ public static class BvhlProbe
             }
         }
 
-        Record(site, address, size, magic);
+        Record(site, address, size, magic, -1, -1, 0);
     }
 
     public static int FindMagic(ReadOnlySpan<byte> bytes)
@@ -164,18 +203,26 @@ public static class BvhlProbe
         return (0, 0);
     }
 
-    private static void Record(string site, ulong address, ulong size, int magic)
+    private static void Record(string site, ulong address, ulong size, int magic, int changed, int reverted, ulong firstChanged)
     {
         var count = SiteCounts.AddOrUpdate(site, 1, static (_, value) => value + 1);
-        string? stack = count <= 3 || magic >= 0 ? Environment.StackTrace : null;
-        var entry = new Entry(Ms, site, address, size, Environment.CurrentManagedThreadId, magic, stack);
+        var changing = 0L;
+        if (changed > 0)
+        {
+            changing = ChangingSites.AddOrUpdate(site, 1, static (_, value) => value + 1);
+            Interlocked.Increment(ref _changingWrites);
+            Interlocked.Add(ref _revertedLinks, reverted);
+        }
+
+        var entry = new Entry(Ms, site, address, size, Environment.CurrentManagedThreadId, magic, changed, reverted, firstChanged);
         var slot = Interlocked.Increment(ref _ringNext) - 1;
         Ring[slot % RingSize] = entry;
-        if (count <= 3 || magic >= 0 || count % 1000 == 0)
+        var stack = count <= 3 || magic >= 0 || (changing is > 0 and <= 5) || reverted > 0 && changing <= 20;
+        if (stack || count % 1000 == 0 || (changing > 0 && changing % 100 == 0))
         {
-            Console.Error.WriteLine($"[BVHL] host-write site={site} n={count} ms={entry.Ms} addr=0x{address:X}+0x{size:X} thread={entry.Thread} magic_offset={(magic >= 0 ? "0x" + magic.ToString("X", CultureInfo.InvariantCulture) : "none")}" +
-                (stack is not null ? Environment.NewLine + stack : ""));
-            if (magic >= 0)
+            Console.Error.WriteLine($"[BVHL] host-write site={site} n={count} changing_n={changing} ms={entry.Ms} addr=0x{address:X}+0x{size:X} thread={entry.Thread} magic_offset={(magic >= 0 ? "0x" + magic.ToString("X", CultureInfo.InvariantCulture) : "none")} changed={changed} reverted_links={reverted} first_changed=0x{firstChanged:X}" +
+                (stack ? Environment.NewLine + Environment.StackTrace : ""));
+            if (magic >= 0 || reverted > 0)
                 Console.Error.Flush();
         }
     }
@@ -185,7 +232,7 @@ public static class BvhlProbe
         Interlocked.Increment(ref _headerWrites);
         var count = HeaderSites.AddOrUpdate(site, 1, static (_, value) => value + 1);
         var slot = Interlocked.Increment(ref _headerNext) - 1;
-        HeaderRing[slot % HeaderRing.Length] = new Entry(Ms, site, address, size, Environment.CurrentManagedThreadId, 0, null);
+        HeaderRing[slot % HeaderRing.Length] = new Entry(Ms, site, address, size, Environment.CurrentManagedThreadId, 0, 0, 0, 0);
         if (count <= 2)
             Console.Error.WriteLine($"[BVHL] header-write site={site} n={count} ms={Ms} addr=0x{address:X}+0x{size:X} thread={Environment.CurrentManagedThreadId}{Environment.NewLine}{Environment.StackTrace}");
     }
@@ -195,9 +242,10 @@ public static class BvhlProbe
         byte[]? previous = null;
         var current = Array.Empty<byte>();
         var globals = new byte[GlobalsBytes];
+        var after = new byte[GlobalsBytes];
         var lastHeartbeat = 0L;
         var located = false;
-        ulong lastHitNode = 0;
+        ulong lastMagicNode = 0, lastWalkNode = 0;
         while (true)
         {
             Thread.Sleep(ScanMs);
@@ -241,6 +289,9 @@ public static class BvhlProbe
                     continue;
                 }
 
+                // The game pops and pushes while the block is read: walk the list only when head and used held still.
+                var still = _fixedBase != 0 || (memory.TryRead(Globals, after) && after.AsSpan(8, 8).SequenceEqual(globals.AsSpan(8, 8)) && after.AsSpan(0x18, 4).SequenceEqual(globals.AsSpan(0x18, 4)));
+
                 if (Volatile.Read(ref _poolBase) != poolBase || Volatile.Read(ref _poolEnd) != poolBase + (ulong)bytes)
                 {
                     Volatile.Write(ref _poolEnd, poolBase + (ulong)bytes);
@@ -251,21 +302,34 @@ public static class BvhlProbe
 
                 var scans = Interlocked.Increment(ref _scans);
                 var hit = FindMagic(current);
-                var walk = WalkFreeList(current, poolBase, head, capacity);
-                if (hit >= 0 || walk.Problem is not null)
+                var walk = still ? WalkFreeList(current, poolBase, head, capacity) : new FreeWalk(-1, null, 0);
+                if (hit >= 0)
                 {
-                    var node = hit >= 0 ? poolBase + (ulong)hit : walk.BadNode;
-                    if (node != lastHitNode)
+                    var node = poolBase + (ulong)hit;
+                    if (node != lastMagicNode)
                     {
-                        lastHitNode = node;
-                        var hits = Interlocked.Increment(ref _hits);
-                        if (hits <= 20)
-                            ReportHit(poolBase, head, used, peak, capacity, hit, walk, current, previous);
+                        lastMagicNode = node;
+                        if (Interlocked.Increment(ref _magicHits) <= MagicReports)
+                            ReportHit("MAGIC", poolBase, head, used, peak, capacity, hit, walk, current, previous);
                     }
                 }
                 else
                 {
-                    lastHitNode = 0;
+                    lastMagicNode = 0;
+                }
+
+                if (walk.Problem is not null)
+                {
+                    if (walk.BadNode != lastWalkNode)
+                    {
+                        lastWalkNode = walk.BadNode;
+                        if (Interlocked.Increment(ref _walkHits) <= WalkReports)
+                            ReportHit("WALK", poolBase, head, used, peak, capacity, -1, walk, current, previous);
+                    }
+                }
+                else if (still)
+                {
+                    lastWalkNode = 0;
                 }
 
                 previous ??= new byte[bytes];
@@ -273,7 +337,7 @@ public static class BvhlProbe
                 if (Ms - lastHeartbeat >= 60_000)
                 {
                     lastHeartbeat = Ms;
-                    Console.Error.WriteLine($"[BVHL] alive ms={Ms} scans={scans} used={used} peak={peak} capacity={capacity} free_walk={walk.Steps} writes_pool={Interlocked.Read(ref _writesPool)} writes_globals={Interlocked.Read(ref _writesGlobals)} header_writes={Interlocked.Read(ref _headerWrites)} hits={Interlocked.Read(ref _hits)} sites=[{Summary(SiteCounts)}] header_sites=[{Summary(HeaderSites)}]");
+                    Console.Error.WriteLine($"[BVHL] alive ms={Ms} scans={scans} used={used} peak={peak} capacity={capacity} free_walk={walk.Steps} writes_pool={Interlocked.Read(ref _writesPool)} changing={Interlocked.Read(ref _changingWrites)} reverted_links={Interlocked.Read(ref _revertedLinks)} writes_globals={Interlocked.Read(ref _writesGlobals)} header_writes={Interlocked.Read(ref _headerWrites)} magic_hits={Interlocked.Read(ref _magicHits)} walk_hits={Interlocked.Read(ref _walkHits)} sites=[{Summary(SiteCounts)}] changing_sites=[{Summary(ChangingSites)}] header_sites=[{Summary(HeaderSites)}]");
                 }
             }
             catch (Exception exception)
@@ -304,11 +368,11 @@ public static class BvhlProbe
         return new FreeWalk(steps, null, 0);
     }
 
-    private static void ReportHit(ulong poolBase, ulong head, uint used, uint peak, uint capacity, int hit, FreeWalk walk, byte[] current, byte[]? previous)
+    private static void ReportHit(string kind, ulong poolBase, ulong head, uint used, uint peak, uint capacity, int hit, FreeWalk walk, byte[] current, byte[]? previous)
     {
         var text = new StringBuilder();
         var node = hit >= 0 ? poolBase + (ulong)hit : walk.BadNode;
-        text.Append($"[BVHL] HIT ms={Ms} node=0x{node:X} slot={(hit >= 0 ? hit / 16 : -1)} magic={(hit >= 0)} head=0x{head:X} used={used} peak={peak} capacity={capacity} free_walk={walk.Steps} problem={walk.Problem ?? "none"} bad=0x{walk.BadNode:X}");
+        text.Append($"[BVHL] HIT {kind} ms={Ms} node=0x{node:X} slot={(hit >= 0 ? hit / 16 : -1)} head=0x{head:X} used={used} peak={peak} capacity={capacity} free_walk={walk.Steps} problem={walk.Problem ?? "none"} bad=0x{walk.BadNode:X}");
         text.AppendLine();
         if (previous is not null)
         {
@@ -359,7 +423,7 @@ public static class BvhlProbe
         for (var index = Math.Max(0, next - RingSize); index < next; index++)
         {
             var entry = Ring[index % RingSize];
-            text.Append($"  ms={entry.Ms} site={entry.Site} addr=0x{entry.Address:X}+0x{entry.Size:X} thread={entry.Thread} magic_offset={entry.MagicOffset}");
+            text.Append($"  ms={entry.Ms} site={entry.Site} addr=0x{entry.Address:X}+0x{entry.Size:X} thread={entry.Thread} magic_offset={entry.MagicOffset} changed={entry.Changed} reverted_links={entry.Reverted} first_changed=0x{entry.FirstChanged:X}");
             text.AppendLine();
         }
 
