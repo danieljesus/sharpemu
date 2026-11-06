@@ -26,6 +26,35 @@ public sealed class RenderExecutorDrawTests : IDisposable
 
     public void Dispose() => _fatal.Dispose();
 
+    // [local] SHARPEMU_BDA_READ_ONLY_SCOPES: only a proven read-only device-address stage, and only with the switch on,
+    // keeps its draw from being memory-writing. xnetcat 2aa04103.
+    [Theory]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    public void OnlyProvenReadOnlyDeviceAccessesAvoidMemoryWritingScope(bool enabled, bool readOnly, bool writing)
+    {
+        var previous = RenderExecutor.BdaReadOnlyScopes;
+        RenderExecutor.BdaReadOnlyScopes = enabled;
+        try
+        {
+            _pipelines.Graphics = Programs(pixelStage: Stage(new ShaderProgramInfo
+            {
+                Stage = ShaderStageKind.Pixel,
+                UsesDeviceAddresses = true,
+                DeviceAddressesAreReadOnly = readOnly,
+            }));
+            _executor.DrawIndexed(1, Banks(), Indexed(3));
+            Assert.Equal(writing, _host.Calls.Contains("prepare_memory_writing_draw"));
+            Assert.Contains("prepare_device_addresses", _host.Calls);
+        }
+        finally
+        {
+            RenderExecutor.BdaReadOnlyScopes = previous;
+        }
+    }
+
     private void AssertOrder(params string[] prefixes)
     {
         var last = -1;

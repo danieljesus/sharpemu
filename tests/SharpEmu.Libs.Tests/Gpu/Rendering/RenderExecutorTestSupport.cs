@@ -340,6 +340,8 @@ internal sealed class RecordingRenderHost : IRenderHost
 
     public void PrepareDeviceAddresses() => Calls.Add("prepare_device_addresses");
 
+    public void PrepareMemoryWritingDraw() => Calls.Add("prepare_memory_writing_draw"); // [local]
+
     public void BindResources(IPreparedBindings prepared) => Calls.Add($"bind_resources {((RecordedBindings)prepared).Id}");
 
     public void CommitBindings(PipelineBindPoint bindPoint, in PipelineHandle pipeline, ReadOnlySpan<IPreparedBindings> stages) =>

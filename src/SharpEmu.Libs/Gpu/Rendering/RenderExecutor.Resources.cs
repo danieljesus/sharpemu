@@ -14,14 +14,22 @@ public sealed partial class RenderExecutor
     // by RenderRecorder since the upstream merge; it reads this switch where it prepares the stages' images.
     internal static readonly bool PrepareStageImagesEnabled = Environment.GetEnvironmentVariable("SHARPEMU_PREPARE_STAGE_IMAGES") != "0";
 
+    // [local] SHARPEMU_BDA_READ_ONLY_SCOPES=1 (default off): a stage the resource plan proves only reads through device
+    // addresses no longer makes its draw memory-writing, so it neither breaks a pruned render scope nor notes a write
+    // for the scope barrier tracker. Otherwise device-address accesses count as stores. xnetcat 2aa04103.
+    internal static bool BdaReadOnlyScopes = Environment.GetEnvironmentVariable("SHARPEMU_BDA_READ_ONLY_SCOPES") == "1";
+
+    private static bool WritesThroughDeviceAddresses(ShaderProgramInfo program) =>
+        program.UsesDeviceAddresses && !(BdaReadOnlyScopes && program.DeviceAddressesAreReadOnly);
+
     private bool DrawWritesMemory(ShaderStageResources stage) =>
         stage.Program is { } program &&
-        (program.UsesDeviceAddresses || WritesStorageImage(program) || HasBufferWrites(stage));
+        (WritesThroughDeviceAddresses(program) || WritesStorageImage(program) || HasBufferWrites(stage)); // [local]
 
     // [local] With the stage's HasBufferWrites already evaluated by the caller.
     private static bool DrawWritesMemory(ShaderStageResources stage, bool bufferWrites) =>
         stage.Program is { } program &&
-        (program.UsesDeviceAddresses || WritesStorageImage(program) || bufferWrites);
+        (WritesThroughDeviceAddresses(program) || WritesStorageImage(program) || bufferWrites); // [local]
 
     private bool HasBufferWrites(ShaderStageResources stage)
     {

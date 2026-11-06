@@ -323,8 +323,23 @@ public sealed class ShaderResourcePlan
         if (ResourceTableReadPlanner.DeviceDataVerify && plan.Memory.Entries.Any(memory => memory.DeviceDataVerify)) plan.Info.UsesDeviceAddresses = true; // [local] the verify loads go through the page table
         if (hash == 0x35B85620669D35A4) plan.Info.UsesDeviceAddresses = true; // [local] gives the scan shader a fault buffer for trace records
         if (hash == 0x220AB61E9C35767C && Environment.GetEnvironmentVariable("SHARPEMU_LOOKBACK_PROBE") == "1") plan.Info.UsesDeviceAddresses = true; // [local] fault buffer for the look-back probe
+        plan.DeviceAddressesAreReadOnly = plan.Info.UsesDeviceAddresses && // [local]
+            hash is not (0x35B85620669D35A4 or 0x220AB61E9C35767C) && IsReadOnly(plan, program);
         return plan;
     }
+
+    // [local] The program reaches memory through the device-address table and provably only reads: every memory
+    // instruction is a load (or a BVH intersection, which reads its nodes), no device range is written, and the
+    // program has no linked calls or call-fault records whose code or writes the table does not show. Anything
+    // unknown (LDS and aperture stores included) counts as a write. xnetcat 2aa04103, stricter.
+    public bool DeviceAddressesAreReadOnly { get; private set; }
+
+    private static bool IsReadOnly(ShaderResourcePlan plan, Gen5ShaderProgram program) =>
+        !plan.Info.UsesDeviceAddressFallback && !Gen5ShaderCallLinker.IsLinked(program) &&
+        !program.Instructions.Any(static instruction => instruction.Control is ShaderCallFaultControl) &&
+        plan.DeviceAddressRanges.All(static range => !range.Written) &&
+        plan.Memory.Entries.All(static memory => !memory.DeviceDataVerify &&
+            (memory.Access == MemoryAccess.Read || (memory.Kind == MemoryResourceKind.None && memory.Access == MemoryAccess.None)));
 
     public const int WrittenRangeDwordCount = 3;
 
