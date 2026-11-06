@@ -44,6 +44,7 @@ internal static class FpsLog
         // [local] SHARPEMU_PROFILE_FRONT=1 without the render profiler: the front loop split (cheap) per window.
         foreach (var line in FrontProfile.TakeReport((int)_frames)) Console.Error.WriteLine(line);
         if (Diagnostics.CheapProbe.Enabled) Console.Error.WriteLine(Diagnostics.CheapProbe.TakeReport(_frames)); // [local]
+        if (Diagnostics.DispatchCpuProbe.Enabled) Console.Error.WriteLine(Diagnostics.DispatchCpuProbe.TakeReport(_frames)); // [local]
         _windowStart = now;
         _frames = 0;
     }

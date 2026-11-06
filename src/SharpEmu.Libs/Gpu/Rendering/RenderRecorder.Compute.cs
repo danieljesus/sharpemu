@@ -14,12 +14,18 @@ internal sealed partial class RenderRecorder
 
     public void Record(ResolvedDispatch record)
     {
+        var started = Diagnostics.DispatchCpuProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
         try
         {
             RecordDispatch(record);
         }
         finally
         {
+            if (started != 0) // [local] SHARPEMU_DISPATCH_CPU_PROBE
+            {
+                Diagnostics.DispatchCpuProbe.Note(record.Program?.Input.Stage.Program?.Hash ?? 0, System.Diagnostics.Stopwatch.GetTimestamp() - started, OnWorker);
+            }
+
             _pendingWrites?.Release(record.Sequence);
             if (_returnsRecords)
             {
