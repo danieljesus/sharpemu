@@ -214,7 +214,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             // [local] One read of the timeline for the whole collection (it read it up to twice, ~2 us each): the
             // submissions and the deferred work both use it; what completes after it is collected next time.
-            _scheduler.Timeline.RefreshCompletedTick();
+            if (_pendingGuestSubmissions.Count != 0 || _scheduler.Active) _scheduler.Timeline.RefreshCompletedTick();
             while (_pendingGuestSubmissions.TryPeek(out var submission) &&
                    _scheduler.IsTickKnownComplete(submission.Tick))
             {
