@@ -77,6 +77,21 @@ public static partial class ResourceMaterializer
     // be readable again on a later dispatch.
     [ThreadStatic] private static string? _failureDetail;
 
+    // [local] SHARPEMU_INDIRECT_IMAGE_STRIDE0 (=1 by default, =0 off): a material table read by scalar loads may come in a
+    // V# with stride 0. Scalar buffer loads ignore the stride and address bytes, which ReadScalarBufferWord already does,
+    // so the table is read and enumerated like one whose stride matches the selector's (a loop-selected table still
+    // needs the matching stride: it walks records). GTA V's 0xD44E gets such a table (selector stride 188) outside
+    // the prologue bank; the mismatch failed the materialization with reason=Other. Settable for tests.
+    public static int IndirectImageStride0Mode
+    {
+        get => IndirectImageStride0Override.Value ?? IndirectImageStride0Default;
+        set => IndirectImageStride0Override.Value = value;
+    }
+
+    private static readonly int IndirectImageStride0Default =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_INDIRECT_IMAGE_STRIDE0"), out var stride0Mode) ? stride0Mode : 1;
+    private static readonly AsyncLocal<int?> IndirectImageStride0Override = new();
+
     public const string ImageTableDetailPrefix = "image table: ";
 
     public static string? TakeFailureDetail()
@@ -1474,9 +1489,9 @@ public static partial class ResourceMaterializer
         }
 
         var materialStride = (material.Dwords[1] >> 16) & 0x3FFF;
-        if (materialStride != indirect.SelectorStride)
+        if (materialStride != indirect.SelectorStride && !(materialStride == 0 && !indirect.SharedSelector && IndirectImageStride0Mode != 0))
         {
-            return FailWith($"material stride={materialStride} selector stride={indirect.SelectorStride}");
+            return FailWith($"material stride={materialStride} selector stride={indirect.SelectorStride} material=[{string.Join(',', material.Dwords.Select(word => $"0x{word:X8}"))}]");
         }
 
         var period = 1ul << 32;
@@ -1502,7 +1517,7 @@ public static partial class ResourceMaterializer
         var records = (ulong)material.Dwords[2];
         if (provenOffsets is null && (indirect.SharedSelector ? records : probeCount) > MaxIndirectImageProbes)
         {
-            return FailWith($"probes={probeCount} records={records} size=0x{size:X} limit={MaxIndirectImageProbes}");
+            return FailWith($"probes={probeCount} records={records} size=0x{size:X} limit={MaxIndirectImageProbes} material=[{string.Join(',', material.Dwords.Select(word => $"0x{word:X8}"))}]");
         }
 
         var keys = new List<uint> { 0 };

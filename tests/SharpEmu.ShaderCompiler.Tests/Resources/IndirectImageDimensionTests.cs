@@ -381,4 +381,56 @@ public sealed class IndirectImageDimensionTests
             return 0;
         });
     }
+
+    // [local] SHARPEMU_INDIRECT_IMAGE_STRIDE0: a material table in a stride-0 V# (num_records in bytes) is read like the
+    // same table with the selector's stride; scalar loads ignore the stride.
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, true)]
+    public void AStrideZeroMaterialTableIsReadByBytesWithTheSwitch(int stride0Mode, bool accepted)
+    {
+        var plan = Extract(SpirvBindingDeclarationTests.IndirectImageAfterPlainImageProgram(indirectDimension: 1));
+        var (userData, memory) = SpirvBindingDeclarationTests.IndirectImageAfterPlainImageInputs(64, false);
+        var (expectedSnapshot, expectedSpecialization) = WithMode(1, () =>
+        {
+            var snapshot = new ResourceSnapshot();
+            var specialization = new ResourceSpecialization();
+            Assert.True(ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read), ref snapshot, ref specialization));
+            return (snapshot, specialization);
+        });
+
+        var stride = (userData[1] >> 16) & 0x3FFF;
+        userData[2] *= stride;
+        userData[1] &= ~(0x3FFFu << 16);
+        var previous = ResourceMaterializer.IndirectImageStride0Mode;
+        ResourceMaterializer.IndirectImageStride0Mode = stride0Mode;
+        try
+        {
+            WithMode(1, () =>
+            {
+                var snapshot = new ResourceSnapshot();
+                var specialization = new ResourceSpecialization();
+                var success = ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read),
+                    ref snapshot, ref specialization, out var failure);
+                var detail = ResourceMaterializer.TakeFailureDetail();
+                Assert.Equal(accepted, success);
+                if (!accepted)
+                {
+                    Assert.Equal(ResourceMaterializationFailure.Other, failure);
+                    Assert.StartsWith(ResourceMaterializer.ImageTableDetailPrefix + "material stride=0", detail);
+                    return 0;
+                }
+
+                Assert.Equal(expectedSpecialization.Images, specialization.Images);
+                Assert.Equal(expectedSnapshot.Images.Length, snapshot.Images.Length);
+                for (var index = 0; index < snapshot.Images.Length; index++)
+                    Assert.Equal(expectedSnapshot.Images[index], snapshot.Images[index]);
+                return 0;
+            });
+        }
+        finally
+        {
+            ResourceMaterializer.IndirectImageStride0Mode = previous;
+        }
+    }
 }
