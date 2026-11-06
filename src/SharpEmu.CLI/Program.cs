@@ -706,6 +706,8 @@ internal static partial class Program
 
                 childExitCode = unchecked((int)exitCode);
                 Console.Error.WriteLine("[DEBUG] Running in mitigated child process (CET/CFG disabled).");
+                // [local] A shell keeps only the low 8 bits of the exit code; an NTSTATUS such as 0xC0000409 needs all 32.
+                Console.Error.WriteLine($"[LOADER][INFO] Mitigated child exited: code=0x{exitCode:X8}.");
                 return true;
             }
             catch (System.ComponentModel.Win32Exception exception)
