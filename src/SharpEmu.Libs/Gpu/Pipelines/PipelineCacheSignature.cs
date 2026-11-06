@@ -39,6 +39,16 @@ public static class PipelineCacheSignature
         return file;
     }
 
+    // [local] The bytes of Wrap written to a stream, without a second copy of the payload.
+    public static void WriteTo(Stream stream, string signature, ReadOnlySpan<byte> payload)
+    {
+        stream.Write(Encoding.ASCII.GetBytes(signature));
+        Span<byte> hash = stackalloc byte[sizeof(ulong)];
+        BinaryPrimitives.WriteUInt64LittleEndian(hash, XxHash3.HashToUInt64(payload));
+        stream.Write(hash);
+        stream.Write(payload);
+    }
+
     // The payload when the signature and the hash match; false for any other file.
     public static bool TryUnwrap(string signature, ReadOnlySpan<byte> file, out byte[] payload)
     {

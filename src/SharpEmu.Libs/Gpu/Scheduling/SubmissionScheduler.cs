@@ -619,9 +619,12 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
         }
     }
 
-    public void RunCompletedOperations()
+    public void RunCompletedOperations() => RunCompletedOperations(refresh: true);
+
+    // [local] refresh: false runs what the last read of the timeline completed, for a caller that has just read it.
+    public void RunCompletedOperations(bool refresh)
     {
-        _timeline.RefreshCompletedTick();
+        if (refresh) _timeline.RefreshCompletedTick();
         for (;;)
         {
             TickWork operation;

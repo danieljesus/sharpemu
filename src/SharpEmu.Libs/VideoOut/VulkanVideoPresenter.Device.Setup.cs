@@ -62,6 +62,14 @@ internal static unsafe partial class VulkanVideoPresenter
         private const ulong MaxPipelineCacheBytes = 256UL * 1024 * 1024;
         private HashSet<string>? _resetPipelineCachePaths;
         private nuint _pipelineCacheSavedBytes;
+        // [local] SHARPEMU_PIPELINE_CACHE_WRITE_ASYNC (on by default, =0 off): a periodic checkpoint exports the driver
+        // cache on the render thread as before, but writes the file (and the prewarm stamp) on a worker, in order. The
+        // 132 MB GTA V cache cost one 5.4 s window 540 ms and 258 MB of render-thread allocations. Teardown waits.
+        private static readonly bool PipelineCacheWriteAsync =
+            Environment.GetEnvironmentVariable("SHARPEMU_PIPELINE_CACHE_WRITE_ASYNC") != "0";
+        private Task _pipelineCacheWrites = Task.CompletedTask;
+        private readonly object _pipelineCacheWriteGate = new();
+        private bool _pipelineCacheWriteInline;
         private Queue _queue;
         private uint _queueFamilyIndex;
 
@@ -1774,8 +1782,31 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void SavePipelineCache(bool force)
         {
+            if (force) JoinPipelineCacheWrites(); // [local] the final save writes inline, after the checkpoints still being written
             // Cache export must not race asynchronous pipeline creation.
             if (_pendingComputePipelines.Values.Any(pending => !pending.Compile.IsCompleted)) return;
+            if (force) // [local]
+            {
+                _pipelineCacheWriteInline = true;
+                try { SavePipelineCacheCore(force); }
+                finally { _pipelineCacheWriteInline = false; }
+                return;
+            }
+
+            SavePipelineCacheCore(force);
+        }
+
+        // [local]
+        private void JoinPipelineCacheWrites()
+        {
+            Task writes;
+            lock (_pipelineCacheWriteGate) writes = _pipelineCacheWrites;
+            try { writes.GetAwaiter().GetResult(); }
+            catch (Exception exception) { Console.Error.WriteLine($"[LOADER][WARN] Vulkan pipeline cache save failed: {exception.Message}"); }
+        }
+
+        private void SavePipelineCacheCore(bool force)
+        {
             _lastPipelineCacheSaveTick = Environment.TickCount64;
             SaveGuestPipelineCaches();
             if (_pipelineCache.Handle == 0 || string.IsNullOrWhiteSpace(_pipelineCachePath))
@@ -1865,11 +1896,21 @@ internal static unsafe partial class VulkanVideoPresenter
                     Array.Resize(ref data, checked((int)size));
                 }
 
-                WritePipelineCacheFile(path, data);
-                if (completion is not null && data.Length != 0)
+                if (PipelineCacheWriteAsync && !_pipelineCacheWriteInline) // [local]
                 {
-                    ShaderPrewarmList.WriteStamp(completion.StampPath,
-                        ShaderPrewarmList.CacheStamp(completion.CoverageStamp, data));
+                    var signature = DriverCacheSignature();
+                    lock (_pipelineCacheWriteGate)
+                    _pipelineCacheWrites = _pipelineCacheWrites.ContinueWith(
+                        _ =>
+                        {
+                            try { WritePipelineCacheFiles(path, signature, data, completion); }
+                            catch (Exception exception) { Console.Error.WriteLine($"[LOADER][WARN] Vulkan pipeline cache save failed: {exception.Message}"); }
+                        },
+                        CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+                }
+                else
+                {
+                    WritePipelineCacheFiles(path, DriverCacheSignature(), data, completion);
                 }
                 savedBytes = size;
                 return true;
@@ -1882,7 +1923,21 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        private void WritePipelineCacheFile(string path, ReadOnlySpan<byte> data)
+        // [local] Either thread: it reads nothing of the presenter.
+        private static void WritePipelineCacheFiles(string path, string signature, byte[] data, ShaderPrewarmCompletion? completion)
+        {
+            WritePipelineCacheFile(path, signature, data);
+            if (completion is not null && data.Length != 0)
+            {
+                ShaderPrewarmList.WriteStamp(completion.StampPath,
+                    ShaderPrewarmList.CacheStamp(completion.CoverageStamp, data));
+            }
+        }
+
+        private void WritePipelineCacheFile(string path, ReadOnlySpan<byte> data) =>
+            WritePipelineCacheFile(path, DriverCacheSignature(), data);
+
+        private static void WritePipelineCacheFile(string path, string signature, ReadOnlySpan<byte> data)
         {
             var directory = Path.GetDirectoryName(path);
             if (!string.IsNullOrWhiteSpace(directory))
@@ -1891,7 +1946,11 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             var temporaryPath = path + $".{Environment.ProcessId}.tmp";
-            File.WriteAllBytes(temporaryPath, PipelineCacheSignature.Wrap(DriverCacheSignature(), data));
+            using (var file = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None)) // [local] no second copy
+            {
+                PipelineCacheSignature.WriteTo(file, signature, data);
+            }
+
             File.Move(temporaryPath, path, overwrite: true);
         }
 

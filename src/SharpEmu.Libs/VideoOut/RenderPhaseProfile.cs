@@ -159,6 +159,10 @@ internal static class RenderPhaseProfile
         SubmitThreadWait,
         // [local] A draw's image work recorded before its pipeline (PrepareStageImages, P1).
         StageImagePreparation,
+        // [local] A guest readback (mostly inside QueueRelay): cutting the batch its writer is in, and the readback
+        // queue's own submit.
+        ReadbackFlush,
+        ReadbackSubmit,
         // [local] Pieces of DescriptorPreparation.
         BindingSetup,
         // [local] Upstream's scope around every vkCmd* (97 sites, ~13000 per frame in GTA V): fine, as its cost is the
