@@ -1009,7 +1009,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             return true;
         }
 
-        if (AsyncGraphicsPipelines == 0) // [local]
+        var asyncMode = AsyncGraphicsPipelines; // [local] once: it is hot
+        if (asyncMode == 0) // [local]
         {
             pipeline = _pipelines.CreateGraphicsPipeline(
                 DrawState.BoundColors(ref state),
@@ -1024,7 +1025,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 state.Programs.Vertex,
                 state.Programs.Pixel);
         }
-        else if (!TryCreateGraphicsPipelineAsync(record, ref state, vertexInput, pixelInput, out pipeline))
+        else if (!TryCreateGraphicsPipelineAsync(record, ref state, vertexInput, pixelInput, asyncMode, out pipeline))
         {
             return false;
         }
@@ -1041,7 +1042,9 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
     // compile (250-1500 ms each in GTA V outside its prewarmed scenes). DB_COUNT_CONTROL's reset value already counts
     // occlusion samples, so =1 waits for nearly every draw of a game that leaves it so; =2 also leaves out draws that
     // count samples, whose visibility results then miss them while the pipeline compiles. Off (0) by default until measured.
-    internal static readonly int AsyncGraphicsPipelinesMode =
+    // Hot (SHARPEMU_HOTFLAGS_FILE), read once per pipeline lookup. A pipeline still compiling on a worker when the mode
+    // goes to 0 is created again synchronously; the worker's copy stays unused.
+    internal static volatile int AsyncGraphicsPipelinesMode = // [local]
         Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_GRAPHICS_PIPELINES") switch { "1" => 1, "2" => 2, _ => 0 };
 
     // [local] A test sets the mode for its own flow.
@@ -1053,10 +1056,10 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
     // [local] A draw that may be left out waits for nothing; any other waits for the compile as before.
     private bool TryCreateGraphicsPipelineAsync(ResolvedDraw record, ref DrawState state, VertexInputInfo vertexInput,
-        PixelInputInfo? pixelInput, out PipelineHandle pipeline)
+        PixelInputInfo? pixelInput, int asyncMode, out PipelineHandle pipeline)
     {
         var skippable = MaySkipWhileCompiling(record, vertexInput, pixelInput, state.Programs.MeshInput is not null,
-            occlusionSkippable: AsyncGraphicsPipelines == 2);
+            occlusionSkippable: asyncMode == 2);
         long waitStarted = 0;
         while (!_pipelines.TryCreateGraphicsPipeline(
                    DrawState.BoundColors(ref state),

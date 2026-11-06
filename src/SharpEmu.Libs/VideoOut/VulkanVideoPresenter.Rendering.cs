@@ -38,7 +38,7 @@ internal static unsafe partial class VulkanVideoPresenter
     // on it while the rest is recorded instead of after the next synchronizing read drains it. Outside a render pass
     // only, unless SHARPEMU_IDLE_FLUSH_PASS=1 (then the pass ends there). The boundary is the one a full batch already
     // places at any preparation: no command, barrier or order changes.
-    private static readonly int IdleFlushDraws = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IDLE_FLUSH"), out var idleDraws) ? Math.Max(idleDraws, 0) : 4;
+    internal static volatile int IdleFlushDraws = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IDLE_FLUSH"), out var idleDraws) ? Math.Max(idleDraws, 0) : 4; // [local] hot (SHARPEMU_HOTFLAGS_FILE)
     private static readonly bool IdleFlushInPass = Environment.GetEnvironmentVariable("SHARPEMU_IDLE_FLUSH_PASS") == "1";
 
     private static void RequireRenderingFeature(bool supported, string feature, string deviceName)
@@ -856,8 +856,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 EndRendering();
                 FlushBatchedGuestCommands();
             }
-            else if (IdleFlushDraws != 0 && _presenter._batchOpen && _presenter._batchDrawCount >= IdleFlushDraws &&
-                ((_presenter._batchDrawCount - IdleFlushDraws) & 3) == 0 && (IdleFlushInPass || !_renderingActive) &&
+            else if (IdleFlushDraws is var idleFlushDraws && idleFlushDraws != 0 && _presenter._batchOpen && _presenter._batchDrawCount >= idleFlushDraws &&
+                ((_presenter._batchDrawCount - idleFlushDraws) & 3) == 0 && (IdleFlushInPass || !_renderingActive) &&
                 _scheduler.IsQueueIdle()) // [local] SHARPEMU_IDLE_FLUSH
             {
                 _idleFlushes++;

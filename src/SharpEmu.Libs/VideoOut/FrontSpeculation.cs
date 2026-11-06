@@ -32,7 +32,8 @@ namespace SharpEmu.Libs.VideoOut;
 // Left off.
 internal static class FrontSpeculation
 {
-    private static readonly int DefaultMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SPECULATE"), out var mode) && mode is 1 or 2 ? mode : 0;
+    // Hot (SHARPEMU_HOTFLAGS_FILE): Begin/End/Take follow each preparation's own state, not the mode.
+    internal static volatile int DefaultMode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SPECULATE"), out var mode) && mode is 1 or 2 ? mode : 0; // [local]
     private static readonly AsyncLocal<int?> ModeOverride = new();
 
     // Tests set it per async flow.

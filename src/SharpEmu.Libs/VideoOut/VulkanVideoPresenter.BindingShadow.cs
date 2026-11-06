@@ -19,8 +19,17 @@ namespace SharpEmu.Libs.VideoOut;
 // views, and a descriptor it cannot describe never repeats.
 internal static unsafe partial class VulkanVideoPresenter
 {
-    internal static readonly int NativeStateReuseMode =
+    // Hot (SHARPEMU_HOTFLAGS_FILE): a change bumps the shadow generation first, so every recording host resets its shadow
+    // at its next bind; a bind recorded across the change cannot leave a shadow that its own bind did not update.
+    internal static volatile int NativeStateReuseMode = // [local]
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_NATIVE_STATE_REUSE"), out var reuse) ? reuse : 0;
+    private static int _nativeStateGeneration; // [local]
+
+    internal static void SetNativeStateReuse(int mode) // [local] SHARPEMU_HOTFLAGS_FILE
+    {
+        Interlocked.Increment(ref _nativeStateGeneration);
+        NativeStateReuseMode = mode;
+    }
 
     private static bool NativeStateReuse => NativeStateReuseMode != 0;
 
@@ -52,6 +61,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private nint _shadowCommand;
         private ulong _shadowTick;
         private long _shadowEpoch = -1;
+        private int _shadowGeneration; // [local] SHARPEMU_NATIVE_STATE_REUSE hot
         private Pipeline _shadowGraphicsPipeline;
         private Pipeline _shadowComputePipeline;
         private PipelineLayout _shadowPushLayout;
@@ -85,7 +95,8 @@ internal static unsafe partial class VulkanVideoPresenter
 
             var tick = (ulong)CurrentRecording().Generation;
             var epoch = NativeBindingEpoch.Value;
-            if (command.Handle == _shadowCommand && tick == _shadowTick && epoch == _shadowEpoch)
+            var generation = Volatile.Read(ref _nativeStateGeneration); // [local]
+            if (command.Handle == _shadowCommand && tick == _shadowTick && epoch == _shadowEpoch && generation == _shadowGeneration)
             {
                 return true;
             }
@@ -93,6 +104,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _shadowCommand = command.Handle;
             _shadowTick = tick;
             _shadowEpoch = epoch;
+            _shadowGeneration = generation; // [local]
             _shadowGraphicsPipeline = default;
             _shadowComputePipeline = default;
             _shadowPushLayout = default;

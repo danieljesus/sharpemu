@@ -62,13 +62,24 @@ internal static unsafe partial class VulkanVideoPresenter
     // [local] SHARPEMU_STAGE_MEMO (1 by default, 0 off): upstream's memo of a stage's prepared textures, samplers and
     // buffer sources by content (TryFindStagePreparation/ReuseStagePreparation). Off, every stage resolves its bindings
     // as 3368666f did (the image-binding memo and the buffer-source memos still apply).
-    internal static readonly bool StageMemoEnabled = Environment.GetEnvironmentVariable("SHARPEMU_STAGE_MEMO") != "0";
+    // Hot (SHARPEMU_HOTFLAGS_FILE): a change bumps the memo generation first, so each recording host drops its memos at
+    // its next stage preparation (the bindings prepared while it was off no longer reach them to invalidate them).
+    internal static volatile bool StageMemoEnabled = Environment.GetEnvironmentVariable("SHARPEMU_STAGE_MEMO") != "0"; // [local]
+    private static int _stageMemoGeneration; // [local]
+
+    internal static void SetStageMemo(bool on) // [local] SHARPEMU_HOTFLAGS_FILE
+    {
+        Interlocked.Increment(ref _stageMemoGeneration);
+        StageMemoEnabled = on;
+    }
+
+    internal static int StageMemoGeneration => Volatile.Read(ref _stageMemoGeneration); // [local]
 
     // [local] SHARPEMU_STAGE_MEMO_TOUCH (1 by default, 0 off): the render thread checks a remembered texture's freshness
     // with one hold of the image cache lock (GuestImageCache.TryTouchRememberedImage) instead of two.
     internal static readonly bool StageMemoTouch = Environment.GetEnvironmentVariable("SHARPEMU_STAGE_MEMO_TOUCH") != "0";
 
-    internal static readonly int BufferSourceMemoMode =
+    internal static volatile int BufferSourceMemoMode = // [local] hot (SHARPEMU_HOTFLAGS_FILE): table hits are checked as before
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BUFFER_SOURCE_MEMO"), out var sourceMemo) && sourceMemo is >= 0 and <= 2 ? sourceMemo : 0;
     private const int BufferSourceTableCapacity = 1 << 16;
     private static long _bufferSourceTableHits, _bufferSourceTableMisses, _bufferSourceTableVerified, _bufferSourceTableMismatches, _bufferSourceTableClears;
@@ -311,10 +322,18 @@ internal static unsafe partial class VulkanVideoPresenter
         // Render-state discovery for one shader image; the view is acquired later with the draw.
         private const int StagePreparationCapacity = 1024;
         private Dictionary<ShaderProgramInfo, StagePreparationSet>? _stagePreparations;
+        private int _stagePreparationsGeneration; // [local] SHARPEMU_STAGE_MEMO hot
         private XxHash3? _contentHasher;
 
         private StagePreparationSet StagePreparationsOf(ShaderProgramInfo program)
         {
+            var generation = StageMemoGeneration; // [local]
+            if (generation != _stagePreparationsGeneration)
+            {
+                DropStagePreparations();
+                _stagePreparationsGeneration = generation;
+            }
+
             var all = _stagePreparations ??= new Dictionary<ShaderProgramInfo, StagePreparationSet>(ReferenceEqualityComparer.Instance);
             if (!all.TryGetValue(program, out var set))
             {
@@ -323,6 +342,29 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             return set;
+        }
+
+        // [local] SHARPEMU_STAGE_MEMO changed: every memo of this host is invalidated and forgotten.
+        private void DropStagePreparations()
+        {
+            if (_stagePreparations is not { } all)
+            {
+                return;
+            }
+
+            foreach (var set in all.Values)
+            {
+                set.Last?.Invalidate();
+                foreach (var memo in set.ByContent.Values)
+                {
+                    memo.Invalidate();
+                }
+
+                set.ByContent.Clear();
+                set.Last = null;
+            }
+
+            all.Clear();
         }
 
         private ulong ContentKeyOf(ResourceSnapshot snapshot, ulong shaderBase)
@@ -1252,6 +1294,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var memos = BufferSourceMemosOf(program, sources.Length);
             var spans = GuestGpuMemoryHook.Current?.SpanVersion ?? 0;
             var mapping = _guestMemory.MappingGeneration; // [local]
+            var sourceMemoMode = BufferSourceMemoMode; // [local] SHARPEMU_BUFFER_SOURCE_MEMO, once per stage
             for (var index = 0; index < sources.Length; index++)
             {
                 var words = snapshot.Buffers[index];
@@ -1271,7 +1314,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var known = mapping != long.MinValue && memo.Mapping == mapping &&
                     memo.Address == descriptor.Address && memo.Requested == requested && memo.Spans == spans;
                 var tabled = false;
-                if (!known && BufferSourceMemoMode != 0 && mapping != long.MinValue && descriptor.Address != 0 && requested != 0) // [local] SHARPEMU_BUFFER_SOURCE_MEMO
+                if (!known && sourceMemoMode != 0 && mapping != long.MinValue && descriptor.Address != 0 && requested != 0) // [local] SHARPEMU_BUFFER_SOURCE_MEMO
                 {
                     if (_bufferSourceTable is { } table &&
                         table.TryGetValue(new BufferSourceKey(program.Hash, index, descriptor.Address, requested), out var kept) &&
@@ -1304,7 +1347,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 PublishImagesUnderWrite(prepared.Resources.Info.Buffers[index], descriptor.Address, size);
                 if (remembered && memo.RegionStamp == _bufferCache.RegionStamp(descriptor.Address, requested))
                 {
-                    if (tabled && BufferSourceMemoMode == 2) // [local] SHARPEMU_BUFFER_SOURCE_MEMO=2: the table's answer against a fresh one
+                    if (tabled && sourceMemoMode == 2) // [local] SHARPEMU_BUFFER_SOURCE_MEMO=2: the table's answer against a fresh one
                     {
                         _bufferSourceTableVerified++;
                         var checkedSize = ClampMappedSize(descriptor.Address, requested, prepared, index);
@@ -1324,7 +1367,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     var buffer = FindBuffer(descriptor.Address, size);
                     sources[index] = (descriptor, buffer, size);
                     memo = new BufferSourceMemo(descriptor.Address, requested, _bufferCache.RegionStamp(descriptor.Address, requested), spans, mapping, buffer, size);
-                    if (BufferSourceMemoMode != 0 && mapping != long.MinValue) // [local] SHARPEMU_BUFFER_SOURCE_MEMO
+                    if (sourceMemoMode != 0 && mapping != long.MinValue) // [local] SHARPEMU_BUFFER_SOURCE_MEMO
                     {
                         var table = _bufferSourceTable ??= new Dictionary<BufferSourceKey, BufferSourceMemo>();
                         if (table.Count >= BufferSourceTableCapacity)

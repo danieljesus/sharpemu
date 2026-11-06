@@ -899,10 +899,18 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     // vkQueueSubmit2 (one VkSubmitInfo2 each, own waits and signals). Same buffers, same order, same semaphores: only
     // the number of queue calls changes. Off with SHARPEMU_UPLOAD_GPU_WAIT (its waits are added per buffer). Tests set
     // SubmitBatchLimit on their own scheduler.
-    internal static readonly int SubmitBatchDefault =
+    // Hot (SHARPEMU_HOTFLAGS_FILE): a scheduler without its own limit follows the default; the submit thread reads it
+    // once per batch.
+    internal static volatile int SubmitBatchDefault = // [local]
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SUBMIT_BATCH"), out var submitBatch) ? Math.Clamp(submitBatch, 0, 32) : 0;
 
-    internal int SubmitBatchLimit { get; set; } = SubmitBatchDefault;
+    private int? _submitBatchLimit; // [local]
+
+    internal int SubmitBatchLimit
+    {
+        get => _submitBatchLimit ?? SubmitBatchDefault;
+        set => _submitBatchLimit = value;
+    }
 
     private readonly List<SealedSubmit> _batch = new();
     private nint[][] _batchBuffers = [];
@@ -1185,7 +1193,7 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
     }
 
     // [local] SHARPEMU_SUBMIT_BATCH: the queue part for the oldest sealed buffer and the ready ones behind it.
-    private bool SubmitSealedBatch(in SealedSubmit head, out int taken, out ulong lastTick, out string failure)
+    private bool SubmitSealedBatch(in SealedSubmit head, int limit, out int taken, out ulong lastTick, out string failure)
     {
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
         GpuStarveProbe.SetSubmitState(GpuStarveProbe.SubmitReplay); // [local] SHARPEMU_GPU_STARVE_PROBE
@@ -1197,7 +1205,6 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
 
         _batch.Clear();
         _batch.Add(head);
-        var limit = SubmitBatchLimit;
         var targetDone = SubmitTargetDone;
         var joinsTargets = WaitSubmitTarget != null;
         lock (_submitLock)
@@ -1301,9 +1308,10 @@ public sealed class SubmissionScheduler : IGpuTickScheduler, IDisposable
             var lastTick = item.Tick;
             try
             {
-                if (SubmitBatchLimit > 1 && GpuWaitSubmitTarget == null)
+                var batchLimit = SubmitBatchLimit; // [local] once: it is hot
+                if (batchLimit > 1 && GpuWaitSubmitTarget == null)
                 {
-                    if (!SubmitSealedBatch(item, out taken, out lastTick, out var batchFailure))
+                    if (!SubmitSealedBatch(item, batchLimit, out taken, out lastTick, out var batchFailure))
                     {
                         message = FormatSubmitFailure(item, batchFailure);
                     }
