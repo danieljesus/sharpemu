@@ -16,5 +16,11 @@ internal static class DeviceDataReadsDefault
         {
             Environment.SetEnvironmentVariable("SHARPEMU_DEVICE_DATA_READS", "0");
         }
+
+        // [local] The pipeline cache tests read the files a checkpoint writes as soon as it returns.
+        if (Environment.GetEnvironmentVariable("SHARPEMU_PIPELINE_CACHE_WRITE_ASYNC") is null)
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_PIPELINE_CACHE_WRITE_ASYNC", "0");
+        }
     }
 }

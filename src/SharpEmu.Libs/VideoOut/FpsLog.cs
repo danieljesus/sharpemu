@@ -21,6 +21,7 @@ internal static class FpsLog
         Gpu.Scheduling.GpuStarveProbe.NoteFrame(); // [local]
         Gpu.Buffers.DeferredUploadWorker.NoteFrame(); // [local]
         Diagnostics.ReadbackOriginProbe.NoteFrame(); // [local]
+        Diagnostics.HotFlags.FramePresented(); // [local] SHARPEMU_HOTFLAGS_FILE
         if (!Enabled)
         {
             return;

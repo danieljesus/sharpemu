@@ -597,11 +597,11 @@ internal static unsafe partial class VulkanVideoPresenter
             return result;
         }
 
-        internal ComputeProgram? TryPrepareComputeOnFront(ulong key, Func<ComputeProgram?> prepare)
+        internal ComputeProgram? TryPrepareComputeOnFront(ulong key, Func<ComputeProgram?> prepare, bool? speculate = null)
         {
             if (SkipFrontPreparation(key))
                 return null;
-            var result = TryPrepareComputeOnFront(prepare);
+            var result = TryPrepareComputeOnFront(prepare, speculate);
             // [local] SHARPEMU_FRONT_SPECULATE: a speculated one counts when the render thread has replayed its reads.
             if (result is null || !FrontSpeculation.Pending)
                 NoteFrontPreparation(key, result is null);
@@ -638,11 +638,11 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool FrontPrepLog = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_PREP_LOG") == "1"; // [local]
         private static int _frontPrepLogs;
 
-        internal ComputeProgram? TryPrepareComputeOnFront(Func<ComputeProgram?> prepare)
+        internal ComputeProgram? TryPrepareComputeOnFront(Func<ComputeProgram?> prepare, bool? speculate = null)
         {
             _preparingOnFront = true;
             if (!_onPrepWorker) FrontPrepReads.Begin(); // [local] SHARPEMU_FRONT_PREP_RANGES
-            if (!_onPrepWorker && FrontSpeculation.Enabled) FrontSpeculation.Begin(); // [local] SHARPEMU_FRONT_SPECULATE
+            if (!_onPrepWorker && (speculate ?? FrontSpeculation.Enabled)) FrontSpeculation.Begin(); // [local] SHARPEMU_FRONT_SPECULATE
             var started = FrontProfile.LoopEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             try
             {

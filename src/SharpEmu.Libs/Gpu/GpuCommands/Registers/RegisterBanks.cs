@@ -132,9 +132,32 @@ public sealed class RegisterBanks
     // every register's next write moves its stamp. A clone or a snapshot starts without shadows. Off by default: in
     // GTA V 39 % of the stamped writes stop moving their stamp (dc17), but the program registers change in 70 % of
     // their writes, so the layout memo resolves 5 % less (55.7k vs 58.9k per window) and no phase moves >= 0.1 ms.
-    internal static readonly bool StampOnChange = Environment.GetEnvironmentVariable("SHARPEMU_STAMP_ON_CHANGE") == "1";
+    // Hot (SHARPEMU_HOTFLAGS_FILE): a change bumps the shadow generation first, so each bank forgets its shadows at its
+    // next compared write (the writes made while it was off did not update them).
+    internal static volatile bool StampOnChange = Environment.GetEnvironmentVariable("SHARPEMU_STAMP_ON_CHANGE") == "1"; // [local]
+    private static int _rawGeneration; // [local]
+    private int _rawGenerationSeen; // [local]
     private uint[]? _rawContext, _rawShader;
     private bool[]? _rawContextKnown, _rawShaderKnown;
+
+    internal static void SetStampOnChange(bool on) // [local] SHARPEMU_HOTFLAGS_FILE
+    {
+        ForgetAllRawShadows();
+        StampOnChange = on;
+    }
+
+    // [local] Every bank forgets its raw shadows at its next compared write, on the thread that writes it.
+    internal static void ForgetAllRawShadows() => Interlocked.Increment(ref _rawGeneration);
+
+    private void SyncRawGeneration() // [local]
+    {
+        var generation = Volatile.Read(ref _rawGeneration);
+        if (generation != _rawGenerationSeen)
+        {
+            ForgetRaw();
+            _rawGenerationSeen = generation;
+        }
+    }
     private static long _stampWrites, _stampSkipped;
 
     private static bool HasContextWriteSideEffects(uint register) => register is ContextRegisterOffset.DbZInfo or ContextRegisterOffset.DbDepthSizeXy;
@@ -146,6 +169,7 @@ public sealed class RegisterBanks
     // that carry side effects, or that have no shadow yet.
     internal uint ContextBitsChanged(uint offset, ReadOnlySpan<uint> values)
     {
+        SyncRawGeneration(); // [local]
         var raw = _rawContext ??= new uint[RegisterBankLayout.ContextRegisterCount];
         var known = _rawContextKnown ??= new bool[RegisterBankLayout.ContextRegisterCount];
         var bits = 0u;
@@ -175,6 +199,7 @@ public sealed class RegisterBanks
 
     internal uint ShaderBitsChanged(uint offset, ReadOnlySpan<uint> values)
     {
+        SyncRawGeneration(); // [local]
         var raw = _rawShader ??= new uint[RegisterBankLayout.ShaderRegisterCount];
         var known = _rawShaderKnown ??= new bool[RegisterBankLayout.ShaderRegisterCount];
         var bits = 0u;

@@ -41,7 +41,8 @@ public sealed partial class RenderExecutor
     // image. The host still synchronizes the guest metadata, completes the publications and resolves the DCC clear
     // on every draw (IRenderHost.FindImageRemembered); only the image lookup is skipped, as for the other targets.
     // The mode 2 of SHARPEMU_TARGET_MEMO verifies these too.
-    internal static readonly bool TargetMemoDcc = Environment.GetEnvironmentVariable("SHARPEMU_TARGET_MEMO_DCC") != "0";
+    // Hot (SHARPEMU_HOTFLAGS_FILE): a remembered target is still checked against the lookup stamp and its words.
+    internal static volatile bool TargetMemoDcc = Environment.GetEnvironmentVariable("SHARPEMU_TARGET_MEMO_DCC") != "0"; // [local]
 
     // [local] Shared with RenderRecorder's memo (the one that runs after the upstream merge).
     internal static long _memoHits, _memoMisses, _memoDcc, _memoMismatches, _memoStampChanges, _memoDccReused;

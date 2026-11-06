@@ -768,9 +768,10 @@ internal static unsafe partial class VulkanVideoPresenter
             var timelineQueue = Diagnostics.LabelTimeline.FrontQueue; // [local] SHARPEMU_LABEL_TIMELINE
             var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
             // [local] SHARPEMU_FRONT_SPECULATE: the indirect ones too, with the counts the render thread prepares them with.
-            var frontPrepares = indirectArgumentsAddress == 0 || FrontSpeculation.Enabled;
+            var speculate = FrontSpeculation.Enabled; // [local] read once: it is hot (SHARPEMU_HOTFLAGS_FILE)
+            var frontPrepares = indirectArgumentsAddress == 0 || speculate;
             var prepared = frontPrepares
-                ? presenter.TryPrepareComputeOnFront(snapshot.Shader.Compute.Address, prepareOnFront)
+                ? presenter.TryPrepareComputeOnFront(snapshot.Shader.Compute.Address, prepareOnFront, speculate)
                 : null;
             var prepPages = frontPrepares ? Presenter.TakePrepPages() : null; // [local] SHARPEMU_FRONT_PREP_RANGES
             var speculated = frontPrepares ? FrontSpeculation.Take() : null; // [local]

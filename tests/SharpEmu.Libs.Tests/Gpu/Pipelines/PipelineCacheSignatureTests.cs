@@ -35,6 +35,21 @@ public sealed class PipelineCacheSignatureTests
         Assert.Equal(payload, loaded);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(5)]
+    [InlineData(4099)]
+    public void WriteTo_WritesTheBytesOfWrap(int length)
+    {
+        var payload = new byte[length];
+        new System.Random(length).NextBytes(payload);
+        using var stream = new MemoryStream();
+
+        PipelineCacheSignature.WriteTo(stream, Signature(), payload);
+
+        Assert.Equal(PipelineCacheSignature.Wrap(Signature(), payload), stream.ToArray());
+    }
+
     [Fact]
     public void SignatureMismatch_Invalidates()
     {

@@ -5168,11 +5168,13 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         {
             _splitFlushed = true; // [local] SHARPEMU_LABEL_POLL_SPLIT
             Diagnostics.ReadbackOriginProbe.NoteFlush(); // [local]
-            _scheduler.Flush();
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
+                _scheduler.Flush();
         }
         else
         {
-            _scheduler.EnsureSubmitted(waitTick);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
+                _scheduler.EnsureSubmitted(waitTick);
         }
 
         var pieces = new ReadbackPiece[copies.Count];
@@ -5265,11 +5267,13 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         if (waitTick >= _scheduler.CurrentTick)
         {
             Diagnostics.ReadbackOriginProbe.NoteFlush(); // [local]
-            _scheduler.Flush();
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
+                _scheduler.Flush();
         }
         else
         {
-            _scheduler.EnsureSubmitted(waitTick);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
+                _scheduler.EnsureSubmitted(waitTick);
         }
 
         var pieces = new ReadbackPiece[copies.Count];
@@ -5610,14 +5614,15 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferDirtySynchronization);
         var startedAt = BufferUploadProfile.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        var texelCleanSkip = TexelCleanSkipMode; // [local] once: it is hot (SHARPEMU_HOTFLAGS_FILE)
         // [local] SHARPEMU_WRITTEN_SYNC_CPU_DIRTY=1: a written range that is already GPU-modified still uploads its CPU-dirty pages.
         var nothingToUpload = isWritten
             ? _gpuModifiedRanges.Contains(guestAddress, size) && (!WrittenSyncCpuDirty || !_tracker.MayHaveCpuDirtyPages(guestAddress, size))
-            : (TexelCleanSkipMode != 0 || !isTexelBuffer) && !_tracker.MayHaveCpuDirtyPages(guestAddress, size);
+            : (texelCleanSkip != 0 || !isTexelBuffer) && !_tracker.MayHaveCpuDirtyPages(guestAddress, size);
         // [local] SHARPEMU_TEXEL_CLEAN_SKIP (0 by default): upstream skips the upload of every read without CPU-dirty
         // pages; with 0 a texel read still runs its (empty) upload as on our branch before the merge, where the skip cost
         // ~2 FPS panning in GTA V. =1 takes upstream's skip; =2 runs the upload anyway and counts the ones that copied.
-        var texelVerify = nothingToUpload && TexelCleanSkipMode == 2 && isTexelBuffer && !isWritten;
+        var texelVerify = nothingToUpload && texelCleanSkip == 2 && isTexelBuffer && !isWritten;
         if (nothingToUpload && !texelVerify)
         {
             if (isTexelBuffer && !isWritten)
@@ -5635,7 +5640,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         profileScope.SwitchPhase(isWritten
             ? RenderPhaseProfile.Phase.BufferDirtySyncWritten
             : isTexelBuffer ? RenderPhaseProfile.Phase.BufferDirtySyncTexel : RenderPhaseProfile.Phase.BufferDirtySyncUpload);
-        if (TexelCleanSkipMode != 0 && !texelVerify && isTexelBuffer && !isWritten && !_tracker.MayHaveCpuDirtyPages(guestAddress, size))
+        if (texelCleanSkip != 0 && !texelVerify && isTexelBuffer && !isWritten && !_tracker.MayHaveCpuDirtyPages(guestAddress, size))
         {
             if (BufferUploadProfile.Enabled)
                 BufferUploadProfile.Record(guestAddress, size, 0, 0, 0, System.Diagnostics.Stopwatch.GetTimestamp() - startedAt);
@@ -5915,7 +5920,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         return copiedFromImage;
     }
 
-    internal static readonly int TexelCleanSkipMode =
+    internal static volatile int TexelCleanSkipMode = // [local] hot (SHARPEMU_HOTFLAGS_FILE)
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TEXEL_CLEAN_SKIP"), out var texelSkip) ? texelSkip : 0;
     private static long _texelCleanSkips, _texelCleanChecked, _texelCleanMismatches;
     private static int _texelCleanLogs;
