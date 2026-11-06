@@ -1056,8 +1056,10 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         PixelInputInfo? pixelInput, out PipelineHandle pipeline)
     {
         var skippable = MaySkipWhileCompiling(record, vertexInput, pixelInput, state.Programs.MeshInput is not null,
-            occlusionSkippable: AsyncGraphicsPipelines == 2);
+            occlusionSkippable: AsyncGraphicsPipelines == 2) &&
+            !(AsyncGraphicsExemptActive && KeepsTargetsWhileCompiling(DrawState.BoundColors(ref state))); // [local]
         long waitStarted = 0;
+        var boundedWait = false; // [local]
         while (!_pipelines.TryCreateGraphicsPipeline(
                    DrawState.BoundColors(ref state),
                    in state.Depth,
@@ -1073,6 +1075,14 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                    out pipeline,
                    out var completion))
         {
+            if (skippable && !boundedWait && AsyncGraphicsExemptActive && AsyncGraphicsWaitMilliseconds > 0 && completion is not null) // [local]
+            {
+                // A pipeline the driver has cached finishes within a few milliseconds: wait that long before leaving the draw out.
+                boundedWait = true;
+                if (completion.Wait(AsyncGraphicsWaitMilliseconds))
+                    continue;
+            }
+
             if (skippable)
             {
                 var vertexHash = vertexInput.Stage.Program?.Hash ?? 0;
@@ -1099,6 +1109,38 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             Pipelines.CompileLog.Note("draw-wait", System.Diagnostics.Stopwatch.GetElapsedTime(waitStarted).TotalMilliseconds,
                 vertexInput.Stage.Program?.Hash ?? 0);
         return true;
+    }
+
+    // [local] SHARPEMU_ASYNC_GRAPHICS_EXEMPT (=1 by default, =0 off; only with SHARPEMU_ASYNC_GRAPHICS_PIPELINES): a draw
+    // left out leaves its targets without that draw for good when nothing redraws them every frame. Linear targets are
+    // read back by the CPU, and small ones (every colour target <= 1024x1024) are atlases and cached layers, so those
+    // draws wait for the compile. In GTA V the minimap lost its map with mode 2. SHARPEMU_ASYNC_GRAPHICS_WAIT_MS
+    // (20 by default) is how long a draw that may be left out waits first: a pipeline the driver has cached is ready by then.
+    internal static readonly bool AsyncGraphicsExempt = Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_GRAPHICS_EXEMPT") != "0";
+
+    internal static readonly AsyncLocal<bool?> AsyncGraphicsExemptOverride = new();
+
+    private static bool AsyncGraphicsExemptActive => AsyncGraphicsExemptOverride.Value ?? AsyncGraphicsExempt;
+
+    internal static readonly int AsyncGraphicsWaitMilliseconds =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_GRAPHICS_WAIT_MS"), out var asyncWait) ? Math.Max(0, asyncWait) : 20;
+
+    internal const uint SmallTargetExtent = 1024;
+
+    internal static bool KeepsTargetsWhileCompiling(ReadOnlySpan<ColorTargetState> colors)
+    {
+        if (colors.IsEmpty)
+            return false;
+        var allSmall = true;
+        foreach (ref readonly var color in colors)
+        {
+            if (!color.Resolution.Request.Description.IsTiled)
+                return true;
+            if (color.Resolution.Extent.Width > SmallTargetExtent || color.Resolution.Extent.Height > SmallTargetExtent)
+                allSmall = false;
+        }
+
+        return allSmall;
     }
 
     // [local] Only a draw whose effects stay in its colour, depth and stencil attachments may be left out: no stage
