@@ -23,11 +23,17 @@ public sealed class AsyncGraphicsPipelineTests : IDisposable
     private readonly RenderExecutor _executor;
     private readonly FatalScope _fatal = new();
 
-    public AsyncGraphicsPipelineTests() => _executor = new RenderExecutor(_host, _pipelines);
+    public AsyncGraphicsPipelineTests()
+    {
+        _executor = new RenderExecutor(_host, _pipelines);
+        // [local] These draws use a small target: the exemptions are covered by their own tests below.
+        RenderRecorder.AsyncGraphicsExemptOverride.Value = false;
+    }
 
     public void Dispose()
     {
         RenderRecorder.AsyncGraphicsPipelinesOverride.Value = null;
+        RenderRecorder.AsyncGraphicsExemptOverride.Value = null;
         _fatal.Dispose();
     }
 
@@ -173,5 +179,24 @@ public sealed class AsyncGraphicsPipelineTests : IDisposable
             throw new InvalidOperationException("The caching provider has no compute program.");
 
         public PipelineHandle CreateComputePipeline(ComputeInputInfo input, ShaderProgram program) => cache.CreateComputePipeline(input, program);
+    }
+
+    // [local] SHARPEMU_ASYNC_GRAPHICS_EXEMPT: linear targets and all-small targets keep their draws while compiling.
+    private static ColorTargetState Target(uint width, uint height, GuestTileMode tileMode)
+    {
+        var description = new ImageDescription { TileMode = tileMode };
+        var request = new ImageRequest(description, ImageViewDescription.Default, default);
+        return new ColorTargetState(new ColorTargetResolution(request, 0, 0, new Extent2D(width, height), 0, 0, 1, default, false, false, default), 0, default);
+    }
+
+    [Fact]
+    public void Exemptions_KeepLinearAndSmallTargetsAndLeaveLargeTiledOnes()
+    {
+        Assert.False(RenderRecorder.KeepsTargetsWhileCompiling([]));
+        Assert.True(RenderRecorder.KeepsTargetsWhileCompiling([Target(1024, 1024, GuestTileMode.Standard64KB)]));
+        Assert.True(RenderRecorder.KeepsTargetsWhileCompiling([Target(256, 128, GuestTileMode.Standard64KB), Target(512, 512, GuestTileMode.Standard64KB)]));
+        Assert.False(RenderRecorder.KeepsTargetsWhileCompiling([Target(1920, 1080, GuestTileMode.Standard64KB)]));
+        Assert.False(RenderRecorder.KeepsTargetsWhileCompiling([Target(256, 256, GuestTileMode.Standard64KB), Target(3840, 2160, GuestTileMode.Standard64KB)]));
+        Assert.True(RenderRecorder.KeepsTargetsWhileCompiling([Target(3840, 2160, GuestTileMode.Linear)]));
     }
 }
