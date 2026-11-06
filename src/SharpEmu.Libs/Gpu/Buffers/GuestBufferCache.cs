@@ -5168,11 +5168,13 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         {
             _splitFlushed = true; // [local] SHARPEMU_LABEL_POLL_SPLIT
             Diagnostics.ReadbackOriginProbe.NoteFlush(); // [local]
-            _scheduler.Flush();
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
+                _scheduler.Flush();
         }
         else
         {
-            _scheduler.EnsureSubmitted(waitTick);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
+                _scheduler.EnsureSubmitted(waitTick);
         }
 
         var pieces = new ReadbackPiece[copies.Count];
@@ -5265,11 +5267,13 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         if (waitTick >= _scheduler.CurrentTick)
         {
             Diagnostics.ReadbackOriginProbe.NoteFlush(); // [local]
-            _scheduler.Flush();
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
+                _scheduler.Flush();
         }
         else
         {
-            _scheduler.EnsureSubmitted(waitTick);
+            using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
+                _scheduler.EnsureSubmitted(waitTick);
         }
 
         var pieces = new ReadbackPiece[copies.Count];

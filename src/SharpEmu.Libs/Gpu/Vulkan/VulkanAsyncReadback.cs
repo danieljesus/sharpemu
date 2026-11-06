@@ -521,7 +521,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             PSignalSemaphoreInfos = &signal,
         };
         // [local] PrepareMainQueueWait ran before the gate: with the guard, waitTick is already on the main queue.
-        Require(vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback)");
+        using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackSubmit)) // [local]
+            Require(vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback)");
         slot.Busy = true;
         slot.WaitTick = waitTick;
         slot.Value = signalValue;
