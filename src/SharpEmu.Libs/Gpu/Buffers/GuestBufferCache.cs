@@ -454,9 +454,10 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         _gpuModifiedGate.EnterReadLock();
         try
         {
-            _gpuModifiedSnapshotStale = false;
+            // Publish before clearing the flag: a lock-free reader that sees it clear must also see this snapshot.
             var snapshot = _gpuModifiedRanges.Snapshot();
             Volatile.Write(ref _gpuModifiedSnapshot, snapshot);
+            _gpuModifiedSnapshotStale = false;
             return snapshot;
         }
         finally
