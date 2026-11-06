@@ -7,24 +7,29 @@ using System.Text;
 
 namespace SharpEmu.Libs.Diagnostics;
 
-// [local] SHARPEMU_DISPATCH_CPU_PROBE=1 (off; with SHARPEMU_FPS_LOG=1): the CPU each compute program costs the recording
-// threads, by program hash. One stopwatch around RenderRecorder.Record(ResolvedDispatch): preparation deferred to the
-// render thread, materialization and its readback waits, bindings, pipeline and the recorded commands. Render-thread time
-// (the critical path) and slice-worker time are kept apart. One [PERF][DISPATCH_CPU] line per FPS window with the totals
-// per frame, the top programs by render-thread ms per frame and, always, SHARPEMU_DISPATCH_CPU_PROBE_PINNED (comma list
-// of 16-hex-digit hashes; default the refit chain F43B/E45A/5981/AACC).
+// [local] SHARPEMU_DISPATCH_CPU_PROBE=1 (off; with SHARPEMU_FPS_LOG=1): the CPU each compute program costs the thread
+// that runs the translation's dispatch, by program hash. One stopwatch around RenderExecutor.Dispatch (the program's
+// preparation when the front deferred it: materialization and its readback waits; then RenderRecorder.Record: bindings,
+// pipeline and the recorded commands), and a second one around the Record part alone. With SHARPEMU_RENDER_PIPELINE=1
+// that thread is the render thread, the critical path. One [PERF][DISPATCH_CPU] line per FPS window with the totals per
+// frame, the pinned hashes (SHARPEMU_DISPATCH_CPU_PROBE_PINNED, a comma list of 16-hex-digit hashes; default the refit
+// chain F43B/E45A/5981/AACC) and the top 16 by ms per frame, each as count/total ms(record ms) per frame.
 internal static class DispatchCpuProbe
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_DISPATCH_CPU_PROBE") == "1";
 
     private sealed class Entry
     {
-        public long Count, Ticks, WorkerCount, WorkerTicks;
+        public long Count, Ticks, RecordTicks;
     }
 
     private static readonly object Gate = new();
     private static readonly Dictionary<ulong, Entry> Entries = new();
     private static readonly ulong[] Pinned = ReadPinned();
+
+    // The hash of the program the executor resolved for the dispatch in flight on this thread (0 when it skipped it).
+    [ThreadStatic] internal static ulong CurrentHash;
+    [ThreadStatic] private static long _recordTicks;
 
     private static ulong[] ReadPinned()
     {
@@ -42,8 +47,20 @@ internal static class DispatchCpuProbe
         return list.ToArray();
     }
 
-    public static void Note(ulong hash, long ticks, bool onWorker)
+    public static long Begin()
     {
+        CurrentHash = 0;
+        _recordTicks = 0;
+        return Stopwatch.GetTimestamp();
+    }
+
+    public static void NoteRecord(long ticks) => _recordTicks += ticks;
+
+    public static void End(long started)
+    {
+        var ticks = Stopwatch.GetTimestamp() - started;
+        var hash = CurrentHash;
+        var recordTicks = _recordTicks;
         lock (Gate)
         {
             if (!Entries.TryGetValue(hash, out var entry))
@@ -52,16 +69,9 @@ internal static class DispatchCpuProbe
                 Entries[hash] = entry;
             }
 
-            if (onWorker)
-            {
-                entry.WorkerCount++;
-                entry.WorkerTicks += ticks;
-            }
-            else
-            {
-                entry.Count++;
-                entry.Ticks += ticks;
-            }
+            entry.Count++;
+            entry.Ticks += ticks;
+            entry.RecordTicks += recordTicks;
         }
     }
 
@@ -73,16 +83,15 @@ internal static class DispatchCpuProbe
         builder.Append(frames.ToString(CultureInfo.InvariantCulture));
         lock (Gate)
         {
-            long count = 0, ticks = 0, workerCount = 0, workerTicks = 0;
+            long count = 0, ticks = 0, recordTicks = 0;
             foreach (var entry in Entries.Values)
             {
                 count += entry.Count;
                 ticks += entry.Ticks;
-                workerCount += entry.WorkerCount;
-                workerTicks += entry.WorkerTicks;
+                recordTicks += entry.RecordTicks;
             }
 
-            builder.Append(CultureInfo.InvariantCulture, $" render={count / (double)divisor:F1}/{ticks / perMs / divisor:F2}ms worker={workerCount / (double)divisor:F1}/{workerTicks / perMs / divisor:F2}ms pinned:");
+            builder.Append(CultureInfo.InvariantCulture, $" dispatches={count / (double)divisor:F1}/{ticks / perMs / divisor:F2}ms({recordTicks / perMs / divisor:F2}) pinned:");
             foreach (var hash in Pinned)
             {
                 Entries.TryGetValue(hash, out var entry);
@@ -101,13 +110,6 @@ internal static class DispatchCpuProbe
         return builder.ToString();
     }
 
-    // hash=count/ms per frame on the render thread (+count/ms on workers when any).
-    private static void Append(StringBuilder builder, ulong hash, Entry? entry, long divisor, double perMs)
-    {
-        builder.Append(CultureInfo.InvariantCulture, $" {hash >> 48:X4}={(entry?.Count ?? 0) / (double)divisor:F1}/{(entry?.Ticks ?? 0) / perMs / divisor:F3}");
-        if (entry is { WorkerCount: > 0 })
-        {
-            builder.Append(CultureInfo.InvariantCulture, $"(+{entry.WorkerCount / (double)divisor:F1}/{entry.WorkerTicks / perMs / divisor:F3})");
-        }
-    }
+    private static void Append(StringBuilder builder, ulong hash, Entry? entry, long divisor, double perMs) =>
+        builder.Append(CultureInfo.InvariantCulture, $" {hash >> 48:X4}={(entry?.Count ?? 0) / (double)divisor:F1}/{(entry?.Ticks ?? 0) / perMs / divisor:F3}({(entry?.RecordTicks ?? 0) / perMs / divisor:F3})");
 }

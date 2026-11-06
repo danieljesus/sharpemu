@@ -174,6 +174,7 @@ public sealed partial class RenderExecutor
 
         var input = computeProgram.Input;
         var program = input.Stage.Program ?? throw _host.Fatal($"The compute program is missing: shader=0x{compute.Address:X16}.");
+        if (Diagnostics.DispatchCpuProbe.Enabled) Diagnostics.DispatchCpuProbe.CurrentHash = program.Hash; // [local]
         if (Diagnostics.DccWriterTrace.Enabled)
         {
             Diagnostics.DccWriterTrace.CurrentProgram = program.Hash;

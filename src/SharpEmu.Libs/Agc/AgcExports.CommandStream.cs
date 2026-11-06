@@ -438,12 +438,14 @@ public static partial class AgcExports
             if (_executor is not { } executor) throw _host.Fatal("The command stream has no render executor.");
             state.FrameDispatchCount++;
             var executorStarted = DcbParseProfile.Begin();
+            var probeStarted = Diagnostics.DispatchCpuProbe.Enabled ? Diagnostics.DispatchCpuProbe.Begin() : 0; // [local]
             try
             {
                 executor.Dispatch(submitId, banks, endX, endY, endZ, dispatchInitiator, indirectArgumentsAddress, prepared);
             }
             finally
             {
+                if (probeStarted != 0) Diagnostics.DispatchCpuProbe.End(probeStarted); // [local] SHARPEMU_DISPATCH_CPU_PROBE
                 DcbParseProfile.RecordDispatch(executorStarted);
             }
         }
@@ -663,12 +665,14 @@ public static partial class AgcExports
             uint dispatchInitiator, ulong indirectArgumentsAddress, ComputeProgram? prepared = null)
         {
             var executorStarted = DcbParseProfile.Begin();
+            var probeStarted = Diagnostics.DispatchCpuProbe.Enabled ? Diagnostics.DispatchCpuProbe.Begin() : 0; // [local]
             try
             {
                 executor.Dispatch(submitId, banks, endX, endY, endZ, dispatchInitiator, indirectArgumentsAddress, prepared);
             }
             finally
             {
+                if (probeStarted != 0) Diagnostics.DispatchCpuProbe.End(probeStarted); // [local] SHARPEMU_DISPATCH_CPU_PROBE
                 DcbParseProfile.RecordDispatch(executorStarted);
             }
         }

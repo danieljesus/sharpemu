@@ -23,7 +23,7 @@ internal sealed partial class RenderRecorder
         {
             if (started != 0) // [local] SHARPEMU_DISPATCH_CPU_PROBE
             {
-                Diagnostics.DispatchCpuProbe.Note(record.Program?.Input.Stage.Program?.Hash ?? 0, System.Diagnostics.Stopwatch.GetTimestamp() - started, OnWorker);
+                Diagnostics.DispatchCpuProbe.NoteRecord(System.Diagnostics.Stopwatch.GetTimestamp() - started);
             }
 
             _pendingWrites?.Release(record.Sequence);
