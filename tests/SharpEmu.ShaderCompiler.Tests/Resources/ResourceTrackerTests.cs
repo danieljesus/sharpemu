@@ -279,6 +279,48 @@ public sealed class ResourceTrackerTests
         Image(44, "ImageSampleLz", 0, 36, dmask: 1, vectorAddress: 22),
         EndProgram(48));
 
+    // [local] Upstream PR #1097 ecdcc99c: the reachability walks stay linear on shared subgraphs and keep their answers.
+    [Fact]
+    public void ReachabilityWalksStayLinearOnSharedSubgraphs()
+    {
+        // Every level uses the previous one twice: 2^60 paths, 61 nodes.
+        var value = ScalarValue.UserData(0);
+        for (var level = 0; level < 60; level++)
+        {
+            value = ScalarValue.MakeOperation(ScalarOperation.IAdd32, ScalarValueType.U32, value, value);
+        }
+
+        var walk = System.Threading.Tasks.Task.Run(() => (HasRead(value), HasReadKind(value, ScalarValueKind.ScalarAddressWord)));
+        Assert.True(walk.Wait(TimeSpan.FromSeconds(10)), "the reachability walk re-walked shared nodes");
+        Assert.Equal((false, false), walk.Result);
+    }
+
+    [Fact]
+    public void ReachabilityWalksFindAReadBehindASharedSubgraph()
+    {
+        var shared = ScalarValue.UserData(0);
+        for (var level = 0; level < 8; level++)
+        {
+            shared = ScalarValue.MakeOperation(ScalarOperation.IAdd32, ScalarValueType.U32, shared, shared);
+        }
+
+        var read = ScalarValue.MakeOperation(ScalarOperation.IAdd32, ScalarValueType.U32, shared,
+            ScalarValue.MemoryRead(ScalarValueKind.ScalarAddressWord, ScalarValue.UserData(1), ScalarValue.UserData(2), 0));
+        var value = ScalarValue.MakeOperation(ScalarOperation.IAdd32, ScalarValueType.U32, shared, read);
+        Assert.True(HasRead(value));
+        Assert.True(HasReadKind(value, ScalarValueKind.ScalarAddressWord));
+        Assert.False(HasReadKind(value, ScalarValueKind.ScalarBufferWord));
+        Assert.False(HasRead(shared));
+    }
+
+    private static bool HasRead(ScalarValue value) =>
+        (bool)typeof(ResourceTracker).GetMethod("HasRuntimeRead", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static,
+            [typeof(ScalarValue)])!.Invoke(null, [value])!;
+
+    private static bool HasReadKind(ScalarValue value, ScalarValueKind kind) =>
+        (bool)typeof(ResourceTracker).GetMethod("HasRuntimeReadKind", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static,
+            [typeof(ScalarValue), typeof(ScalarValueKind)])!.Invoke(null, [value, kind])!;
+
     [Fact]
     public void SamplerWithDivergentBits_IsRejected()
     {
