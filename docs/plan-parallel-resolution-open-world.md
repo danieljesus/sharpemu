@@ -134,7 +134,7 @@ Fuente: estudio de solo lectura de AnyPS5 `main b5cc94b1b2` (GPL-2.0-only; solo 
   La sonda del paso 1 da la cifra: `draw_record_ms` es lo que se iría al committer.
 - **Lo portable sin cambio estructural va a la fase 1:**
   - memo por hilo en array sellado y bitmaps con `countr_zero` (~2× en captura por draw según ellos; nuestro equivalente es `ResourceMaterialization`/`BufferAcquisitionChecks`);
-  - comprobar si el pool de búferes desaloja por tope (`ResourceDestroy` 173k/ventana en st37, ~5.600 por fotograma: **sospechoso de ser lo mismo que `ccb6697109`**);
+  - comprobar si el pool de búferes desaloja por tope, como el que arregló `ccb6697109`. Ojo: el `n` de `ResourceDestroy` en st37 (173k por ventana) coincide con el número de draws: cuenta entradas al ámbito, no destrucciones. Hay que contar las destrucciones reales antes de perseguirlo;
   - índice de último escritor por gránulo de 64 KiB para `HasPendingBetween`/`BufferDirtySynchronization`.
 
 ## 7. Plan incremental
@@ -209,14 +209,15 @@ Cada paso va tras un `SHARPEMU_*` apagado por defecto, se mide por mecanismo (ms
 | Campo | Qué es |
 |---|---|
 | `items`, `draws`, `dispatches`, `other` | ítems de la cola del fondo por fotograma, y sus `*_ms` (reloj de pared del ítem en el hilo de render) |
-| `draw_resolve_ms` / `draw_record_ms` | reparto del draw: ejecutor (`RenderExecutor`, sin la grabación) frente a `RenderRecorder.Record` |
+| `draw_resolve_ms` / `draw_record_ms` | reparto del draw: todo lo que no es `RenderRecorder.Record` (ejecutor más el cuerpo de la closure: `FrontPreparationStillValid`, `TablesStillValid`, `TakeWorkerPreparation` y la propia puerta de la sonda) frente a `RenderRecorder.Record` |
 | `gate=ok:N/ms,no_targets:…,unknown_pair:…,writes:…,stale_pair:…` | puerta del `ResolvePool` evaluada antes del draw: el par de shaders se vio sin escribir, nunca se vio, se vio escribiendo, o se vio con otra generación del registro de cabeceras |
 | `dispatch_serial` | 1 si `NeedsSerialDispatch` (los dispatches cortan siempre) |
 | `runs=` / `scope_runs=` | corridas de draws aptos: número, longitud media, y draws y ms en corridas ≥8/≥16/≥32. `scope_runs` corta además cuando cambia el ámbito de render (`DrawScope.Scope`) |
 | `breaks=` | causa de cada fin de corrida: ítem no draw, dispatch, draw no apto, cambio de ámbito (solo `scope_runs`) |
-| `breakers=[...]` | ítems no draw que cortaron, por método de la closure (muestreado 1/8, cifras ya escaladas) |
+| `breakers=[...]` | ítems no draw que cortaron, por método del delegado, muestreados 1/8 y con las cifras ya escaladas. Los delegados de campo salen con su nombre (`Presenter.Flush`, `FlushFrame`, `EmitGlobalBarrier`); las lambdas, como `<>c__DisplayClass…` con el método de origen entre `<>` |
 | `scope_changes`, `lookup_generation_changes` | cambios de ámbito de render y de la generación de búsquedas de imagen por fotograma |
 
+- **Sesgo:** la sonda llama a `DrawHasTargets` una vez más por draw; la llamada real acierta en el memo de layout que deja la sonda, así que en estas sesiones `[PERF][TARGET_MEMO]` sale inflado.
 - **Cuentas para decidir:**
   - fracción apta = `gate ok_ms / draw_ms`;
   - techo del paso 3 ≈ `runs ms≥16 × (1−1/N)` − unión;
