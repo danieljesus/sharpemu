@@ -212,8 +212,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 _scheduler.Wait(oldest.Tick);
             }
 
+            // [local] One read of the timeline for the whole collection (it read it up to twice, ~2 us each): the
+            // submissions and the deferred work both use it; what completes after it is collected next time.
+            _scheduler.Timeline.RefreshCompletedTick();
             while (_pendingGuestSubmissions.TryPeek(out var submission) &&
-                   _scheduler.IsTickComplete(submission.Tick))
+                   _scheduler.IsTickKnownComplete(submission.Tick))
             {
                 _pendingGuestSubmissions.Dequeue();
                 RetireGuestSubmission(submission);
@@ -223,7 +226,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // Deferred tick work (buffer erases, one-shot uploads, fault parses) runs here.
             if (_scheduler.Active)
             {
-                _scheduler.RunCompletedOperations();
+                _scheduler.RunCompletedOperations(refresh: false);
             }
 
             _commandStream.NotifyCompletedGpuTick(_scheduler.Timeline.CompletedTick);
