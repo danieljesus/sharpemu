@@ -393,7 +393,10 @@ public sealed partial class GpuCommandInterpreter
             var length = PacketHeader.Length(header);
             if (length > remaining)
             {
-                throw _host.Fatal($"The packet is longer than the buffer: offset=0x{offset:X5} header=0x{header:X8} length={length} remaining={remaining} address=0x{packetAddress:X16}.");
+                if (!ExtendOverrunPacket(ref cursor, offset, header, length, packetAddress)) // [local]
+                    throw _host.Fatal($"The packet is longer than the buffer: offset=0x{offset:X5} header=0x{header:X8} length={length} remaining={remaining} address=0x{packetAddress:X16}.");
+                total = cursor.DwordCount;
+                remaining = cursor.Remaining;
             }
 
             if (PacketHeader.IsPredicated(header) && PredicateSkip)
@@ -612,6 +615,34 @@ public sealed partial class GpuCommandInterpreter
         }
 
         return scratch;
+    }
+
+    // [local] SHARPEMU_PACKET_OVERRUN (=1 by default, =0 fatal as before): a packet whose header says it runs past the end
+    // of its buffer is read whole from guest memory and the buffer is extended to cover it. GTA V ended a 20-dword buffer
+    // with an 8-dword ReleaseMemory NOP at offset 0x10 (the scene inside Simeon's dealership after the first Franklin
+    // mission); the console ran that buffer, so the size the emulator holds is short, not the packet. The buffer around
+    // the packet is dumped on power-of-two counts so the size can be traced to its source.
+    private static readonly bool PacketOverrunExtends = Environment.GetEnvironmentVariable("SHARPEMU_PACKET_OVERRUN") != "0";
+    private static long _packetOverruns;
+
+    private bool ExtendOverrunPacket(ref PacketCursor cursor, uint offset, uint header, uint length, ulong packetAddress)
+    {
+        if (!PacketOverrunExtends)
+            return false;
+        Span<byte> tail = stackalloc byte[(int)(length - cursor.Remaining) * sizeof(uint)];
+        if (!TryReadCommand(cursor.Address + ((ulong)cursor.DwordCount * sizeof(uint)), tail))
+            return false;
+        var count = Interlocked.Increment(ref _packetOverruns);
+        if ((count & (count - 1)) == 0)
+        {
+            Console.Error.WriteLine($"[GPU][WARN][PACKET_OVERRUN] A packet runs past its buffer; it is read from memory: queue={QueueId} offset=0x{offset:X5} header=0x{header:X8} length={length} remaining={cursor.Remaining} buffer=0x{cursor.Address:X16} dwords={cursor.DwordCount} address=0x{packetAddress:X16} count={count}.");
+            var extended = cursor;
+            extended.DwordCount = offset + length;
+            DumpUnknownPacket(in extended, offset);
+        }
+
+        cursor.DwordCount = offset + length;
+        return true;
     }
 
     private void DumpUnknownPacket(in PacketCursor cursor, uint offset)

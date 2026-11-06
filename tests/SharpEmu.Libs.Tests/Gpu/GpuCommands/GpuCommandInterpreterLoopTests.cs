@@ -60,13 +60,27 @@ public sealed class GpuCommandInterpreterLoopTests
         Assert.Contains("offset=0x00002", fatal.Message);
     }
 
+    // [local] SHARPEMU_PACKET_OVERRUN: a packet that runs past its buffer is read whole from memory; only a tail that
+    // cannot be read is still fatal.
     [Fact]
-    public void PacketLongerThanTheBuffer_IsFatal()
+    public void PacketLongerThanTheBuffer_IsReadWholeFromMemory()
     {
         var runner = new StreamRunner();
-        runner.Load(Command, new[] { PacketHeader.Make(4, PacketOpcode.NumInstances), 1u });
+        runner.Load(Command, new[] { PacketHeader.Make(4, Nop), 0u, 0u, 0u });
 
-        var fatal = Assert.Throws<CommandStreamFatalException>(() => runner.Run());
+        var progress = runner.Interpreter.Process(runner.Commands, Command, 2);
+
+        Assert.Equal(SubmissionProgress.Complete, progress);
+    }
+
+    [Fact]
+    public void PacketLongerThanTheBuffer_IsFatalWhenItsTailCannotBeRead()
+    {
+        const ulong lastWords = RecordingCommandStreamHost.MemoryBase + RecordingCommandStreamHost.MemorySize - 8;
+        var runner = new StreamRunner();
+        runner.Load(lastWords, new[] { PacketHeader.Make(4, Nop), 0u });
+
+        var fatal = Assert.Throws<CommandStreamFatalException>(() => runner.Interpreter.Process(runner.Commands, lastWords, 2));
 
         Assert.Contains("length=4 remaining=2", fatal.Message);
     }
