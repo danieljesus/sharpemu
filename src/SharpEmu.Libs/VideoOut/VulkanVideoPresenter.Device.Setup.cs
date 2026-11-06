@@ -68,6 +68,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private static readonly bool PipelineCacheWriteAsync =
             Environment.GetEnvironmentVariable("SHARPEMU_PIPELINE_CACHE_WRITE_ASYNC") != "0";
         private Task _pipelineCacheWrites = Task.CompletedTask;
+        private readonly object _pipelineCacheWriteGate = new();
         private bool _pipelineCacheWriteInline;
         private Queue _queue;
         private uint _queueFamilyIndex;
@@ -1798,7 +1799,9 @@ internal static unsafe partial class VulkanVideoPresenter
         // [local]
         private void JoinPipelineCacheWrites()
         {
-            try { _pipelineCacheWrites.GetAwaiter().GetResult(); }
+            Task writes;
+            lock (_pipelineCacheWriteGate) writes = _pipelineCacheWrites;
+            try { writes.GetAwaiter().GetResult(); }
             catch (Exception exception) { Console.Error.WriteLine($"[LOADER][WARN] Vulkan pipeline cache save failed: {exception.Message}"); }
         }
 
@@ -1896,6 +1899,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (PipelineCacheWriteAsync && !_pipelineCacheWriteInline) // [local]
                 {
                     var signature = DriverCacheSignature();
+                    lock (_pipelineCacheWriteGate)
                     _pipelineCacheWrites = _pipelineCacheWrites.ContinueWith(
                         _ =>
                         {
