@@ -110,6 +110,23 @@ public static partial class AgcExports
             return false;
         }
 
+        // [local] SHARPEMU_PARRES_PROBE: the pool's gate for this draw, without counting it as held.
+        private int ProbeDrawGate(RegisterBanks banks)
+        {
+            if (!_executor!.DrawHasTargets(banks))
+            {
+                return ParallelResolveProbe.GateNoTargets;
+            }
+
+            if (!_drawWrites.TryGetValue((banks.Shader.Vertex.ExportAddress, banks.Shader.Pixel.Address), out var known))
+            {
+                return ParallelResolveProbe.GateUnknownPair;
+            }
+
+            return known.Registrations != ShaderHeaderRegistry.Registrations ? ParallelResolveProbe.GateStalePair
+                : known.Writes ? ParallelResolveProbe.GateWrites : ParallelResolveProbe.GateOk;
+        }
+
         private void LearnDrawWrites(ResolvedDraw record)
         {
             if (record.Kind == ResolvedDrawKind.Draw && _learningKey != default)

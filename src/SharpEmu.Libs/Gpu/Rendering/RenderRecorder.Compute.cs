@@ -31,7 +31,7 @@ internal sealed partial class RenderRecorder
     // [local] Hooks of ours that keep process-wide state, record host work of their own or submit the batch
     // (SHARPEMU_TLAS_HLE, SHARPEMU_RT_RAYQUERY, SHARPEMU_EARLY_WRITER_SUBMIT, SHARPEMU_CUT_POLICY and the dispatch
     // probes, all off by default) run on the render thread only: a worker hands such a dispatch back to it.
-    private static bool NeedsSerialDispatch =>
+    internal static bool NeedsSerialDispatch => // [local] read by SHARPEMU_PARRES_PROBE
         Buffers.TlasHle.Instance is not null || Buffers.RayQueryHle.Instance is not null ||
         Buffers.GuestBufferCache.EarlyWriterSubmit || Buffers.CutPolicy.Words || Buffers.CutPolicy.GuestWindows ||
         Buffers.WriteDiffProbe.Enabled || Vulkan.IndirectArgsProbe.Enabled || Vulkan.ArgsWriterProbe.Enabled || Buffers.RangeDumpProbe.Enabled ||

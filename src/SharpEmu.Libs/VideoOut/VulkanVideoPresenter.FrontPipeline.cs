@@ -417,6 +417,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                 }
 
+                var probeStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
                 try
                 {
                     work();
@@ -427,6 +428,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     throw;
                 }
 
+                if (probeStarted != 0) ParallelResolveProbe.EndItem(work, System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted); // [local]
                 ran++;
                 Volatile.Write(ref Executed, Executed + 1);
                 AfterItem?.Invoke();
@@ -1283,6 +1285,7 @@ internal static unsafe partial class VulkanVideoPresenter
             try
             {
                 _translation.ExecuteDraw(submitId, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs, drawRegisters);
+                if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDrawScope(Recording.DrawScope); // [local] SHARPEMU_PARRES_PROBE
                 if (Diagnostics.LabelTimeline.Enabled) Interlocked.Increment(ref Diagnostics.LabelTimeline.Draws); // [local]
             }
             finally
@@ -1297,6 +1300,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDispatchTranslation);
             Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.Dispatches); // [local]
+            if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDispatch(); // [local] SHARPEMU_PARRES_PROBE
             var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             try

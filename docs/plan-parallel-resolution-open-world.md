@@ -105,6 +105,38 @@
 6. **Cachés:** los trabajadores no mutan `GuestImageCache` ni `GuestBufferCache`: ni LRU, ni memo, ni inserciones. Las mutaciones van como peticiones a la unión.
 7. **Exactitud:** cada paso con verificación `=2` cuando aplique, y capturas en la misma marca (Muscle Beach, cámara fija) iguales bit a bit con el interruptor encendido y apagado.
 
+## 6b. La forma de AnyPS5: hilo «committer» en tubería, ordenado por rangos de escritura
+
+Fuente: estudio de solo lectura de AnyPS5 `main b5cc94b1b2` (GPL-2.0-only; solo ideas, nada de código).
+- **`3b34d1fdb6`** pasa la grabación de draws a un hilo *committer* detrás del *packet worker* (`APS5_PIPELINED_DRAWS`, activo por defecto) y ordena por los rangos de memoria que escribe el guest.
+- **`4651980eba`** baja la captura de memoria de shaders por draw de 15 a 6,6 µs con:
+  - un memo por hilo en array sellado en vez de tabla hash;
+  - registros de plan compactos de 32 B;
+  - mapas de bits de 64 bits recorridos con `countr_zero`;
+  - un pool de páginas por hilo.
+
+  Con los dos commits, el interior del banco de GTA V pasa de 11,7 a ~20 FPS.
+- **`ccb6697109`** da slots libres por clave en el pool de búferes (4096 por nivel). Con un tope de 512, cada draw desalojaba y recreaba búferes.
+- **`a4fe5dc1c4`** añade un índice por gránulo de 64 KiB para encontrar al último escritor.
+
+**Cómo encaja con SharpEmu:**
+- **Packet worker → committer** es exactamente nuestro **frente → hilo de render** de `SHARPEMU_RENDER_PIPELINE=1`, en producción desde octubre.
+  - Su «orden por rangos de escritura» equivale a:
+    - nuestras validaciones al ejecutar: `FrontPreparationStillValid`, `FRONT_PREP_RANGES`, `TablesStillValid`;
+    - `PendingLabels` para las etiquetas;
+    - en el camino de upstream, `PendingWrites` y `ResolveReadLog`.
+  - **Ese primer paso estructural ya lo tenemos.** Su ganancia en el banco es del mismo tipo que la de nuestra tubería frente/fondo, que no se ha medido aislada en mundo abierto.
+- **En mundo abierto no basta:** el committer, que es nuestro render a 207 ms, es el cuello, no el intérprete. La siguiente subdivisión de la misma forma sería un **tercer hilo**: frente → **resolvedor** (ejecutor + búsquedas en caché, dueño de las cachés) → **grabador/committer** (descriptores, `vkCmd*`, envío). Es la «forma de tres etapas» de `paralelizacion-back.md` y el reparto de upstream (`CommandThread` resuelve, `RecordingHost` graba). Tope: max(resolución, grabación) en lugar de su suma. Con las cifras de §2, **[E]** ~105 ms de grabación frente a ~70 de resolución + serie, lo que da ~105 ms/fotograma. Sin trabajadores en paralelo sigue lejos de 33 ms: sirve de escalón, no de destino.
+- **Dónde lo pondría en el plan:**
+  - como **alternativa barata al paso 3**, si el paso 1 da corridas cortas (<8): con corridas cortas los slices no amortizan y un hilo único de grabación sí, porque no corta por lote;
+  - el traspaso sería el de `par6`, pero con **todo** el trabajo de grabación por draw viajando (~25–30 µs en mundo abierto), no solo los ~3 µs de emisión.
+
+  La sonda del paso 1 da la cifra: `draw_record_ms` es lo que se iría al committer.
+- **Lo portable sin cambio estructural va a la fase 1:**
+  - memo por hilo en array sellado y bitmaps con `countr_zero` (~2× en captura por draw según ellos; nuestro equivalente es `ResourceMaterialization`/`BufferAcquisitionChecks`);
+  - comprobar si el pool de búferes desaloja por tope (`ResourceDestroy` 173k/ventana en st37, ~5.600 por fotograma: **sospechoso de ser lo mismo que `ccb6697109`**);
+  - índice de último escritor por gránulo de 64 KiB para `HasPendingBetween`/`BufferDirtySynchronization`.
+
 ## 7. Plan incremental
 
 Cada paso va tras un `SHARPEMU_*` apagado por defecto, se mide por mecanismo (ms del hilo de render por fotograma, criterio de `sharpemu-criterio-ms`) y solo los paquetes de ≥3–5 ms se validan en FPS (6+6).
@@ -129,6 +161,7 @@ Cada paso va tras un `SHARPEMU_*` apagado por defecto, se mide por mecanismo (ms
 - **Coste:** un `Stopwatch` por ítem y la puerta evaluada una vez más por draw; no cambia el comportamiento. Sesgo: con la sonda encendida, los ms suben un poco por igual en todos los brazos.
 - **Seguir** si los ms aptos son ≥60 % de los ms de draw y ≥70 % de ellos caen en corridas ≥16.
 - **Abandonar la fase 2 en mundo abierto** (y volver a la fase 1) si los ms aptos son <40 %, o si <40 % de ellos caen en corridas ≥8.
+- **Si las corridas son cortas pero `draw_record_ms` es grande** (≥60 ms), probar antes el committer único de §6b que los slices.
 - **Límite conocido:** no ve los cortes del grabador (`Serial(...)` de `RecordingHost`) ni las lecturas GPU-modificadas que haría un trabajador de resolución. Es una cota superior; el paso 0 da la cifra real del grabador.
 
 ### Paso 2. El frente alimenta el `ResolvePool` (`SHARPEMU_FRONT_RESOLVE_POOL=1`; 3–5 días)

@@ -325,7 +325,9 @@ public static partial class AgcExports
                 }
                 else
                 {
+                    var probeStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
                     owner._recorder!.Record(record);
+                    if (probeStarted != 0) ParallelResolveProbe.AddRecordTicks(System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted); // [local]
                 }
             }
 
@@ -333,7 +335,9 @@ public static partial class AgcExports
             {
                 if (!owner.Producing)
                 {
+                    var probeStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
                     owner._recorder!.Record(record);
+                    if (probeStarted != 0) ParallelResolveProbe.AddRecordTicks(System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted); // [local]
                     return;
                 }
 
@@ -459,6 +463,7 @@ public static partial class AgcExports
             RecordKnownColorTargets(state, banks);
             state.FrameDrawCount++;
             state.SawIndexedDraw |= indexed;
+            if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDraw(ProbeDrawGate(banks)); // [local] SHARPEMU_PARRES_PROBE
             if (_resolvePool is { } pool && Producing && _executor.DrawHasTargets(banks) && DrawKnownNotToWrite(banks))
             {
                 var deferStarted = DcbParseProfile.Begin();
