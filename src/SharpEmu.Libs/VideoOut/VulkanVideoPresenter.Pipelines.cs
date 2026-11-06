@@ -1409,6 +1409,12 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             CommandReadCounts[3].Increment();
             Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            if (!_guestMemory.CanRead(address, sizeof(uint))) // [local] an unmapped word fails the read instead of reaching the page tracker's fatal range check (mb13)
+            {
+                word = 0;
+                return false;
+            }
+
             if (!HasPendingMemoryPublication(address, sizeof(uint)) && IsCleanReadPage(address, sizeof(uint)) && TryReadAliasBytes(address, bytes))
             {
                 CommandReadCounts[4].Increment();

@@ -654,6 +654,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             RenderPhaseProfile.RecordCleanRead(hit: false);
+            if (!_guestMemory.CanRead(address, size)) return false; // [local] an unmapped read fails instead of reaching the page tracker's fatal range check (mb13)
+
             var thread = _commandThread!;
             if (thread.TryReadShadow(address, destination, out var shadowSequence, out var shadowSource) &&
                 !NewerPendingWrite(address, size, shadowSequence) && !thread.HasPendingRangeAfter(address, size, shadowSequence))
