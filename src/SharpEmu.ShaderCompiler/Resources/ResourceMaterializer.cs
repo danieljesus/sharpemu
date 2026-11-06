@@ -72,6 +72,26 @@ public static partial class ResourceMaterializer
 
     public static Action<string> SpecializationFailed { get; set; } = message => Console.Error.WriteLine($"shader resource specialization failed: {message}");
 
+    // [local] Why the last materialization on this thread failed with Other when an image table could not be read; those
+    // returns are otherwise silent. Taking it clears it. A detail starting with "image table:" names a table that may
+    // be readable again on a later dispatch.
+    [ThreadStatic] private static string? _failureDetail;
+
+    public const string ImageTableDetailPrefix = "image table: ";
+
+    public static string? TakeFailureDetail()
+    {
+        var detail = _failureDetail;
+        _failureDetail = null;
+        return detail;
+    }
+
+    private static bool FailWith(string detail)
+    {
+        _failureDetail = ImageTableDetailPrefix + detail;
+        return false;
+    }
+
     private sealed class IndirectImageTable
     {
         public uint Resource;
@@ -420,6 +440,7 @@ public static partial class ResourceMaterializer
     {
         using var totalProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.Total);
         failure = ResourceMaterializationFailure.Other;
+        _failureDetail = null;
         _lastFastOutcome = MaterializationTally.Outcome.FastFallback;
         if (plan.RequiresSpecializationMemory && inputs.ReadCleanMemory is null)
         {
@@ -844,6 +865,7 @@ public static partial class ResourceMaterializer
     {
         using var snapshotProfile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.Snapshot);
         failure = ResourceMaterializationFailure.Other;
+        _failureDetail = null;
         snapshot = new MaterializedSnapshot();
         ranges = null;
         if (plan.RequiresSpecializationMemory && inputs.ReadCleanMemory is null)
@@ -903,7 +925,7 @@ public static partial class ResourceMaterializer
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, directCandidates.Select(candidate => candidate.Source).ToArray(),
                         cleanInputs, [], evaluateTable: false, out var descriptors, out _))
                     {
-                        return false;
+                        return FailWith($"direct candidates not evaluable image={imageIndex}");
                     }
                     var directTable = new IndirectImageTable { Resource = (uint)imageIndex };
                     for (var candidateIndex = 0; candidateIndex < descriptors.Count; candidateIndex++)
@@ -930,7 +952,7 @@ public static partial class ResourceMaterializer
                         out var waveSources, out _))
                         return false;
                     if (!MaterializeWaveIndexedImage(plan, indirect, waveIndexed, waveSources[0], image, image.R128, inputs, out var waveTable, out failure))
-                        return false;
+                        return failure == ResourceMaterializationFailure.Other ? FailWith($"wave-indexed table unreadable image={imageIndex}") : false;
                     snapshot.Images[imageIndex] = waveTable.Descriptors[(int)waveTable.Candidates[0]].Dwords;
                     if (waveTable.Descriptors.Count > 1)
                     {
@@ -945,7 +967,7 @@ public static partial class ResourceMaterializer
                         out var denseSources, out _))
                         return false;
                     if (!MaterializeDenseIndirectImage(plan, indirect, denseSources[0], image, image.R128, inputs, out var denseTable, out failure))
-                        return false;
+                        return failure == ResourceMaterializationFailure.Other ? FailWith($"dense table unreadable image={imageIndex}") : false;
                     snapshot.Images[imageIndex] = denseTable.Descriptors[(int)denseTable.Candidates[0]].Dwords;
                     if (denseTable.Descriptors.Count > 1)
                     {
@@ -955,13 +977,20 @@ public static partial class ResourceMaterializer
                     continue;
                 }
                 IndirectImageTable indirectTable;
-                if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.MaterialSource, indirect.HeapSource], cleanInputs, [], evaluateTable: false, out var tables, out _) ||
+                var tablesRead = RuntimeValueEvaluator.EvaluateSources(plan, [indirect.MaterialSource, indirect.HeapSource], cleanInputs, [], evaluateTable: false, out var tables, out _);
+                if (!tablesRead ||
                     !MaterializeIndirectImage(plan, indirect, tables[0], tables[1], image, inputs, captureSelectorDiagnostic, out indirectTable, out failure))
                 {
                     if (!indirect.SharedSelector)
                     {
+                        if (!tablesRead)
+                            FailWith($"material or heap descriptor not evaluable image={imageIndex}");
+                        else if (_failureDetail is { } detail)
+                            _failureDetail = $"{detail} image={imageIndex}";
                         return false;
                     }
+
+                    _failureDetail = null;
 
                     // The table is unreadable now: keep the null image this access read as before it had a table.
                     snapshot.Images[imageIndex] = new uint[8];
@@ -1441,13 +1470,13 @@ public static partial class ResourceMaterializer
         result = new IndirectImageTable();
         if (material.DwordCount != 4 || heap.DwordCount != 4)
         {
-            return false;
+            return FailWith($"descriptor dwords material={material.DwordCount} heap={heap.DwordCount}");
         }
 
         var materialStride = (material.Dwords[1] >> 16) & 0x3FFF;
         if (materialStride != indirect.SelectorStride)
         {
-            return false;
+            return FailWith($"material stride={materialStride} selector stride={indirect.SelectorStride}");
         }
 
         var period = 1ul << 32;
@@ -1473,7 +1502,7 @@ public static partial class ResourceMaterializer
         var records = (ulong)material.Dwords[2];
         if (provenOffsets is null && (indirect.SharedSelector ? records : probeCount) > MaxIndirectImageProbes)
         {
-            return false;
+            return FailWith($"probes={probeCount} records={records} size=0x{size:X} limit={MaxIndirectImageProbes}");
         }
 
         var keys = new List<uint> { 0 };
@@ -1488,7 +1517,7 @@ public static partial class ResourceMaterializer
         {
             if (!ReadScalarBufferWord(material.Dwords, (uint)offset, indirect.MaterialImmediate, inputs, out var key))
             {
-                return false;
+                return FailWith($"material word unreadable offset=0x{offset:X}");
             }
 
             if (seen.Add(key))
@@ -1508,7 +1537,7 @@ public static partial class ResourceMaterializer
             {
                 if (!ReadScalarBufferWord(heap.Dwords, heapOffset, dword * sizeof(uint), inputs, out candidate[dword]))
                 {
-                    return false;
+                    return FailWith($"heap word unreadable key=0x{key:X} dword={dword}");
                 }
             }
 

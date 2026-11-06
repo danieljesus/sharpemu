@@ -613,6 +613,22 @@ internal sealed class ShaderProgramCache
 
     private sealed class ShaderProgramRejectedException(string message) : Exception(message);
 
+    // [local] SHARPEMU_UNREADABLE_IMAGE_TABLE_REJECT (=1 by default, =0 fatal as before): a program whose image table cannot be
+    // read or enumerated for this dispatch is rejected like one with incompatible candidates, so the dispatch is skipped
+    // and the next one tries again. GTA V's 0xD44E (reflection hit shading) failed this way, fatally, with reason=Other
+    // right after the player got into the car outside the prologue bank.
+    private static readonly bool UnreadableImageTableRejects =
+        Environment.GetEnvironmentVariable("SHARPEMU_UNREADABLE_IMAGE_TABLE_REJECT") != "0";
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, long> UnreadableImageTables = new();
+
+    private static void NoteUnreadableImageTable(ulong hash, string message)
+    {
+        var count = UnreadableImageTables.AddOrUpdate(hash, 1, static (_, value) => value + 1);
+        if ((count & (count - 1)) == 0)
+            Console.Error.WriteLine($"[GPU][WARN][UNREADABLE_IMAGE_TABLE] count={count} {message}");
+    }
+
     private sealed class ShaderProgramPendingException() : Exception("The linked program is still being prepared.");
 
     [ThreadStatic]
@@ -818,9 +834,16 @@ internal sealed class ShaderProgramCache
                     System.Diagnostics.Stopwatch.GetTimestamp() - frontStarted);
             if (!materialized)
             {
-                var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}.";
+                var detail = ResourceMaterializer.TakeFailureDetail(); // [local]
+                var message = $"The shader resources could not be materialized: stage={source.Label} hash=0x{source.Hash:X16} shader=0x{source.Address:X16} reason={materializationFailure}" +
+                    (detail is null ? "." : $" detail=[{detail}].");
                 if (materializationFailure is ResourceMaterializationFailure.IncompatibleImageCandidates or ResourceMaterializationFailure.ImageCapacityExceeded)
                     throw new ShaderProgramRejectedException(message);
+                if (UnreadableImageTableRejects && detail?.StartsWith(ResourceMaterializer.ImageTableDetailPrefix, StringComparison.Ordinal) == true) // [local]
+                {
+                    NoteUnreadableImageTable(source.Hash, message);
+                    throw new ShaderProgramRejectedException(message);
+                }
                 throw SubmissionScheduler.Fatal(message);
             }
         }

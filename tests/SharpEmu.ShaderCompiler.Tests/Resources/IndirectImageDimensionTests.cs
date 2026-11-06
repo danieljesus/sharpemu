@@ -351,4 +351,34 @@ public sealed class IndirectImageDimensionTests
             ResourceMaterializer.IndirectImageMsaaMode = previous;
         }
     }
+
+    // [local] An image table that cannot be read still fails the materialization with Other, and now says which word,
+    // so the program cache can reject the dispatch instead of failing (SHARPEMU_UNREADABLE_IMAGE_TABLE_REJECT).
+    [Fact]
+    public void AnUnreadableImageTableNamesTheWordItCouldNotRead()
+    {
+        var plan = Extract(SpirvBindingDeclarationTests.IndirectImageAfterPlainImageProgram(indirectDimension: 1));
+        var (userData, memory) = SpirvBindingDeclarationTests.IndirectImageAfterPlainImageInputs(64, false);
+        bool Read(ulong address, out uint word)
+        {
+            word = 0;
+            return address is not (>= 0x2020 and < 0x2040) && memory.Read(address, out word);
+        }
+
+        WithMode(1, () =>
+        {
+            var snapshot = new ResourceSnapshot();
+            var specialization = new ResourceSpecialization();
+            Assert.False(ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: Read),
+                ref snapshot, ref specialization, out var failure));
+            Assert.Equal(ResourceMaterializationFailure.Other, failure);
+            Assert.StartsWith(ResourceMaterializer.ImageTableDetailPrefix + "heap word unreadable", ResourceMaterializer.TakeFailureDetail());
+            Assert.Null(ResourceMaterializer.TakeFailureDetail());
+
+            Assert.True(ResourceMaterializer.Materialize(plan, Inputs(userData, readCleanMemory: memory.Read),
+                ref snapshot, ref specialization, out _));
+            Assert.Null(ResourceMaterializer.TakeFailureDetail());
+            return 0;
+        });
+    }
 }
