@@ -58,7 +58,8 @@ public sealed partial class RenderExecutor
         return string.Create(CultureInfo.InvariantCulture,
             $"[PERF][TARGET_MEMO] mode={TargetMemoMode} hits={Interlocked.Exchange(ref _memoHits, 0)} misses={Interlocked.Exchange(ref _memoMisses, 0)} " +
             $"dcc_excluded={Interlocked.Exchange(ref _memoDcc, 0)} dcc_reused={Interlocked.Exchange(ref _memoDccReused, 0)} mismatches={Interlocked.Exchange(ref _memoMismatches, 0)} " +
-            $"stamp_changes={Interlocked.Exchange(ref _memoStampChanges, 0)} layout_resolves={Interlocked.Exchange(ref _layoutResolves, 0)}");
+            $"stamp_changes={Interlocked.Exchange(ref _memoStampChanges, 0)} layout_resolves={Interlocked.Exchange(ref _layoutResolves, 0)} " +
+            $"layout_verified={Interlocked.Exchange(ref _layoutVerified, 0)} layout_mismatches={Interlocked.Exchange(ref _layoutMismatches, 0)}"); // [local] SHARPEMU_TARGET_LAYOUT_VERIFY
     }
 
     // Drops every remembered target when the stamp moved since they were taken.

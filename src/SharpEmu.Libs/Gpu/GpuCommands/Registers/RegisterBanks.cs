@@ -121,6 +121,96 @@ public sealed class RegisterBanks
         return "[PERF][STAMP_PROBE] writes/unchanged " + string.Join(" ", parts);
     }
 
+    // [local] SHARPEMU_STAMP_ON_CHANGE (0 by default, =1 on): a context or shader register write whose raw dwords all
+    // repeat the bank's current values does not move the stamps (GTA V repeats 72-95 % of its context writes and 30 %
+    // of its program writes, [PERF][STAMP_PROBE] dc07), so the memos keyed by stamps (target layout, pipeline key,
+    // dynamic state, in-place draws) keep their answers across draws that only rewrite the same registers. The typed
+    // state after such a write is what it was before it: the writers decode the dwords they are given into their own
+    // fields, except for the registers listed in HasWriteSideEffects (the depth writes that clear the composite extent
+    // and the user data, whose marker the write consumes), which always move their stamp. The raw shadows are forgotten
+    // whenever the typed state changes by another route (Reset, the context state operations, CopyFrom), after which
+    // every register's next write moves its stamp. A clone or a snapshot starts without shadows. Off by default: in
+    // GTA V 39 % of the stamped writes stop moving their stamp (dc17), but the program registers change in 70 % of
+    // their writes, so the layout memo resolves 5 % less (55.7k vs 58.9k per window) and no phase moves >= 0.1 ms.
+    internal static readonly bool StampOnChange = Environment.GetEnvironmentVariable("SHARPEMU_STAMP_ON_CHANGE") == "1";
+    private uint[]? _rawContext, _rawShader;
+    private bool[]? _rawContextKnown, _rawShaderKnown;
+    private static long _stampWrites, _stampSkipped;
+
+    private static bool HasContextWriteSideEffects(uint register) => register is ContextRegisterOffset.DbZInfo or ContextRegisterOffset.DbDepthSizeXy;
+
+    private static bool HasShaderWriteSideEffects(uint register) =>
+        RegisterStamps.ShaderStampOf(register) is RegisterStamp.VertexUserData or RegisterStamp.PixelUserData or RegisterStamp.ComputeUserData;
+
+    // The stamp bits a context write of these dwords at offset moves: those of the registers whose value changed, or
+    // that carry side effects, or that have no shadow yet.
+    internal uint ContextBitsChanged(uint offset, ReadOnlySpan<uint> values)
+    {
+        var raw = _rawContext ??= new uint[RegisterBankLayout.ContextRegisterCount];
+        var known = _rawContextKnown ??= new bool[RegisterBankLayout.ContextRegisterCount];
+        var bits = 0u;
+        for (var index = 0u; index < values.Length; index++)
+        {
+            var register = offset + index;
+            var value = values[(int)index];
+            _stampWrites++;
+            if (register >= raw.Length || HasContextWriteSideEffects(register) || !known[register] || raw[register] != value)
+            {
+                bits |= 1u << (int)RegisterStamps.ContextStampOf(register);
+            }
+            else
+            {
+                _stampSkipped++;
+            }
+
+            if (register < raw.Length)
+            {
+                raw[register] = value;
+                known[register] = true;
+            }
+        }
+
+        return bits;
+    }
+
+    internal uint ShaderBitsChanged(uint offset, ReadOnlySpan<uint> values)
+    {
+        var raw = _rawShader ??= new uint[RegisterBankLayout.ShaderRegisterCount];
+        var known = _rawShaderKnown ??= new bool[RegisterBankLayout.ShaderRegisterCount];
+        var bits = 0u;
+        for (var index = 0u; index < values.Length; index++)
+        {
+            var register = offset + index;
+            var value = values[(int)index];
+            _stampWrites++;
+            if (register >= raw.Length || HasShaderWriteSideEffects(register) || !known[register] || raw[register] != value)
+            {
+                bits |= 1u << (int)RegisterStamps.ShaderStampOf(register);
+            }
+            else
+            {
+                _stampSkipped++;
+            }
+
+            if (register < raw.Length)
+            {
+                raw[register] = value;
+                known[register] = true;
+            }
+        }
+
+        return bits;
+    }
+
+    private void ForgetRaw()
+    {
+        if (_rawContextKnown is { } context) Array.Clear(context);
+        if (_rawShaderKnown is { } shader) Array.Clear(shader);
+    }
+
+    internal static string? TakeStampOnChangeReport() =>
+        StampOnChange ? FormattableString.Invariant($"[PERF][STAMP_ON_CHANGE] writes={Interlocked.Exchange(ref _stampWrites, 0)} unmoved={Interlocked.Exchange(ref _stampSkipped, 0)}") : null;
+
     public void MarkWritten(uint stampBits)
     {
         while (stampBits != 0)
@@ -144,7 +234,22 @@ public sealed class RegisterBanks
     }
 
     // A depth extent carried by a composite binding packet; a direct write clears it.
-    public uint? CompositeDepthSizeXy { get; set; }
+    // [local] SHARPEMU_STAMP_ON_CHANGE: the extent is draw state the depth registers do not carry, so a change of it
+    // moves the DepthTargets stamp itself (the register write that used to carry the bump may now repeat its value).
+    private uint? _compositeDepthSizeXy;
+
+    public uint? CompositeDepthSizeXy
+    {
+        get => _compositeDepthSizeXy;
+        set
+        {
+            if (_compositeDepthSizeXy != value)
+            {
+                _compositeDepthSizeXy = value;
+                MarkWritten(1u << (int)RegisterStamp.DepthTargets);
+            }
+        }
+    }
 
     public UserScalarKind UserDataMarker { get; set; }
 
@@ -174,6 +279,7 @@ public sealed class RegisterBanks
         UserDataMarker = source.UserDataMarker;
         IndexTypeAndSize = source.IndexTypeAndSize;
         _stamps = source._stamps;
+        ForgetRaw(); // [local] SHARPEMU_STAMP_ON_CHANGE: the typed state came from elsewhere
     }
 
     // The parts a snapshot shares with these banks; each is copied before its next write here.
@@ -506,6 +612,7 @@ public sealed class RegisterBanks
         UserDataMarker = UserScalarKind.Unknown;
         IndexTypeAndSize = 0;
         if (StampProbe) ProbeForget(); // [local]
+        ForgetRaw(); // [local] SHARPEMU_STAMP_ON_CHANGE
         MarkWritten(RegisterStamps.AllBits);
     }
 
@@ -542,6 +649,7 @@ public sealed class RegisterBanks
         }
 
         if (StampProbe) ProbeForget(); // [local]
+        ForgetRaw(); // [local] SHARPEMU_STAMP_ON_CHANGE
         MarkWritten(RegisterStamps.ContextBits);
         if (Rendering.RenderTrace.Enabled)
         {

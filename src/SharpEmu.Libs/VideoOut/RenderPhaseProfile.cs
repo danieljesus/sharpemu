@@ -848,6 +848,7 @@ internal static class RenderPhaseProfile
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeLookupReport());
         if (Gpu.Rendering.RenderExecutor.TakeTargetMemoReport() is { } targetMemo) Console.Error.WriteLine(targetMemo); // [local]
         if (Gpu.GpuCommands.Registers.RegisterBanks.TakeStampProbeReport() is { } stampProbe) Console.Error.WriteLine(stampProbe); // [local] SHARPEMU_STAMP_PROBE
+        if (Gpu.GpuCommands.Registers.RegisterBanks.TakeStampOnChangeReport() is { } stampOnChange) Console.Error.WriteLine(stampOnChange); // [local] SHARPEMU_STAMP_ON_CHANGE
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeDccClearReport()); // [local]
         Console.Error.WriteLine(SharpEmu.Libs.Gpu.Buffers.GuestBufferCache.TakeObtainReport()); // [local]
         if (VulkanVideoPresenter.TakeNativeStateReport() is { } nativeState) Console.Error.WriteLine(nativeState); // [local]

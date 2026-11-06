@@ -97,6 +97,12 @@ public sealed partial class RenderExecutor
         return layout.ColorCount != 0 || layout.Depth is not null;
     }
 
+    // [local] SHARPEMU_TARGET_LAYOUT_VERIFY=1: every reuse of the layout memo is checked against a fresh resolution
+    // (counts in [PERF][TARGET_MEMO] layout_verified/layout_mismatches); the verification of SHARPEMU_STAMP_ON_CHANGE.
+    internal static readonly bool TargetLayoutVerify = Environment.GetEnvironmentVariable("SHARPEMU_TARGET_LAYOUT_VERIFY") == "1";
+    private DrawResolution? _layoutCheck;
+    internal static long _layoutVerified, _layoutMismatches;
+
     private DrawResolution ResolveTargetLayout(RegisterBanks banks)
     {
         var resolution = _drawResolution;
@@ -104,9 +110,55 @@ public sealed partial class RenderExecutor
         var programsStamp = banks.Stamp(RegisterStamp.ShaderPrograms);
         if (resolution.TargetContextStamp == contextStamp && resolution.TargetProgramsStamp == programsStamp)
         {
+            if (TargetLayoutVerify)
+            {
+                VerifyTargetLayout(banks, resolution);
+            }
+
             return resolution;
         }
 
+        ResolveTargetLayoutInto(banks, resolution);
+        resolution.TargetContextStamp = contextStamp;
+        resolution.TargetProgramsStamp = programsStamp;
+        resolution.TargetVersion = (uint)Interlocked.Increment(ref _targetVersions);
+        Interlocked.Increment(ref _layoutResolves); // [local]
+        return resolution;
+    }
+
+    private void VerifyTargetLayout(RegisterBanks banks, DrawResolution kept)
+    {
+        var fresh = _layoutCheck ??= new DrawResolution();
+        ResolveTargetLayoutInto(banks, fresh);
+        _layoutVerified++;
+        var same = fresh.ColorCount == kept.ColorCount && fresh.PixelActive == kept.PixelActive &&
+            fresh.ColorSlots.AsSpan(0, fresh.ColorCount).SequenceEqual(kept.ColorSlots.AsSpan(0, kept.ColorCount)) &&
+            (fresh.Depth is null) == (kept.Depth is null);
+        if (same && !System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<ColorTargetResolution>())
+        {
+            same = System.Runtime.InteropServices.MemoryMarshal.AsBytes(fresh.Colors.AsSpan(0, fresh.ColorCount))
+                .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.AsBytes(kept.Colors.AsSpan(0, kept.ColorCount)));
+        }
+
+        if (same && fresh.Depth is { } freshDepth && kept.Depth is { } keptDepth &&
+            !System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<DepthTargetState>())
+        {
+            same = System.Runtime.InteropServices.MemoryMarshal.AsBytes(new ReadOnlySpan<DepthTargetState>(in freshDepth))
+                .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.AsBytes(new ReadOnlySpan<DepthTargetState>(in keptDepth)));
+        }
+
+        if (!same)
+        {
+            _layoutMismatches++;
+            if (_layoutMismatches <= 20)
+            {
+                Console.Error.WriteLine($"[TARGET_LAYOUT_MISMATCH] total={_layoutMismatches} colors={kept.ColorCount}/{fresh.ColorCount} depth={kept.Depth is not null}/{fresh.Depth is not null} pixel={kept.PixelActive}/{fresh.PixelActive}");
+            }
+        }
+    }
+
+    private void ResolveTargetLayoutInto(RegisterBanks banks, DrawResolution resolution)
+    {
         var context = banks.Context;
         resolution.ColorCount = 0;
         for (var slot = 0u; slot < ContextRegisters.ColorTargetCount; slot++)
@@ -127,11 +179,6 @@ public sealed partial class RenderExecutor
 
         resolution.Depth = DepthTargetResolver.Resolve(context, _host.FormatSupport, _fatal);
         resolution.PixelActive = HasActivePixelShader(banks);
-        resolution.TargetContextStamp = contextStamp;
-        resolution.TargetProgramsStamp = programsStamp;
-        resolution.TargetVersion = (uint)Interlocked.Increment(ref _targetVersions);
-        Interlocked.Increment(ref _layoutResolves); // [local]
-        return resolution;
     }
 
     private bool VertexStageWritesMemory(RegisterBanks banks, ref DrawState state)

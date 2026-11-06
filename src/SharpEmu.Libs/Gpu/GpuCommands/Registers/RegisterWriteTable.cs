@@ -31,7 +31,9 @@ public static class RegisterWriteTable
         banks.PrepareContextWrite();
         if (RegisterBanks.StampProbe) banks.ProbeContextWrite(offset, values); // [local]
         var consumed = WritePacket(banks, in packet, offset, values, Context, ContextIndirect, "context", emptyIsHandled: true);
-        banks.MarkWritten(RegisterStamps.ContextBitsFor(offset, consumed));
+        banks.MarkWritten(RegisterBanks.StampOnChange && consumed <= (uint)values.Length // [local] SHARPEMU_STAMP_ON_CHANGE
+            ? banks.ContextBitsChanged(offset, values[..(int)consumed])
+            : RegisterStamps.ContextBitsFor(offset, consumed));
         if (Rendering.RenderTrace.Enabled)
         {
             for (var index = 0; index < values.Length && index < consumed; index++)
@@ -49,7 +51,9 @@ public static class RegisterWriteTable
         banks.PrepareShaderWrite(offset, (uint)values.Length);
         if (RegisterBanks.StampProbe) banks.ProbeShaderWrite(offset, values); // [local]
         var consumed = WritePacket(banks, in packet, offset, values, Shader, ShaderIndirect, "shader", emptyIsHandled: false);
-        banks.MarkWritten(RegisterStamps.ShaderBitsFor(offset, consumed));
+        banks.MarkWritten(RegisterBanks.StampOnChange && consumed <= (uint)values.Length // [local] SHARPEMU_STAMP_ON_CHANGE
+            ? banks.ShaderBitsChanged(offset, values[..(int)consumed])
+            : RegisterStamps.ShaderBitsFor(offset, consumed));
         if (Rendering.RenderTrace.Enabled)
         {
             for (var index = 0; index < values.Length && index < consumed; index++)
@@ -80,7 +84,7 @@ public static class RegisterWriteTable
             WriteEntry(banks, offset, value, ContextIndirect, "context", tableAddress);
         }
 
-        banks.MarkWritten(RegisterStamps.ContextBitsFor(offset, 1));
+        banks.MarkWritten(RegisterBanks.StampOnChange ? banks.ContextBitsChanged(offset, [value]) : RegisterStamps.ContextBitsFor(offset, 1)); // [local] SHARPEMU_STAMP_ON_CHANGE
         if (Rendering.RenderTrace.Enabled)
         {
             TraceDepthStateWrite(offset, value, tableAddress, "table");
@@ -105,7 +109,7 @@ public static class RegisterWriteTable
         banks.PrepareShaderWrite(offset, 1);
         if (RegisterBanks.StampProbe) banks.ProbeShaderWrite(offset, [value]); // [local]
         WriteEntry(banks, offset, value, ShaderIndirect, "shader", tableAddress);
-        banks.MarkWritten(RegisterStamps.ShaderBitsFor(offset, 1));
+        banks.MarkWritten(RegisterBanks.StampOnChange ? banks.ShaderBitsChanged(offset, [value]) : RegisterStamps.ShaderBitsFor(offset, 1)); // [local] SHARPEMU_STAMP_ON_CHANGE
         if (Rendering.RenderTrace.Enabled)
             TracePixelRegisterWrite(banks, offset, value, tableAddress, "table");
     }

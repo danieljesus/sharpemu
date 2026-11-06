@@ -56,7 +56,9 @@ internal static unsafe partial class VulkanVideoPresenter
     // the buffer lookup ran again for bindings the previous frame had resolved. A table keyed by the descriptor
     // (program, slot, address, footprint) keeps those answers; a table hit is checked exactly as a slot hit is (same
     // guest spans and mapping generation, then the region stamp before the buffer is reused). =2 looks the buffer up
-    // again on every table hit and counts the answers that differ.
+    // again on every table hit and counts the answers that differ. Off by default: in GTA V most of those descriptors
+    // point into per-frame rings, so the keys do not repeat (dc06: 14 % table hits, the table filled and cleared six
+    // times per report window) and BindingMemoBuffers cost 0.55 ms/frame more than without it.
     // [local] SHARPEMU_STAGE_MEMO (1 by default, 0 off): upstream's memo of a stage's prepared textures, samplers and
     // buffer sources by content (TryFindStagePreparation/ReuseStagePreparation). Off, every stage resolves its bindings
     // as 3368666f did (the image-binding memo and the buffer-source memos still apply).
@@ -67,7 +69,7 @@ internal static unsafe partial class VulkanVideoPresenter
     internal static readonly bool StageMemoTouch = Environment.GetEnvironmentVariable("SHARPEMU_STAGE_MEMO_TOUCH") != "0";
 
     internal static readonly int BufferSourceMemoMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BUFFER_SOURCE_MEMO"), out var sourceMemo) && sourceMemo is >= 0 and <= 2 ? sourceMemo : 1;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BUFFER_SOURCE_MEMO"), out var sourceMemo) && sourceMemo is >= 0 and <= 2 ? sourceMemo : 0;
     private const int BufferSourceTableCapacity = 1 << 16;
     private static long _bufferSourceTableHits, _bufferSourceTableMisses, _bufferSourceTableVerified, _bufferSourceTableMismatches, _bufferSourceTableClears;
 
