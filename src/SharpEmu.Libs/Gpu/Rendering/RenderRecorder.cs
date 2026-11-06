@@ -553,7 +553,15 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         Span<IPreparedBindings> stages = pixelBindings is null ? [vertexBindings] : [vertexBindings, pixelBindings];
         if (RenderExecutor.PrepareStageImagesEnabled) // [local] SHARPEMU_PREPARE_STAGE_IMAGES
             _host.PrepareStageImages(PipelineBindPoint.Graphics, stages);
-        var pipeline = ResolvePipeline(record, ref state, vertexInput, state.PixelActive ? pixelInput : null);
+        if (!TryResolvePipeline(record, ref state, vertexInput, state.PixelActive ? pixelInput : null, out var pipeline))
+        {
+            // [local] SHARPEMU_ASYNC_GRAPHICS_PIPELINES: left out while its pipeline compiles. Its attachments were
+            // acquired but no rendering began, so the next draw acquires its own.
+            _inPlace.Valid = false;
+            IndexedDrawTrace.Write(record.IndexedTrace, "pipeline-compiling", submitId, record.PacketAddress);
+            return;
+        }
+
         if (record.SetBindDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x100);
@@ -970,7 +978,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         return rendering;
     }
 
-    private PipelineHandle ResolvePipeline(ResolvedDraw record, ref DrawState state, VertexInputInfo vertexInput, PixelInputInfo? pixelInput)
+    private bool TryResolvePipeline(ResolvedDraw record, ref DrawState state, VertexInputInfo vertexInput, PixelInputInfo? pixelInput,
+        out PipelineHandle pipeline) // [local] false: SHARPEMU_ASYNC_GRAPHICS_PIPELINES left the draw out
     {
         var boundSlots = 0u;
         for (var index = 0; index < state.ColorCount; index++)
@@ -996,26 +1005,143 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         var kept = _pipeline;
         if (kept.Valid && kept.Key == key && kept.Rendering.Equals(state.Rendering))
         {
-            return kept.Handle;
+            pipeline = kept.Handle;
+            return true;
         }
 
-        var pipeline = _pipelines.CreateGraphicsPipeline(
-            DrawState.BoundColors(ref state),
-            in state.Depth,
-            vertexInput,
-            pixelInput,
-            record.Context,
-            in state.Rendering,
-            record.Topology,
-            record.PrimitiveRestart,
-            state.Programs.DisableBlending,
-            state.Programs.Vertex,
-            state.Programs.Pixel);
+        if (AsyncGraphicsPipelines == 0) // [local]
+        {
+            pipeline = _pipelines.CreateGraphicsPipeline(
+                DrawState.BoundColors(ref state),
+                in state.Depth,
+                vertexInput,
+                pixelInput,
+                record.Context,
+                in state.Rendering,
+                record.Topology,
+                record.PrimitiveRestart,
+                state.Programs.DisableBlending,
+                state.Programs.Vertex,
+                state.Programs.Pixel);
+        }
+        else if (!TryCreateGraphicsPipelineAsync(record, ref state, vertexInput, pixelInput, out pipeline))
+        {
+            return false;
+        }
+
         kept.Key = key;
         kept.Rendering = state.Rendering;
         kept.Handle = pipeline;
         kept.Valid = true;
-        return pipeline;
+        return true;
+    }
+
+    // [local] SHARPEMU_ASYNC_GRAPHICS_PIPELINES=1 compiles a new graphics pipeline on a worker and leaves out the draws
+    // that need it until it is ready, as Ryujinx and yuzu do, instead of holding the render thread for the driver
+    // compile (250-1500 ms each in GTA V outside its prewarmed scenes). DB_COUNT_CONTROL's reset value already counts
+    // occlusion samples, so =1 waits for nearly every draw of a game that leaves it so; =2 also leaves out draws that
+    // count samples, whose visibility results then miss them while the pipeline compiles. Off (0) by default until measured.
+    internal static readonly int AsyncGraphicsPipelinesMode =
+        Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_GRAPHICS_PIPELINES") switch { "1" => 1, "2" => 2, _ => 0 };
+
+    // [local] A test sets the mode for its own flow.
+    internal static readonly AsyncLocal<int?> AsyncGraphicsPipelinesOverride = new();
+
+    private static int AsyncGraphicsPipelines => AsyncGraphicsPipelinesOverride.Value ?? AsyncGraphicsPipelinesMode;
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(ulong Vertex, ulong Pixel), long> AsyncGraphicsSkips = new();
+
+    // [local] A draw that may be left out waits for nothing; any other waits for the compile as before.
+    private bool TryCreateGraphicsPipelineAsync(ResolvedDraw record, ref DrawState state, VertexInputInfo vertexInput,
+        PixelInputInfo? pixelInput, out PipelineHandle pipeline)
+    {
+        var skippable = MaySkipWhileCompiling(record, vertexInput, pixelInput, state.Programs.MeshInput is not null,
+            occlusionSkippable: AsyncGraphicsPipelines == 2);
+        long waitStarted = 0;
+        while (!_pipelines.TryCreateGraphicsPipeline(
+                   DrawState.BoundColors(ref state),
+                   in state.Depth,
+                   vertexInput,
+                   pixelInput,
+                   record.Context,
+                   in state.Rendering,
+                   record.Topology,
+                   record.PrimitiveRestart,
+                   state.Programs.DisableBlending,
+                   state.Programs.Vertex,
+                   state.Programs.Pixel,
+                   out pipeline,
+                   out var completion))
+        {
+            if (skippable)
+            {
+                var vertexHash = vertexInput.Stage.Program?.Hash ?? 0;
+                var pixelHash = pixelInput?.Stage.Program?.Hash ?? 0;
+                var skipped = AsyncGraphicsSkips.AddOrUpdate((vertexHash, pixelHash), 1, static (_, count) => count + 1);
+                if ((skipped & (skipped - 1)) == 0)
+                    Console.Error.WriteLine($"[GPU][WARN][ASYNC_GRAPHICS] Draws are skipped while their pipeline compiles: vs=0x{vertexHash:X16} ps=0x{pixelHash:X16} skipped={skipped}.");
+                return false;
+            }
+
+            if (waitStarted == 0)
+                waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (completion is not null)
+            {
+                completion.GetAwaiter().GetResult();
+            }
+            else
+            {
+                Thread.Yield();
+            }
+        }
+
+        if (waitStarted != 0 && Pipelines.CompileLog.Timed)
+            Pipelines.CompileLog.Note("draw-wait", System.Diagnostics.Stopwatch.GetElapsedTime(waitStarted).TotalMilliseconds,
+                vertexInput.Stage.Program?.Hash ?? 0);
+        return true;
+    }
+
+    // [local] Only a draw whose effects stay in its colour, depth and stencil attachments may be left out: no stage
+    // stores to memory (buffers, storage images, device addresses, GDS, linked calls), it is no mesh or tessellation draw
+    // and it counts no occlusion samples the game reads back (unless occlusionSkippable).
+    internal static bool MaySkipWhileCompiling(ResolvedDraw record, VertexInputInfo vertexInput, PixelInputInfo? pixelInput, bool mesh,
+        bool occlusionSkippable = false)
+    {
+        const uint incrementDisabled = 1u;
+        const uint counterZeroEnabled = 1u << 8;
+        if (record.Kind != ResolvedDrawKind.Draw || record.WritesMemory || record.WriteStages != PipelineStageFlags.None ||
+            mesh || vertexInput.Tessellation is not null ||
+            (!occlusionSkippable && (record.Dynamic.DepthCountControl & (incrementDisabled | counterZeroEnabled)) == counterZeroEnabled))
+        {
+            return false;
+        }
+
+        return vertexInput.Stage.Program is { } vertex && !MayWriteMemory(vertex) &&
+            (pixelInput is null || (pixelInput.Stage.Program is { } pixel && !MayWriteMemory(pixel)));
+    }
+
+    // [local] From the program alone, whatever the draw's descriptors point at.
+    private static bool MayWriteMemory(ShaderProgramInfo program)
+    {
+        if (program.UsesDeviceAddresses || program.StoresUniformValues || program.ConstantStoreValue is not null ||
+            program.ConstantFill is not null || program.BoundedFill is not null || program.BoundedCopy is not null ||
+            program.Bindings is { CallTargetCount: not 0 } ||
+            program.Bindings?.Find(ShaderCompiler.Resources.DescriptorBindingKind.GlobalDataShare) is not null)
+        {
+            return true;
+        }
+
+        foreach (var buffer in program.Buffers)
+        {
+            if (buffer.Written || buffer.Atomic) return true;
+        }
+
+        foreach (var image in program.Images)
+        {
+            if (image.Written) return true;
+        }
+
+        return false;
     }
 
     private void EmitDraw(GuestPrimitiveType primitiveType, VertexInputInfo vertexInput, in DrawCall draw, in DrawEmission emission)

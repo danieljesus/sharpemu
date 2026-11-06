@@ -1509,6 +1509,75 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         }
     }
 
+    // [local] SHARPEMU_ASYNC_GRAPHICS_PIPELINES: CreateGraphicsPipeline without waiting for the host compiler; false while
+    // the host compiles it, with the compile as the completion. The compile runs outside the pipeline gate.
+    public bool TryCreateGraphicsPipeline(
+        ReadOnlySpan<ColorTargetState> colors,
+        in DepthAttachmentState depth,
+        VertexInputInfo vertexInput,
+        PixelInputInfo? pixelInput,
+        ContextRegisters context,
+        in RenderingState rendering,
+        PrimitiveTopology topology,
+        bool primitiveRestartEnabled,
+        bool disableBlending,
+        ShaderProgram vertexProgram,
+        ShaderProgram pixelProgram,
+        out PipelineHandle handle,
+        out Task? completion)
+    {
+        using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PipelineCreation);
+        completion = null;
+        var lookup = _graphicsLookup ??= new GraphicsPipelineKey
+        {
+            Rendering = new PipelineRenderingState(),
+            VertexInput = new PipelineVertexInputState(),
+            StaticParameters = new PipelineStaticParameters(),
+        };
+        lookup.Rendering.Reset();
+        lookup.VertexInput.Reset();
+        lookup.StaticParameters.Reset();
+        FillGraphicsState(colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending,
+            vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts, lookup.Rendering, lookup.StaticParameters, lookup.VertexInput);
+        lookup.VertexProgramId = vertexProgram.Id;
+        lookup.PixelProgramId = pixelInput is not null ? pixelProgram.Id : 0;
+        lookup.Tessellation = vertexInput.Tessellation;
+        if (_graphicsPipelines.TryGetValue(lookup, out handle))
+        {
+            return true;
+        }
+
+        var description = BuildGraphicsDescription(
+            colors, in depth, vertexInput, pixelInput, context, in rendering, topology, primitiveRestartEnabled, disableBlending,
+            vertexProgram, pixelProgram, _host.NoAttachmentSampleCounts);
+        var key = KeyOf(description);
+        profileScope.SwitchPhase(RenderPhaseProfile.Phase.PipelineSharedGateWait);
+        lock (_pipelineGate)
+        {
+            profileScope.SwitchPhase(RenderPhaseProfile.Phase.PipelineCreation);
+            if (_graphicsPipelines.TryGetValue(key, out handle))
+            {
+                return true;
+            }
+
+            if (!_host.TryCreateGraphicsPipeline(description, out handle, out completion))
+            {
+                return false;
+            }
+
+            Diagnostics.FrameMissProbe.CountOnRender(Diagnostics.FrameMissProbe.Counter.PipelineCreates);
+            _graphicsPipelines.TryAdd(key, handle);
+            if (_host.ShaderPrewarm is { } prewarm && description.Tessellation is null &&
+                description.VertexStage.Stage == ShaderStageKind.Vertex)
+            {
+                prewarm.RecordGraphics(description);
+            }
+
+            ShaderCacheCounters.CountGraphicsPipeline();
+            return true;
+        }
+    }
+
     [ThreadStatic]
     private static GraphicsPipelineKey? _graphicsLookup;
 

@@ -174,6 +174,15 @@ internal interface IShaderPipelineHost
 
     PipelineHandle CreateGraphicsPipeline(GraphicsPipelineDescription description);
 
+    // [local] SHARPEMU_ASYNC_GRAPHICS_PIPELINES: false while the host compiles the pipeline, with the compile as the
+    // completion; asking again hands it over once done, without starting a second compile.
+    bool TryCreateGraphicsPipeline(GraphicsPipelineDescription description, out PipelineHandle handle, out Task? completion)
+    {
+        handle = CreateGraphicsPipeline(description);
+        completion = null;
+        return true;
+    }
+
     PipelineHandle CreateComputePipeline(ComputePipelineDescription description);
 
     Task? GetComputePipelineCompletion(ShaderProgram program) => null;

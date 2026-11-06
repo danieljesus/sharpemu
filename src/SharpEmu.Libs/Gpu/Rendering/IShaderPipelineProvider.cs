@@ -174,6 +174,29 @@ public interface IShaderPipelineProvider
         ShaderProgram vertexProgram,
         ShaderProgram pixelProgram);
 
+    // [local] SHARPEMU_ASYNC_GRAPHICS_PIPELINES: false while the host compiles the pipeline, with the compile as the
+    // completion; asking again returns it once the compile finishes.
+    bool TryCreateGraphicsPipeline(
+        ReadOnlySpan<ColorTargetState> colors,
+        in DepthAttachmentState depth,
+        VertexInputInfo vertexInput,
+        PixelInputInfo? pixelInput,
+        ContextRegisters context,
+        in RenderingState rendering,
+        PrimitiveTopology topology,
+        bool primitiveRestartEnabled,
+        bool disableBlending,
+        ShaderProgram vertexProgram,
+        ShaderProgram pixelProgram,
+        out PipelineHandle handle,
+        out Task? completion)
+    {
+        handle = CreateGraphicsPipeline(colors, in depth, vertexInput, pixelInput, context, in rendering, topology,
+            primitiveRestartEnabled, disableBlending, vertexProgram, pixelProgram);
+        completion = null;
+        return true;
+    }
+
     // The dispatch dimensions are groups, or threads when the initiator counts threads.
     ComputeProgram GetComputeProgram(
         ComputeStageRegisters compute,
