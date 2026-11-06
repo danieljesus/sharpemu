@@ -164,23 +164,39 @@ Cada paso va tras un `SHARPEMU_*` apagado por defecto, se mide por mecanismo (ms
 - **Si las corridas son cortas pero `draw_record_ms` es grande** (≥60 ms), probar antes el committer único de §6b que los slices.
 - **Límite conocido:** no ve los cortes del grabador (`Serial(...)` de `RecordingHost`) ni las lecturas GPU-modificadas que haría un trabajador de resolución. Es una cota superior; el paso 0 da la cifra real del grabador.
 
-### Paso 2. El frente alimenta el `ResolvePool` (`SHARPEMU_FRONT_RESOLVE_POOL=1`; 3–5 días)
-- **Qué:** el frente ya saca una instantánea de los bancos por draw. Con la puerta del pool, en vez de la closure de `ExecuteQueuedDraw`, encola un `DeferredDraw` (`DeferDraw`) y el hilo de render llama a `JoinDeferredDraw` en su posición.
-- **Trabajo:**
-  - `Producing`/`Sink` para el frente (hoy exige `CommandThread`);
-  - `IsPendingForWorker` sin `_commandThread` (usar `PendingWrites` y las etiquetas del frente);
-  - aprender `DrawKnownNotToWrite` también en el frente.
-- **Esperado:** quitar `DrawExecutor` + `CommandDrawTranslation` + parte de `ResourceMaterialization`, ≈16–22 ms/fotograma brutos. Unión ~1–2 µs/draw (espera + validación) ≈ 5–9 ms. Neto **8–14 ms [E]**.
-- **Abandonar** si:
-  - la unión y la validación cuestan ≥50 % de lo movido;
-  - `invalid` supera el 5 %;
-  - `join_wait_ms` supera 3 ms/fotograma (los trabajadores no llegan a tiempo);
-  - la cola por trabajador (`BlockingCollection`: cerrojo y semáforo por ítem) cuesta ≥2 µs/draw medido en la sonda.
+### Paso 2. El frente alimenta el `ResolvePool` (`SHARPEMU_FRONT_RESOLVE_POOL=1`; implementado)
+
+- **Medido antes de empezar (mb15, la sonda del paso 1):**
+  - por fotograma, `draw_ms` 63,6 = resolución 9,0 + grabación 54,6, con 1.699 draws;
+  - dispatches 49,1 ms, de ellos 33,3 de grabación.
+- **Corrección.** El neto de 8–14 ms que preveía este paso estaba mal por ~2×. El frente ya prepara los programas de cada draw, así que en el hilo de render la resolución de draws es como mucho ~9 ms brutos, y esos 9 ms incluyen el cuerpo de la closure y la puerta de la sonda. El grueso es la grabación, que es el paso 3.
+- **El valor del paso ahora:**
+  - (a) la tubería que el paso 3 también necesita: draws tipados en la cola (`FrontDraw`), números de secuencia, unión en su posición y lecturas de trabajador sin `CommandThread`;
+  - (b) alivio del frente: los draws del pool se saltan `TryPrepareOnFront`.
+- **Cómo funciona:**
+  1. El frente encola un objeto `FrontDraw` (instantánea de bancos, argumentos y registros) en lugar de la closure.
+  2. Cuando un ítem ya se ha ejecutado, el hilo de render ofrece al pool los siguientes de la cola, hasta `SHARPEMU_FRONT_RESOLVE_AHEAD` (8 por defecto), mientras pasen la puerta (`DrawHasTargets && DrawKnownNotToWrite`). El recorrido se para en el primer ítem que no la pase: escritura, fill, copia, dispatch, barrera o draw que escribe memoria. Así ningún trabajador resuelve más allá de algo que cambie la memoria.
+  3. En su posición, `ExecuteFrontDeferredDraw` registra el estado del draw (snapshots de geometría, targets conocidos y contadores) y llama a `JoinDeferredDraw`: espera, `ValidateWorkerReads`, y grabación o resolución en serie.
+  4. Las lecturas de trabajador sin `CommandThread` leen la memoria del guest tal cual: no hay overlay ni sombras, porque nunca se pasa de una escritura en cola.
+  5. Las marcas de `PendingWrites` de los draws del pool llevan secuencias crecientes y se liberan al grabarse.
+- **Coste fijo:** un objeto por draw (sustituye a la closure) y un recorrido de ≤8 ítems bajo el cerrojo de la cola por ítem.
+- **Abandono, reanclado:**
+  - con el pool sin trabajadores (brazo C), la tubería no puede costar más de 1 ms/fotograma en el hilo de render (`draw_ms` de la sonda, A frente a C). Ojo: C además quita la preparación en el frente, así que mezcla las dos cosas;
+  - con el pool encendido (brazo B), hace falta un neto ≥3 ms/fotograma frente a A, con `invalid` ≤5 % de `deferred` y `join_wait_ms` ≤3 ms/fotograma. Si no, queda solo como tubería para el paso 3, siempre que C cumpla lo anterior.
+- **Brazos** (todos con `SHARPEMU_RENDER_PIPELINE=1 SHARPEMU_PARRES_PROBE=1 SHARPEMU_FPS_LOG=1`):
+  - A: base;
+  - B: `SHARPEMU_FRONT_RESOLVE_POOL=1` (4 trabajadores por defecto);
+  - C: `SHARPEMU_FRONT_RESOLVE_POOL=1 SHARPEMU_RESOLVE_WORKERS=0`.
+- **Líneas:**
+  - `[PERF][PARRES]` `draw_ms`, `draw_resolve_ms`, `draw_record_ms`. En los draws del pool, `draw_resolve_ms` es la espera de la unión más la validación y el registro de estado;
+  - `[PERF][RESOLVE_POOL]` `deferred`, `held`, `valid`, `invalid`, `serial=…`, `join_wait_ms`, `serial_ms`, `record_waits`. Son totales por ventana: hay que dividir por `frames` de `[PERF][PARRES]`. La sonda las imprime cuando `PROFILE_RENDER` está apagado;
+  - `[PERF][FRONT]` `work_ms`/`cpu_ms`, si se pone `SHARPEMU_PROFILE_FRONT=1`.
 
 ### Paso 3. Slices bajo el frente (`SHARPEMU_FRONT_SLICES=1`; 1,5–2,5 semanas)
 - **Qué:** la cola del fondo pasa a llevar ítems tipados (`CommandThread.Item` o equivalente) para draws, dispatches y barreras globales. Las closures se quedan solo para lo raro. El hilo de render corta corridas aptas en `RenderSlice` y las reparte al `RenderWorkerPool`, reutilizando `RecordSlice`/`JoinSegment`.
 - **Requisitos:**
-  - el paso 2, para que la resolución no esté en serie delante;
+  - la tubería del paso 2 (`FrontDraw` y la unión en orden); la resolución en serie delante cuesta poco (~9 ms en mb15), así que no hace falta que el pool gane para empezar el paso 3;
+  - los dispatches suponen ~45 % del tiempo de draw+dispatch en mb15 (49 ms, 33 de grabación): tienen que ir en los slices cuando `NeedsSerialDispatch` sea falso;
   - auditar los memos `[local]` del `RecordingHost` principal para el host trabajador (`ATTACH_REPEAT` ya se niega en trabajadores; revisar `STAGE_MEMO`, `TARGET_MEMO`, `TABLE_WORD_MEMO.ProgramScope` y `BindingShadow`).
 - **Esperado:** grabación apta × (1−1/N) − unión. Con 70 % apto y N=4: ~105 × 0,7 × 0,75 ≈ 55 ms brutos, menos 10–15 ms de unión → **neto 40 ms/fotograma [E]**.
 - **Abandonar** si:

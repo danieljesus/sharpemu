@@ -234,5 +234,7 @@ internal static class ParallelResolveProbe
         _drawTicks = _dispatchTicks = _otherTicks = _drawRecordTicks = _dispatchRecordTicks = 0;
         _scopeChanges = _lookupChanges = _dispatchesInRuns = 0;
         Console.Error.WriteLine(text.ToString());
+        if (VulkanVideoPresenter.FrontResolvePoolEnabled && !RenderPhaseProfile.Enabled)
+            Console.Error.WriteLine(SharpEmu.Libs.Agc.AgcExports.TakeResolvePoolReport());
     }
 }

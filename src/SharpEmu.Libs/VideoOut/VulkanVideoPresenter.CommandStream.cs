@@ -364,7 +364,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw new SerialResolveRequiredException("pending write read");
             }
 
-            if (!_commandThread!.ReadOverlayBefore(address, destination, worker.Sequence))
+            if (!ReadOverlayForWorker(address, destination, worker.Sequence))
             {
                 return false;
             }
@@ -374,12 +374,26 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        // [local] SHARPEMU_FRONT_RESOLVE_POOL: with the front, no command thread holds stores or known GPU writes ahead of the
+        // render thread for a worker (it never resolves past a queued write), so guest memory is what the stream position sees.
+        private bool ReadOverlayForWorker(ulong address, Span<byte> destination, long sequence) =>
+            _commandThread is { } thread ? thread.ReadOverlayBefore(address, destination, sequence) : _guestMemory.TryRead(address, destination);
+
+        private bool TryReadShadowBeforeForWorker(ulong address, Span<byte> destination, long sequence, out long shadowSequence, out CommandThread.ShadowSource source) // [local]
+        {
+            if (_commandThread is { } thread)
+                return thread.TryReadShadowBefore(address, destination, sequence, out shadowSequence, out source);
+            shadowSequence = 0;
+            source = default;
+            return false;
+        }
+
         // A known GPU write before the draw serves the read as it does on the stream thread; a write
         // marked between the two makes the known bytes stale, so the draw resolves in order instead.
         private bool TryReadShadowForWorker(ulong address, Span<byte> destination)
         {
             var sequence = _resolveWorker!.Sequence;
-            if (!_commandThread!.TryReadShadowBefore(address, destination, sequence, out var shadowSequence, out var shadowSource))
+            if (!TryReadShadowBeforeForWorker(address, destination, sequence, out var shadowSequence, out var shadowSource)) // [local]
             {
                 return false;
             }
@@ -389,7 +403,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw new SerialResolveRequiredException("shadowed pending write read");
             }
 
-            if (_commandThread.HasPendingRangeBetween(address, (ulong)destination.Length, shadowSequence, sequence))
+            if (_commandThread!.HasPendingRangeBetween(address, (ulong)destination.Length, shadowSequence, sequence)) // [local] only after a shadow read, which needs the command thread
             {
                 throw new SerialResolveRequiredException("shadowed pending range read");
             }
@@ -407,7 +421,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var sequence = _resolveWorker!.Sequence;
             return (_translation.PendingWrites is { } pending && pending.HasPendingBetween(address, size, pending.Released, sequence)) ||
-                _commandThread!.HasShadowBefore(address, size, sequence);
+                (_commandThread?.HasShadowBefore(address, size, sequence) ?? false); // [local] no command thread with the front
         }
 
         // Items run in batches; completions are collected between them so blocked waits retry.

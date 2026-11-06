@@ -135,6 +135,59 @@ public static partial class AgcExports
             }
         }
 
+        // [local] SHARPEMU_FRONT_RESOLVE_POOL: the pool the render thread feeds from the front's queue, and the stream
+        // positions its draws carry (increasing in stream order, so pending-write marks release in order).
+        private ResolvePool? _frontPool;
+        private long _frontSequence;
+
+        // [local] On the render thread, for a queued draw ahead of the one running: null when the pool's gate refuses it.
+        internal DeferredDraw? TryDeferFrontDraw(ulong submitId, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments)
+        {
+            if (_executor is not { } executor || _host.RenderHost is not { } renderHost || _host.ResolveWorkerCount <= 0 || !_pipelines!.SupportsParallelResolution)
+            {
+                return null;
+            }
+
+            if (!executor.DrawHasTargets(banks) || !DrawKnownNotToWrite(banks))
+            {
+                return null;
+            }
+
+            var pool = _frontPool ??= new ResolvePool(this, renderHost, _host.ResolveWorkerCount);
+            var work = _spareDeferred.TryDequeue(out var spare) ? spare : new DeferredDraw();
+            work.Banks = banks.Snapshot(work.Banks);
+            work.SubmitId = submitId;
+            work.Indexed = indexed;
+            work.IndexedArguments = indexedArguments;
+            work.AutoArguments = autoArguments;
+            work.Sequence = ++_frontSequence;
+            Interlocked.Increment(ref _deferredDraws);
+            pool.Dispatch(work);
+            return work;
+        }
+
+        // [local] At the draw's position: the stream state the inline path records first, then the join.
+        internal void ExecuteFrontDeferredDraw(DeferredDraw deferred, KeyValuePair<uint, uint>[]? drawRegisters)
+        {
+            if (deferred.Indexed) RecordIndexedDrawState(in deferred.IndexedArguments, drawRegisters);
+            else RecordAutoDrawState(in deferred.AutoArguments, drawRegisters);
+            var state = RequireCurrent();
+            RecordKnownColorTargets(state, deferred.Banks);
+            state.FrameDrawCount++;
+            state.SawIndexedDraw |= deferred.Indexed;
+            var drawStarted = DcbParseProfile.Begin();
+            try
+            {
+                JoinDeferredDraw(deferred);
+            }
+            finally
+            {
+                DcbParseProfile.RecordDraw(drawStarted);
+                state.CurrentIndexSnapshot = null;
+                state.CurrentVertexSnapshot = null;
+            }
+        }
+
         private void DeferDraw(ResolvePool pool, ulong submitId, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments)
         {
             var work = _spareDeferred.TryDequeue(out var spare) ? spare : new DeferredDraw();
@@ -231,7 +284,9 @@ public static partial class AgcExports
                 Interlocked.Increment(ref _deferredValid);
             }
 
+            var probeStarted = ParallelResolveProbe.Enabled ? Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
             _recorder!.Record(record);
+            if (probeStarted != 0) ParallelResolveProbe.AddRecordTicks(Stopwatch.GetTimestamp() - probeStarted); // [local]
             deferred.Reset();
             _spareDeferred.Enqueue(deferred);
         }
