@@ -90,6 +90,68 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
         _backingPool = ImageBackingPool.Enabled ? new ImageBackingPool(device) : null;
+        if (DeviceBudget) // [local]
+        {
+            ConfigureDeviceBudget();
+        }
+    }
+
+    // [local] SHARPEMU_IMAGE_DEVICE_BUDGET=1 (default off): size the collection thresholds to the device instead of the
+    // fixed 1536/1536/3072 MiB. The budget is what the device has available when the cache starts minus a margin
+    // (SHARPEMU_IMAGE_BUDGET_MARGIN_DIVISOR, default an eighth, at least 512 MiB); without VK_EXT_memory_budget it is
+    // the heap size capped at 4 GiB. The thresholds are SHARPEMU_IMAGE_THRESHOLDS=<start>,<pressure>,<critical>
+    // percent of it (default 60,85,92). Set once: recomputed later it would count the cache's own images as used.
+    // Off by default: the budget leaves the buffer cache, scratch and other processes only the margin, which has not
+    // been measured on GTA. DarthPotato 5a4bf244.
+    internal static readonly bool DeviceBudget = Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_DEVICE_BUDGET") == "1";
+
+    private const ulong MinimumMemorySafetyMargin = 512 * MiB;
+    private const ulong NoBudgetImageCacheLimit = 4096 * MiB;
+    private static int _budgetLogged;
+
+    private static readonly ulong BudgetMarginDivisor =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_BUDGET_MARGIN_DIVISOR"), out var divisor) && divisor is >= 2 and <= 64
+            ? divisor
+            : 8;
+
+    private static readonly (ulong Start, ulong Pressure, ulong Critical) ThresholdPercents =
+        ParseThresholds(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_THRESHOLDS"));
+
+    internal static (ulong Start, ulong Pressure, ulong Critical) ParseThresholds(string? value)
+    {
+        var parts = value?.Split(',');
+        return parts is { Length: 3 } &&
+            ulong.TryParse(parts[0], out var start) && ulong.TryParse(parts[1], out var pressure) && ulong.TryParse(parts[2], out var critical) &&
+            start > 0 && start <= pressure && pressure <= critical && critical <= 100
+            ? (start, pressure, critical)
+            : (60, 85, 92);
+    }
+
+    internal static ulong ComputeImageCacheBudget(ulong available, bool hasMemoryBudget, ulong marginDivisor)
+    {
+        available = Math.Max(available, 1UL);
+        var safetyMargin = Math.Max(available / marginDivisor, MinimumMemorySafetyMargin);
+        var imageBudget = available > safetyMargin ? available - safetyMargin : Math.Max(available / 2, MiB);
+        return hasMemoryBudget ? imageBudget : Math.Min(imageBudget, NoBudgetImageCacheLimit);
+    }
+
+    internal static (ulong Start, ulong Pressure, ulong Critical) ComputeCollectionThresholds(ulong budget,
+        (ulong Start, ulong Pressure, ulong Critical) percents) =>
+        (Math.Max(budget / 100 * percents.Start, MiB), Math.Max(budget / 100 * percents.Pressure, MiB),
+            Math.Max(budget / 100 * percents.Critical, MiB));
+
+    private void ConfigureDeviceBudget()
+    {
+        var memory = _device.ReadDeviceLocalMemory();
+        var budget = ComputeImageCacheBudget(memory.AvailableBytes, memory.FromBudget, BudgetMarginDivisor);
+        (_collectionStartBytes, _memoryPressureBytes, _criticalMemoryBytes) = ComputeCollectionThresholds(budget, ThresholdPercents);
+        if (Interlocked.Exchange(ref _budgetLogged, 1) == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Image cache budget source={(memory.FromBudget ? "VK_EXT_memory_budget" : "device-local heap size")} " +
+                $"heap={memory.HeapBytes} available={memory.AvailableBytes} image_budget={budget} " +
+                $"thresholds={_collectionStartBytes}/{_memoryPressureBytes}/{_criticalMemoryBytes}");
+        }
     }
 
     public ulong TotalUsedMemory => _totalUsedMemory;

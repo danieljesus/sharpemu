@@ -24,6 +24,10 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
     // size-compatible color format (D16 <-> R16).
     public bool Maintenance8Supported { get; init; }
 
+    // [local] The physical device supports VK_EXT_memory_budget, so it reports how much device-local memory this
+    // process can still use (SHARPEMU_IMAGE_DEVICE_BUDGET).
+    public bool MemoryBudgetSupported { get; init; }
+
     public GpuDeviceInfo(Vk vk, PhysicalDevice physicalDevice, Device device)
     {
         Vk = vk;
@@ -68,6 +72,53 @@ public sealed unsafe class GpuDeviceInfo : IImageFormatSupport
         {
             return (&properties->MemoryHeaps.Element0)[heap].Size;
         }
+    }
+
+    // [local] The device-local heaps' total size and what is still available to this process: the driver's budget
+    // minus its usage with VK_EXT_memory_budget, the heap size without it. DarthPotato 5a4bf244.
+    public (ulong HeapBytes, ulong AvailableBytes, bool FromBudget) ReadDeviceLocalMemory()
+    {
+        var heaps = new bool[_memoryProperties.MemoryHeapCount];
+        ulong heapBytes = 0;
+        fixed (PhysicalDeviceMemoryProperties* properties = &_memoryProperties)
+        {
+            var memoryTypes = &properties->MemoryTypes.Element0;
+            for (var index = 0u; index < properties->MemoryTypeCount; index++)
+            {
+                if ((memoryTypes[index].PropertyFlags & MemoryPropertyFlags.DeviceLocalBit) != 0)
+                {
+                    heaps[(int)memoryTypes[index].HeapIndex] = true;
+                }
+            }
+
+            for (var index = 0; index < heaps.Length; index++)
+            {
+                if (heaps[index])
+                {
+                    heapBytes += (&properties->MemoryHeaps.Element0)[index].Size;
+                }
+            }
+        }
+
+        if (!MemoryBudgetSupported)
+        {
+            return (heapBytes, heapBytes, false);
+        }
+
+        var budget = new PhysicalDeviceMemoryBudgetPropertiesEXT { SType = StructureType.PhysicalDeviceMemoryBudgetPropertiesExt };
+        var queried = new PhysicalDeviceMemoryProperties2 { SType = StructureType.PhysicalDeviceMemoryProperties2, PNext = &budget };
+        Vk.GetPhysicalDeviceMemoryProperties2(PhysicalDevice, &queried);
+        ulong totalBudget = 0, available = 0;
+        for (var index = 0; index < heaps.Length; index++)
+        {
+            if (heaps[index])
+            {
+                totalBudget += budget.HeapBudget[index];
+                available += budget.HeapBudget[index] > budget.HeapUsage[index] ? budget.HeapBudget[index] - budget.HeapUsage[index] : 0;
+            }
+        }
+
+        return totalBudget != 0 ? (heapBytes, available, true) : (heapBytes, heapBytes, false);
     }
 
     public bool IsDeviceLocalHeap(uint heap)
