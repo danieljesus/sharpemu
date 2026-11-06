@@ -556,6 +556,41 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
 
     public List<bool> DisableBlendingRequests { get; } = new();
 
+    // [local] How many asks report the graphics pipeline still compiling, with this completion handed back.
+    public int PendingGraphicsCompiles { get; set; }
+    public int GraphicsPipelineAttempts { get; private set; }
+    public Task PendingGraphicsCompletion { get; set; } = Task.CompletedTask;
+
+    public bool TryCreateGraphicsPipeline(
+        ReadOnlySpan<ColorTargetState> colors,
+        in DepthAttachmentState depth,
+        VertexInputInfo vertexInput,
+        PixelInputInfo? pixelInput,
+        ContextRegisters context,
+        in RenderingState rendering,
+        PrimitiveTopology topology,
+        bool primitiveRestartEnabled,
+        bool disableBlending,
+        ShaderProgram vertexProgram,
+        ShaderProgram pixelProgram,
+        out PipelineHandle handle,
+        out Task? completion)
+    {
+        GraphicsPipelineAttempts++;
+        if (PendingGraphicsCompiles > 0)
+        {
+            PendingGraphicsCompiles--;
+            handle = default;
+            completion = PendingGraphicsCompletion;
+            return false;
+        }
+
+        completion = null;
+        handle = CreateGraphicsPipeline(colors, in depth, vertexInput, pixelInput, context, in rendering, topology,
+            primitiveRestartEnabled, disableBlending, vertexProgram, pixelProgram);
+        return true;
+    }
+
     public (uint X, uint Y, uint Z) LastDispatchDimensions { get; private set; }
 
     public ComputeProgram GetComputeProgram(ComputeStageRegisters compute, ShaderInterfaceRegisters shaderInterface, uint dispatchInitiator, uint dimensionX, uint dimensionY, uint dimensionZ)

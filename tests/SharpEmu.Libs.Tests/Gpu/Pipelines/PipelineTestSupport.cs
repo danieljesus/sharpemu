@@ -171,6 +171,24 @@ internal sealed class FakePipelineHost(ICpuMemory memory) : IShaderPipelineHost
         return new PipelineHandle(handle, handle, UsesPushDescriptors: true);
     }
 
+    // [local] How many asks report the next graphics pipeline still compiling before it is handed over.
+    public int PendingGraphicsCompiles { get; set; }
+
+    public bool TryCreateGraphicsPipeline(GraphicsPipelineDescription description, out PipelineHandle handle, out Task? completion)
+    {
+        if (PendingGraphicsCompiles > 0)
+        {
+            PendingGraphicsCompiles--;
+            handle = default;
+            completion = Task.CompletedTask;
+            return false;
+        }
+
+        completion = null;
+        handle = CreateGraphicsPipeline(description);
+        return true;
+    }
+
     // How many times each program reports "still compiling" before it is handed over,
     // standing in for the host shader compiler running on a worker thread.
     public Dictionary<ulong, int> PendingComputeCompiles { get; } = new();
