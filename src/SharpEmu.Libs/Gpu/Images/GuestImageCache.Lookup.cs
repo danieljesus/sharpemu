@@ -284,7 +284,7 @@ public sealed partial class GuestImageCache
     private static bool SameRequest(in ImageRequest left, in ImageRequest right) =>
         SameDescription(left.Description, right.Description) && left.View == right.View && left.Role == right.Role &&
         left.TraceTextureMetadataAddress == right.TraceTextureMetadataAddress &&
-        string.Equals(left.TraceTextureDescriptor, right.TraceTextureDescriptor, StringComparison.Ordinal) &&
+        left.TraceTextureDescriptorId == right.TraceTextureDescriptorId && // [local]
         left.TraceMetadataCompress == right.TraceMetadataCompress && left.TraceWriteCompress == right.TraceWriteCompress;
 
     private static bool SameDescription(in ImageDescription left, in ImageDescription right)

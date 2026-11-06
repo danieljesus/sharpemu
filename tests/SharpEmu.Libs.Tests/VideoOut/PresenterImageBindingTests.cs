@@ -256,6 +256,54 @@ public sealed class PresenterImageBindingTests : IClassFixture<HeadlessVulkanFix
         harness.Shutdown();
     }
 
+    // [local] The memo hit reads the memo by reference and returns early: it binds exactly what the full lookup bound,
+    // and so does the lookup made again once the memo is stale.
+    [Fact]
+    public void RepeatedBinding_MemoHitBindsWhatTheLookupBound()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var fatal = new FatalScope();
+        using var presenter = new PresenterUnderTest(_vulkan);
+        var harness = presenter.Harness;
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        harness.Write(address, new byte[0x10000]);
+        presenter.Run(() =>
+        {
+            var resource = new ImageResource
+            {
+                ResourceClass = PlanImageResourceClass.Sampled,
+                NumericClass = ImageNumericClass.Float,
+                Dimension = ImageDimension.Dim2D,
+                Read = true,
+            };
+            var program = new ShaderProgramInfo();
+            var words = RegisterWords.Texture(address, GuestPixelFormat.Bits32Float, 48, 24);
+            var missed = presenter.InvokeMethod("ResolveImageBinding", resource, words, program, 0)!;
+            var hit = presenter.InvokeMethod("ResolveImageBinding", resource, words, program, 0)!;
+            AssertSameBinding(missed, hit);
+
+            typeof(GuestImageCache).GetMethod("DeleteImage", InstanceMembers)!.Invoke(harness.Images, [GetFieldValue(missed, "ImageIdentifier")]);
+            var refound = presenter.InvokeMethod("ResolveImageBinding", resource, words, program, 0)!;
+            Assert.True(SameRequestBytes((ImageRequest)GetFieldValue(missed, "Request"), (ImageRequest)GetFieldValue(refound, "Request")));
+            presenter.RenderHost.ResetBindings();
+        });
+        harness.Shutdown();
+    }
+
+    private static void AssertSameBinding(object left, object right)
+    {
+        Assert.Equal(GetFieldValue(left, "ImageIdentifier"), GetFieldValue(right, "ImageIdentifier"));
+        Assert.True(SameRequestBytes((ImageRequest)GetFieldValue(left, "Request"), (ImageRequest)GetFieldValue(right, "Request")));
+        foreach (var name in new[] { "Address", "IsStorage", "DestinationSelect", "Width", "Height" })
+        {
+            Assert.Equal(GetFieldValue(left, name), GetFieldValue(right, name));
+        }
+    }
+
+    private static bool SameRequestBytes(ImageRequest left, ImageRequest right) =>
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(new ReadOnlySpan<ImageRequest>(in left))
+            .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.AsBytes(new ReadOnlySpan<ImageRequest>(in right)));
+
     [Fact]
     public void RepeatedBinding_ReusesTheLookupUntilTheImageIsRemoved()
     {

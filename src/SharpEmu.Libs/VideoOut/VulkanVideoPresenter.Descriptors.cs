@@ -650,6 +650,9 @@ internal static unsafe partial class VulkanVideoPresenter
             Interlocked.Increment(ref _stageMemoCaptures);
         }
 
+        // [local] A memo hit reads the memo by reference and returns early; the lookups live in methods of their own.
+        // Request-sized locals (an image request carries its whole mip layout) are otherwise zeroed on every call.
+        // DarthPotato 7edfffe5 + 8112fc7f.
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
             if (words.Length < 4)
@@ -665,73 +668,101 @@ internal static unsafe partial class VulkanVideoPresenter
             var key = ImageBindingKey.Of(words, shape);
             var memos = _imageBindingMemos ??= new Dictionary<ImageBindingKey, ImageBindingMemo>();
             ref var memo = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrNullRef(memos, key);
-            var known = !System.Runtime.CompilerServices.Unsafe.IsNullRef(ref memo);
-            var originalResolution = known
-                ? memo.OriginalResolution
-                : program.Frontend is { } frontend
-                    ? frontend.ResolveTexture(words, shape, program.Hash, index)
-                    : ImageRequestBuilders.Texture(words, shape, program.Hash, index);
+            if (System.Runtime.CompilerServices.Unsafe.IsNullRef(ref memo)) // [local]
+            {
+                return ResolveFreshImageBinding(image, words, program, index, storage, shape, key, memos); // [local]
+            }
+
+            TraceImageLookup(image, words, program, index, memo.OriginalResolution.Request); // [local]
+            CompleteOverlappingPublications(memo.OriginalResolution.Request.Description.Data.Address, // [local]
+                memo.OriginalResolution.Request.Description.Data.Size, includeLabels: false); // [local]
+            SynchronizeColorMetadata(memo.OriginalResolution.Request); // [local]
+            EnsureBatchedGuestCommands();
+            if (!(_worker // [local]
+                    ? _imageCache.TryRememberedForSlice(memo.Found, ref memo.Generation, memo.Begin, memo.End)
+                    : _imageCache.TryTouchRemembered(memo.Found, ref memo.Generation, memo.Begin, memo.End)))
+            {
+                return ResolveImageBindingMiss(image, words, program, index, storage, key, memos, memo.OriginalResolution); // [local]
+            }
+
+            GuestImageCache.CountBindingMemo(hit: true);
+            if (memo.CompletesLookup)
+            {
+                if (_worker)
+                {
+                    if (!_imageCache.CompleteLookupIsNoopForSlice(memo.Found, memo.Resolution.Request)) // [local]
+                    {
+                        throw Serial("dcc lookup");
+                    }
+                }
+                else
+                {
+                    _imageCache.CompleteLookup(memo.Found, memo.Resolution.Request, memo.MetadataBaseLayer); // [local]
+                }
+            }
+
+            return FinishImageBinding(image, words, program, index, storage, memo.Found, memo.Resolution); // [local]
+        }
+
+        // [local] No memo for these words: resolve the descriptor. Its locals are all written before they are read.
+        [System.Runtime.CompilerServices.SkipLocalsInit]
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private TextureResource ResolveFreshImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index, bool storage,
+            ShaderImageShape shape, ImageBindingKey key, Dictionary<ImageBindingKey, ImageBindingMemo> memos)
+        {
+            var originalResolution = program.Frontend is { } frontend
+                ? frontend.ResolveTexture(words, shape, program.Hash, index)
+                : ImageRequestBuilders.Texture(words, shape, program.Hash, index);
             TraceImageLookup(image, words, program, index, originalResolution.Request);
             CompleteOverlappingPublications(originalResolution.Request.Description.Data.Address,
                 originalResolution.Request.Description.Data.Size, includeLabels: false);
             SynchronizeColorMetadata(originalResolution.Request);
             EnsureBatchedGuestCommands();
-            TextureRequestResolution resolution;
-            ResourceSlotIdentifier imageIdentifier;
-            if (known &&
-                (_worker
-                    ? _imageCache.TryRememberedForSlice(memo.Found, ref memo.Generation, memo.Begin, memo.End)
-                    : _imageCache.TryTouchRemembered(memo.Found, ref memo.Generation, memo.Begin, memo.End)))
-            {
-                GuestImageCache.CountBindingMemo(hit: true);
-                resolution = memo.Resolution;
-                imageIdentifier = memo.Found;
-                if (memo.CompletesLookup)
-                {
-                    if (_worker)
-                    {
-                        if (!_imageCache.CompleteLookupIsNoopForSlice(imageIdentifier, resolution.Request))
-                        {
-                            throw Serial("dcc lookup");
-                        }
-                    }
-                    else
-                    {
-                        _imageCache.CompleteLookup(imageIdentifier, resolution.Request, memo.MetadataBaseLayer);
-                    }
-                }
-            }
-            else
-            {
-                GuestImageCache.CountBindingMemo(hit: false);
-                resolution = originalResolution;
-                var request = resolution.Request;
-                var metadataBaseLayer = request.View.BaseLayer;
-                imageIdentifier = LookUpImage(ref request, resolution.ExactFormat);
-                resolution = resolution with { Request = request };
-                if (!ImageDescription.IsEmptyRange(request.Description.Data))
-                {
-                    if (memos.Count >= ImageBindingMemoCapacity)
-                    {
-                        memos.Clear();
-                    }
+            return ResolveImageBindingMiss(image, words, program, index, storage, key, memos, originalResolution);
+        }
 
-                    var remembered = _imageCache.RememberedRange(imageIdentifier, request);
-                    memos[key] = new ImageBindingMemo
-                    {
-                        Generation = _imageCache.LookupGeneration,
-                        Begin = remembered.Address,
-                        End = remembered.End,
-                        Resolution = resolution,
-                        OriginalResolution = originalResolution,
-                        Found = imageIdentifier,
-                        MetadataBaseLayer = metadataBaseLayer,
-                        CompletesLookup = request.Description.Metadata.Kind == MetadataKind.Dcc ||
-                            Image(imageIdentifier).Description.DccSliceSize != 0,
-                    };
+        // [local] The full lookup. The original resolution may live in the memo table, which this clears: it is copied first.
+        [System.Runtime.CompilerServices.SkipLocalsInit]
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private TextureResource ResolveImageBindingMiss(ImageResource image, uint[] words, ShaderProgramInfo program, int index, bool storage,
+            ImageBindingKey key, Dictionary<ImageBindingKey, ImageBindingMemo> memos, in TextureRequestResolution original)
+        {
+            var originalResolution = original;
+            GuestImageCache.CountBindingMemo(hit: false);
+            var resolution = originalResolution;
+            var request = resolution.Request;
+            var metadataBaseLayer = request.View.BaseLayer;
+            var imageIdentifier = LookUpImage(ref request, resolution.ExactFormat);
+            resolution = resolution with { Request = request };
+            if (!ImageDescription.IsEmptyRange(request.Description.Data))
+            {
+                if (memos.Count >= ImageBindingMemoCapacity)
+                {
+                    memos.Clear();
                 }
+
+                var remembered = _imageCache.RememberedRange(imageIdentifier, request);
+                memos[key] = new ImageBindingMemo
+                {
+                    Generation = _imageCache.LookupGeneration,
+                    Begin = remembered.Address,
+                    End = remembered.End,
+                    Resolution = resolution,
+                    OriginalResolution = originalResolution,
+                    Found = imageIdentifier,
+                    MetadataBaseLayer = metadataBaseLayer,
+                    CompletesLookup = request.Description.Metadata.Kind == MetadataKind.Dcc ||
+                        Image(imageIdentifier).Description.DccSliceSize != 0,
+                };
             }
 
+            return FinishImageBinding(image, words, program, index, storage, imageIdentifier, resolution);
+        }
+
+        // [local] What every lookup ends with: tracing, owner validation and the binding itself.
+        private TextureResource FinishImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index, bool storage,
+            ResourceSlotIdentifier imageIdentifier, in TextureRequestResolution resolution)
+        {
             _imageCache.TraceTextureMetadata(resolution.Request);
             if (Gpu.Images.ImageClearTrace.Enabled)
             {

@@ -23,15 +23,15 @@ public sealed partial class GuestImageCacheTests
         harness.Write(address, Bytes(0x44332211u));
 
         var first = Sampled(address);
-        first.TraceTextureDescriptor = descriptor;
+        first.TraceTextureDescriptorId = descriptor is null ? 0 : TextureDescriptorTraceText.Intern(descriptor);
         var firstId = harness.Find(ref first);
         var created = Sampled(address);
-        created.TraceTextureDescriptor = descriptor;
+        created.TraceTextureDescriptorId = descriptor is null ? 0 : TextureDescriptorTraceText.Intern(descriptor);
         Assert.Equal(firstId, harness.Find(ref created));
         var baseline = harness.Images.LookupMemoCounters;
 
         var repeated = Sampled(address);
-        repeated.TraceTextureDescriptor = descriptor is null ? null : new string(descriptor.ToCharArray());
+        repeated.TraceTextureDescriptorId = descriptor is null ? 0 : TextureDescriptorTraceText.Intern(new string(descriptor.ToCharArray()));
         Assert.Equal(firstId, harness.Find(ref repeated));
         Assert.Equal(baseline.Hits + 1, harness.Images.LookupMemoCounters.Hits);
         Assert.Equal(first.View, repeated.View);
@@ -40,12 +40,12 @@ public sealed partial class GuestImageCacheTests
         harness.Images.AddPageOwner(address, stale);
         Assert.True(harness.Images.RemovePageOwner(address, stale));
         var afterChange = Sampled(address);
-        afterChange.TraceTextureDescriptor = descriptor;
+        afterChange.TraceTextureDescriptorId = descriptor is null ? 0 : TextureDescriptorTraceText.Intern(descriptor);
         Assert.Equal(firstId, harness.Find(ref afterChange));
         Assert.Equal(baseline.Hits + 1, harness.Images.LookupMemoCounters.Hits);
 
         var reusedAgain = Sampled(address);
-        reusedAgain.TraceTextureDescriptor = descriptor;
+        reusedAgain.TraceTextureDescriptorId = descriptor is null ? 0 : TextureDescriptorTraceText.Intern(descriptor);
         Assert.Equal(firstId, harness.Find(ref reusedAgain));
         Assert.Equal(baseline.Hits + 2, harness.Images.LookupMemoCounters.Hits);
     }

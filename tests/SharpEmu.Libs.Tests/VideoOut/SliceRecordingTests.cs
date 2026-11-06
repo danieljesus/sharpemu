@@ -475,7 +475,7 @@ public sealed class SliceRecordingTests : IClassFixture<HeadlessVulkanFixture>
     }
 
     private static ImageRequest TracedColorTarget(string descriptor) =>
-        new(CachedImageTests.Color2D(16, 16), ImageViewDescription.Default, ImageRole.ColorTarget) { TraceTextureDescriptor = descriptor };
+        new(CachedImageTests.Color2D(16, 16), ImageViewDescription.Default, ImageRole.ColorTarget) { TraceTextureDescriptorId = TextureDescriptorTraceText.Intern(descriptor) };
 
     private static bool KeptAttachment(object host, ResourceSlotIdentifier image, ImageRequest request) =>
         (bool)PresenterUnderTest.RecordingHostType.GetMethod("TryKeptAttachment", PresenterUnderTest.InstanceMembers)!

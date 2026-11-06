@@ -432,7 +432,8 @@ public static partial class ImageRequestBuilders
             request.TraceTextureMetadataAddress = descriptor.MetadataAddress << 8;
             request.TraceMetadataCompress = descriptor.MetadataCompress;
             request.TraceWriteCompress = descriptor.WriteCompress;
-            request.TraceTextureDescriptor = string.Join(",", ((ReadOnlySpan<uint>)descriptor.Fields).ToArray().Select(word => word.ToString("X8")));
+            request.TraceTextureDescriptorId = TextureDescriptorTraceText.Intern( // [local]
+                string.Join(",", ((ReadOnlySpan<uint>)descriptor.Fields).ToArray().Select(word => word.ToString("X8"))));
         }
         return new TextureRequestResolution(request, shaderConversion, pixelFormat, DestinationSwizzle(descriptor));
     }

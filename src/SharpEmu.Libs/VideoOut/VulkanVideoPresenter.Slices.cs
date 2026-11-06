@@ -263,7 +263,7 @@ internal static unsafe partial class VulkanVideoPresenter
         internal static bool SameRequest(in ImageRequest left, in ImageRequest right) =>
             SameBytes(left.Description, right.Description) && left.View == right.View && left.Role == right.Role &&
             left.TraceTextureMetadataAddress == right.TraceTextureMetadataAddress &&
-            string.Equals(left.TraceTextureDescriptor, right.TraceTextureDescriptor, StringComparison.Ordinal) &&
+            left.TraceTextureDescriptorId == right.TraceTextureDescriptorId && // [local]
             left.TraceMetadataCompress == right.TraceMetadataCompress && left.TraceWriteCompress == right.TraceWriteCompress;
 
         private static bool SameBytes<T>(in T left, in T right) where T : unmanaged =>
