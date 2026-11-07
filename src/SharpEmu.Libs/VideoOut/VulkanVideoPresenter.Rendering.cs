@@ -594,8 +594,21 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private ResourceSlotIdentifier LookUpImage(ref ImageRequest request, bool exactFormat = false) =>
             _worker
-                ? _imageCache.TryFindImageForSlice(ref request, exactFormat, out var found) ? found : throw Serial("image lookup", resumable: true)
+                ? LookUpImageForSlice(ref request, exactFormat)
                 : _imageCache.FindImage(ref request, exactFormat);
+
+        private ResourceSlotIdentifier LookUpImageForSlice(ref ImageRequest request, bool exactFormat)
+        {
+            var started = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
+            var found = _imageCache.TryFindImageForSlice(ref request, exactFormat, out var image);
+            if (started != 0)
+            {
+                Interlocked.Increment(ref ParallelResolveProbe.WorkerLookups);
+                Interlocked.Add(ref ParallelResolveProbe.WorkerLookupTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+            }
+
+            return found ? image : throw Serial("image lookup", resumable: true);
+        }
 
         public void ResetBindings()
         {
@@ -1555,6 +1568,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.BeginRendering, vkProbe992); // [local]
             }
             _renderingScopesBegun++;
+            if (_worker && ParallelResolveProbe.Enabled) Interlocked.Increment(ref ParallelResolveProbe.WorkerScopes); // [local] SHARPEMU_PARRES_PROBE
             _keptTextureSets[0] = null;
             _keptTextureSets[1] = null;
             if (GpuSyncProfile.Enabled)

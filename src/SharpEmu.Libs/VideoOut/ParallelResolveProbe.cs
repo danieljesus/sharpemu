@@ -122,6 +122,41 @@ internal static class ParallelResolveProbe
 
     public static void AddSliceWorkerTicks(long ticks) => Interlocked.Add(ref _sliceWorkerTicks, ticks);
 
+    // [local] SHARPEMU_FRONT_SLICES, any worker thread: where a worker's time goes. Segments begun with the cost of
+    // beginning (buffer, barrier, state reset) and ending (end rendering, end buffer) them, items recorded and their
+    // cost, items it stopped at (Serial) and the time spent on them before it stopped, render scopes it began,
+    // attachments it acquired (not kept from earlier in the segment) and kept, and its image lookups.
+    internal static long WorkerSegments, WorkerBeginTicks, WorkerEndTicks, WorkerItems, WorkerItemTicks, WorkerSerial, WorkerSerialTicks,
+        WorkerDispatches, WorkerDispatchTicks, WorkerScopes, WorkerAttach, WorkerAttachTicks, WorkerKept, WorkerLookups, WorkerLookupTicks;
+
+    // [local] Render thread: the items it ran after all (slice_inline) and the joins caused by the front's preparation check.
+    internal static long SliceInlineItems;
+
+    private static string PerUnit(long ticks, long count) =>
+        (count == 0 ? 0 : ticks * 1_000_000.0 / Stopwatch.Frequency / count).ToString("F1", CultureInfo.InvariantCulture);
+
+    private static void AppendWorker(StringBuilder text, double frames)
+    {
+        long Take(ref long value) => Interlocked.Exchange(ref value, 0);
+        var segments = Take(ref WorkerSegments);
+        var begin = Take(ref WorkerBeginTicks);
+        var end = Take(ref WorkerEndTicks);
+        var items = Take(ref WorkerItems);
+        var itemTicks = Take(ref WorkerItemTicks);
+        var serial = Take(ref WorkerSerial);
+        var serialTicks = Take(ref WorkerSerialTicks);
+        var dispatches = Take(ref WorkerDispatches);
+        var dispatchTicks = Take(ref WorkerDispatchTicks);
+        var scopes = Take(ref WorkerScopes);
+        var attach = Take(ref WorkerAttach);
+        var attachTicks = Take(ref WorkerAttachTicks);
+        var kept = Take(ref WorkerKept);
+        var lookups = Take(ref WorkerLookups);
+        var lookupTicks = Take(ref WorkerLookupTicks);
+        text.Append(CultureInfo.InvariantCulture,
+            $" slice_worker=segments:{segments / frames:F1}/begin_us:{PerUnit(begin, segments)}/end_us:{PerUnit(end, segments)},items:{items / frames:F0}/us:{PerUnit(itemTicks, items)},dispatches:{dispatches / frames:F0}/us:{PerUnit(dispatchTicks, dispatches)},serial:{serial / frames:F1}/us:{PerUnit(serialTicks, serial)},scopes:{scopes / frames:F1},attach:{attach / frames:F0}/us:{PerUnit(attachTicks, attach)},kept:{kept / frames:F0},lookups:{lookups / frames:F0}/us:{PerUnit(lookupTicks, lookups)}");
+    }
+
     public static void OnFrame() => Interlocked.Increment(ref _frames);
 
     public static void NoteDraw(int gate)
@@ -250,6 +285,9 @@ internal static class ParallelResolveProbe
             $" front_slices=n:{stats.Slices / frames:F1},items_mean:{(stats.Slices == 0 ? 0 : stats.Items / (double)stats.Slices):F1},items:{stats.Items / frames:F0},joined:{stats.Joined / frames:F0},segments:{stats.Segments / frames:F1}");
         text.Append(CultureInfo.InvariantCulture,
             $" slice_handoff_ms={Ms(SliceHandoffTicks) / frames:F2} slice_join_wait_ms={Ms(SliceWaitTicks) / frames:F2} slice_rest_wait_ms={Ms(SliceRestWaitTicks) / frames:F2} slice_join_ms={Ms(SliceJoinTicks) / frames:F2} slice_inline_ms={Ms(SliceInlineTicks) / frames:F2} slice_worker_ms={Ms(Interlocked.Exchange(ref _sliceWorkerTicks, 0)) / frames:F2}");
+        text.Append(CultureInfo.InvariantCulture, $" slice_inline_us={PerUnit(SliceInlineTicks, SliceInlineItems)}");
+        SliceInlineItems = 0;
+        AppendWorker(text, frames);
         text.Append(" slice_inline=");
         for (var index = 0; index < InlineNames.Length; index++)
         {

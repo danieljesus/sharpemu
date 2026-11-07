@@ -192,6 +192,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var started = Stopwatch.GetTimestamp();
             _presenter.RunFrontSliceWork(work);
             ParallelResolveProbe.SliceInlineTicks += Stopwatch.GetTimestamp() - started;
+            ParallelResolveProbe.SliceInlineItems++;
         }
 
         int FrontSliceCutter<FrontSliceItem, RenderSlice>.IBackend.Workers => _presenter.SlicesEnabled ? _presenter.WorkerCount : 0;
