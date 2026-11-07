@@ -433,7 +433,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 fullyMapped = _fullyMapped ??= new HashSet<(ulong Address, ulong Size)>();
                 if (fullyMapped.Contains((address, size)))
                 {
-                    Render2Probe.MappedKeepHits++;
+                    if (Render2Probe.Enabled) Render2Probe.MappedKeepHits++; // [local] a static counter, as at the other sites
                     if (MappedSizeKeepMode != 2)
                     {
                         return size;
@@ -694,7 +694,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void TransitionDepthAttachment(in DepthAttachmentState depth, ImageAspectFlags writeAspects)
         {
             using var transitionProbe = new SharpEmu.Libs.Gpu.Rendering.AttachProbe.Scope(SharpEmu.Libs.Gpu.Rendering.AttachProbe.Part.Transition,
-                SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0); // [local]
+                SharpEmu.Libs.Gpu.Rendering.AttachProbe.Enabled && !_worker ? System.Diagnostics.Stopwatch.GetTimestamp() : 0); // [local] static: render thread only
             var command = BeginBatchedGuestCommands();
             var image = Image(depth.Image);
             var view = depth.Target.Target.Request.View;
@@ -1441,7 +1441,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void BeginRendering(in RenderingState state)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRenderingSetup);
-            if (Gpu.Rendering.BatchSimulation.Enabled) Gpu.Rendering.BatchSimulation.NoteDraw(in state); // [local]
+            if (Gpu.Rendering.BatchSimulation.Enabled && !_worker) Gpu.Rendering.BatchSimulation.NoteDraw(in state); // [local] static state: the render thread's stream only
             _beginRenderingCalls++; // [local] SHARPEMU_ATTACH_REPEAT
             if (_renderingActive && _renderingState == state)
             {
@@ -1452,10 +1452,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            if (Gpu.Buffers.CpWriteDeferProbe.Enabled && Gpu.Buffers.CpWriteDeferProbe.AfterBreak) // [local]
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled && Gpu.Buffers.CpWriteDeferProbe.AfterBreak && !_worker) // [local]
                 Gpu.Buffers.CpWriteDeferProbe.OnBeginRendering(state == _probeBrokenState);
             EndRendering();
-            var scopeBarrierPrunable = Gpu.Vulkan.ScopeBarrierTracker.Enabled && DeferGlobalBarriers && // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
+            // [local] SHARPEMU_SCOPE_BARRIER_PRUNE: the tracker follows the render thread's stream; a slice worker's scope
+            // always records its barrier (its writes are not noted, and the flag is another stream's).
+            var scopeBarrierPrunable = !_worker && Gpu.Vulkan.ScopeBarrierTracker.Enabled && DeferGlobalBarriers &&
                 Gpu.Vulkan.ScopeBarrierTracker.ScopeBegins(_nextDrawWritesMemory);
             var pruneScopeBarrier = scopeBarrierPrunable && Gpu.Vulkan.ScopeBarrierTracker.Mode == 2;
             _scopeBarrierPruned = pruneScopeBarrier;
@@ -1464,18 +1466,18 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 // A guest cache flush inside this scope may be deferred to its end; this keeps
                 // everything recorded before the scope ordered before its draws either way.
-                Gpu.Buffers.CpWriteDeferProbe.Suppress = true; // [local] the scope's own barrier
+                if (!_worker) Gpu.Buffers.CpWriteDeferProbe.Suppress = true; // [local] the scope's own barrier
                 RequestGuestMemoryBarrier(GlobalMemoryBarrier);
-                Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
+                if (!_worker) Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
             }
 
             var command = BeginBatchedGuestCommands();
             _commandBuffer = command;
             if (DeferGlobalBarriers && !BatchBarriers && !pruneScopeBarrier)
             {
-                Gpu.Buffers.CpWriteDeferProbe.Suppress = true; // [local] the scope's own barrier
-                _presenter.RecordGlobalBarrier(command);
-                Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
+                if (!_worker) Gpu.Buffers.CpWriteDeferProbe.Suppress = true; // [local] the scope's own barrier
+                _presenter.RecordGlobalBarrier(command, mainStream: !_worker);
+                if (!_worker) Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
             }
 
             _renderingWritesMemory = _nextDrawWritesMemory;
@@ -1660,7 +1662,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _renderingActive = false;
             _renderingState = default;
-            if (Gpu.Buffers.CpWriteDeferProbe.Enabled) Gpu.Buffers.CpWriteDeferProbe.OnEndRendering(); // [local]
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled && !_worker) Gpu.Buffers.CpWriteDeferProbe.OnEndRendering(); // [local]
             var command = new CommandBuffer(CurrentRecording().Handle);
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
             {
@@ -1708,7 +1710,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
                 else
                 {
-                    _presenter.RecordGlobalBarrier(command);
+                    _presenter.RecordGlobalBarrier(command, mainStream: !_worker); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
                 }
             }
 
@@ -2202,7 +2204,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void ShaderWriteBarrier(PipelineStageFlags sourceStages)
         {
-            if (Gpu.Rendering.BatchSimulation.Enabled) Gpu.Rendering.BatchSimulation.CutAfterDraw(); // [local]
+            if (Gpu.Rendering.BatchSimulation.Enabled && !_worker) Gpu.Rendering.BatchSimulation.CutAfterDraw(); // [local]
             NoteShaderMayWriteMappedMemory();
             RecordMemoryBarrier(
                 sourceStages,

@@ -958,7 +958,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            _presenter.RecordGlobalBarrier(BeginBatchedGuestCommands());
+            _presenter.RecordGlobalBarrier(BeginBatchedGuestCommands(), mainStream: !_worker); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         }
 
         private static void NoteReadsVersion(SliceRequests requests, SharpEmu.Libs.Agc.AgcExports.DeferredWork work)

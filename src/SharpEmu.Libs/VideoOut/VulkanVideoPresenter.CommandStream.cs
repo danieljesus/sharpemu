@@ -939,10 +939,12 @@ internal static unsafe partial class VulkanVideoPresenter
             if (probeSuppress) Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
         }
 
-        internal void RecordGlobalBarrier(CommandBuffer commandBuffer)
+        // [local] mainStream false: a slice worker's barrier, recorded into a buffer submitted later; the scope-barrier
+        // tracker and the probe follow the render thread's stream only.
+        internal void RecordGlobalBarrier(CommandBuffer commandBuffer, bool mainStream = true)
         {
-            if (Gpu.Vulkan.ScopeBarrierTracker.Enabled) Gpu.Vulkan.ScopeBarrierTracker.NoteFullBarrier(); // [local]
-            if (Gpu.Buffers.CpWriteDeferProbe.Enabled) Gpu.Buffers.CpWriteDeferProbe.OnFullBarrier(); // [local]
+            if (Gpu.Vulkan.ScopeBarrierTracker.Enabled && mainStream) Gpu.Vulkan.ScopeBarrierTracker.NoteFullBarrier(); // [local]
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled && mainStream) Gpu.Buffers.CpWriteDeferProbe.OnFullBarrier(); // [local]
             var barrier = new MemoryBarrier2
             {
                 SType = StructureType.MemoryBarrier2,
