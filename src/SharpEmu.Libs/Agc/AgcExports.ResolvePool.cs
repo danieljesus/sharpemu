@@ -119,6 +119,12 @@ public static partial class AgcExports
             return false;
         }
 
+        // [local] SHARPEMU_FRONT_SLICES: the pool's gate (targets, shaders known not to write memory), without counting.
+        internal bool DrawPassesSliceGate(RegisterBanks banks) =>
+            _executor is { } executor && executor.DrawHasTargets(banks) &&
+            _drawWrites.TryGetValue((banks.Shader.Vertex.ExportAddress, banks.Shader.Pixel.Address), out var known) &&
+            known.Registrations == ShaderHeaderRegistry.Registrations && !known.Writes;
+
         // [local] SHARPEMU_PARRES_PROBE: the pool's gate for this draw, without counting it as held.
         private int ProbeDrawGate(RegisterBanks banks)
         {

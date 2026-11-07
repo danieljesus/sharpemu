@@ -314,7 +314,9 @@ public static partial class AgcExports
 
         private sealed class ExecutorSink(CommandStreamTranslation owner) : IResolvedCommandSink
         {
-            public long NextSequence() => owner.Producing ? owner.Sink!.NextSequence : 0;
+            // [local] SHARPEMU_FRONT_SLICES: a captured draw takes a stream position, so its pending writes stay marked until
+            // its slice is joined.
+            public long NextSequence() => owner.Producing ? owner.Sink!.NextSequence : owner._sliceCapture is not null ? ++owner._frontSequence : 0;
 
             public void Record(ResolvedDraw record)
             {
@@ -322,6 +324,10 @@ public static partial class AgcExports
                 if (owner.Producing)
                 {
                     owner.Sink!.EnqueueDeferred(new ResolvedDrawWork(record), isDraw: true);
+                }
+                else if (owner._sliceCapture is { } capture) // [local] SHARPEMU_FRONT_SLICES: the render thread records it later, in order
+                {
+                    capture.Add(new ResolvedDrawWork(record));
                 }
                 else
                 {
@@ -333,6 +339,11 @@ public static partial class AgcExports
 
             public void Record(ResolvedDispatch record)
             {
+                if (owner._sliceCapture is not null) // [local] SHARPEMU_FRONT_SLICES captures draws only
+                {
+                    throw owner._host.Fatal("A dispatch was resolved while the front slices captured a draw.");
+                }
+
                 if (!owner.Producing)
                 {
                     var probeStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
@@ -351,6 +362,21 @@ public static partial class AgcExports
                 sink.EnqueueDeferred(new ResolvedDispatchWork(record), isDraw: false);
             }
         }
+
+        // [local] SHARPEMU_FRONT_SLICES: while set, the executor's draw records are added here instead of being recorded;
+        // the render thread hands them to the slice workers or records them itself, in stream order.
+        private List<DeferredWork>? _sliceCapture;
+
+        internal void BeginSliceCapture(List<DeferredWork> into) => _sliceCapture = into;
+
+        internal void EndSliceCapture() => _sliceCapture = null;
+
+        // [local] A captured record a slice worker may record: a draw (or a skipped one) that writes no memory, so what
+        // the stream resolves after it cannot read anything it writes except its render targets (pending writes).
+        internal static bool IsSliceableDraw(DeferredWork work) =>
+            work is ResolvedDrawWork { Record: { WritesMemory: false, Kind: ResolvedDrawKind.Draw or ResolvedDrawKind.Skipped } };
+
+        internal static long SequenceOf(DeferredWork work) => work is ResolvedDrawWork draw ? draw.Record.Sequence : 0;
 
         public void RunDeferred(DeferredWork work)
         {

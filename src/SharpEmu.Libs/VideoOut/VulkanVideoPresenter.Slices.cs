@@ -422,6 +422,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
 
                     _workerBusyTicks.Add(System.Diagnostics.Stopwatch.GetTimestamp() - busyStarted);
+                    if (ParallelResolveProbe.Enabled) ParallelResolveProbe.AddSliceWorkerTicks(System.Diagnostics.Stopwatch.GetTimestamp() - busyStarted); // [local]
                     slice.Done.Set();
                     slice.Progress.Set();
                 }
@@ -1114,8 +1115,9 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!isWritten && !imageBytes && _bufferCache.PrefersStreamCopy(address, size, isTexelBuffer) &&
                 _presenter._translation.PendingWrites is { } pending && !pending.MayHavePending(address, size))
             {
-                var thread = _presenter._commandThread!;
-                if (thread.HasPendingRange(address, size))
+                // [local] No command thread with the front (SHARPEMU_FRONT_SLICES): no copy of guest memory while the render
+                // thread resolves ahead; the buffer is used through the slice's prologue instead.
+                if (_presenter._commandThread is not { } thread || thread.HasPendingRange(address, size))
                 {
                     _streamFallbacks.Increment();
                 }

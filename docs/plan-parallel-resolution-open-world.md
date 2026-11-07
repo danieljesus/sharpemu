@@ -364,3 +364,26 @@ Medido el 06-11 en partida (ventanas de 5 s, `y2a`/`y2b`/`y2c` en `%TEMP%\gta`),
   - 3b: dispatches dentro de los slices, con la regla de corte por `PendingWrites`;
   - 3c: tubería de K slices por delante;
   - 3d: secundarios.
+
+### 3a implementado (07-11, `SHARPEMU_FRONT_SLICES=1`)
+- **Código:**
+  - `FrontSliceCutter.cs`: el corte y la unión, genéricos y con pruebas (`FrontSliceCutterTests`). Cierra a `SHARPEMU_FRONT_SLICE_ITEMS` (64) y reparte al momento. En un corte, el resto se parte en `min(N, len/16)` (uno por debajo de 32; ninguno por debajo de `SHARPEMU_FRONT_SLICE_MIN`, 8, que corre en el hilo de render). Une en orden como `CommandThread.JoinSlice`: robado, segmento inválido o vacío, el ítem `Serial(...)` y la cola tras `Resume` corren en línea.
+  - `VulkanVideoPresenter.FrontSlices.cs`: el puente con el `BackQueue` (`ISlicer`) y con `RenderWorkerPool`/`NextSegment`/`JoinSegment`/`FinishSlice` de upstream, sin cambios en estos.
+  - Captura en la traducción (`BeginSliceCapture`): el draw corre igual que en serie (`FrontDraw.Run` → `ExecuteQueuedDraw` → ejecutor), pero `ExecutorSink` guarda el registro en vez de grabarlo y le da secuencia (`++_frontSequence`), así que sus escrituras pendientes (render targets) quedan marcadas hasta la unión.
+- **Qué se toma:** draws del frente que pasan la puerta del pool (`DrawPassesSliceGate`) y cuyo registro es `Draw`/`Skipped` sin `WritesMemory`, y las barreras globales con algo tomado. Cualquier otro ítem une todo antes de correr.
+- **Cortes y vueltas a serie (contados en `slice_flushes`/`slice_inline`):**
+  - `item`: ítem no tomado;
+  - `exit`: fin de `RunPending` (sin tubería entre llamadas);
+  - `read`: una lectura de memoria del guest en el hilo de render (`TryReadGuest`, `DrainingWriteMemory`) que solapa una escritura pendiente de un draw tomado;
+  - `record`: registro que no es un draw simple o que escribe memoria;
+  - `after`: antes de `AfterItem` (`RUNAHEAD_TICKS`).
+- **Seguridad:**
+  - el banco del frente que lee el registro (`Context`) vuelve a la pila solo tras la unión (`HoldSnapshot`);
+  - sin hilo de comandos, el trabajador no hace copias de flujo (`stream_fallbacks`);
+  - `SHARPEMU_FRONT_RESOLVE_POOL` se ignora con slices.
+- **Sonda** (`[PERF][PARRES]`, por fotograma):
+  - `front_slices=n,items_mean,items,joined,segments`;
+  - `slice_handoff_ms`, `slice_join_wait_ms` (con los relevos que corran en la espera), `slice_join_ms`, `slice_inline_ms`, `slice_worker_ms`;
+  - `slice_inline=short,stolen,invalid,serial,tail`, `slice_flushes=item,exit,read,record,after` y `slice_serial=[motivo:n]`.
+  - Con slices, `draw_record_ms` solo cuenta lo que se graba por el sumidero del ejecutor, y `draw_ms` incluye las uniones `read` que caen dentro de un draw.
+- **Brazos** (con `SHARPEMU_RENDER_PIPELINE=1 SHARPEMU_PARRES_PROBE=1 SHARPEMU_FPS_LOG=1`): A base; S `SHARPEMU_FRONT_SLICES=1` (N = `SHARPEMU_RENDER_WORKERS`; por defecto, procesadores/4 entre 1 y 6); S0 = S con `SHARPEMU_RENDER_WORKERS=0`, que debe dar lo mismo que A (nada se toma).

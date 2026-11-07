@@ -14,6 +14,8 @@ namespace SharpEmu.Libs.VideoOut;
 // runs of consecutive gated draws are measured between the items that would end a slice. No behaviour changes.
 // slice_runs and draw_barrier_runs are the runs step 3 (SHARPEMU_FRONT_SLICES) would cut with typed barriers: global
 // barriers do not end them, and dispatches do not end slice_runs either unless NeedsSerialDispatch.
+// With SHARPEMU_FRONT_SLICES the line also carries the slices' cost on the render thread (front_slices=…, slice_*), and
+// draw_record_ms only counts the draws recorded through the executor's sink (the taken ones are recorded elsewhere).
 // docs/plan-parallel-resolution-open-world.md §8 explains the [PERF][PARRES] line.
 internal static class ParallelResolveProbe
 {
@@ -112,6 +114,13 @@ internal static class ParallelResolveProbe
 
     // The front's global barrier item (one delegate instance), set when the front starts.
     public static Delegate? BarrierItem;
+
+    // [local] SHARPEMU_FRONT_SLICES (render thread): handing slices to the workers, waiting for their segments (with the
+    // relays run meanwhile), joining them, and the taken items recorded here after all. The workers' recording, any thread.
+    internal static long SliceHandoffTicks, SliceWaitTicks, SliceJoinTicks, SliceInlineTicks;
+    private static long _sliceWorkerTicks;
+
+    public static void AddSliceWorkerTicks(long ticks) => Interlocked.Add(ref _sliceWorkerTicks, ticks);
 
     public static void OnFrame() => Interlocked.Increment(ref _frames);
 
@@ -228,6 +237,42 @@ internal static class ParallelResolveProbe
 
     private static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
 
+    private static readonly string[] InlineNames = ["short", "stolen", "invalid", "serial", "tail"];
+    private static readonly string[] FlushNames = ["item", "exit", "read", "record", "after"];
+
+    // [local] SHARPEMU_FRONT_SLICES, per frame: slices handed out and their mean items, items joined (recorded by a worker),
+    // the render thread's ms per part, the workers' ms, items recorded here after all by reason, joins by what caused them,
+    // and the reasons a worker stopped (Serial).
+    internal static void AppendSlices(StringBuilder text, double frames)
+    {
+        var stats = FrontSliceStats.Shared;
+        text.Append(CultureInfo.InvariantCulture,
+            $" front_slices=n:{stats.Slices / frames:F1},items_mean:{(stats.Slices == 0 ? 0 : stats.Items / (double)stats.Slices):F1},items:{stats.Items / frames:F0},joined:{stats.Joined / frames:F0},segments:{stats.Segments / frames:F1}");
+        text.Append(CultureInfo.InvariantCulture,
+            $" slice_handoff_ms={Ms(SliceHandoffTicks) / frames:F2} slice_join_wait_ms={Ms(SliceWaitTicks) / frames:F2} slice_join_ms={Ms(SliceJoinTicks) / frames:F2} slice_inline_ms={Ms(SliceInlineTicks) / frames:F2} slice_worker_ms={Ms(Interlocked.Exchange(ref _sliceWorkerTicks, 0)) / frames:F2}");
+        text.Append(" slice_inline=");
+        for (var index = 0; index < InlineNames.Length; index++)
+        {
+            text.Append(index == 0 ? "" : ",").Append(InlineNames[index]).Append(':').Append((stats.Inline[index] / frames).ToString("F1", CultureInfo.InvariantCulture));
+            stats.Inline[index] = 0;
+        }
+
+        text.Append(" slice_flushes=");
+        for (var index = 0; index < FlushNames.Length; index++)
+        {
+            text.Append(index == 0 ? "" : ",").Append(FlushNames[index]).Append(':').Append((stats.Flushes[index] / frames).ToString("F1", CultureInfo.InvariantCulture));
+            stats.Flushes[index] = 0;
+        }
+
+        text.Append(" slice_serial=[");
+        text.AppendJoin(",", stats.SerialReasons.OrderByDescending(pair => pair.Value).Take(8)
+            .Select(pair => string.Create(CultureInfo.InvariantCulture, $"{pair.Key.Replace(' ', '_')}:{pair.Value / frames:F1}")));
+        text.Append(']');
+        stats.SerialReasons.Clear();
+        stats.Slices = stats.Items = stats.Joined = stats.Segments = 0;
+        SliceHandoffTicks = SliceWaitTicks = SliceJoinTicks = SliceInlineTicks = 0;
+    }
+
     private static void Report(long now)
     {
         var seconds = (now - _windowStart) / (double)Stopwatch.Frequency;
@@ -257,6 +302,8 @@ internal static class ParallelResolveProbe
         SliceRuns.Append(text, "slice_runs", f);
         DrawBarrierRuns.Append(text, "draw_barrier_runs", f);
         text.Append(CultureInfo.InvariantCulture, $" scope_changes={_scopeChanges / f:F1} lookup_generation_changes={_lookupChanges / f:F1}");
+        if (VulkanVideoPresenter.FrontSlicesEnabled)
+            AppendSlices(text, f);
         text.Append(" breakers=[");
         text.AppendJoin(",", Breakers.OrderByDescending(pair => pair.Value.Count).Take(10)
             .Select(pair => string.Create(CultureInfo.InvariantCulture, $"{pair.Key}:{pair.Value.Count / f:F1}/{Ms(pair.Value.Ticks) / f:F2}ms")));

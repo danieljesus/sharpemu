@@ -570,6 +570,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (presenter.OnResolveWorker)
                     return presenter.ReadOnResolveWorker(virtualAddress, destination);
+                presenter.BeforeFrontSliceRead(virtualAddress, (ulong)destination.Length); // [local] SHARPEMU_FRONT_SLICES (render thread only)
                 if (presenter.HasPendingMemoryPublication(virtualAddress, (ulong)destination.Length))
                     presenter.CompleteOverlappingPublications(virtualAddress, (ulong)destination.Length);
                 return presenter.OnCommandThread
@@ -766,6 +767,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return ReadOnCommandThread(address, destination);
             }
 
+            BeforeFrontSliceRead(address, (ulong)destination.Length); // [local] SHARPEMU_FRONT_SLICES
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemorySync))
             {
                 if (HasPendingMemoryPublication(address, (ulong)destination.Length))
