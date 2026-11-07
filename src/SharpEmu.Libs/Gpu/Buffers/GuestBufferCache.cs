@@ -451,11 +451,15 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             return current;
         }
 
+        var rebuildStarted = SharpEmu.Libs.Diagnostics.RelayProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_RELAY_PROBE
         _gpuModifiedGate.EnterReadLock();
         try
         {
             // Publish before clearing the flag: a lock-free reader that sees it clear must also see this snapshot.
             var snapshot = _gpuModifiedRanges.Snapshot();
+            if (rebuildStarted != 0)
+                SharpEmu.Libs.Diagnostics.RelayProbe.NoteSnapshotRebuild(_relay.IsGpuQueueThread, snapshot.Count,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - rebuildStarted);
             Volatile.Write(ref _gpuModifiedSnapshot, snapshot);
             _gpuModifiedSnapshotStale = false;
             return snapshot;
@@ -2238,8 +2242,24 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             Environment.FailFast($"The address range is invalid: 0x{guestAddress:X16}, 0x{size:X16}.");
         }
 
+        if ((ModifiedTreeReads || ForceModifiedTreeReads) && _relay.IsGpuQueueThread) // [local] SHARPEMU_MODIFIED_TREE_READS
+        {
+            return _gpuModifiedRanges.Overlaps(guestAddress, size);
+        }
+
         return GpuModifiedSnapshot().Overlaps(guestAddress, size); // [local]
     }
+
+    // [local] SHARPEMU_MODIFIED_TREE_READS=1 (off by default): on the GPU queue thread HasGpuDirtyBytes asks the
+    // GPU-modified set itself instead of its lock-free snapshot. The snapshot is rebuilt (every range copied into two
+    // new arrays) on the first read after each change, and every guest read's completion changes the set
+    // (RemoveGpuModified) and then asks it (the clean check), so each completion paid a rebuild. Exact: the queue thread
+    // is the only one that changes the set (Add in ObtainBuffer and RemoveGpuModified, both under the write lock), and it
+    // already reads it without a lock (_gpuModifiedRanges.Contains in ObtainBuffer and IsPieceCurrent); other threads
+    // keep the snapshot.
+    internal static readonly bool ModifiedTreeReads = Environment.GetEnvironmentVariable("SHARPEMU_MODIFIED_TREE_READS") == "1";
+
+    internal bool ForceModifiedTreeReads { get; set; }
 
     public bool EverGpuWritten(ulong guestAddress, ulong size) => _tracker.MayHaveGpuWrittenPages(guestAddress, size);
 
@@ -3057,19 +3077,30 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 var split = source == GuestMemoryProfile.ReadbackSource.StoreDownload && Diagnostics.LabelPollSplit.Measures(guestAddress, size) // [local]
                     ? new Diagnostics.LabelPollSplit.Sample { Started = System.Diagnostics.Stopwatch.GetTimestamp() }
                     : null;
+                // [local] SHARPEMU_READBACK_GUEST_SUBMIT: the copy is recorded and submitted below, by this thread.
+                var offQueueSubmit = (GuestSubmit || ForceGuestSubmit) && split is null && !Diagnostics.ReadbackOriginProbe.Enabled;
                 if (!_relay.TryRunOnGpuQueue(() =>
                     {
                         beginStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                         if (GuestReadSplit) relayEntered = beginStarted;
                         if (split is not null) BeginSplit(split);
-                        pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true, markHot, waitForSlot);
-                        if (CutPolicy.GuestWindows && pending is not null && !_scheduler.IsTickComplete(pending.Ticket.WaitTick)) // [local] SHARPEMU_CUT_POLICY
+                        var synchronousBefore = SharpEmu.Libs.Diagnostics.RelayProbe.Enabled ? Interlocked.Read(ref ReadbacksSynchronous) : 0; // [local]
+                        pending = BeginReadMemoryOnGpu(guestAddress, size, isWrite, source, allowPending: true, markHot, waitForSlot,
+                            offQueueSubmit: offQueueSubmit);
+                        if (CutPolicy.GuestWindows && pending is not null && !_scheduler.IsTickComplete(pending.WaitTick)) // [local] SHARPEMU_CUT_POLICY
                             _cut.NoteWindow(guestAddress, _batchSerial);
                         slotsBusy = _beginSlotsBusy;
                         completedAtBegin = _scheduler.CompletedTick;
                         frameAtBegin = FrameTicks.LatestSubmittedFrame + 1;
                         if (split is not null) EndSplitBegin(split, pending, guestAddress, size);
                         beginEnded = System.Diagnostics.Stopwatch.GetTimestamp();
+                        if (SharpEmu.Libs.Diagnostics.RelayProbe.Enabled) // [local] SHARPEMU_RELAY_PROBE
+                            SharpEmu.Libs.Diagnostics.RelayProbe.NoteBegin(source, pending is not null
+                                    ? pending.DeferredPieces is not null ? SharpEmu.Libs.Diagnostics.RelayProbe.Outcome.OffQueue : SharpEmu.Libs.Diagnostics.RelayProbe.Outcome.Pending
+                                    : slotsBusy ? SharpEmu.Libs.Diagnostics.RelayProbe.Outcome.SlotsBusy
+                                    : Interlocked.Read(ref ReadbacksSynchronous) != synchronousBefore ? SharpEmu.Libs.Diagnostics.RelayProbe.Outcome.Synchronous
+                                    : SharpEmu.Libs.Diagnostics.RelayProbe.Outcome.NoDownload,
+                                beginEnded - beginStarted);
                     }))
                 {
                     return AwaitShutdown();
@@ -3102,6 +3133,17 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                     return true;
                 }
 
+                if (pending.DeferredPieces is { } deferred) // [local] SHARPEMU_READBACK_GUEST_SUBMIT
+                {
+                    switch (SubmitOffQueue(readback, pending, deferred))
+                    {
+                        case OffQueueSubmit.ReadSynchronously:
+                            return true;
+                        case OffQueueSubmit.RelayClosed:
+                            return AwaitShutdown();
+                    }
+                }
+
                 var gpuWaitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 readback.Wait(pending.Ticket);
                 NoteGuestReadback(pending, completedAtBegin, frameAtBegin, beginStarted - beginPosted, beginEnded - beginStarted,
@@ -3117,7 +3159,18 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 Action complete = () =>
                 {
                     if (timelineLabel) Diagnostics.LabelTimeline.Log('b', _scheduler.CurrentTick);
+                    if (!SharpEmu.Libs.Diagnostics.RelayProbe.Enabled)
+                    {
+                        applied = CompleteReadMemoryOnGpu(pending, retrySynchronously: lastAttempt);
+                        return;
+                    }
+
+                    var completeStarted = System.Diagnostics.Stopwatch.GetTimestamp(); // [local] SHARPEMU_RELAY_PROBE
+                    var staleBefore = StalePiecesKept;
                     applied = CompleteReadMemoryOnGpu(pending, retrySynchronously: lastAttempt);
+                    var stale = (int)(StalePiecesKept - staleBefore);
+                    SharpEmu.Libs.Diagnostics.RelayProbe.NoteComplete(applied, pending.Copies.Count - stale, stale,
+                        System.Diagnostics.Stopwatch.GetTimestamp() - completeStarted);
                 };
                 if (!(lastAttempt ? _relay.TryRunOnGpuQueue(complete) : _relay.TryRunNestableOnGpuQueue(complete)))
                 {
@@ -3361,7 +3414,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             return EagerStart.Nothing;
         }
 
-        if (!TryBeginDownloadAsync(copies, out var ticket, out var writeTicks, out _))
+        if (!TryBeginDownloadAsync(copies, offQueueSubmit: false, out var ticket, out _, out var writeTicks, out _, out _))
         {
             return EagerStart.Deferred;
         }
@@ -3550,6 +3603,72 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_READBACK_RETRIES"), out var retries) && retries >= 0 ? retries : 3;
     private static long _reportedAsyncRetried;
 
+    // [local] SHARPEMU_READBACK_GUEST_SUBMIT=1 (off by default): a guest read's copy is recorded and submitted to the
+    // readback queue by the guest thread that waits for it, not by the GPU queue thread. The relayed begin still finds
+    // the pieces, seals and submits their writer and retains their buffers there; only vkQueueSubmit2 (~33 us in GTA V,
+    // ReadbackSubmit in the render profile, ~340 per frame in the open world) and the recording leave the render thread.
+    // Exact: the copy waits for the same writer tick on the main timeline, and the completion, still on the queue
+    // thread, publishes only the pieces whose writer did not change, as for a copy submitted at once.
+    internal static readonly bool GuestSubmit = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_GUEST_SUBMIT") == "1";
+
+    internal bool ForceGuestSubmit { get; set; }
+
+    // Tests: runs on the guest thread between the relayed begin and its own submit.
+    internal Action? BeforeGuestSubmit { get; set; }
+
+    private long _guestSubmittedReadbacks, _guestSubmitFallbacks;
+
+    internal long GuestSubmittedReadbacks => Interlocked.Read(ref _guestSubmittedReadbacks);
+
+    internal long GuestSubmitFallbacks => Interlocked.Read(ref _guestSubmitFallbacks);
+
+    private enum OffQueueSubmit { Submitted, ReadSynchronously, RelayClosed }
+
+    // On the guest thread: submits the deferred copy of pending. Without a free slot whose staging fits, the GPU queue
+    // thread submits it as it would have, or, with every slot busy, releases the pieces and reads synchronously.
+    private OffQueueSubmit SubmitOffQueue(VulkanAsyncReadback readback, PendingDownload pending, ReadbackPiece[] pieces)
+    {
+        BeforeGuestSubmit?.Invoke();
+        var submitStarted = SharpEmu.Libs.Diagnostics.RelayProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        if (readback.TryBeginOffQueue(pieces, pending.DeferredWaitTick, out var ticket) && ticket is not null)
+        {
+            if (submitStarted != 0) SharpEmu.Libs.Diagnostics.RelayProbe.NoteSubmit(offQueue: true, System.Diagnostics.Stopwatch.GetTimestamp() - submitStarted);
+            pending.Ticket = ticket;
+            pending.DeferredPieces = null;
+            Interlocked.Increment(ref _guestSubmittedReadbacks);
+            return OffQueueSubmit.Submitted;
+        }
+
+        Interlocked.Increment(ref _guestSubmitFallbacks);
+        if (SharpEmu.Libs.Diagnostics.RelayProbe.Enabled) SharpEmu.Libs.Diagnostics.RelayProbe.NoteGuestFallback();
+        var submitted = false;
+        if (!_relay.TryRunOnGpuQueue(() => submitted = SubmitDeferredOnQueue(pending, pieces)))
+        {
+            return OffQueueSubmit.RelayClosed;
+        }
+
+        return submitted ? OffQueueSubmit.Submitted : OffQueueSubmit.ReadSynchronously;
+    }
+
+    private bool SubmitDeferredOnQueue(PendingDownload pending, ReadbackPiece[] pieces)
+    {
+        if (AsyncReadback is { } readback && readback.TryBegin(pieces, pending.DeferredWaitTick, out var ticket) && ticket is not null)
+        {
+            pending.Ticket = ticket;
+            pending.DeferredPieces = null;
+            return true;
+        }
+
+        foreach (var copy in pending.Copies)
+        {
+            copy.Buffer.ReleaseForeignRead();
+        }
+
+        Interlocked.Increment(ref ReadbacksBusy);
+        ReadMemoryOnGpu(pending.GuestAddress, pending.Size, pending.IsWrite, pending.Source);
+        return false;
+    }
+
     private bool AwaitShutdown()
     {
         lock (_shutdownGate)
@@ -3583,7 +3702,11 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     private sealed record PendingDownload
     {
-        public required VulkanAsyncReadback.Ticket Ticket { get; init; }
+        // [local] null while DeferredPieces waits for the guest thread's submit (SHARPEMU_READBACK_GUEST_SUBMIT).
+        public VulkanAsyncReadback.Ticket Ticket { get; set; } = null!;
+        public ReadbackPiece[]? DeferredPieces { get; set; }
+        public ulong DeferredWaitTick { get; init; }
+        public ulong WaitTick => Ticket?.WaitTick ?? DeferredWaitTick;
         public required List<DownloadPiece> Copies { get; init; }
         public required ulong[] WriteTicks { get; init; }
         public required ulong WindowBegin { get; init; }
@@ -3598,11 +3721,11 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     }
 
     private PendingDownload? BeginReadMemoryOnGpu(ulong guestAddress, ulong size, bool isWrite, GuestMemoryProfile.ReadbackSource source,
-        bool allowPending, bool markHot = false, bool waitForSlot = false, bool useEager = false)
+        bool allowPending, bool markHot = false, bool waitForSlot = false, bool useEager = false, bool offQueueSubmit = false)
     {
         if (!Diagnostics.ReadbackOriginProbe.Enabled)
         {
-            return BeginReadMemoryOnGpuCore(guestAddress, size, isWrite, source, allowPending, markHot, waitForSlot, useEager);
+            return BeginReadMemoryOnGpuCore(guestAddress, size, isWrite, source, allowPending, markHot, waitForSlot, useEager, offQueueSubmit);
         }
 
         // [local] SHARPEMU_READBACK_ORIGIN_PROBE: the tickets started here carry their origin.
@@ -3620,7 +3743,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     }
 
     private PendingDownload? BeginReadMemoryOnGpuCore(ulong guestAddress, ulong size, bool isWrite, GuestMemoryProfile.ReadbackSource source,
-        bool allowPending, bool markHot, bool waitForSlot, bool useEager)
+        bool allowPending, bool markHot, bool waitForSlot, bool useEager, bool offQueueSubmit = false)
     {
         _beginSlotsBusy = false;
         if (MeshDrawTrace.Enabled) MeshDrawTrace.Range("cpu-synchronize", guestAddress, size, $"write={isWrite} source={source}");
@@ -3689,7 +3812,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         }
 
         var slotsBusy = false;
-        if (copies.Count != 0 && allowPending && TryBeginDownloadAsync(copies, out var ticket, out var writeTicks, out slotsBusy))
+        if (copies.Count != 0 && allowPending &&
+            TryBeginDownloadAsync(copies, offQueueSubmit, out var ticket, out var deferred, out var writeTicks, out var waitTick, out slotsBusy))
         {
             foreach (var copy in copies)
             {
@@ -3699,6 +3823,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             return new PendingDownload
             {
                 Ticket = ticket,
+                DeferredPieces = deferred,
+                DeferredWaitTick = waitTick,
                 Copies = copies,
                 WriteTicks = writeTicks,
                 WindowBegin = windowBegin,
@@ -4415,12 +4541,14 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             var copies = pending.Copies;
             var current = new bool[copies.Count];
             var published = 0;
+            var probeStarted = SharpEmu.Libs.Diagnostics.RelayProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_RELAY_PROBE
             for (var index = 0; index < copies.Count; index++)
             {
                 current[index] = IsPieceCurrent(pending, index);
                 published += current[index] ? 1 : 0;
             }
 
+            var probeChecked = probeStarted != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var splitSample = pending.Ticket.Observe; // [local] SHARPEMU_LABEL_POLL_SPLIT
             readback.Complete(pending.Ticket, published == 0 ? null : (index, bytes) =>
             {
@@ -4439,6 +4567,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
                 }
             });
+            var probeCopied = probeStarted != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             for (var index = 0; index < copies.Count; index++)
             {
                 if (current[index])
@@ -4447,6 +4576,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 }
             }
 
+            var probeRemoved = probeStarted != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var windowSize = pending.WindowEnd - pending.WindowBegin;
             if (published == copies.Count && !_gpuModifiedRanges.Overlaps(pending.WindowBegin, windowSize))
             {
@@ -4465,6 +4595,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 }
             }
 
+            if (probeStarted != 0)
+                SharpEmu.Libs.Diagnostics.RelayProbe.NoteCompleteSplit(probeChecked - probeStarted, probeCopied - probeChecked,
+                    probeRemoved - probeCopied, System.Diagnostics.Stopwatch.GetTimestamp() - probeRemoved);
             var stale = copies.Count - published;
             StalePiecesKept += stale;
             Interlocked.Add(ref _reportedPublishedPieces, published);
@@ -5138,17 +5271,21 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         GuestReadbackFrameAge[(int)Math.Clamp(age, 0, GuestReadbackFrameAge.Length - 1)].Increment();
     }
 
-    private bool TryBeginDownloadAsync(List<DownloadPiece> copies, out VulkanAsyncReadback.Ticket ticket, out ulong[] writeTicks, out bool slotsBusy)
+    // [local] offQueueSubmit (SHARPEMU_READBACK_GUEST_SUBMIT): the copy is not submitted; deferred holds its pieces for
+    // the guest thread, and ticket stays null.
+    private bool TryBeginDownloadAsync(List<DownloadPiece> copies, bool offQueueSubmit, out VulkanAsyncReadback.Ticket ticket,
+        out ReadbackPiece[]? deferred, out ulong[] writeTicks, out ulong waitTick, out bool slotsBusy)
     {
         ticket = null!;
+        deferred = null;
         writeTicks = [];
+        waitTick = 0;
         slotsBusy = false;
         if (AsyncReadback is not { } readback || copies.Count == 0)
         {
             return false;
         }
 
-        var waitTick = 0UL;
         var total = 0UL;
         var ticks = new ulong[copies.Count];
         for (var index = 0; index < copies.Count; index++)
@@ -5171,6 +5308,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             return false;
         }
 
+        if (SharpEmu.Libs.Diagnostics.RelayProbe.Enabled) // [local] SHARPEMU_RELAY_PROBE
+            SharpEmu.Libs.Diagnostics.RelayProbe.NoteCopies(
+                SharpEmu.Libs.Diagnostics.RelayProbe.ClassifyWriter(waitTick, _scheduler.CurrentTick, _scheduler.Timeline.CompletedTick), copies.Count, total);
         if (waitTick >= _scheduler.CurrentTick)
         {
             _splitFlushed = true; // [local] SHARPEMU_LABEL_POLL_SPLIT
@@ -5190,12 +5330,22 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             pieces[index] = new ReadbackPiece(copies[index].Buffer, copies[index].SourceOffset, copies[index].Size);
         }
 
+        if (offQueueSubmit) // [local] SHARPEMU_READBACK_GUEST_SUBMIT
+        {
+            Interlocked.Increment(ref ReadbacksStarted);
+            deferred = pieces;
+            writeTicks = ticks;
+            return true;
+        }
+
+        var submitStarted = SharpEmu.Libs.Diagnostics.RelayProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
         if (!readback.TryBegin(pieces, waitTick, out var started, out slotsBusy) || started is null)
         {
             Interlocked.Increment(ref ReadbacksBusy);
             return false;
         }
 
+        if (submitStarted != 0) SharpEmu.Libs.Diagnostics.RelayProbe.NoteSubmit(offQueue: false, System.Diagnostics.Stopwatch.GetTimestamp() - submitStarted);
         Interlocked.Increment(ref ReadbacksStarted);
 
         ticket = started;

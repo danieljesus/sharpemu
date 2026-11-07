@@ -31,6 +31,11 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
     private readonly Slot[] _slots;
     private readonly VkSemaphore _timeline;
     private readonly object _gate = new();
+    // [local] SHARPEMU_READBACK_GUEST_SUBMIT: every vkQueueSubmit2 to this queue and the signal value it takes, from the
+    // GPU queue thread (holding _gate too) or from a guest thread (TryBeginOffQueue, which also records under it, into
+    // the command buffers of its own pool). Never held while taking _gate.
+    private readonly object _submitGate = new();
+    private readonly CommandPool _offQueuePool;
 
     // [local] SHARPEMU_READBACK_SUBMIT_GUARD=1 (off by default): before a copy that waits on the main timeline for
     // waitTick is submitted, wait until the submit thread has handed waitTick to the main queue, so the readback queue
@@ -41,9 +46,10 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
     private int _waiters;
     private bool _disposed;
 
-    internal sealed class Slot(CommandBuffer command)
+    internal sealed class Slot(CommandBuffer command, CommandBuffer offQueueCommand)
     {
         public readonly CommandBuffer Command = command;
+        public readonly CommandBuffer OffQueueCommand = offQueueCommand; // [local] SHARPEMU_READBACK_GUEST_SUBMIT
         public GpuBuffer? Staging;
         public bool Busy;
         public ulong WaitTick, Value; // [local] SHARPEMU_LABEL_POLL_SPLIT
@@ -87,10 +93,14 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         };
         var commands = stackalloc CommandBuffer[SlotCount];
         Require(vk.AllocateCommandBuffers(device.Device, &allocateInfo, commands), "vkAllocateCommandBuffers(readback)");
+        Require(vk.CreateCommandPool(device.Device, &poolInfo, null, out _offQueuePool), "vkCreateCommandPool(readback off queue)");
+        allocateInfo.CommandPool = _offQueuePool;
+        var offQueueCommands = stackalloc CommandBuffer[SlotCount];
+        Require(vk.AllocateCommandBuffers(device.Device, &allocateInfo, offQueueCommands), "vkAllocateCommandBuffers(readback off queue)");
         _slots = new Slot[SlotCount];
         for (var index = 0; index < SlotCount; index++)
         {
-            _slots[index] = new Slot(commands[index]);
+            _slots[index] = new Slot(commands[index], offQueueCommands[index]);
         }
 
         var typeInfo = new SemaphoreTypeCreateInfo
@@ -158,6 +168,65 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             }
 
             slotsBusy = true;
+        }
+
+        return false;
+    }
+
+    // [local] SHARPEMU_READBACK_GUEST_SUBMIT: the copy recorded and submitted by the guest thread that waits for it
+    // instead of by the GPU queue thread, which only sealed waitTick and chose the pieces. Only a free asynchronous slot
+    // whose staging already fits takes it, so nothing is allocated off the queue thread; false otherwise, and the caller
+    // submits on the queue thread as before.
+    public bool TryBeginOffQueue(ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick, out Ticket? ticket)
+    {
+        ticket = null;
+        if (!PrepareMainQueueWait(_scheduler, waitTick, SubmitGuard))
+        {
+            return false;
+        }
+
+        var total = StagingBytes(pieces);
+        Slot? slot = null;
+        lock (_gate)
+        {
+            if (_disposed)
+            {
+                return false;
+            }
+
+            for (var index = 1; index < _slots.Length; index++)
+            {
+                if (!_slots[index].Busy && _slots[index].Staging is { } staging && staging.Size >= total)
+                {
+                    slot = _slots[index];
+                    slot.Busy = true;
+                    break;
+                }
+            }
+        }
+
+        if (slot is null)
+        {
+            return false;
+        }
+
+        lock (_submitGate)
+        {
+            if (!Volatile.Read(ref _disposed))
+            {
+                RecordCopies(slot.OffQueueCommand, slot.Staging!, pieces, out var offsets, out var sizes);
+                var value = SubmitCopies(slot.OffQueueCommand, waitTick);
+                slot.WaitTick = waitTick;
+                slot.Value = value;
+                ticket = new Ticket(slot, value, waitTick, offsets, sizes);
+                return true;
+            }
+        }
+
+        lock (_gate)
+        {
+            slot.Busy = false;
+            Monitor.PulseAll(_gate);
         }
 
         return false;
@@ -418,15 +487,58 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
 
     private Ticket BeginLocked(Slot slot, ReadOnlySpan<ReadbackPiece> pieces, ulong waitTick)
     {
+        var staging = EnsureStaging(slot, StagingBytes(pieces));
+        var vk = _device.Vk;
+        var command = slot.Command;
+        RecordCopies(command, staging, pieces, out var offsets, out var sizes);
+
+        ulong aheadCount = 0, aheadTick = 0;
+        if (Diagnostics.LabelPollSplit.Enabled) // [local]
+        {
+            ulong signaledNow = 0;
+            _ = vk.GetSemaphoreCounterValue(_device.Device, _timeline, &signaledNow);
+            foreach (var other in _slots)
+            {
+                if (other.Busy && other.Value > signaledNow)
+                {
+                    aheadCount++;
+                    aheadTick = Math.Max(aheadTick, other.WaitTick);
+                }
+            }
+        }
+
+        ulong signalValue;
+        lock (_submitGate) // [local] SHARPEMU_READBACK_GUEST_SUBMIT: guest threads submit to this queue too
+        {
+            signalValue = SubmitCopies(command, waitTick);
+        }
+
+        slot.Busy = true;
+        slot.WaitTick = waitTick;
+        slot.Value = signalValue;
+        return new Ticket(slot, signalValue, waitTick, offsets, sizes)
+        {
+            AheadCount = aheadCount,
+            AheadTick = aheadTick,
+            Origin = Diagnostics.ReadbackOriginProbe.Enabled ? Diagnostics.ReadbackOriginProbe.Current : default,
+        };
+    }
+
+    private static ulong StagingBytes(ReadOnlySpan<ReadbackPiece> pieces)
+    {
         var total = 0UL;
         foreach (var piece in pieces)
         {
             total = AlignUp(total, Alignment) + piece.Size;
         }
 
-        var staging = EnsureStaging(slot, total);
+        return total;
+    }
+
+    // Records the copies of the pieces into the staging buffer and the barrier that makes them visible to the host.
+    private void RecordCopies(CommandBuffer command, GpuBuffer staging, ReadOnlySpan<ReadbackPiece> pieces, out ulong[] offsets, out ulong[] sizes)
+    {
         var vk = _device.Vk;
-        var command = slot.Command;
         Require(vk.ResetCommandBuffer(command, 0), "vkResetCommandBuffer(readback)");
         var beginInfo = new CommandBufferBeginInfo
         {
@@ -434,8 +546,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
         };
         Require(vk.BeginCommandBuffer(command, &beginInfo), "vkBeginCommandBuffer(readback)");
-        var offsets = new ulong[pieces.Length];
-        var sizes = new ulong[pieces.Length];
+        offsets = new ulong[pieces.Length];
+        sizes = new ulong[pieces.Length];
         var offset = 0UL;
         for (var index = 0; index < pieces.Length; index++)
         {
@@ -471,22 +583,11 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             vk.CmdPipelineBarrier2(command, &dependency);
         }
         Require(vk.EndCommandBuffer(command), "vkEndCommandBuffer(readback)");
+    }
 
-        ulong aheadCount = 0, aheadTick = 0;
-        if (Diagnostics.LabelPollSplit.Enabled) // [local]
-        {
-            ulong signaledNow = 0;
-            _ = vk.GetSemaphoreCounterValue(_device.Device, _timeline, &signaledNow);
-            foreach (var other in _slots)
-            {
-                if (other.Busy && other.Value > signaledNow)
-                {
-                    aheadCount++;
-                    aheadTick = Math.Max(aheadTick, other.WaitTick);
-                }
-            }
-        }
-
+    // Under _submitGate: submits the recorded copies and returns the value they signal.
+    private ulong SubmitCopies(CommandBuffer command, ulong waitTick)
+    {
         var signalValue = ++_signaled;
         // The semaphore wait orders the copies after every write the main queue made
         // up to waitTick and makes those writes visible to them.
@@ -522,16 +623,8 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
         };
         // [local] PrepareMainQueueWait ran before the gate: with the guard, waitTick is already on the main queue.
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackSubmit)) // [local]
-            Require(vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback)");
-        slot.Busy = true;
-        slot.WaitTick = waitTick;
-        slot.Value = signalValue;
-        return new Ticket(slot, signalValue, waitTick, offsets, sizes)
-        {
-            AheadCount = aheadCount,
-            AheadTick = aheadTick,
-            Origin = Diagnostics.ReadbackOriginProbe.Enabled ? Diagnostics.ReadbackOriginProbe.Current : default,
-        };
+            Require(_device.Vk.QueueSubmit2(_queue, 1, &submit, default), "vkQueueSubmit2(readback)");
+        return signalValue;
     }
 
     public delegate void ReadbackConsumer(int index, ReadOnlySpan<byte> bytes);
@@ -571,6 +664,10 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             }
 
             _disposed = true;
+        }
+
+        lock (_submitGate) // [local] SHARPEMU_READBACK_GUEST_SUBMIT: a guest submit that found the queue still open counts
+        {
             signaled = _signaled;
         }
 
@@ -603,6 +700,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
 
             vk.DestroySemaphore(_device.Device, _timeline, null);
             vk.DestroyCommandPool(_device.Device, _pool, null);
+            vk.DestroyCommandPool(_device.Device, _offQueuePool, null);
         }
     }
 }
