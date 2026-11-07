@@ -619,6 +619,13 @@ public sealed partial class RenderExecutor
         record.ContextStamp = banks.ContextStamp;
         record.DynamicStamp = banks.Stamp(RegisterStamp.ContextDynamic);
         record.TargetVersion = _drawResolution.TargetVersion;
+        if (PlanRegisterShadow.Enabled) // [local] SHARPEMU_PLAN_PROBE: the composite depth extent is depth state no register carries
+        {
+            var groups = banks.PlanHashes;
+            groups.DepthTargets ^= banks.CompositeDepthSizeXy is { } extent ? PlanRegisterShadow.Mix(0x8000_0000u, extent) : 0;
+            record.PlanGroups = groups;
+        }
+
         record.Dynamic = ResolveDynamicState(banks, in state, WrittenColorTargets(context, in state, pixelProgram), record.SubmitId, record.PacketAddress);
         record.WritesMemory = DrawWritesMemory(vertexInput.Stage, vertexBufferWrites) || (state.PixelActive && DrawWritesMemory(pixelInput.Stage, pixelBufferWrites));
         record.WriteStages = writeStages;

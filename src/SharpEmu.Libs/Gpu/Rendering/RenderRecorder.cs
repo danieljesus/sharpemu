@@ -502,6 +502,11 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             Diagnostics.RepeatProbe.NoteDraw(record, ref state, vertexInput, state.PixelActive ? pixelInput : null);
         }
 
+        if (Diagnostics.PlanProbe.Enabled && !OnWorker) // [local] SHARPEMU_PLAN_PROBE: the draw's shape and groups, before its bindings
+        {
+            Diagnostics.PlanProbe.NoteDraw(record, ref state, vertexInput, state.PixelActive ? pixelInput : null);
+        }
+
         IPreparedBindings vertexBindings;
         IPreparedBindings? pixelBindings;
         try
@@ -588,6 +593,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawPipeline); // [local] SHARPEMU_DRAWCOST_PROBE
         if (Diagnostics.RepeatProbe.Enabled && !OnWorker) Diagnostics.RepeatProbe.NotePipeline(pipeline.Pipeline); // [local] SHARPEMU_REPEAT_PROBE
+        if (Diagnostics.PlanProbe.Enabled && !OnWorker) Diagnostics.PlanProbe.NotePipeline(record, pipeline.Pipeline, in state.Rendering); // [local] SHARPEMU_PLAN_PROBE
         if (record.SetBindDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x100);
@@ -640,6 +646,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         var imageSnapshot = _host.BeginImageSnapshot(pixelBindings);
         indirectMesh?.Prepare();
         _host.BeginRendering(in state.Rendering);
+        if (Diagnostics.PlanProbe.Enabled && !OnWorker) Diagnostics.PlanProbe.NoteRendering(record, _host.DrawScope.Scope); // [local] SHARPEMU_PLAN_PROBE: the runs
         scopeEmit.Dispose();
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawBeginRendering); // [local] SHARPEMU_DRAWCOST_PROBE
         if (MeshDrawTrace.Active) MeshDrawTrace.Write("rendering", $"width={state.Rendering.Width} height={state.Rendering.Height} layers={state.Rendering.Layers} colors={state.ColorCount}");

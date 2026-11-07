@@ -31,6 +31,7 @@ public static class RegisterWriteTable
         banks.PrepareContextWrite();
         if (RegisterBanks.StampProbe) banks.ProbeContextWrite(offset, values); // [local]
         var consumed = WritePacket(banks, in packet, offset, values, Context, ContextIndirect, "context", emptyIsHandled: true);
+        if (PlanRegisterShadow.Enabled) banks.NotePlanContextWrite(offset, values[..(int)Math.Min(consumed, (uint)values.Length)]); // [local] SHARPEMU_PLAN_PROBE
         banks.MarkWritten(RegisterBanks.StampOnChange && consumed <= (uint)values.Length // [local] SHARPEMU_STAMP_ON_CHANGE
             ? banks.ContextBitsChanged(offset, values[..(int)consumed])
             : RegisterStamps.ContextBitsFor(offset, consumed));
@@ -84,6 +85,7 @@ public static class RegisterWriteTable
             WriteEntry(banks, offset, value, ContextIndirect, "context", tableAddress);
         }
 
+        if (PlanRegisterShadow.Enabled) banks.NotePlanContextWrite(offset, [value]); // [local] SHARPEMU_PLAN_PROBE
         banks.MarkWritten(RegisterBanks.StampOnChange ? banks.ContextBitsChanged(offset, [value]) : RegisterStamps.ContextBitsFor(offset, 1)); // [local] SHARPEMU_STAMP_ON_CHANGE
         if (Rendering.RenderTrace.Enabled)
         {

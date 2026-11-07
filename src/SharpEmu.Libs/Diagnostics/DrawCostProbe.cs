@@ -246,6 +246,9 @@ internal static class DrawCostProbe
         {
             Interlocked.Increment(ref _frames);
         }
+
+        LiteObtainProbe.NoteFrame(); // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_PLAN_PROBE
+        PlanProbe.NoteFrame();
     }
 
     internal static void Begin(Kind kind)
@@ -258,6 +261,11 @@ internal static class DrawCostProbe
         if (RepeatProbe.Enabled) // [local] SHARPEMU_REPEAT_PROBE: the same items, timed on their own
         {
             RepeatProbe.Begin(kind == Kind.Dispatch);
+        }
+
+        if (LiteObtainProbe.Enabled) // [local] SHARPEMU_LITE_OBTAIN_PROBE: the item kind of the obtains
+        {
+            LiteObtainProbe.Begin(kind == Kind.Dispatch);
         }
     }
 
@@ -364,6 +372,11 @@ internal static class DrawCostProbe
         if (RepeatProbe.Enabled) // [local] SHARPEMU_REPEAT_PROBE
         {
             RepeatProbe.End();
+        }
+
+        if (LiteObtainProbe.Enabled) // [local] SHARPEMU_LITE_OBTAIN_PROBE
+        {
+            LiteObtainProbe.End();
         }
     }
 
@@ -520,6 +533,8 @@ internal static class DrawCostProbe
         Array.Clear(_itemTicks);
         _gapTicks = 0;
         _gaps = 0;
+        LiteObtainProbe.Report(); // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_PLAN_PROBE: the same window, after its lines
+        PlanProbe.Report();
         _windowStart = Stopwatch.GetTimestamp();
     }
 

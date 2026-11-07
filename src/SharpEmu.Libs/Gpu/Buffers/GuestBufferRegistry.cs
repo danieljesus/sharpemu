@@ -206,6 +206,25 @@ internal sealed class GuestBufferRegistry<TBuffer> : IDisposable where TBuffer :
             ? owner.Identifier : default;
     }
 
+    // [local] SHARPEMU_LITE_OBTAIN_PROBE: FindContainingBuffer's page lookup with the registered resource itself; partial
+    // when the first page has an owner that does not contain the whole range.
+    public TBuffer? FindContainingResource(ulong address, ulong size, out ResourceSlotIdentifier identifier, out bool partial)
+    {
+        identifier = default;
+        partial = false;
+        if (size == 0 || address >= _addressSpaceSize || size > _addressSpaceSize - address) return null;
+        var owner = FindPageOwner(address >> _pageShift);
+        if (owner is null) return null;
+        if (address < owner.Address || size > owner.Size - (address - owner.Address))
+        {
+            partial = true;
+            return null;
+        }
+
+        identifier = owner.Identifier;
+        return owner.Resource;
+    }
+
     public int FindFirstOverlappingIndex(ulong address)
     {
         var position = FindInsertionIndex(address);

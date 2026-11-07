@@ -1353,6 +1353,81 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0, bool allowStream = true, bool requiresDeviceAddress = false,
         bool conservativeWrite = false) // [local] conservativeWrite: SHARPEMU_WRITE_DIFF / SHARPEMU_STORE_TABLE_EXACT=2
     {
+        if (Diagnostics.LiteObtainProbe.Enabled && !isWritten) // [local] SHARPEMU_LITE_OBTAIN_PROBE: the light path in shadow
+        {
+            if (Diagnostics.LiteObtainProbe.Owns)
+                return ObtainBufferProbed(guestAddress, size, isTexelBuffer, bufferIdentifier, traceShaderHash, allowStream, requiresDeviceAddress);
+            Diagnostics.LiteObtainProbe.NoteUnattributed();
+        }
+
+        return ObtainBufferCore(guestAddress, size, isWritten, isTexelBuffer, bufferIdentifier, traceShaderHash, allowStream, requiresDeviceAddress,
+            conservativeWrite);
+    }
+
+    // [local] SHARPEMU_LITE_OBTAIN_PROBE: a predicate over the pending publications a read would complete or overlay
+    // (any occlusion dump over the range), set by the presenter.
+    internal Func<ulong, ulong, bool>? MayHaveGuestPublications { get; set; }
+
+    // [local] SHARPEMU_LITE_OBTAIN_PROBE: the light read obtain (see LiteObtainProbe), before the real one.
+    internal Diagnostics.LiteObtainProbe.Cause LiteObtain(ulong guestAddress, ulong size, bool isTexelBuffer, out GpuBuffer? buffer, out ulong offset)
+    {
+        buffer = null;
+        offset = 0;
+        if (MayHaveGuestPublications?.Invoke(guestAddress, size) == true)
+            return Diagnostics.LiteObtainProbe.Cause.Pub;
+        var owner = _registry.FindContainingResource(guestAddress, size, out _, out var partial);
+        if (owner is null)
+            return partial ? Diagnostics.LiteObtainProbe.Cause.Cross : Diagnostics.LiteObtainProbe.Cause.Unmapped;
+        if (_tracker.MayHaveCpuDirtyPages(guestAddress, size))
+            return _tracker.IsCpuWriteHotRange(guestAddress, size) ? Diagnostics.LiteObtainProbe.Cause.Hot : Diagnostics.LiteObtainProbe.Cause.Cpu;
+        if (isTexelBuffer && ImageCache?.MayHaveImageBytes(guestAddress, size) == true)
+            return Diagnostics.LiteObtainProbe.Cause.Img;
+        buffer = owner;
+        offset = owner.Offset(guestAddress);
+        return Diagnostics.LiteObtainProbe.Cause.Fast;
+    }
+
+    // [local] SHARPEMU_LITE_OBTAIN_PROBE: the light lookup of FindBuffers (the page owner of the range).
+    internal Diagnostics.LiteObtainProbe.Cause LiteFind(ulong guestAddress, ulong size, out ResourceSlotIdentifier identifier)
+    {
+        var owner = _registry.FindContainingResource(guestAddress, size, out identifier, out var partial);
+        return owner is not null ? Diagnostics.LiteObtainProbe.Cause.Fast
+            : partial ? Diagnostics.LiteObtainProbe.Cause.Cross : Diagnostics.LiteObtainProbe.Cause.Unmapped;
+    }
+
+    internal long RegistryEpoch => _registry.Epoch; // [local] SHARPEMU_LITE_OBTAIN_PROBE
+
+    private (GpuBuffer Buffer, ulong Offset) ObtainBufferProbed(ulong guestAddress, ulong size, bool isTexelBuffer, ResourceSlotIdentifier bufferIdentifier,
+        ulong traceShaderHash, bool allowStream, bool requiresDeviceAddress)
+    {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var cause = LiteObtain(guestAddress, size, isTexelBuffer, out var liteBuffer, out var liteOffset);
+        var lite = System.Diagnostics.Stopwatch.GetTimestamp();
+        var uploads = _syncUploads;
+        var epoch = _registry.Epoch;
+        var publications = Volatile.Read(ref Diagnostics.LiteObtainProbe.PublicationWork);
+        var imageCopies = Diagnostics.LiteObtainProbe.ImageCopies;
+        var result = ObtainBufferCore(guestAddress, size, false, isTexelBuffer, bufferIdentifier, traceShaderHash, allowStream, requiresDeviceAddress);
+        var real = System.Diagnostics.Stopwatch.GetTimestamp();
+        var work = (_syncUploads != uploads ? Diagnostics.LiteObtainProbe.Work.Upload : 0) |
+            (_registry.Epoch != epoch ? Diagnostics.LiteObtainProbe.Work.Registry : 0) |
+            (ReferenceEquals(result.Buffer, _stream) ? Diagnostics.LiteObtainProbe.Work.Stream : 0) |
+            (Volatile.Read(ref Diagnostics.LiteObtainProbe.PublicationWork) != publications ? Diagnostics.LiteObtainProbe.Work.Publication : 0) |
+            (Diagnostics.LiteObtainProbe.ImageCopies != imageCopies ? Diagnostics.LiteObtainProbe.Work.ImageCopy : 0);
+        var same = ReferenceEquals(liteBuffer, result.Buffer) && liteOffset == result.Offset;
+        if (Diagnostics.LiteObtainProbe.NoteObtain(cause, same, work, lite - started, real - lite) == Diagnostics.LiteObtainProbe.Outcome.FastWrong &&
+            Diagnostics.LiteObtainProbe.TakeDump())
+            Console.Error.WriteLine(
+                $"[GPU][LITE_OBTAIN_WRONG] kind=obtain range=0x{guestAddress:X}+0x{size:X} texel={isTexelBuffer} work={work} " +
+                $"lite=0x{liteBuffer?.CpuAddress ?? 0:X}+0x{liteBuffer?.Size ?? 0:X}@0x{liteOffset:X} real=0x{result.Buffer.CpuAddress:X}+0x{result.Buffer.Size:X}@0x{result.Offset:X} " +
+                $"same_buffer={ReferenceEquals(liteBuffer, result.Buffer)} stream={ReferenceEquals(result.Buffer, _stream)} prefound={bufferIdentifier.IsValid} tick={_scheduler.CurrentTick}");
+        return result;
+    }
+
+    private (GpuBuffer Buffer, ulong Offset) ObtainBufferCore(ulong guestAddress, ulong size, bool isWritten, bool isTexelBuffer = false,
+        ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0, bool allowStream = true, bool requiresDeviceAddress = false,
+        bool conservativeWrite = false)
+    {
         if (SubmissionScheduler.ReadOnlyThread)
         {
             throw SubmissionScheduler.ReadOnlyViolation("buffer obtain");
@@ -6090,6 +6165,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     private bool SynchronizeTexelFromImage(GpuBuffer buffer, ulong guestAddress, ulong size)
     {
         var copiedFromImage = RequireImageCache().TrySynchronizeBufferFromImage(buffer, guestAddress, size);
+        if (copiedFromImage && Diagnostics.LiteObtainProbe.Enabled) Diagnostics.LiteObtainProbe.ImageCopies++; // [local]
         if (copiedFromImage) GuestGpuMemoryHook.Trace(guestAddress, size, $"host-copy-from-image submission_tick={_scheduler.CurrentTick}"); // [local]
         if (copiedFromImage)
         {
