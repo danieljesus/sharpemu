@@ -55,6 +55,48 @@ public sealed partial class GuestImageCache
     private static readonly long[] SliceLookupFailures = new long[SliceLookupFailureNames.Length];
     private static readonly long[] SliceLookupRoleFailures = new long[SliceLookupRoleNames.Length];
 
+    // [local] SHARPEMU_PARRES_PROBE: why a depth_stencil or dcc_clear refusal happened (counted besides it, any thread).
+    internal enum SliceRefusalDetail
+    {
+        DepthStencilUnset,
+        DepthStencilLayers,
+        DepthStencilAddress,
+        DepthStencilPlaneMatched,
+        DccMetadata,
+        DccMetadataNative,
+        DccLayout,
+        DccDirty,
+        DccRead,
+        DccKey,
+        DccNativeAccepted,
+        Count,
+    }
+
+    private static readonly string[] SliceRefusalDetailNames =
+    [
+        "stencil_unset", "stencil_layers", "stencil_address", "stencil_plane_matched",
+        "dcc_metadata", "dcc_metadata_native", "dcc_layout", "dcc_dirty", "dcc_read", "dcc_key", "dcc_native_accepted",
+    ];
+
+    private static readonly long[] SliceRefusalDetails = new long[(int)SliceRefusalDetail.Count];
+
+    private static bool Refused(SliceRefusalDetail detail)
+    {
+        Interlocked.Increment(ref SliceRefusalDetails[(int)detail]);
+        return false;
+    }
+
+    // [local] SHARPEMU_SLICE_STENCIL_PLANE=1: a worker compares a depth target's stencil plane with the one the render
+    // thread's acquisition would leave in the image (StencilPlaneOfImage: a view of the first layers of a layered target
+    // names their plane only, the image keeps the plane of every layer), not with the request's span; when they are
+    // equal that acquisition does not change it. Off: the request's span, which never matches a view of fewer layers.
+    internal static readonly bool SliceStencilPlane = Environment.GetEnvironmentVariable("SHARPEMU_SLICE_STENCIL_PLANE") == "1";
+
+    // [local] SHARPEMU_SLICE_DCC_NATIVE=1: a worker treats the DCC clear materialization of a request with a native color
+    // clear as a no-op, as MaterializeDccClear is (it returns before touching the image or the metadata; the native clear
+    // goes through ApplyNativeColorClear, checked at the join). Off: the metadata must match, as for the other requests.
+    internal static readonly bool SliceDccNative = Environment.GetEnvironmentVariable("SHARPEMU_SLICE_DCC_NATIVE") == "1";
+
     private static bool SliceLookupFailed(SliceLookupFailure reason, ImageRole role)
     {
         Interlocked.Increment(ref SliceLookupFailures[(int)reason]);
@@ -69,6 +111,7 @@ public sealed partial class GuestImageCache
 
     public static string TakeSliceLookupReport() =>
         "lookup_fail=" + TakeCounts(SliceLookupFailures, SliceLookupFailureNames) + " lookup_fail_role=" + TakeCounts(SliceLookupRoleFailures, SliceLookupRoleNames) +
+        " lookup_detail=" + TakeCounts(SliceRefusalDetails, SliceRefusalDetailNames) + // [local]
         FormattableString.Invariant($" parks={Interlocked.Exchange(ref _parks, 0)} park_releases={Interlocked.Exchange(ref _parkReleases, 0)} unparks={Interlocked.Exchange(ref _unparks, 0)} park_expiries={Interlocked.Exchange(ref _parkExpiries, 0)}");
 
     private static string TakeCounts(long[] counters, string[] names)
@@ -387,9 +430,19 @@ public sealed partial class GuestImageCache
             return true;
         }
 
+        if (description.Metadata.NativeColorClear && SliceDccNative) // [local] SHARPEMU_SLICE_DCC_NATIVE
+        {
+            if (!image.Description.Metadata.Equals(description.Metadata))
+            {
+                Interlocked.Increment(ref SliceRefusalDetails[(int)SliceRefusalDetail.DccNativeAccepted]);
+            }
+
+            return true;
+        }
+
         if (!image.Description.Metadata.Equals(description.Metadata))
         {
-            return false;
+            return Refused(description.Metadata.NativeColorClear ? SliceRefusalDetail.DccMetadataNative : SliceRefusalDetail.DccMetadata); // [local]
         }
 
         var range = description.Metadata.Range;
@@ -401,7 +454,7 @@ public sealed partial class GuestImageCache
         var layers = description.TransferLayers;
         if (!ImageDescription.IsValidRange(range) || layers == 0 || range.Size % layers != 0)
         {
-            return false;
+            return Refused(SliceRefusalDetail.DccLayout); // [local]
         }
 
         var view = request.View;
@@ -410,13 +463,13 @@ public sealed partial class GuestImageCache
         var count = volume ? description.Extent.Depth : view.LayerCount;
         if (first >= layers || count == 0 || count > layers - first)
         {
-            return false;
+            return Refused(SliceRefusalDetail.DccLayout); // [local]
         }
 
         var sliceSize = range.Size / layers;
         if (_bufferCache.HasGpuDirtyBytes(range.Address + sliceSize * first, sliceSize * count))
         {
-            return false;
+            return Refused(SliceRefusalDetail.DccDirty); // [local]
         }
 
         Span<byte> firstByte = stackalloc byte[1];
@@ -425,13 +478,13 @@ public sealed partial class GuestImageCache
             var address = range.Address + sliceSize * (first + slice);
             if (!_backing.TryReadBacking(address, firstByte))
             {
-                return false;
+                return Refused(SliceRefusalDetail.DccRead); // [local]
             }
 
             if (PackedClearValue.TryDecodeDccColor(view.Format, firstByte[0] * 0x01010101u, description.Metadata,
                     allowClearToRegister: request.Role == ImageRole.ColorTarget, out _))
             {
-                return false;
+                return Refused(SliceRefusalDetail.DccKey); // [local]
             }
         }
 
@@ -595,9 +648,19 @@ public sealed partial class GuestImageCache
 
         if (request.Description.HasStencil)
         {
-            if (!image.Description.Stencil.Equals(request.Description.Stencil) || !ImageDescription.IsValidRange(request.Description.Stencil))
+            // [local] SHARPEMU_SLICE_STENCIL_PLANE: the plane AcquireDepthTargetCore would store.
+            var plane = SliceStencilPlane ? StencilPlaneOfImage(image.Description, request.Description) : request.Description.Stencil;
+            if (!image.Description.Stencil.Equals(plane) || !ImageDescription.IsValidRange(request.Description.Stencil))
             {
+                var cachedStencil = image.Description.Stencil;
+                _ = Refused(cachedStencil.Size == 0 ? SliceRefusalDetail.DepthStencilUnset :
+                    cachedStencil.Address != request.Description.Stencil.Address ? SliceRefusalDetail.DepthStencilAddress : SliceRefusalDetail.DepthStencilLayers); // [local]
                 return SliceLookupFailed(SliceLookupFailure.DepthStencil, request.Role);
+            }
+
+            if (SliceStencilPlane && !image.Description.Stencil.Equals(request.Description.Stencil))
+            {
+                Interlocked.Increment(ref SliceRefusalDetails[(int)SliceRefusalDetail.DepthStencilPlaneMatched]); // [local]
             }
 
             var association = ResourceSlotIdentifier.Invalid;
