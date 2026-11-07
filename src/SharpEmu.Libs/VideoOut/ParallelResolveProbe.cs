@@ -12,6 +12,8 @@ namespace SharpEmu.Libs.VideoOut;
 // could go to the resolve pool and the slice workers. Every item the render thread runs is timed; a draw is split into
 // executor and recorder time and classified by the resolve pool's gate (DrawHasTargets && DrawKnownNotToWrite), and the
 // runs of consecutive gated draws are measured between the items that would end a slice. No behaviour changes.
+// slice_runs and draw_barrier_runs are the runs step 3 (SHARPEMU_FRONT_SLICES) would cut with typed barriers: global
+// barriers do not end them, and dispatches do not end slice_runs either unless NeedsSerialDispatch.
 // docs/plan-parallel-resolution-open-world.md §8 explains the [PERF][PARRES] line.
 internal static class ParallelResolveProbe
 {
@@ -33,6 +35,7 @@ internal static class ParallelResolveProbe
     private static int _kind;
     private static int _gate;
     private static long _itemRecordTicks;
+    private static long _lookaheadTicks;
 
     private static long _draws, _dispatches, _others, _drawTicks, _dispatchTicks, _otherTicks, _drawRecordTicks, _dispatchRecordTicks;
     private static readonly long[] GateDraws = new long[GateCount];
@@ -104,6 +107,11 @@ internal static class ParallelResolveProbe
 
     private static readonly Runs GateRuns = new();
     private static readonly Runs ScopeRuns = new();
+    private static readonly Runs SliceRuns = new();
+    private static readonly Runs DrawBarrierRuns = new();
+
+    // The front's global barrier item (one delegate instance), set when the front starts.
+    public static Delegate? BarrierItem;
 
     public static void OnFrame() => Interlocked.Increment(ref _frames);
 
@@ -116,6 +124,9 @@ internal static class ParallelResolveProbe
     public static void NoteDispatch() => _kind = KindDispatch;
 
     public static void AddRecordTicks(long ticks) => _itemRecordTicks += ticks;
+
+    // SHARPEMU_FRONT_RESOLVE_POOL: the render thread's scan after each item (gate, hand-off to a worker), outside every item.
+    public static void AddLookaheadTicks(long ticks) => _lookaheadTicks += ticks;
 
     // After the draw: the rendering scope it ended in and the image lookup generation.
     public static void NoteDrawScope(DrawScopeToken scope)
@@ -152,11 +163,15 @@ internal static class ParallelResolveProbe
                 {
                     GateRuns.Add(ticks);
                     ScopeRuns.Add(ticks);
+                    SliceRuns.Add(ticks);
+                    DrawBarrierRuns.Add(ticks);
                 }
                 else
                 {
                     GateRuns.End(BreakIneligible);
                     ScopeRuns.End(BreakIneligible);
+                    SliceRuns.End(BreakIneligible);
+                    DrawBarrierRuns.End(BreakIneligible);
                 }
 
                 break;
@@ -164,20 +179,35 @@ internal static class ParallelResolveProbe
                 _dispatches++;
                 _dispatchTicks += ticks;
                 _dispatchRecordTicks += record;
+                DrawBarrierRuns.End(BreakDispatch);
                 if (RenderRecorder.NeedsSerialDispatch)
                 {
                     GateRuns.End(BreakDispatch);
                     ScopeRuns.End(BreakDispatch);
+                    SliceRuns.End(BreakDispatch);
                 }
-                else if (GateRuns.Length != 0)
+                else
                 {
-                    _dispatchesInRuns++;
+                    if (GateRuns.Length != 0)
+                        _dispatchesInRuns++;
+                    SliceRuns.Add(ticks);
                 }
 
                 break;
             default:
                 _others++;
                 _otherTicks += ticks;
+                if (ReferenceEquals(work, BarrierItem))
+                {
+                    SliceRuns.Add(ticks);
+                    DrawBarrierRuns.Add(ticks);
+                }
+                else
+                {
+                    SliceRuns.End(BreakOther);
+                    DrawBarrierRuns.End(BreakOther);
+                }
+
                 var ended = GateRuns.End(BreakOther);
                 ScopeRuns.End(BreakOther);
                 if (ended && (++_breakerSample & BreakerSampleMask) == 0)
@@ -210,7 +240,7 @@ internal static class ParallelResolveProbe
         text.Append(CultureInfo.InvariantCulture,
             $" draw_ms={Ms(_drawTicks) / f:F2} draw_resolve_ms={Ms(_drawTicks - _drawRecordTicks) / f:F2} draw_record_ms={Ms(_drawRecordTicks) / f:F2}");
         text.Append(CultureInfo.InvariantCulture,
-            $" dispatch_ms={Ms(_dispatchTicks) / f:F2} dispatch_record_ms={Ms(_dispatchRecordTicks) / f:F2} other_ms={Ms(_otherTicks) / f:F2}");
+            $" dispatch_ms={Ms(_dispatchTicks) / f:F2} dispatch_record_ms={Ms(_dispatchRecordTicks) / f:F2} other_ms={Ms(_otherTicks) / f:F2} lookahead_ms={Ms(_lookaheadTicks) / f:F2}");
         text.Append(" gate=");
         for (var gate = 0; gate < GateCount; gate++)
         {
@@ -224,6 +254,8 @@ internal static class ParallelResolveProbe
         text.Append(CultureInfo.InvariantCulture, $" dispatch_serial={(RenderRecorder.NeedsSerialDispatch ? 1 : 0)} dispatches_in_runs={_dispatchesInRuns / f:F1}");
         GateRuns.Append(text, "runs", f);
         ScopeRuns.Append(text, "scope_runs", f);
+        SliceRuns.Append(text, "slice_runs", f);
+        DrawBarrierRuns.Append(text, "draw_barrier_runs", f);
         text.Append(CultureInfo.InvariantCulture, $" scope_changes={_scopeChanges / f:F1} lookup_generation_changes={_lookupChanges / f:F1}");
         text.Append(" breakers=[");
         text.AppendJoin(",", Breakers.OrderByDescending(pair => pair.Value.Count).Take(10)
@@ -231,7 +263,7 @@ internal static class ParallelResolveProbe
         text.Append(']');
         Breakers.Clear();
         _draws = _dispatches = _others = 0;
-        _drawTicks = _dispatchTicks = _otherTicks = _drawRecordTicks = _dispatchRecordTicks = 0;
+        _drawTicks = _dispatchTicks = _otherTicks = _drawRecordTicks = _dispatchRecordTicks = _lookaheadTicks = 0;
         _scopeChanges = _lookupChanges = _dispatchesInRuns = 0;
         Console.Error.WriteLine(text.ToString());
         if (VulkanVideoPresenter.FrontResolvePoolEnabled && !RenderPhaseProfile.Enabled)

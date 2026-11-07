@@ -24,8 +24,9 @@ internal static unsafe partial class VulkanVideoPresenter
     // render thread hands the next queued draws (up to SHARPEMU_FRONT_RESOLVE_AHEAD, 8 by default) to upstream's resolve pool
     // while they pass its gate (targets, shaders known not to write memory); the scan stops at the first other item, so a
     // worker never resolves past a queued write, fill, copy, dispatch or memory-writing draw. The render thread joins each
-    // one at its position (JoinDeferredDraw: validate the worker's reads, record, or resolve it again in order). These draws
-    // skip the front's program preparation: the worker prepares them. docs/plan-parallel-resolution-open-world.md, step 2.
+    // one at its position (JoinDeferredDraw: validate the worker's reads, record, or resolve it again in order). The front
+    // prepares every draw's programs as without the pool and the worker resolves with them; the draw that runs next and
+    // pairs a worker recently could not resolve stay inline. docs/plan-parallel-resolution-open-world.md, step 2.
     internal static readonly bool FrontResolvePoolEnabled = RenderPipelineEnabled && Environment.GetEnvironmentVariable("SHARPEMU_FRONT_RESOLVE_POOL") == "1";
     internal static readonly int FrontResolveAhead =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_RESOLVE_AHEAD"), out var ahead) && ahead > 0 ? Math.Min(ahead, 256) : 8;
@@ -284,15 +285,15 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // [local] SHARPEMU_FRONT_RESOLVE_POOL: offered the queued items after the one about to run, oldest first; the first
         // refusal ends the scan until that item runs. Render thread only, like the counters below.
-        public Func<Action, bool>? Lookahead { get; set; }
+        public Func<Action, bool, bool>? Lookahead { get; set; }
         private int _aheadOffered;
         private bool _aheadStopped;
         private Action[]? _ahead;
 
-        private void OfferAhead(Func<Action, bool> offer)
+        private void OfferAhead(Func<Action, bool, bool> offer)
         {
             var depth = FrontResolveAhead;
-            if (_aheadStopped || _aheadOffered >= depth)
+            if (_aheadStopped || _aheadOffered > depth / 2) // [local] tops up once half ran: the skip below is O(offered)
                 return;
             var ahead = _ahead ??= new Action[depth];
             var count = 0;
@@ -311,7 +312,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             for (var index = 0; index < count; index++)
             {
-                var accepted = offer(ahead[index]);
+                var accepted = offer(ahead[index], _aheadOffered == 0); // [local] nothing before it is offered: it runs next
                 ahead[index] = null!;
                 if (!accepted)
                 {
@@ -490,7 +491,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 if (probeStarted != 0) ParallelResolveProbe.EndItem(work, System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted); // [local]
-                if (Lookahead is { } offer) OfferAhead(offer); // [local] only once the item ran: what follows sees its effects
+                if (Lookahead is { } offer) // [local] only once the item ran: what follows sees its effects
+                {
+                    var aheadStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
+                    OfferAhead(offer);
+                    if (aheadStarted != 0) ParallelResolveProbe.AddLookaheadTicks(System.Diagnostics.Stopwatch.GetTimestamp() - aheadStarted);
+                }
                 ran++;
                 Volatile.Write(ref Executed, Executed + 1);
                 AfterItem?.Invoke();
@@ -522,6 +528,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly Action _flush = presenter.Flush;
         private readonly Action _flushFrame = presenter.FlushFrame; // [local] upstream's frame boundary (frame ticks), in stream order
         private readonly Action _barrier = presenter.EmitGlobalBarrier;
+        internal Action BarrierItem => _barrier; // [local] SHARPEMU_PARRES_PROBE
         private readonly Action _collect = presenter.RunGarbageCollector;
         private readonly Action _pauseAlias = presenter.PauseFrontAliasAccess;
         private readonly Action _resumeAlias = presenter.ResumeFrontAliasAccess;
@@ -684,36 +691,71 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // [local] SHARPEMU_FRONT_RESOLVE_POOL: a queued draw the render thread can hand to the resolve pool before it runs.
+        // The front prepares its programs as for any queued draw; a worker resolves with that preparation, and the draw's
+        // position checks it as the inline path does (a preparation discarded there sends the draw to a resolve in order).
         internal sealed class FrontDraw(FrontCommandStreamHost host, ulong submitId, RegisterBanks snapshot, bool indexed,
-            DrawIndexedArguments indexedArguments, DrawAutoArguments autoArguments, KeyValuePair<uint, uint>[]? registers)
+            DrawIndexedArguments indexedArguments, DrawAutoArguments autoArguments, KeyValuePair<uint, uint>[]? registers, long version)
         {
             private AgcExports.DeferredDraw? _deferred;
+            internal GraphicsPrograms? Prepared;
+            internal RenderExecutor.DrawProgramInputs Inputs;
+            internal FrontPrepReads.Pages? PrepPages;
+            internal long TableMark;
 
-            public bool TryDefer() =>
-                (_deferred = host.Presenter.Translation.TryDeferFrontDraw(submitId, snapshot, indexed, in indexedArguments, in autoArguments)) is not null;
+            // The lookahead's offer; false ends the scan. `next` is the item the render thread runs next.
+            public bool Offer(bool next)
+            {
+                _deferred = host.Presenter.Translation.TryDeferFrontDraw(submitId, snapshot, indexed, in indexedArguments, in autoArguments,
+                    Prepared, in Inputs, next, out var passes);
+                return passes;
+            }
 
             public void Run()
             {
                 try
                 {
+                    var rangesVerify = false; // [local] SHARPEMU_FRONT_PREP_RANGES=2
+                    var lent = Prepared;
+                    if (Prepared is null)
+                        FrontPrepReads.Release(PrepPages);
+                    else if (!host.Presenter.FrontPreparationStillValid(version, PrepPages, out rangesVerify) || !host.Presenter.TablesStillValid(TableMark))
+                    {
+                        Prepared = null;
+                        Inputs = default;
+                    }
+
+                    if (Prepared is not null && (FrontPrepVerify.Enabled || rangesVerify)) // [local] SHARPEMU_FRONT_PREP_VERIFY
+                        Prepared = Presenter.VerifyGraphics(Prepared, ref Inputs, Prepare, rangesVerify);
+
                     if (_deferred is { } deferred)
-                        host.Presenter.ExecuteFrontDeferredDraw(deferred, registers);
+                        host.Presenter.ExecuteFrontDeferredDraw(deferred, registers, ReferenceEquals(lent, Prepared), Prepared, in Inputs);
                     else
-                        host.Presenter.ExecuteQueuedDraw(submitId, snapshot, indexed, in indexedArguments, in autoArguments, null, default, registers);
+                        host.Presenter.ExecuteQueuedDraw(submitId, snapshot, indexed, in indexedArguments, in autoArguments, Prepared, in Inputs, registers);
                 }
                 finally
                 {
                     _deferred = null;
+                    Prepared = null;
+                    PrepPages = null;
                     host._snapshots.Push(snapshot);
                 }
             }
+
+            internal (GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs) Prepare() =>
+                host.Presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default;
         }
 
         internal Presenter Presenter => presenter; // [local]
 
-        private void EnqueueFrontDraw(ulong submitId, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments) // [local]
+        // [local] As the inline path below: the front prepares the programs; the render thread checks them at the draw.
+        private void EnqueueFrontDraw(ulong submitId, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments)
         {
-            var draw = new FrontDraw(this, submitId, Snapshot(), indexed, indexedArguments, autoArguments, DrawRegisters());
+            var snapshot = Snapshot();
+            var draw = new FrontDraw(this, submitId, snapshot, indexed, indexedArguments, autoArguments, DrawRegisters(), presenter.FrontPreparationVersion);
+            var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
+            draw.Prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), draw.Prepare, out draw.Inputs);
+            draw.PrepPages = Presenter.TakePrepPages(); // [local] SHARPEMU_FRONT_PREP_RANGES
+            draw.TableMark = Presenter.EndTableMark(tableMark);
             queue.Enqueue(draw.Run, _pauseAlias, _resumeAlias);
         }
 
@@ -1118,8 +1160,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 _back.AfterItem = () => Gpu.Scheduling.RunaheadBound.Hold(_scheduler.Timeline, () => _scheduler.CurrentTick - 1, RunPendingCommands);
             }
             _front = new FrontCommandStreamHost(this, _back);
+            if (ParallelResolveProbe.Enabled) ParallelResolveProbe.BarrierItem = _front.BarrierItem; // [local]
             if (FrontResolvePoolEnabled) // [local] SHARPEMU_FRONT_RESOLVE_POOL
-                _back.Lookahead = static work => work.Target is FrontCommandStreamHost.FrontDraw draw && draw.TryDefer();
+                _back.Lookahead = static (work, next) => work.Target is FrontCommandStreamHost.FrontDraw draw && draw.Offer(next);
             RenderPhaseProfile.FrontReport = TakeFrontReport;
             ShaderPipelineCache.BeforeGuestWrite = _front.Drain;
         }
@@ -1407,12 +1450,14 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         // [local] SHARPEMU_FRONT_RESOLVE_POOL: a draw the resolve pool took, at its position in the stream.
-        internal void ExecuteFrontDeferredDraw(AgcExports.DeferredDraw deferred, KeyValuePair<uint, uint>[]? drawRegisters)
+        // preparationHeld: the front's preparation the worker resolved with is still the one to use here.
+        internal void ExecuteFrontDeferredDraw(AgcExports.DeferredDraw deferred, KeyValuePair<uint, uint>[]? drawRegisters, bool preparationHeld,
+            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
             Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.Draws);
             if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDraw(ParallelResolveProbe.GateOk);
-            _translation.ExecuteFrontDeferredDraw(deferred, drawRegisters);
+            _translation.ExecuteFrontDeferredDraw(deferred, drawRegisters, preparationHeld, prepared, in preparedInputs);
             if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDrawScope(Recording.DrawScope);
         }
 
