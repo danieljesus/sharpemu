@@ -258,13 +258,23 @@ internal static unsafe partial class VulkanVideoPresenter
             // [local] A read of bytes a queued WriteGuestNow has not applied yet (overlay mode 2):
             // it runs on the render thread after the write, also while preparing (no deferral).
             _backReadForPendingWrite = PendingWriteOverlay.Mode >= 2 && FrontOverlay.Overlaps(address, size);
-            if (_backReadForPendingWrite || _bufferCache.EverGpuWrittenRanges(address, size))
+            if (_backReadForPendingWrite || EverGpuWrittenForFront(address, size))
                 return true;
             if (_preparingOnFront) FrontPrepReads.Note(address, size); // [local] SHARPEMU_FRONT_PREP_RANGES: a direct read
             return false;
         }
 
         [ThreadStatic] private static bool _backReadForPendingWrite; // [local] per thread: the front and the prep worker
+
+        // [local] SHARPEMU_FRONT_READ_MEMO: the front thread's granule answers (the prep worker asks the set itself).
+        private FrontReadMemo? _frontReadMemo;
+
+        private bool EverGpuWrittenForFront(ulong address, ulong size)
+        {
+            if (FrontReadMemo.Mode == 0 || !OnFrontThread || _onPrepWorker)
+                return _bufferCache.EverGpuWrittenRanges(address, size);
+            return (_frontReadMemo ??= new FrontReadMemo(FrontReadMemo.Mode)).Overlaps(_bufferCache, address, size);
+        }
 
         // [local] SHARPEMU_FRONT_PREP_CHECK (on by default, =0 disables): the front reads guest memory directly only
         // where no GPU write has been recorded (NeedsBackRead), but it runs ahead of the render thread, so a write that

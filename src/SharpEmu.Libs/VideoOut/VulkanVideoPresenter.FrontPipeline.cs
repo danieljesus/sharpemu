@@ -144,6 +144,24 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (IsEmpty || size == 0)
                 return false;
+            if (FrontReadMemo.Mode != 0) // [local] SHARPEMU_FRONT_READ_MEMO: the published ranges, without the lock
+            {
+                var published = Volatile.Read(ref _published).Overlaps(address, size);
+                if (FrontReadMemo.Mode == 2)
+                {
+                    Interlocked.Increment(ref FrontReadMemo.OverlayChecks);
+                    if (published != OverlapsLocked(address, size))
+                        Interlocked.Increment(ref FrontReadMemo.OverlayMismatches);
+                }
+
+                return published;
+            }
+
+            return OverlapsLocked(address, size);
+        }
+
+        private bool OverlapsLocked(ulong address, ulong size)
+        {
             lock (_bytes)
             {
                 foreach (var (start, length, _) in _ranges)
@@ -152,6 +170,19 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             return false;
+        }
+
+        // [local] SHARPEMU_FRONT_READ_MEMO: _ranges as of its last change, rebuilt under the lock on every add and retire.
+        private FrontReadMemo.Published _published = FrontReadMemo.Published.Empty;
+
+        private void Publish()
+        {
+            if (FrontReadMemo.Mode == 0)
+                return;
+            var ranges = new (ulong Start, ulong End)[_ranges.Count];
+            for (var index = 0; index < ranges.Length; index++)
+                ranges[index] = (_ranges[index].Address, _ranges[index].Address + (ulong)_ranges[index].Length);
+            Volatile.Write(ref _published, ranges.Length == 0 ? FrontReadMemo.Published.Empty : new FrontReadMemo.Published(ranges));
         }
 
         public bool IsEmpty => Volatile.Read(ref _count) == 0;
@@ -166,6 +197,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 for (var index = 0; index < bytes.Length; index++)
                     _bytes[address + (ulong)index] = (bytes[index], serial);
                 _ranges.Add((address, bytes.Length, serial));
+                Publish(); // [local] SHARPEMU_FRONT_READ_MEMO
                 Volatile.Write(ref _count, _bytes.Count);
                 return serial;
             }
@@ -193,6 +225,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                 }
 
+                Publish(); // [local] SHARPEMU_FRONT_READ_MEMO
                 Volatile.Write(ref _count, _bytes.Count);
             }
         }
@@ -455,7 +488,7 @@ internal static unsafe partial class VulkanVideoPresenter
     // The interpreter's host on the front thread: reads guest memory directly, prepares the
     // programs of each draw and dispatch from a snapshot of the banks, and queues every
     // host-visible effect to the render thread in stream order.
-    private sealed class FrontCommandStreamHost(Presenter presenter, BackQueue queue) : ICommandStreamHost
+    private sealed class FrontCommandStreamHost(Presenter presenter, BackQueue queue) : ICommandStreamHost, IFrontItemHost // [local] SHARPEMU_FRONT_POOLED_ITEMS
     {
         private readonly ConcurrentStack<RegisterBanks> _snapshots = new();
         private int _queueId;
@@ -632,6 +665,18 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DrawIndexed(ulong submitId, in DrawIndexedArguments arguments)
         {
             if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
+            if (FrontQueuedItems.Enabled && presenter.PrepWorker is null) // [local] SHARPEMU_FRONT_POOLED_ITEMS
+            {
+                QueueDraw(submitId, indexed: true, in arguments, default);
+                return;
+            }
+
+            DrawIndexedWithClosures(submitId, in arguments);
+        }
+
+        // The lambdas' captures are allocated when the method holding them is entered, so they live apart.
+        private void DrawIndexedWithClosures(ulong submitId, in DrawIndexedArguments arguments)
+        {
             var snapshot = Snapshot();
             var registers = DrawRegisters();
             var version = presenter.FrontPreparationVersion; // [local]
@@ -692,6 +737,17 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DrawAuto(ulong submitId, in DrawAutoArguments arguments)
         {
             if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
+            if (FrontQueuedItems.Enabled && presenter.PrepWorker is null) // [local] SHARPEMU_FRONT_POOLED_ITEMS
+            {
+                QueueDraw(submitId, indexed: false, default, in arguments);
+                return;
+            }
+
+            DrawAutoWithClosures(submitId, in arguments);
+        }
+
+        private void DrawAutoWithClosures(ulong submitId, in DrawAutoArguments arguments)
+        {
             var snapshot = Snapshot();
             var registers = DrawRegisters();
             var version = presenter.FrontPreparationVersion; // [local]
@@ -752,6 +808,17 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
         {
             if (FrontProfile.LoopEnabled) FrontProfile.Dispatches++;
+            if (FrontQueuedItems.Enabled && (presenter.PrepWorker is null || !FrontPrepWorker.Compute)) // [local] SHARPEMU_FRONT_POOLED_ITEMS
+            {
+                QueueDispatch(submitId, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress);
+                return;
+            }
+
+            DispatchDirectWithClosures(submitId, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress);
+        }
+
+        private void DispatchDirectWithClosures(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress)
+        {
             var snapshot = Snapshot();
             if (indirectArgumentsAddress != 0) Interlocked.Increment(ref presenter.IndirectDirect); // [local]
             var computeScope = FrontProfile.Measure(FrontProfile.Phase.PrepareCompute);
@@ -819,6 +886,105 @@ internal static unsafe partial class VulkanVideoPresenter
                     _snapshots.Push(snapshot);
                 }
             }, _pauseAlias, _resumeAlias);
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
+        }
+
+        // [local] SHARPEMU_FRONT_POOLED_ITEMS: the paths above with a pooled item instead of the closures; the same steps
+        // in the same order (see FrontQueuedItems).
+        private readonly ConcurrentQueue<FrontQueuedItems.Draw> _drawItems = new();
+        private readonly ConcurrentQueue<FrontQueuedItems.Dispatch> _dispatchItems = new();
+
+        GraphicsPrograms? IFrontItemHost.PrepareGraphicsPrograms(RegisterBanks banks, out RenderExecutor.DrawProgramInputs inputs) =>
+            presenter.Translation.PrepareGraphicsPrograms(banks, out inputs);
+
+        ComputeProgram? IFrontItemHost.PrepareComputeProgram(RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator) =>
+            presenter.Translation.PrepareComputeProgram(banks, groupsX, groupsY, groupsZ, dispatchInitiator);
+
+        bool IFrontItemHost.FrontPreparationStillValid(long version, FrontPrepReads.Pages? pages, out bool verify) =>
+            presenter.FrontPreparationStillValid(version, pages, out verify);
+
+        bool IFrontItemHost.TablesStillValid(long mark) => presenter.TablesStillValid(mark);
+
+        GraphicsPrograms? IFrontItemHost.VerifyGraphics(GraphicsPrograms prepared, ref RenderExecutor.DrawProgramInputs inputs,
+            Func<(GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs)> prepare, bool force) =>
+            Presenter.VerifyGraphics(prepared, ref inputs, prepare, force);
+
+        ComputeProgram? IFrontItemHost.VerifyCompute(ComputeProgram prepared, Func<ComputeProgram?> prepare, bool force) =>
+            Presenter.VerifyCompute(prepared, prepare, force);
+
+        ComputeProgram? IFrontItemHost.ArmSpeculation(ulong key, ComputeProgram? prepared, FrontSpeculation.Reads? reads, Func<ComputeProgram?> prepare) =>
+            presenter.ArmSpeculation(key, prepared, reads, prepare);
+
+        void IFrontItemHost.ExecuteQueuedDraw(ulong submitId, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments,
+            in DrawAutoArguments autoArguments, GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs, KeyValuePair<uint, uint>[]? drawRegisters) =>
+            presenter.ExecuteQueuedDraw(submitId, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs, drawRegisters);
+
+        void IFrontItemHost.ExecuteQueuedDispatch(ulong submitId, RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator,
+            ulong indirectArgumentsAddress, ComputeProgram? prepared) =>
+            presenter.ExecuteQueuedDispatch(submitId, banks, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, prepared);
+
+        void IFrontItemHost.Return(FrontQueuedItems.Draw item) => _drawItems.Enqueue(item);
+
+        void IFrontItemHost.Return(FrontQueuedItems.Dispatch item) => _dispatchItems.Enqueue(item);
+
+        private RegisterBanks SnapshotInto(RegisterBanks banks)
+        {
+            using var profileScope = FrontProfile.Measure(FrontProfile.Phase.Snapshot);
+            banks.CopyFrom(presenter.CommandStream.GetInterpreter(_queueId).TypedRegisters);
+            Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.Snapshots); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Snapshot);
+            return banks;
+        }
+
+        private void QueueDraw(ulong submitId, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments)
+        {
+            if (!_drawItems.TryDequeue(out var item))
+                item = new FrontQueuedItems.Draw(this, presenter.CommandStream.GetInterpreter(_queueId).TypedRegisters.Fatal);
+            SnapshotInto(item.Banks);
+            item.SubmitId = submitId;
+            item.Indexed = indexed;
+            item.IndexedArguments = indexedArguments;
+            item.AutoArguments = autoArguments;
+            item.Registers = DrawRegisters();
+            item.Version = presenter.FrontPreparationVersion;
+            var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
+            item.Prepared = presenter.TryPrepareOnFront(GraphicsKey(item.Banks), item.Prepare, out item.Inputs);
+            item.PrepPages = Presenter.TakePrepPages(); // [local] SHARPEMU_FRONT_PREP_RANGES
+            item.TableMark = Presenter.EndTableMark(tableMark);
+            if (item.Prepared is null) Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepEmpty); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PrepEnd);
+            queue.Enqueue(item.Run, _pauseAlias, _resumeAlias);
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
+        }
+
+        private void QueueDispatch(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress)
+        {
+            if (!_dispatchItems.TryDequeue(out var item))
+                item = new FrontQueuedItems.Dispatch(this, presenter.CommandStream.GetInterpreter(_queueId).TypedRegisters.Fatal);
+            SnapshotInto(item.Banks);
+            if (indirectArgumentsAddress != 0) Interlocked.Increment(ref presenter.IndirectDirect); // [local]
+            var computeScope = FrontProfile.Measure(FrontProfile.Phase.PrepareCompute);
+            item.SubmitId = submitId;
+            item.GroupsX = groupsX;
+            item.GroupsY = groupsY;
+            item.GroupsZ = groupsZ;
+            item.DispatchInitiator = dispatchInitiator;
+            item.IndirectArgumentsAddress = indirectArgumentsAddress;
+            item.Version = presenter.FrontPreparationVersion; // [local]
+            item.TimelineQueue = Diagnostics.LabelTimeline.FrontQueue; // [local] SHARPEMU_LABEL_TIMELINE
+            var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
+            var speculate = FrontSpeculation.Enabled; // [local] read once: it is hot (SHARPEMU_HOTFLAGS_FILE)
+            var frontPrepares = indirectArgumentsAddress == 0 || speculate;
+            item.Prepared = frontPrepares
+                ? presenter.TryPrepareComputeOnFront(item.Banks.Shader.Compute.Address, item.Prepare, speculate)
+                : null;
+            item.PrepPages = frontPrepares ? Presenter.TakePrepPages() : null; // [local] SHARPEMU_FRONT_PREP_RANGES
+            item.Speculated = frontPrepares ? FrontSpeculation.Take() : null; // [local]
+            item.TableMark = Presenter.EndTableMark(tableMark);
+            computeScope.Dispose();
+            if (item.Prepared is null) Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepEmpty); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PrepEnd);
+            queue.Enqueue(item.Run, _pauseAlias, _resumeAlias);
             Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 

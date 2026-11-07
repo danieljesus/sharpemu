@@ -22,7 +22,7 @@ public readonly record struct DownloadPiece(GpuBuffer Buffer, ulong SourceOffset
 public readonly record struct OverlapSpan(int First, int Last, ulong Begin, ulong End, bool HasStreamLeap);
 
 // Guest memory mirrored in device buffers: upload on use, download on CPU fault, page table for BDA.
-public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDisposable
+public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDisposable, VideoOut.IEverGpuWrittenRanges // [local] SHARPEMU_FRONT_READ_MEMO
 {
     public const int CachingPageBits = 14;
     public const ulong CachingPageSize = 1UL << CachingPageBits;
