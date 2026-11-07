@@ -2243,14 +2243,14 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         return GpuModifiedSnapshot().Overlaps(guestAddress, size); // [local]
     }
 
-    // [local] SHARPEMU_MODIFIED_TREE_READS=1 (off by default): on the GPU queue thread HasGpuDirtyBytes asks the
+    // [local] SHARPEMU_MODIFIED_TREE_READS (on by default, =0 off; mt0b/mt1b 2026-11-07: -11 ms/frame open world): on the GPU queue thread HasGpuDirtyBytes asks the
     // GPU-modified set itself instead of its lock-free snapshot. The snapshot is rebuilt (every range copied into two
     // new arrays) on the first read after each change, and every guest read's completion changes the set
     // (RemoveGpuModified) and then asks it (the clean check), so each completion paid a rebuild. Exact: the queue thread
     // is the only one that changes the set (Add in ObtainBuffer and RemoveGpuModified, both under the write lock), and it
     // already reads it without a lock (_gpuModifiedRanges.Contains in ObtainBuffer and IsPieceCurrent); other threads
     // keep the snapshot.
-    internal static readonly bool ModifiedTreeReads = Environment.GetEnvironmentVariable("SHARPEMU_MODIFIED_TREE_READS") == "1";
+    internal static readonly bool ModifiedTreeReads = Environment.GetEnvironmentVariable("SHARPEMU_MODIFIED_TREE_READS") != "0";
 
     internal bool ForceModifiedTreeReads { get; set; }
 
@@ -3596,13 +3596,13 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ASYNC_READBACK_RETRIES"), out var retries) && retries >= 0 ? retries : 3;
     private static long _reportedAsyncRetried;
 
-    // [local] SHARPEMU_READBACK_GUEST_SUBMIT=1 (off by default): a guest read's copy is recorded and submitted to the
+    // [local] SHARPEMU_READBACK_GUEST_SUBMIT (on by default, =0 off; rl0/rl1 2026-11-07): a guest read's copy is recorded and submitted to the
     // readback queue by the guest thread that waits for it, not by the GPU queue thread. The relayed begin still finds
     // the pieces, seals and submits their writer and retains their buffers there; only vkQueueSubmit2 (~33 us in GTA V,
     // ReadbackSubmit in the render profile, ~340 per frame in the open world) and the recording leave the render thread.
     // Exact: the copy waits for the same writer tick on the main timeline, and the completion, still on the queue
     // thread, publishes only the pieces whose writer did not change, as for a copy submitted at once.
-    internal static readonly bool GuestSubmit = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_GUEST_SUBMIT") == "1";
+    internal static readonly bool GuestSubmit = Environment.GetEnvironmentVariable("SHARPEMU_READBACK_GUEST_SUBMIT") != "0";
 
     internal bool ForceGuestSubmit { get; set; }
 
