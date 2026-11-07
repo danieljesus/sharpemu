@@ -135,7 +135,9 @@ internal static class DrawCostProbe
         ObtainWritten,
         ObtainStream,
         ObtainLookup,
+        ObtainLite, // [local] SHARPEMU_LITE_OBTAIN: read obtains the light path answered
         FindBuffer,
+        FindLite, // [local] SHARPEMU_LITE_OBTAIN: read V# the light find answered
         ImageLookup,
         MemoLast,
         MemoContent,
@@ -535,6 +537,7 @@ internal static class DrawCostProbe
         _gaps = 0;
         LiteObtainProbe.Report(); // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_PLAN_PROBE: the same window, after its lines
         PlanProbe.Report();
+        Gpu.Buffers.LiteObtainUse.Report(Gpu.Buffers.LiteObtainUse.DefaultMode); // [local] SHARPEMU_LITE_OBTAIN
         _windowStart = Stopwatch.GetTimestamp();
     }
 

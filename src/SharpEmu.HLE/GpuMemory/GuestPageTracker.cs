@@ -171,6 +171,25 @@ public sealed class GuestPageTracker
 
     public long CpuDirtyEpoch => _cpuDirtySummary.Epoch;
 
+    // [local] SHARPEMU_LITE_OBTAIN=2: the sum of TrackedRegion.CpuDirtyings over the range's blocks, lock-free. It moves
+    // when a page of those blocks turns CPU-dirty (a write fault, an emulator write, returned pages) or changes GPU
+    // ownership, never when an upload cleans one; a block without a region counts 0.
+    public long CpuDirtyingsOf(ulong vaddr, ulong size)
+    {
+        ValidateRange(vaddr, size);
+        var sum = 0L;
+        var last = (vaddr + size - 1) / BlockBytes;
+        for (var index = vaddr / BlockBytes; index <= last; index++)
+        {
+            if (Volatile.Read(ref _regions[index]) is { } region)
+            {
+                sum += region.CpuDirtyings;
+            }
+        }
+
+        return sum;
+    }
+
     public bool HasGpuDirtyPages(ulong vaddr, ulong size)
     {
         RejectUploadCallbackReentry();

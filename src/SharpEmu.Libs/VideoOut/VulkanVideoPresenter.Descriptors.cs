@@ -1314,6 +1314,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var mapping = _guestMemory.MappingGeneration; // [local]
             var sourceMemoMode = BufferSourceMemoMode; // [local] SHARPEMU_BUFFER_SOURCE_MEMO, once per stage
             var ringSlotReuse = RingSlotReuseMode != 0 && !_worker && mapping != long.MinValue; // [local] SHARPEMU_RING_SLOT_REUSE
+            var lightMode = _worker || mapping == long.MinValue ? 0 : _bufferCache.LiteObtainMode; // [local] SHARPEMU_LITE_OBTAIN
             for (var index = 0; index < sources.Length; index++)
             {
                 var words = snapshot.Buffers[index];
@@ -1376,7 +1377,20 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 var remembered = known || (memo.Address == descriptor.Address && memo.Requested == requested && memo.Spans == spans);
                 var ringReused = !remembered && ringSlotReuse && ReusesRingSlot(in memo, descriptor.Address, requested, spans, mapping); // [local] SHARPEMU_RING_SLOT_REUSE
-                var size = remembered ? memo.Size : ringReused ? requested : ClampMappedSize(descriptor.Address, requested, prepared, index);
+                // [local] SHARPEMU_LITE_OBTAIN: a read V# that neither the memo nor the ring slot answers takes the page owner, the
+                // requested size and the owner's range as its window when that range is readable (see LiteObtainUse).
+                var light = false;
+                ResourceSlotIdentifier lightBuffer = default;
+                ulong lightStart = 0, lightEnd = 0;
+                if (lightMode != 0 && !remembered && !ringReused && !prepared.Resources.Info.Buffers[index].Written)
+                {
+                    LiteObtainUse.Finds++;
+                    light = _bufferCache.TryLiteFind(descriptor.Address, requested, mapping, _guestMemory, out lightBuffer, out lightStart, out lightEnd);
+                    if (!light) LiteObtainUse.FindSlow++;
+                }
+
+                var lightUsed = light && lightMode == 1;
+                var size = remembered ? memo.Size : ringReused || lightUsed ? requested : ClampMappedSize(descriptor.Address, requested, prepared, index);
                 if (ringReused && RingSlotReuseMode == 2) // [local] the reused answer against the lookup it replaces
                     VerifyRingSlot(in memo, descriptor.Address, requested, prepared, index);
                 PublishImagesUnderWrite(prepared.Resources.Info.Buffers[index], descriptor.Address, size);
@@ -1399,10 +1413,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
                 else
                 {
-                    var buffer = ringReused ? memo.Buffer : FindBuffer(descriptor.Address, size);
+                    var buffer = ringReused ? memo.Buffer : lightUsed ? lightBuffer : FindBuffer(descriptor.Address, size);
                     sources[index] = (descriptor, buffer, size);
                     var (windowStart, windowEnd) = ringReused ? (memo.WindowStart, memo.WindowEnd)
-                        : ringSlotReuse && size == requested ? RingSlotWindow(buffer) : (0UL, 0UL); // [local] SHARPEMU_RING_SLOT_REUSE
+                        : ringSlotReuse && size == requested ? lightUsed ? LightWindow(lightStart, lightEnd) : RingSlotWindow(buffer) : (0UL, 0UL); // [local] SHARPEMU_RING_SLOT_REUSE
+                    if (light) // [local] SHARPEMU_LITE_OBTAIN: the light answer, used (=1) or against the real one (=2)
+                    {
+                        LiteObtainUse.FindLite++;
+                        if (lightUsed)
+                            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.FindLite);
+                        else
+                            VerifyLightFind(prepared, index, descriptor.Address, requested, size, buffer, ringSlotReuse && size == requested,
+                                (windowStart, windowEnd), lightBuffer, (lightStart, lightEnd));
+                    }
                     memo = new BufferSourceMemo(descriptor.Address, requested, _bufferCache.RegionStamp(descriptor.Address, requested), spans, mapping, buffer, size,
                         windowStart, windowEnd);
                     if (sourceMemoMode != 0 && mapping != long.MinValue) // [local] SHARPEMU_BUFFER_SOURCE_MEMO
@@ -1458,6 +1481,28 @@ internal static unsafe partial class VulkanVideoPresenter
 
         internal static string TakeRingSlotReport() => RingSlotReuseMode == 0 ? "" : FormattableString.Invariant(
             $"ring_slots=reuses:{Interlocked.Exchange(ref _ringSlotReuses, 0)},windows:{Interlocked.Exchange(ref _ringSlotWindows, 0)},verified:{Interlocked.Exchange(ref _ringSlotVerified, 0)},mismatches:{Interlocked.Read(ref _ringSlotMismatches)} ");
+
+        // [local] SHARPEMU_LITE_OBTAIN=1: RingSlotWindow of a light find, whose owner range is already known readable.
+        private static (ulong Start, ulong End) LightWindow(ulong start, ulong end)
+        {
+            _ringSlotWindows++;
+            return (start, end);
+        }
+
+        // [local] SHARPEMU_LITE_OBTAIN=2: the light find against the real lookup (size, buffer and, when the slot keeps a
+        // ring window, the window).
+        private static void VerifyLightFind(PreparedStageBindings prepared, int index, ulong address, ulong requested, ulong size,
+            ResourceSlotIdentifier buffer, bool windowed, (ulong Start, ulong End) window, ResourceSlotIdentifier lightBuffer,
+            (ulong Start, ulong End) lightWindow)
+        {
+            LiteObtainUse.FindVerified++;
+            if ((size == requested && buffer == lightBuffer && (!windowed || window == lightWindow)) || !LiteObtainUse.NoteFindMismatch())
+                return; // the same answer, or a mismatch past the dump budget
+            Console.Error.WriteLine(
+                $"[GPU][LITE_OBTAIN_WRONG] kind=find_verify hash=0x{prepared.Program.Hash:X16} slot={index} address=0x{address:X} requested=0x{requested:X} " +
+                $"lite={lightBuffer}/0x{requested:X} real={buffer}/0x{size:X} windowed={windowed} lite_window=0x{lightWindow.Start:X}-0x{lightWindow.End:X} " +
+                $"real_window=0x{window.Start:X}-0x{window.End:X}");
+        }
 
         private bool ReusesRingSlot(in BufferSourceMemo memo, ulong address, ulong requested, long spans, long mapping)
         {

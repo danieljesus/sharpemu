@@ -211,6 +211,11 @@ public unsafe class GpuBuffer : IDisposable
     public bool IsInBounds(ulong address, ulong size) =>
         address >= CpuAddress && size <= Size && address - CpuAddress <= Size - size;
 
+    // [local] SHARPEMU_LITE_OBTAIN: the mapping generation in which the light find last checked this buffer's guest
+    // range, and whether the whole range was readable then. Read and written on the recording thread only.
+    internal long LiteMapping = long.MinValue;
+    internal bool LiteReadable;
+
     public void AddStreamScore(int score) => StreamScore += score;
 
     // The highest scheduler tick whose command buffer may write this buffer on the GPU.

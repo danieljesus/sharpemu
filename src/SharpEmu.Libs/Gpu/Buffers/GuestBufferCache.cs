@@ -1353,7 +1353,18 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0, bool allowStream = true, bool requiresDeviceAddress = false,
         bool conservativeWrite = false) // [local] conservativeWrite: SHARPEMU_WRITE_DIFF / SHARPEMU_STORE_TABLE_EXACT=2
     {
-        if (Diagnostics.LiteObtainProbe.Enabled && !isWritten) // [local] SHARPEMU_LITE_OBTAIN_PROBE: the light path in shadow
+        if (!isWritten && LiteObtainMode != 0) // [local] SHARPEMU_LITE_OBTAIN (see LiteObtainUse)
+        {
+            if (LiteObtainMode != 2)
+            {
+                LiteObtainUse.Obtains++;
+                if (TryObtainLite(guestAddress, size, isTexelBuffer, out var lite))
+                    return lite;
+            }
+            else
+                return ObtainBufferLiteVerified(guestAddress, size, isTexelBuffer, bufferIdentifier, traceShaderHash, allowStream, requiresDeviceAddress);
+        }
+        else if (Diagnostics.LiteObtainProbe.Enabled && !isWritten) // [local] SHARPEMU_LITE_OBTAIN_PROBE: the light path in shadow
         {
             if (Diagnostics.LiteObtainProbe.Owns)
                 return ObtainBufferProbed(guestAddress, size, isTexelBuffer, bufferIdentifier, traceShaderHash, allowStream, requiresDeviceAddress);
@@ -1364,18 +1375,33 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             conservativeWrite);
     }
 
-    // [local] SHARPEMU_LITE_OBTAIN_PROBE: a predicate over the pending publications a read would complete or overlay
-    // (any occlusion dump over the range), set by the presenter.
+    // [local] SHARPEMU_LITE_OBTAIN: 0 off, 1 the light answer when it applies, 2 both and compare. Per cache so tests set it.
+    internal int LiteObtainMode { get; set; } = LiteObtainUse.DefaultMode;
+
+    // [local] SHARPEMU_LITE_OBTAIN=2, tests only: runs between the light answer and the real path (a CPU write there is
+    // the race the verification tells apart).
+    internal Action? LiteVerifyBetweenForTests { get; set; }
+
+    // [local] SHARPEMU_LITE_OBTAIN, SHARPEMU_LITE_OBTAIN_PROBE: a predicate over the pending publications a read would
+    // complete or overlay (any non-label entry over the range: a superset of what CompleteGuestPublications(OverlaidRead)
+    // completes and of the dumps OverlayGuestPublications copies), set by the presenter.
     internal Func<ulong, ulong, bool>? MayHaveGuestPublications { get; set; }
 
-    // [local] SHARPEMU_LITE_OBTAIN_PROBE: the light read obtain (see LiteObtainProbe), before the real one.
-    internal Diagnostics.LiteObtainProbe.Cause LiteObtain(ulong guestAddress, ulong size, bool isTexelBuffer, out GpuBuffer? buffer, out ulong offset)
+    // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_LITE_OBTAIN: the light read obtain (see LiteObtainUse): the page owner
+    // and its offset when the real read would do no work, otherwise why not.
+    internal Diagnostics.LiteObtainProbe.Cause LiteObtain(ulong guestAddress, ulong size, bool isTexelBuffer, out GpuBuffer? buffer, out ulong offset) =>
+        LiteObtain(guestAddress, size, isTexelBuffer, out buffer, out offset, out _);
+
+    internal Diagnostics.LiteObtainProbe.Cause LiteObtain(ulong guestAddress, ulong size, bool isTexelBuffer, out GpuBuffer? buffer, out ulong offset,
+        out ResourceSlotIdentifier identifier)
     {
         buffer = null;
         offset = 0;
-        if (MayHaveGuestPublications?.Invoke(guestAddress, size) == true)
+        identifier = default;
+        // Without the predicate (a presenter that did not set it) a cache with publications cannot rule them out.
+        if (MayHaveGuestPublications is { } publications ? publications(guestAddress, size) : CompleteGuestPublications is not null)
             return Diagnostics.LiteObtainProbe.Cause.Pub;
-        var owner = _registry.FindContainingResource(guestAddress, size, out _, out var partial);
+        var owner = _registry.FindContainingResource(guestAddress, size, out identifier, out var partial);
         if (owner is null)
             return partial ? Diagnostics.LiteObtainProbe.Cause.Cross : Diagnostics.LiteObtainProbe.Cause.Unmapped;
         if (_tracker.MayHaveCpuDirtyPages(guestAddress, size))
@@ -1385,6 +1411,96 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         buffer = owner;
         offset = owner.Offset(guestAddress);
         return Diagnostics.LiteObtainProbe.Cause.Fast;
+    }
+
+    // [local] SHARPEMU_LITE_OBTAIN: what ObtainBufferCore checks or observes before it could answer a read that the light
+    // path would skip: the read-only thread and an invalid range or command buffer (it throws), and the diagnostics that
+    // watch every read obtain.
+    private bool LiteObtainGuarded(ulong guestAddress, ulong size) =>
+        SubmissionScheduler.ReadOnlyThread || !IsValidRange(guestAddress, size) || _scheduler.Current.IsInvalid || MeshDrawTrace.Active ||
+        CpWriteDeferProbe.Enabled;
+
+    private static LiteObtainUse.Slow SlowOf(Diagnostics.LiteObtainProbe.Cause cause) => cause switch
+    {
+        Diagnostics.LiteObtainProbe.Cause.Pub => LiteObtainUse.Slow.Pub,
+        Diagnostics.LiteObtainProbe.Cause.Cpu => LiteObtainUse.Slow.Cpu,
+        Diagnostics.LiteObtainProbe.Cause.Img => LiteObtainUse.Slow.Img,
+        Diagnostics.LiteObtainProbe.Cause.Hot => LiteObtainUse.Slow.Hot,
+        Diagnostics.LiteObtainProbe.Cause.Cross => LiteObtainUse.Slow.Cross,
+        _ => LiteObtainUse.Slow.Unmapped,
+    };
+
+    // [local] SHARPEMU_LITE_OBTAIN=1: the light answer, with the one effect of the real clean read that later decisions
+    // read (the buffer's use tick for retirement) and its DRAWCOST counts. False sends the read to ObtainBufferCore.
+    private bool TryObtainLite(ulong guestAddress, ulong size, bool isTexelBuffer, out (GpuBuffer Buffer, ulong Offset) result)
+    {
+        result = default;
+        if (LiteObtainGuarded(guestAddress, size))
+        {
+            LiteObtainUse.NoteSlow(LiteObtainUse.Slow.Guard);
+            return false;
+        }
+
+        var cause = LiteObtain(guestAddress, size, isTexelBuffer, out var buffer, out var offset, out var identifier);
+        if (cause != Diagnostics.LiteObtainProbe.Cause.Fast)
+        {
+            LiteObtainUse.NoteSlow(SlowOf(cause));
+            return false;
+        }
+
+        TouchBuffer(identifier);
+        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.Obtain); // [local] SHARPEMU_DRAWCOST_PROBE
+        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ObtainLite);
+        LiteObtainUse.Lite++;
+        result = (buffer!, offset);
+        return true;
+    }
+
+    // [local] SHARPEMU_LITE_OBTAIN=2: the light answer, then the real path, whose answer is used. A light "clean" the
+    // real path disagreed with (another buffer or offset, an upload, a stream copy, a registry change, a publication or
+    // an image copy) is raced when the CPU dirtied a page of the range's blocks in between, otherwise wrong.
+    private (GpuBuffer Buffer, ulong Offset) ObtainBufferLiteVerified(ulong guestAddress, ulong size, bool isTexelBuffer,
+        ResourceSlotIdentifier bufferIdentifier, ulong traceShaderHash, bool allowStream, bool requiresDeviceAddress)
+    {
+        LiteObtainUse.Obtains++;
+        var guarded = LiteObtainGuarded(guestAddress, size);
+        var dirtyings = guarded ? 0 : _tracker.CpuDirtyingsOf(guestAddress, size);
+        var cause = Diagnostics.LiteObtainProbe.Cause.Unmapped;
+        GpuBuffer? liteBuffer = null;
+        ulong liteOffset = 0;
+        if (guarded)
+            LiteObtainUse.NoteSlow(LiteObtainUse.Slow.Guard);
+        else if ((cause = LiteObtain(guestAddress, size, isTexelBuffer, out liteBuffer, out liteOffset)) != Diagnostics.LiteObtainProbe.Cause.Fast)
+            LiteObtainUse.NoteSlow(SlowOf(cause));
+        var fast = !guarded && cause == Diagnostics.LiteObtainProbe.Cause.Fast;
+        LiteVerifyBetweenForTests?.Invoke();
+        var uploads = _syncUploads;
+        var epoch = _registry.Epoch;
+        var publications = Volatile.Read(ref Diagnostics.LiteObtainProbe.PublicationWork);
+        var imageCopies = Diagnostics.LiteObtainProbe.ImageCopies;
+        var result = ObtainBufferCore(guestAddress, size, false, isTexelBuffer, bufferIdentifier, traceShaderHash, allowStream, requiresDeviceAddress);
+        if (fast)
+        {
+            LiteObtainUse.Lite++;
+            LiteObtainUse.Verified++;
+            var work = (_syncUploads != uploads ? Diagnostics.LiteObtainProbe.Work.Upload : 0) |
+                (_registry.Epoch != epoch ? Diagnostics.LiteObtainProbe.Work.Registry : 0) |
+                (ReferenceEquals(result.Buffer, _stream) ? Diagnostics.LiteObtainProbe.Work.Stream : 0) |
+                (Volatile.Read(ref Diagnostics.LiteObtainProbe.PublicationWork) != publications ? Diagnostics.LiteObtainProbe.Work.Publication : 0) |
+                (Diagnostics.LiteObtainProbe.ImageCopies != imageCopies ? Diagnostics.LiteObtainProbe.Work.ImageCopy : 0);
+            if (!ReferenceEquals(liteBuffer, result.Buffer) || liteOffset != result.Offset || work != Diagnostics.LiteObtainProbe.Work.None)
+            {
+                var raced = _tracker.CpuDirtyingsOf(guestAddress, size) != dirtyings;
+                if (LiteObtainUse.NoteMismatch(raced))
+                    Console.Error.WriteLine(
+                        $"[GPU][LITE_OBTAIN_WRONG] kind=verify range=0x{guestAddress:X}+0x{size:X} texel={isTexelBuffer} work={work} " +
+                        $"lite=0x{liteBuffer?.CpuAddress ?? 0:X}+0x{liteBuffer?.Size ?? 0:X}@0x{liteOffset:X} real=0x{result.Buffer.CpuAddress:X}+0x{result.Buffer.Size:X}@0x{result.Offset:X} " +
+                        $"same_buffer={ReferenceEquals(liteBuffer, result.Buffer)} stream={ReferenceEquals(result.Buffer, _stream)} prefound={bufferIdentifier.IsValid} tick={_scheduler.CurrentTick}");
+            }
+        }
+
+        LiteObtainUse.MaybeReport();
+        return result;
     }
 
     // [local] SHARPEMU_LITE_OBTAIN_PROBE: the light lookup of FindBuffers (the page owner of the range).
@@ -1397,9 +1513,44 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     internal long RegistryEpoch => _registry.Epoch; // [local] SHARPEMU_LITE_OBTAIN_PROBE
 
+    internal ulong BufferUseTickForTests(ResourceSlotIdentifier identifier) => _registry.UseTickForTests(identifier); // [local] SHARPEMU_LITE_OBTAIN
+
+    internal long SyncUploadsForTests => _syncUploads; // [local] SHARPEMU_LITE_OBTAIN
+
+    // [local] SHARPEMU_LITE_OBTAIN: the light find of a read V# (see LiteObtainUse): the page owner of [address, address +
+    // size) when the owner's whole guest range is readable under the mapping generation (memory.CanRead, asked once per
+    // buffer and generation), and that range. A readable range has every sub-range readable, so the presenter's
+    // ClampMappedSize keeps the size, FindBuffer returns the owner and RingSlotWindow this range.
+    internal bool TryLiteFind(ulong address, ulong size, long mapping, ICpuMemory memory, out ResourceSlotIdentifier identifier, out ulong start,
+        out ulong end)
+    {
+        start = end = 0;
+        var owner = _registry.FindContainingResource(address, size, out identifier, out _);
+        if (owner is null)
+        {
+            return false;
+        }
+
+        if (owner.LiteMapping != mapping)
+        {
+            owner.LiteReadable = owner.Size != 0 && owner.Size <= ulong.MaxValue - owner.CpuAddress && memory.CanRead(owner.CpuAddress, owner.Size);
+            owner.LiteMapping = mapping;
+        }
+
+        if (!owner.LiteReadable)
+        {
+            return false;
+        }
+
+        start = owner.CpuAddress;
+        end = start + owner.Size;
+        return true;
+    }
+
     private (GpuBuffer Buffer, ulong Offset) ObtainBufferProbed(ulong guestAddress, ulong size, bool isTexelBuffer, ResourceSlotIdentifier bufferIdentifier,
         ulong traceShaderHash, bool allowStream, bool requiresDeviceAddress)
     {
+        var dirtyings = _tracker.CpuDirtyingsOf(guestAddress, size); // [local] a CPU write in between: raced (see LiteObtainUse)
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var cause = LiteObtain(guestAddress, size, isTexelBuffer, out var liteBuffer, out var liteOffset);
         var lite = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -1420,7 +1571,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             Console.Error.WriteLine(
                 $"[GPU][LITE_OBTAIN_WRONG] kind=obtain range=0x{guestAddress:X}+0x{size:X} texel={isTexelBuffer} work={work} " +
                 $"lite=0x{liteBuffer?.CpuAddress ?? 0:X}+0x{liteBuffer?.Size ?? 0:X}@0x{liteOffset:X} real=0x{result.Buffer.CpuAddress:X}+0x{result.Buffer.Size:X}@0x{result.Offset:X} " +
-                $"same_buffer={ReferenceEquals(liteBuffer, result.Buffer)} stream={ReferenceEquals(result.Buffer, _stream)} prefound={bufferIdentifier.IsValid} tick={_scheduler.CurrentTick}");
+                $"same_buffer={ReferenceEquals(liteBuffer, result.Buffer)} stream={ReferenceEquals(result.Buffer, _stream)} prefound={bufferIdentifier.IsValid} " +
+                $"raced={_tracker.CpuDirtyingsOf(guestAddress, size) != dirtyings} tick={_scheduler.CurrentTick}");
         return result;
     }
 
@@ -6165,7 +6317,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     private bool SynchronizeTexelFromImage(GpuBuffer buffer, ulong guestAddress, ulong size)
     {
         var copiedFromImage = RequireImageCache().TrySynchronizeBufferFromImage(buffer, guestAddress, size);
-        if (copiedFromImage && Diagnostics.LiteObtainProbe.Enabled) Diagnostics.LiteObtainProbe.ImageCopies++; // [local]
+        if (copiedFromImage) Diagnostics.LiteObtainProbe.ImageCopies++; // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_LITE_OBTAIN=2
         if (copiedFromImage) GuestGpuMemoryHook.Trace(guestAddress, size, $"host-copy-from-image submission_tick={_scheduler.CurrentTick}"); // [local]
         if (copiedFromImage)
         {

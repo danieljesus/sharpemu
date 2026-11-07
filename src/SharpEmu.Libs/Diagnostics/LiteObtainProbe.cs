@@ -104,14 +104,9 @@ internal static class LiteObtainProbe
     internal static long PublicationWork;
     internal static long ImageCopies;
 
+    // Counted always (rare paths): SHARPEMU_LITE_OBTAIN=2 reads them too.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void NotePublicationWork()
-    {
-        if (Enabled)
-        {
-            Interlocked.Increment(ref PublicationWork);
-        }
-    }
+    internal static void NotePublicationWork() => Interlocked.Increment(ref PublicationWork);
 
     // The sums of one window, per kind.
     internal sealed class Window

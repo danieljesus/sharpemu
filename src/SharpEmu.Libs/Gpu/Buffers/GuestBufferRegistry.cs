@@ -247,6 +247,8 @@ internal sealed class GuestBufferRegistry<TBuffer> : IDisposable where TBuffer :
     public ResourceSlotIdentifier GetRegisteredIdentifier(int index) => _registered.Values[index].Identifier;
     public ResourceSlotIdentifier[] SnapshotRegisteredIdentifiers() => _registered.Values.Select(entry => entry.Identifier).ToArray();
 
+    public ulong UseTickForTests(ResourceSlotIdentifier identifier) => FindEntry(identifier)?.LastUseTick ?? 0; // [local] SHARPEMU_LITE_OBTAIN
+
     public void MarkBufferUsed(ResourceSlotIdentifier identifier, ulong tick)
     {
         var entry = RequireEntry(identifier, BufferLifetimeState.Registered);
