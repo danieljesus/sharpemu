@@ -177,12 +177,13 @@ internal static unsafe partial class VulkanVideoPresenter
             return item;
         }
 
+        // The item's Work stays set: a worker may still read it after the render thread ended the item. RecordSlice notes
+        // the cost of the item it stopped at (Serial) after handing out the segment before it, and the render thread runs
+        // that item as soon as it has the segment. NewItem only reuses items after every slice of the flush finished.
         private void Return(FrontSliceItem item)
         {
             item.Owner?.ReleaseSnapshot();
             item.Owner = null;
-            item.Item.Work = null;
-            item.Item.Sequence = 0;
             _spare.Push(item);
         }
 

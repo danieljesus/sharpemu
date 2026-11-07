@@ -921,6 +921,12 @@ internal static unsafe partial class VulkanVideoPresenter
                         segment!.Count++;
                         NoteReadsVersion(segment.Requests, slice.Items[index].Work!);
                     }
+                    catch (Exception exception) when (exception is not SerialRequiredException) // [local] which item: no pdb in Release
+                    {
+                        var work = slice.Items[index].Work;
+                        throw new InvalidOperationException(FormattableString.Invariant(
+                            $"Recording slice item {index} of {slice.Items.Count} failed: work={work?.GetType().Name ?? "null"} sequence={slice.Items[index].Sequence} segment_first={segment?.First} segment_count={segment?.Count}."), exception);
+                    }
                     catch (SerialRequiredException serial)
                     {
                         segment!.SerialReason = serial.Message;
@@ -935,7 +941,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                     finally
                     {
-                        Diagnostics.ItemCostTally.Note(slice.Items[index].Work!.CostKind, Diagnostics.ItemCostTally.Record,
+                        Diagnostics.ItemCostTally.Note(slice.Items[index].Work?.CostKind ?? Diagnostics.ItemCostTally.Other, Diagnostics.ItemCostTally.Record, // [local] see FrontSlices.Return
                             System.Diagnostics.Stopwatch.GetTimestamp() - started);
                     }
                 }
