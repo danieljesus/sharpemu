@@ -30,7 +30,19 @@ public sealed partial class GuestImageCache
         public bool ExactFormat;
     }
 
-    private const int LookupEventSlots = 64;
+    // [local] SHARPEMU_IMAGE_LOOKUP_HISTORY=<n> (power of two, default 64): how many lookup events a memo can be checked
+    // against before it counts as stale (DarthPotato f8bc6512 measured 64 overflowing in Yotei).
+    private static readonly int LookupEventSlots = LookupHistory();
+
+    private static int LookupHistory()
+    {
+        if (!int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_IMAGE_LOOKUP_HISTORY"), out var slots) || slots < 64)
+        {
+            return 64;
+        }
+
+        return (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Min(slots, 1 << 16));
+    }
 
     private readonly record struct LookupEvent(ulong Generation, ulong Begin, ulong End);
 
@@ -238,7 +250,7 @@ public sealed partial class GuestImageCache
             return true;
         }
 
-        if (_lookupGeneration - generation > LookupEventSlots)
+        if (_lookupGeneration - generation > (ulong)LookupEventSlots)
         {
             return false;
         }
