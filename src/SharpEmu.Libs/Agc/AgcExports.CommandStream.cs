@@ -381,8 +381,22 @@ public static partial class AgcExports
             work is ResolvedDrawWork { Record: { WritesMemory: false, Kind: ResolvedDrawKind.Draw or ResolvedDrawKind.Skipped } };
 
         // [local] SHARPEMU_FRONT_SLICE_DISPATCHES: or any captured dispatch; its writes are marked pending until it is joined.
+        // A program with call records binds device-address ranges the host finds only when it records them
+        // (PrepareCallRecords; a worker hands it back with Serial), so their writes are not among the pending writes and a
+        // read resolved after the record would not wait for them: such a record is recorded in order, on the render thread.
         internal static bool IsSliceableRecord(DeferredWork work, bool dispatches) =>
-            IsSliceableDraw(work) || (dispatches && work is ResolvedDispatchWork);
+            (IsSliceableDraw(work) || (dispatches && work is ResolvedDispatchWork)) && !RecordHasCallRecords(work);
+
+        private static bool HasCallRecords(ShaderProgramInfo? program) => program is { CallRecordCallees.Count: not 0 };
+
+        private static bool RecordHasCallRecords(DeferredWork work) => work switch
+        {
+            ResolvedDrawWork { Record: { Kind: ResolvedDrawKind.Draw, State.Programs: { } programs } } =>
+                HasCallRecords(programs.VertexInput.Stage.Program) || HasCallRecords(programs.PixelInput.Stage.Program) ||
+                (programs.Tessellation is { } tessellation && HasCallRecords(tessellation.Hull.Input.Stage.Program)),
+            ResolvedDispatchWork { Record: { Skipped: false, Program: { } program } } => HasCallRecords(program.Input.Stage.Program),
+            _ => false,
+        };
 
         internal static long SequenceOf(DeferredWork work) =>
             work is ResolvedDrawWork draw ? draw.Record.Sequence : work is ResolvedDispatchWork dispatch ? dispatch.Record.Sequence : 0;

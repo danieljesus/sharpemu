@@ -886,6 +886,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 for (var index = 0; index < slice.Items.Count; index++)
                 {
                     var started = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var probeStarted = started; // [local] SHARPEMU_PARRES_PROBE: after BeginSegment
                     try
                     {
                         if (!_presenter._translation.CanRecordDeferred(slice.Items[index].Work!))
@@ -915,7 +916,7 @@ internal static unsafe partial class VulkanVideoPresenter
                                 var begun = System.Diagnostics.Stopwatch.GetTimestamp();
                                 Interlocked.Increment(ref ParallelResolveProbe.WorkerSegments);
                                 Interlocked.Add(ref ParallelResolveProbe.WorkerBeginTicks, begun - started);
-                                started = begun;
+                                probeStarted = begun;
                             }
                         }
 
@@ -933,7 +934,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         NoteReadsVersion(segment.Requests, slice.Items[index].Work!);
                         if (ParallelResolveProbe.Enabled) // [local]
                         {
-                            var ticks = System.Diagnostics.Stopwatch.GetTimestamp() - started;
+                            var ticks = System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted;
                             var dispatch = slice.Items[index].Work!.IsDispatch;
                             Interlocked.Increment(ref dispatch ? ref ParallelResolveProbe.WorkerDispatches : ref ParallelResolveProbe.WorkerItems);
                             Interlocked.Add(ref dispatch ? ref ParallelResolveProbe.WorkerDispatchTicks : ref ParallelResolveProbe.WorkerItemTicks, ticks);
@@ -950,7 +951,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         if (ParallelResolveProbe.Enabled) // [local] SHARPEMU_PARRES_PROBE: the time spent on the item before it stopped
                         {
                             Interlocked.Increment(ref ParallelResolveProbe.WorkerSerial);
-                            Interlocked.Add(ref ParallelResolveProbe.WorkerSerialTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                            Interlocked.Add(ref ParallelResolveProbe.WorkerSerialTicks, System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted);
                         }
 
                         segment!.SerialReason = serial.Message;
