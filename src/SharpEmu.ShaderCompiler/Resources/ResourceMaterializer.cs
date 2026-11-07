@@ -256,7 +256,8 @@ public static partial class ResourceMaterializer
     private static readonly ThreadCounter _fastStatisticsHits = new();
 
     public static string TakeFastReport() => FormattableString.Invariant(
-        $"fast_materializations={_fastMaterializations.Take()} fast_specialization_hits={_fastSpecializationHits.Take()} fast_statistics_hits={_fastStatisticsHits.Take()}");
+        $"fast_materializations={_fastMaterializations.Take()} fast_specialization_hits={_fastSpecializationHits.Take()} fast_statistics_hits={_fastStatisticsHits.Take()}") +
+        (FastMemoMode != 0 ? " " + TakeFastMemoReport() : ""); // [local] SHARPEMU_FAST_MATERIALIZE_MEMO
 
     private sealed record FastOrigin(ShaderResourcePlan Plan, ResourceRuntimeInputs Inputs);
 
@@ -457,6 +458,7 @@ public static partial class ResourceMaterializer
         failure = ResourceMaterializationFailure.Other;
         _failureDetail = null;
         _lastFastOutcome = MaterializationTally.Outcome.FastFallback;
+        _lastFastMemoAction = FastMemoAction.None; // [local] SHARPEMU_FAST_MATERIALIZE_MEMO
         if (plan.RequiresSpecializationMemory && inputs.ReadCleanMemory is null)
         {
             return false;
@@ -470,6 +472,15 @@ public static partial class ResourceMaterializer
         var output = TakeOutput();
         try
         {
+            if (FastMemoMode != 0 && Memoizable(plan)) // [local] SHARPEMU_FAST_MATERIALIZE_MEMO
+            {
+                var memoized = MaterializeFastMemoized(plan, inputs, output, ref snapshot, ref specialization, out failure, out var ran);
+                if (ran)
+                    return memoized;
+                _programFallbacks.Increment();
+                return MaterializeFastFromSnapshot(plan, inputs, ref snapshot, ref specialization, out failure);
+            }
+
             if (!EvaluateInto(plan, inputs, output))
             {
                 _programFallbacks.Increment();
@@ -510,15 +521,26 @@ public static partial class ResourceMaterializer
             }
         }
 
-        var buffers = new uint[bufferCount][];
-        for (var index = 0; index < bufferCount; index++)
+        uint[][] buffers;
+        uint[] table;
+        DeviceAddressRange[] ranges;
+        if (memo is not null && FastOutputReuseMode != 0) // [local] SHARPEMU_FAST_OUTPUT_REUSE
         {
-            var words = output.Source(index);
-            buffers[index] = memo is not null && (words[3] >> 30) != 0 ? new uint[words.Length] : words.ToArray();
+            ReuseOutputArrays(plan, output, bufferCount, out buffers, out table, out ranges);
+        }
+        else
+        {
+            buffers = new uint[bufferCount][];
+            for (var index = 0; index < bufferCount; index++)
+            {
+                var words = output.Source(index);
+                buffers[index] = memo is not null && (words[3] >> 30) != 0 ? new uint[words.Length] : words.ToArray();
+            }
+
+            table = output.TableWords.ToArray();
+            ranges = output.RangeValues.ToArray();
         }
 
-        var table = output.TableWords.ToArray();
-        var ranges = output.RangeValues.ToArray();
         var userData = inputs.UserData is uint[] array ? array : inputs.UserData.ToArray();
         if (memo is not null)
         {

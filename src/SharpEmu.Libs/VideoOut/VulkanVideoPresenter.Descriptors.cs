@@ -47,6 +47,7 @@ internal static unsafe partial class VulkanVideoPresenter
         FormattableString.Invariant($"stale={Interlocked.Exchange(ref _stageMemoStale, 0)} invalidations={Interlocked.Exchange(ref _stageMemoInvalidations, 0)} acquire_reuses={Interlocked.Exchange(ref _stageMemoAcquireReuses, 0)} ") +
         FormattableString.Invariant($"content_hits={Interlocked.Exchange(ref _stageMemoContentHits, 0)} evictions={Interlocked.Exchange(ref _stageMemoEvictions, 0)} ") +
         FormattableString.Invariant($"buffer_refinds={Interlocked.Exchange(ref _stageMemoBufferRefinds, 0)} buffer_changes={Interlocked.Exchange(ref _stageMemoBufferChanges, 0)} ") +
+        RecordingHost.TakeRingSlotReport() + // [local] SHARPEMU_RING_SLOT_REUSE
         FormattableString.Invariant($"source_table=hits:{Interlocked.Exchange(ref _bufferSourceTableHits, 0)},misses:{Interlocked.Exchange(ref _bufferSourceTableMisses, 0)},verified:{Interlocked.Exchange(ref _bufferSourceTableVerified, 0)},mismatches:{Interlocked.Exchange(ref _bufferSourceTableMismatches, 0)},clears:{Interlocked.Exchange(ref _bufferSourceTableClears, 0)} ") + // [local] SHARPEMU_BUFFER_SOURCE_MEMO
         (PublicationsReport?.Invoke() ?? ""); // [local]
 
@@ -272,7 +273,10 @@ internal static unsafe partial class VulkanVideoPresenter
         private const int ImageBindingMemoCapacity = 1 << 16;
         private Dictionary<ImageBindingKey, ImageBindingMemo>? _imageBindingMemos;
 
-        private readonly record struct BufferSourceMemo(ulong Address, ulong Requested, long RegionStamp, long Spans, long Mapping, ResourceSlotIdentifier Buffer, ulong Size);
+        // [local] WindowStart/WindowEnd (SHARPEMU_RING_SLOT_REUSE): the owner buffer's guest range, found readable in full at
+        // Mapping; empty when not checked.
+        private readonly record struct BufferSourceMemo(ulong Address, ulong Requested, long RegionStamp, long Spans, long Mapping, ResourceSlotIdentifier Buffer, ulong Size,
+            ulong WindowStart = 0, ulong WindowEnd = 0);
         private readonly record struct BufferSourceKey(ulong Program, int Slot, ulong Address, ulong Requested); // [local] SHARPEMU_BUFFER_SOURCE_MEMO
         private Dictionary<BufferSourceKey, BufferSourceMemo>? _bufferSourceTable;
         private Dictionary<ShaderProgramInfo, BufferSourceMemo[]>? _bufferSourceMemos;
@@ -412,6 +416,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 memo = last;
                 Interlocked.Increment(ref _stageMemoHits);
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MemoLast); // [local] SHARPEMU_DRAWCOST_PROBE
                 return true;
             }
 
@@ -425,6 +430,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 set.Last = found;
                 memo = found;
                 Interlocked.Increment(ref _stageMemoContentHits);
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MemoContent); // [local] SHARPEMU_DRAWCOST_PROBE
                 return true;
             }
 
@@ -519,6 +525,8 @@ internal static unsafe partial class VulkanVideoPresenter
             descriptors.Samplers = Scratch.Samplers.Rent(memo.SamplerHandles.Length);
             memo.SamplerHandles.CopyTo(descriptors.Samplers, 0);
             rentScope.Dispose();
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoRent); // [local] SHARPEMU_DRAWCOST_PROBE
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.Textures, memo.Textures.Length); // [local]
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemoImages)) // [local]
             foreach (var texture in memo.Textures)
             {
@@ -530,6 +538,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 BindImage(texture.ImageIdentifier, texture.IsStorage);
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoImages); // [local] SHARPEMU_DRAWCOST_PROBE
             var layout = program.Bindings!;
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingShaderData)) // [local]
             {
@@ -540,8 +549,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoShaderData); // [local] SHARPEMU_DRAWCOST_PROBE
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingDeviceRanges)) // [local]
                 FindDeviceAddressBuffers(prepared);
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoRanges); // [local]
             using var buffersScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemoBuffers); // [local]
             var spans = GuestGpuMemoryHook.Current?.SpanVersion ?? 0;
             var sameBuffers = memo.Spans == spans && SameWords(memo.Buffers, stage.Resources.Buffers);
@@ -560,6 +571,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!sameBuffers || memo.RegistrationSerial != _bufferCache.RegistrationSerial)
             {
                 Interlocked.Increment(ref sameBuffers ? ref _stageMemoBufferRefinds : ref _stageMemoBufferChanges); // [local]
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MemoBuffersChanged); // [local] SHARPEMU_DRAWCOST_PROBE
                 FindBuffers(prepared);
                 prepared.BufferSources.CopyTo(memo.Sources, 0);
                 memo.Buffers = stage.Resources.Buffers;
@@ -572,6 +584,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 memo.Sources.CopyTo(prepared.BufferSources, 0);
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoBuffers); // [local] SHARPEMU_DRAWCOST_PROBE
             return prepared;
         }
 
@@ -981,16 +994,20 @@ internal static unsafe partial class VulkanVideoPresenter
 
             StagePreparationMemo? memo = null;
             preludeScope.Dispose();
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindPrelude); // [local] SHARPEMU_DRAWCOST_PROBE
             var memoScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemo); // [local]
             var memoFound = StageMemoEnabled && frontendReady && !movieActive && !Gpu.Images.ImageClearTrace.Enabled && !MeshDrawTrace.Active && // [local] SHARPEMU_STAGE_MEMO
                 TryFindStagePreparation(preparations, snapshot, stage.ShaderBase, out memo);
             memoScope.Dispose();
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoFind); // [local] SHARPEMU_DRAWCOST_PROBE
             if (memoFound)
             {
                 return ReuseStagePreparation(preparation, stage, program, memo!);
             }
 
             Interlocked.Increment(ref _stageMemoMisses);
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MemoMiss); // [local]
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.Textures, info.Images.Count); // [local]
             using var setupScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingSetup); // [local]
             var prepared = RentStage(stage, program);
             // Register ownership before preparation can fail halfway through.
@@ -1070,6 +1087,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"samplers={info.Samplers.Count} userData={snapshot.UserData.Length} flattened={snapshot.FlattenedResourceTable.Length} shaderData={shaderData.Length}");
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMiss); // [local] SHARPEMU_DRAWCOST_PROBE
             return prepared;
         }
 
@@ -1295,6 +1313,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var spans = GuestGpuMemoryHook.Current?.SpanVersion ?? 0;
             var mapping = _guestMemory.MappingGeneration; // [local]
             var sourceMemoMode = BufferSourceMemoMode; // [local] SHARPEMU_BUFFER_SOURCE_MEMO, once per stage
+            var ringSlotReuse = RingSlotReuseMode != 0 && !_worker && mapping != long.MinValue; // [local] SHARPEMU_RING_SLOT_REUSE
             for (var index = 0; index < sources.Length; index++)
             {
                 var words = snapshot.Buffers[index];
@@ -1343,7 +1362,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     Gpu.Buffers.ConservativeRecords.VerifyBinding(index, descriptor.RecordCount, requested, _bufferCache.ContainingBufferExtent(descriptor.Address, ulong.MaxValue, 0));
                 requested = ConservativeRequested(program.Hash, descriptor, requested); // [local] SHARPEMU_CONSERVATIVE_RECORDS
                 var remembered = known || (memo.Address == descriptor.Address && memo.Requested == requested && memo.Spans == spans);
-                var size = remembered ? memo.Size : ClampMappedSize(descriptor.Address, requested, prepared, index);
+                var ringReused = !remembered && ringSlotReuse && ReusesRingSlot(in memo, descriptor.Address, requested, spans, mapping); // [local] SHARPEMU_RING_SLOT_REUSE
+                var size = remembered ? memo.Size : ringReused ? requested : ClampMappedSize(descriptor.Address, requested, prepared, index);
+                if (ringReused && RingSlotReuseMode == 2) // [local] the reused answer against the lookup it replaces
+                    VerifyRingSlot(in memo, descriptor.Address, requested, prepared, index);
                 PublishImagesUnderWrite(prepared.Resources.Info.Buffers[index], descriptor.Address, size);
                 if (remembered && memo.RegionStamp == _bufferCache.RegionStamp(descriptor.Address, requested))
                 {
@@ -1364,9 +1386,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
                 else
                 {
-                    var buffer = FindBuffer(descriptor.Address, size);
+                    var buffer = ringReused ? memo.Buffer : FindBuffer(descriptor.Address, size);
                     sources[index] = (descriptor, buffer, size);
-                    memo = new BufferSourceMemo(descriptor.Address, requested, _bufferCache.RegionStamp(descriptor.Address, requested), spans, mapping, buffer, size);
+                    var (windowStart, windowEnd) = ringReused ? (memo.WindowStart, memo.WindowEnd)
+                        : ringSlotReuse && size == requested ? RingSlotWindow(buffer) : (0UL, 0UL); // [local] SHARPEMU_RING_SLOT_REUSE
+                    memo = new BufferSourceMemo(descriptor.Address, requested, _bufferCache.RegionStamp(descriptor.Address, requested), spans, mapping, buffer, size,
+                        windowStart, windowEnd);
                     if (sourceMemoMode != 0 && mapping != long.MinValue) // [local] SHARPEMU_BUFFER_SOURCE_MEMO
                     {
                         var table = _bufferSourceTable ??= new Dictionary<BufferSourceKey, BufferSourceMemo>();
@@ -1393,6 +1418,55 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             prepared.BufferSources = sources;
+        }
+
+        // [local] SHARPEMU_RING_SLOT_REUSE (=1 on, =2 verify, off by default): GTA V moves most buffer slots of a program from
+        // one draw to the next inside the same per-frame ring ([PERF][STAGE_MEMO] buffer_changes ~ hits), so the slot's memo
+        // misses and the slot pays the clamp to the mapped size (a fully-mapped set lookup, a per-frame map lookup, a
+        // readability check and an insert into one of them) and a buffer lookup, for a range inside the buffer the slot had.
+        // A slot memo now keeps that owner's guest range when the whole of it was readable (checked once, when the memo
+        // comes from a lookup). A moved descriptor whose range lies inside that window, with the same mapping generation and
+        // guest spans, that the registry still answers with the same buffer (FindContainingBuffer: what FindBuffer returns
+        // before it would create one; registered buffers are disjoint) takes that buffer and its requested size. That is
+        // the clamp's answer: readability only shrinks with an unmap or a clear, and both move the mapping generation (the
+        // invariant SHARPEMU_MAPPED_SIZE_KEEP relies on). Render thread only. =2 clamps and looks the buffer up again on
+        // every reuse and counts the answers that differ ([PERF][STAGE_MEMO] ring_slots=).
+        internal static readonly int RingSlotReuseMode =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RING_SLOT_REUSE"), out var ringSlot) ? ringSlot : 0;
+        private static long _ringSlotReuses, _ringSlotWindows, _ringSlotVerified, _ringSlotMismatches;
+        private static int _ringSlotLogs;
+
+        internal static string TakeRingSlotReport() => RingSlotReuseMode == 0 ? "" : FormattableString.Invariant(
+            $"ring_slots=reuses:{Interlocked.Exchange(ref _ringSlotReuses, 0)},windows:{Interlocked.Exchange(ref _ringSlotWindows, 0)},verified:{Interlocked.Exchange(ref _ringSlotVerified, 0)},mismatches:{Interlocked.Read(ref _ringSlotMismatches)} ");
+
+        private bool ReusesRingSlot(in BufferSourceMemo memo, ulong address, ulong requested, long spans, long mapping)
+        {
+            if (!memo.Buffer.IsValid || memo.Mapping != mapping || memo.Spans != spans || !GuestBufferCache.WindowCovers(memo.WindowStart, memo.WindowEnd, address, requested) ||
+                _bufferCache.FindContainingBuffer(address, requested) != memo.Buffer)
+                return false;
+            _ringSlotReuses++;
+            return true;
+        }
+
+        private (ulong Start, ulong End) RingSlotWindow(ResourceSlotIdentifier buffer)
+        {
+            if (!buffer.IsValid || !_bufferCache.TryGetRegisteredExtent(buffer, out var start, out var size) || size == 0 ||
+                size > ulong.MaxValue - start || !_guestMemory.CanRead(start, size))
+                return (0, 0);
+            _ringSlotWindows++;
+            return (start, start + size);
+        }
+
+        private void VerifyRingSlot(in BufferSourceMemo memo, ulong address, ulong requested, PreparedStageBindings prepared, int index)
+        {
+            _ringSlotVerified++;
+            var checkedSize = ClampMappedSize(address, requested, prepared, index);
+            var checkedBuffer = FindBuffer(address, checkedSize);
+            if (checkedSize == requested && checkedBuffer == memo.Buffer)
+                return;
+            Interlocked.Increment(ref _ringSlotMismatches);
+            if (_ringSlotLogs++ < 20)
+                Console.Error.WriteLine($"[RING_SLOT_MISMATCH] hash=0x{prepared.Program.Hash:X16} slot={index} address=0x{address:X} requested=0x{requested:X} reused={memo.Buffer} now={checkedBuffer}/0x{checkedSize:X}");
         }
 
         // [local] SHARPEMU_CONSERVATIVE_RECORDS: a descriptor sized by the sentinel record count spans the rest of the cache
@@ -1902,9 +1976,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.BindBuffers, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
                 using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingBuffers)) // [local]
                     BindBuffers(stage);
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResBuffers); // [local] SHARPEMU_DRAWCOST_PROBE
                 using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ObtainAddressRanges, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
                 using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingDeviceRanges)) // [local]
                     ObtainDeviceAddressRanges(stage);
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResRanges); // [local]
             }
             finally
             {
@@ -1914,6 +1990,10 @@ internal static unsafe partial class VulkanVideoPresenter
                         _bufferCache.EndUploadBatch();
                 }
             }
+
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResUploadEnd); // [local] SHARPEMU_DRAWCOST_PROBE
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.StorageBuffers, info.Buffers.Count); // [local]
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DeviceRanges, stage.Stage.Resources.DeviceAddressRanges.Length); // [local]
 
             if (KeepsTextureSet(stage))
             {
@@ -1928,6 +2008,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _preparedTextures.Add(stage.Textures);
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResImages); // [local] SHARPEMU_DRAWCOST_PROBE
         }
 
         // Textures bound for the draw being prepared; cleared when its preparation closes.
@@ -2846,8 +2927,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                 }
 
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.CommitBuild); // [local] SHARPEMU_DRAWCOST_PROBE
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DescriptorWrites, writeIndex); // [local]
                 if (hasPushData)
                 {
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PushConstants); // [local]
                     var pushStages = bindPoint == PipelineBindPoint.Graphics
                         ? ((entry.Description?.VertexStage.Stage == ShaderStageKind.Mesh
                             ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
@@ -2861,6 +2945,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (writeIndex != 0 && DescriptorsAlreadyBound(command, bindPoint, entry.Layout, writes[..writeIndex])) // SHARPEMU_NATIVE_STATE_REUSE
                 {
                     Interlocked.Increment(ref _descriptorsShadowed);
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DescriptorShadowed); // [local] SHARPEMU_DRAWCOST_PROBE
                 }
                 else if (writeIndex != 0)
                 {
@@ -2876,6 +2961,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             }
                             AcceptOwnBind(); // [local] the VkRecord bind advanced the native binding epoch
                             ShaderCacheCounters.CountPushSet();
+                            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DescriptorPush); // [local] SHARPEMU_DRAWCOST_PROBE
                         }
                         else
                         {
@@ -2899,6 +2985,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             }
                             AcceptOwnBind(); // [local]
                             ShaderCacheCounters.CountHeapSet();
+                            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DescriptorHeap); // [local] SHARPEMU_DRAWCOST_PROBE
                         }
                     }
                 }
@@ -2914,6 +3001,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.CommitPush); // [local] SHARPEMU_DRAWCOST_PROBE
             var spare = _worker ? null : _presenter._spareSubmissionResources ??= new Stack<SubmissionUploadResources>();
             var uploads = spare is { Count: not 0 } ? spare.Pop() : new SubmissionUploadResources();
             uploads.DebugName = bindPoint == PipelineBindPoint.Compute ? Presenter.DispatchDebugName : Presenter.DrawDebugName;
@@ -2937,6 +3025,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 RenderTrace.Write($"Bindings committed bindPoint={bindPoint} pipeline={pipeline.Pipeline} writes={writeIndex} push={entry.UsesPushDescriptors} pushData={hasPushData}");
             }
+
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.CommitTail); // [local] SHARPEMU_DRAWCOST_PROBE
         }
     }
 }

@@ -14,6 +14,7 @@ internal sealed partial class RenderRecorder
 
     public void Record(ResolvedDispatch record)
     {
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.RecHandOver); // [local] SHARPEMU_DRAWCOST_PROBE
         try
         {
             RecordDispatch(record);
@@ -25,6 +26,8 @@ internal sealed partial class RenderRecorder
             {
                 _pool.Return(record);
             }
+
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.RecReturn); // [local]
         }
     }
 
@@ -62,6 +65,7 @@ internal sealed partial class RenderRecorder
         _host.RunPendingOperations();
         using var memoProgram = new Buffers.TableWordMemo.ProgramScope(); // [local] no program's once the dispatch is recorded
         SetDebugInformation(in record.Debug);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.RecPending); // [local] SHARPEMU_DRAWCOST_PROBE
         var userScalars = record.UserScalars is { } scalars ? (ReadOnlySpan<uint>)scalars : ReadOnlySpan<uint>.Empty; // [local]
         if (record.ShaderAddress != 0 && Buffers.TlasHle.Instance is { } tlasHle) // [local] SHARPEMU_TLAS_HLE
         {
@@ -97,6 +101,7 @@ internal sealed partial class RenderRecorder
             _host.NoteIndirectArgsWriter(program.Hash, userScalars, input.Stage.Resources.FlattenedResourceTable, record.GroupsX);
         if (Buffers.RayQueryHle.Instance?.NoteDispatch(program.Hash) == true) // [local] SHARPEMU_RT_RAYQUERY / SHARPEMU_RQ_MAP
             _host.ResetBindings();
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchSetup); // [local] SHARPEMU_DRAWCOST_PROBE
         if (record.IndirectArgumentsAddress == 0)
         {
             bool consumed;
@@ -112,6 +117,7 @@ internal sealed partial class RenderRecorder
                 Diagnostics.DispatchRunTally.NoteConsume(program.Hash, kinds, consumed);
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchConsume); // [local] SHARPEMU_DRAWCOST_PROBE
             if (consumed)
             {
                 _host.ResetBindings();
@@ -126,8 +132,15 @@ internal sealed partial class RenderRecorder
 
         using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchEndRendering)) // [local]
             _host.EndRendering();
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchEndRendering); // [local] SHARPEMU_DRAWCOST_PROBE
+        if (Diagnostics.RepeatProbe.Enabled && !OnWorker) // [local] SHARPEMU_REPEAT_PROBE: the dispatch's inputs, before its preparation
+        {
+            Diagnostics.RepeatProbe.NoteDispatch(record, computeProgram);
+        }
+
         using (_host.BeginPreparation())
         {
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.PrepBegin); // [local]
             PipelineHandle pipeline;
             if (ReferenceEquals(computeProgram, _keptComputeProgram))
             {
@@ -160,6 +173,7 @@ internal sealed partial class RenderRecorder
                 _keptComputePipeline = pipeline;
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchPipeline); // [local] SHARPEMU_DRAWCOST_PROBE
             if (Buffers.WriteDiffProbe.Enabled) Buffers.WriteDiffProbe.Arm(program.Hash); // [local] SHARPEMU_WRITE_DIFF
             var bindings = PrepareBindings(input.Stage);
             var bindScope = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchBind); // [local]
@@ -169,6 +183,7 @@ internal sealed partial class RenderRecorder
                     _host.PrepareDeviceAddresses();
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.Bda); // [local] SHARPEMU_DRAWCOST_PROBE
             _host.BindResources(bindings);
             bindScope.Dispose();
             Span<IPreparedBindings> stages = [bindings];
@@ -182,6 +197,7 @@ internal sealed partial class RenderRecorder
                 _host.ShaderWriteHazardBarrier();
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchBarrier); // [local] SHARPEMU_DRAWCOST_PROBE
             var imageSnapshot = _host.BeginComputeImageSnapshot(bindings);
             _host.BeginCheckedDispatch();
             _host.BindPipeline(PipelineBindPoint.Compute, in pipeline);
@@ -215,6 +231,7 @@ internal sealed partial class RenderRecorder
             }
 
             dispatchEmit.Dispose();
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchEmit); // [local] SHARPEMU_DRAWCOST_PROBE
             _host.EndComputeImageSnapshot(imageSnapshot, bindings);
             if (record.IndirectArgumentsAddress == 0 && computeProgram.KnownWrite is { } known)
             {
@@ -238,8 +255,11 @@ internal sealed partial class RenderRecorder
                 if (Buffers.CutPolicy.DispatchCutPending) { Buffers.CutPolicy.DispatchCutPending = false; Buffers.CutPolicy.DispatchCut?.Invoke(); } // [local] SHARPEMU_CUT_POLICY
                 if (Buffers.GuestBufferCache.PostDispatchHooks.Count != 0) { var hooks = Buffers.GuestBufferCache.PostDispatchHooks.ToArray(); Buffers.GuestBufferCache.PostDispatchHooks.Clear(); foreach (var h in hooks) h(); }
             }
+
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchTail); // [local] SHARPEMU_DRAWCOST_PROBE
         }
 
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.PrepEnd); // [local]
         _host.ResetBindings();
     }
 

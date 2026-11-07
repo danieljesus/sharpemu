@@ -157,6 +157,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             request.Role != ImageRole.Texture ? Buffers.GuestBufferCache.PublicationAccess.Write : Buffers.GuestBufferCache.PublicationAccess.Read);
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageLookup);
         if (ResolveProfile.Enabled) ResolveProfile.CountFindImage(request.Role); // [local] SHARPEMU_PROFILE_RESOLVE
+        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ImageLookup); // [local] SHARPEMU_DRAWCOST_PROBE
         var command = _scheduler.Current;
         if (command.IsInvalid)
         {

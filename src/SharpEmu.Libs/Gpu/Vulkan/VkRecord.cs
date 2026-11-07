@@ -62,6 +62,7 @@ internal static unsafe class VkRecord
 
     public static void CmdPipelineBarrier2(Vk vk, CommandBuffer command, DependencyInfo* info)
     {
+        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.Barriers); // [local] SHARPEMU_DRAWCOST_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Barrier); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -472,6 +473,7 @@ internal static unsafe class VkRecord
 
     public static void CmdBeginRendering(Vk vk, CommandBuffer command, RenderingInfo* info)
     {
+        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ScopeBegin); // [local] SHARPEMU_DRAWCOST_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteRendering(command, info); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -526,6 +528,7 @@ internal static unsafe class VkRecord
 
     public static void CmdEndRendering(Vk vk, CommandBuffer command)
     {
+        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ScopeEnd); // [local] SHARPEMU_DRAWCOST_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteEndRendering(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {

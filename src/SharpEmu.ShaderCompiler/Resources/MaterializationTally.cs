@@ -14,6 +14,7 @@ public static class MaterializationTally
         FastHit,
         FastMiss,
         FastFallback,
+        FastMemoHit, // [local] SHARPEMU_FAST_MATERIALIZE_MEMO
         KeptRevalidated,
         KeptStale,
         RevalidateRefused,

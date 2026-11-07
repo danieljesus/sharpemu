@@ -1050,7 +1050,23 @@ internal static unsafe partial class VulkanVideoPresenter
                 Gpu.Buffers.TlasHle.Instance?.NoteCpuRead(address, sizeof(uint), Gpu.Buffers.TableWordMemo.CurrentProgram); // [local] SHARPEMU_TLAS_HLE_CONSUMERS
                 var memoPending = false; // [local] SHARPEMU_TABLE_WORD_MEMO
                 var memoValue = 0u;
-                if (!NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) && Gpu.Buffers.TableWordMemo.Enabled)
+                var fastHit = Gpu.Buffers.TableWordMemo.FastHit; // [local] SHARPEMU_TABLE_WORD_MEMO_FAST_HIT
+                var gpuDirty = !NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint));
+                if (fastHit && gpuDirty && Gpu.Buffers.TableWordMemo.Enabled && Gpu.Buffers.TableWordMemo.Mode == 1)
+                {
+                    if (Gpu.Buffers.TableWordMemo.TryAnswer(address, out memoValue, out var audit, out var speculated))
+                    {
+                        if (audit)
+                            _bufferCache.AuditMemoWord(address, memoValue, speculated);
+                        if (speculated && Gpu.Buffers.CutPolicy.Words)
+                            _bufferCache.NoteCutWord(address);
+                        if (speculated && Gpu.Buffers.TableWordMemo.LearnFlush)
+                            Gpu.Buffers.TableWordMemo.NoteLearnFlush(_bufferCache.FlushOpenWriter(address, sizeof(uint)));
+                        word = memoValue;
+                        return true;
+                    }
+                }
+                else if (gpuDirty && Gpu.Buffers.TableWordMemo.Enabled)
                 {
                     if (Gpu.Buffers.TableWordMemo.TryGet(address, out memoValue))
                     {
@@ -1075,7 +1091,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                 }
 
-                if (!NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint))) // [local] ceiling experiment: read the stale CPU copy instead of waiting
+                if (fastHit ? gpuDirty : !NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint))) // [local] ceiling experiment: read the stale CPU copy instead of waiting
                 {
                     if (Diagnostics.GpuReadTrace.Enabled)
                     {

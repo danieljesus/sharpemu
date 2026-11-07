@@ -208,4 +208,34 @@ public sealed class TableWordMemoTests
             TableWordMemo.NoteGpuWrite(Word - 0x28, 0x100);
         Assert.False(TableWordMemo.TryGet(Word, out _));
     });
+    // [local] SHARPEMU_TABLE_WORD_MEMO_FAST_HIT: one hold answers what TryGet and NoteAnsweredHit answered, with the same
+    // audit sampling sequence.
+    [Fact]
+    public void TryAnswerGivesTheSameValueAndAuditsAsTheTwoCalls()
+    {
+        var audits = new List<bool>();
+        var speculations = new List<bool>();
+        TableWordMemo.ResetForTests();
+        TableWordMemo.Store(Word, 7);
+        for (var hit = 0; hit < 3 * TableWordMemo.AuditRate + 5; hit++)
+        {
+            Assert.True(TableWordMemo.TryGet(Word, out var value));
+            Assert.Equal(7u, value);
+            audits.Add(TableWordMemo.NoteAnsweredHit(Word, out var speculated));
+            speculations.Add(speculated);
+        }
+
+        TableWordMemo.ResetForTests();
+        TableWordMemo.Store(Word, 7);
+        for (var hit = 0; hit < audits.Count; hit++)
+        {
+            Assert.True(TableWordMemo.TryAnswer(Word, out var value, out var audit, out var speculated));
+            Assert.Equal(7u, value);
+            Assert.Equal(audits[hit], audit);
+            Assert.Equal(speculations[hit], speculated);
+        }
+
+        Assert.False(TableWordMemo.TryAnswer(Word + 4, out _, out var missAudit, out _));
+        Assert.False(missAudit);
+    }
 }

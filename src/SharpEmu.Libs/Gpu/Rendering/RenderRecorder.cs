@@ -25,7 +25,14 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
     private readonly HashSet<(ulong ShaderHash, ImageType ImageType, ImageViewType ViewType)> _reportedDrawImageTypeMismatches = [];
     private readonly BufferBinding[] _vertexBindings = new BufferBinding[VertexInputInfo.MaxBuffers];
     private readonly VertexBufferRange[] _vertexRanges = new VertexBufferRange[VertexInputInfo.MaxBuffers];
-    private readonly KeptPipeline _pipeline = new();
+    private KeptPipeline _pipeline = new();
+    // [local] SHARPEMU_KEPT_PIPELINES: the graphics pipelines kept before the most recent one.
+    private readonly KeptPipeline[] _olderPipelines = NewOlderPipelines(KeptPipelinesOverride.Value ?? KeptPipelineCount);
+    private int _olderPipelineNext;
+    // [local] SHARPEMU_DRAWCOST_PROBE: the last eight lookups' keys, and the previous draw's context stamp.
+    private readonly Diagnostics.DrawCostProbe.KeyShadow<(PipelineKey, RenderingState)>? _pipelineShadow =
+        Diagnostics.DrawCostProbe.Enabled ? new() : null;
+    private ulong _probeContextStamp;
     private readonly InPlaceDraw _inPlace = new();
     private long _sequence;
     private static readonly ThreadCounter _inPlaceDraws = new();
@@ -180,18 +187,22 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
     public void Record(ResolvedDraw record)
     {
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.RecHandOver); // [local] SHARPEMU_DRAWCOST_PROBE
         try
         {
             RecordDraw(record);
         }
         finally
         {
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.PrepEnd); // [local]
             using var returnScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecReturn); // [local]
             _pendingWrites?.Release(record.Sequence);
             if (_returnsRecords)
             {
                 _pool.Return(record);
             }
+
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.RecReturn); // [local]
         }
     }
 
@@ -208,6 +219,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
 
             _host.RunPendingOperations();
             SetDebugInformation(in record.Debug);
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.RecPending); // [local] SHARPEMU_DRAWCOST_PROBE
         }
 
         if (OnWorker)
@@ -272,6 +284,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 }
 
                 targetsScope.Dispose();
+                if (inPlace) Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.TargetsInPlace); // [local] SHARPEMU_DRAWCOST_PROBE
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.RecTargets); // [local]
                 RecordDrawCommands(record, ref state, inPlace);
                 break;
             }
@@ -406,6 +420,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         var beginScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepBegin); // [local]
         var preparationScope = _host.BeginPreparation();
         beginScope.Dispose();
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.PrepBegin); // [local] SHARPEMU_DRAWCOST_PROBE
         using var preparation = new PreparationEnd(preparationScope); // [local] the dispose, measured
         using var indirectMesh = meshInput is not null && emission.IndirectArgumentsAddress != 0
             ? _host.PrepareIndirectMeshDraw(new IndirectMeshDrawRequest(emission.IndirectArgumentsAddress,
@@ -482,6 +497,11 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             vertexInput.Stage = meshStage;
         }
 
+        if (Diagnostics.RepeatProbe.Enabled && !OnWorker) // [local] SHARPEMU_REPEAT_PROBE: the draw's inputs, before its bindings
+        {
+            Diagnostics.RepeatProbe.NoteDraw(record, ref state, vertexInput, state.PixelActive ? pixelInput : null);
+        }
+
         IPreparedBindings vertexBindings;
         IPreparedBindings? pixelBindings;
         try
@@ -516,6 +536,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 _host.PrepareDeviceAddresses();
         }
 
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.Bda); // [local] SHARPEMU_DRAWCOST_PROBE
         _host.BindResources(vertexBindings);
         if (pixelBindings is not null)
         {
@@ -530,6 +551,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 emission.Indexed ? RenderExecutor.IndexedIndirectArgumentsSize : RenderExecutor.AutoIndirectArgumentsSize, isWritten: false)
             : default;
         buffersScope.Dispose();
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawBuffers); // [local] SHARPEMU_DRAWCOST_PROBE
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepTargets)) // [local]
             RenderExecutor.DropUnwrittenColorTargets(context, ref state, pixelProgram);
         // [local] SHARPEMU_ATTACH_PROBE (render thread only: static state).
@@ -550,9 +572,11 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         }
         if (attachStarted != 0)
             AttachProbe.Note(sameAttachments, System.Diagnostics.Stopwatch.GetTimestamp() - attachStarted);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawAttachments); // [local] SHARPEMU_DRAWCOST_PROBE
         Span<IPreparedBindings> stages = pixelBindings is null ? [vertexBindings] : [vertexBindings, pixelBindings];
         if (RenderExecutor.PrepareStageImagesEnabled) // [local] SHARPEMU_PREPARE_STAGE_IMAGES
             _host.PrepareStageImages(PipelineBindPoint.Graphics, stages);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawStageImages); // [local]
         if (!TryResolvePipeline(record, ref state, vertexInput, state.PixelActive ? pixelInput : null, out var pipeline))
         {
             // [local] SHARPEMU_ASYNC_GRAPHICS_PIPELINES: left out while its pipeline compiles. Its attachments were
@@ -562,6 +586,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             return;
         }
 
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawPipeline); // [local] SHARPEMU_DRAWCOST_PROBE
+        if (Diagnostics.RepeatProbe.Enabled && !OnWorker) Diagnostics.RepeatProbe.NotePipeline(pipeline.Pipeline); // [local] SHARPEMU_REPEAT_PROBE
         if (record.SetBindDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x100);
@@ -578,6 +604,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepBindVertex)) // [local]
                 _host.BindVertexBuffers(vertexBuffers, vertexInput);
         }
+
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawBindVertex); // [local] SHARPEMU_DRAWCOST_PROBE
 
         if (pixelBindings is not null && record.SetAutoDebug)
         {
@@ -596,6 +624,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         // emission is measured; PartPure and DrawPrepDynamicState no longer have a recording-side piece.
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartDrawEmit)) // [local] SHARPEMU_PARREC_PROBE
             _host.SetDynamicState(in record.Dynamic);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawDynamic); // [local] SHARPEMU_DRAWCOST_PROBE
         if (record.SetAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x400);
@@ -612,6 +641,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         indirectMesh?.Prepare();
         _host.BeginRendering(in state.Rendering);
         scopeEmit.Dispose();
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawBeginRendering); // [local] SHARPEMU_DRAWCOST_PROBE
         if (MeshDrawTrace.Active) MeshDrawTrace.Write("rendering", $"width={state.Rendering.Width} height={state.Rendering.Height} layers={state.Rendering.Layers} colors={state.ColorCount}");
         var drawEmit = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartDrawEmit); // [local] SHARPEMU_PARREC_PROBE
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
@@ -652,6 +682,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         }
 
         drawEmit.Dispose();
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawEmit); // [local] SHARPEMU_DRAWCOST_PROBE
         using var tailScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepTail); // [local]
         _host.EndImageSnapshot(imageSnapshot, DrawState.BoundColors(ref state));
         IndexedDrawTrace.Write(record.IndexedTrace, "emitted", submitId, record.PacketAddress);
@@ -677,6 +708,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         {
             SetDrawDebugPhase(submitId, in draw, 0x700);
         }
+
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawTail); // [local] SHARPEMU_DRAWCOST_PROBE
     }
 
     // [local] Disposes a resource preparation under its own profile phase.
@@ -1002,12 +1035,36 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             (int)record.Topology,
             record.PrimitiveRestart,
             state.Programs.DisableBlending);
+        if (_pipelineShadow is not null) // [local] SHARPEMU_DRAWCOST_PROBE
+        {
+            if (record.ContextStamp == _probeContextStamp)
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ContextUnchanged);
+            _probeContextStamp = record.ContextStamp;
+        }
+
         var kept = _pipeline;
         if (kept.Valid && kept.Key == key && kept.Rendering.Equals(state.Rendering))
         {
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PipelineKept); // [local] SHARPEMU_DRAWCOST_PROBE
             pipeline = kept.Handle;
             return true;
         }
+
+        if (_olderPipelines.Length != 0 && TryTakeOlderPipeline(in key, in state.Rendering, out pipeline)) // [local] SHARPEMU_KEPT_PIPELINES
+        {
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PipelineKeptOlder); // [local] SHARPEMU_DRAWCOST_PROBE
+            return true;
+        }
+
+        if (_pipelineShadow is { } shadow) // [local] SHARPEMU_DRAWCOST_PROBE: would eight kept pipelines have answered it?
+        {
+            var shadowKey = (key, state.Rendering);
+            if (shadow.Contains(in shadowKey))
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PipelineWouldKeep8);
+            shadow.Add(in shadowKey);
+        }
+
+        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PipelineLookup); // [local] SHARPEMU_DRAWCOST_PROBE
 
         var asyncMode = AsyncGraphicsPipelines; // [local] once: it is hot
         if (asyncMode == 0) // [local]
@@ -1030,11 +1087,84 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             return false;
         }
 
-        kept.Key = key;
-        kept.Rendering = state.Rendering;
-        kept.Handle = pipeline;
-        kept.Valid = true;
+        KeepPipeline(in key, in state.Rendering, pipeline); // [local] SHARPEMU_KEPT_PIPELINES
         return true;
+    }
+
+    // [local] SHARPEMU_KEPT_PIPELINES=N (1 by default: only the previous draw's pipeline, as before; 2-16): the recorder
+    // keeps the last N graphics pipelines it resolved with their keys, most recent first, so a draw that alternates
+    // with other programs under unchanged registers (A, B, A with no context write between) takes its pipeline again
+    // without the description fill and the cache lookup of CreateGraphicsPipeline (PipelineCreation, ~0.7 µs per draw
+    // in GTA V's open world). Exact as the single kept pipeline is: the key carries the context and dynamic stamps and
+    // the target version, which move with every write the pipeline could depend on, and the rendering state is compared
+    // in full, so an older entry only matches while nothing it was resolved from has changed.
+    internal static readonly int KeptPipelineCount =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_KEPT_PIPELINES"), out var keptCount) && keptCount is >= 1 and <= 16 ? keptCount : 1;
+
+    // [local] A test sets the count for the recorders it creates.
+    internal static readonly AsyncLocal<int?> KeptPipelinesOverride = new();
+
+    private static KeptPipeline[] NewOlderPipelines(int count)
+    {
+        var older = new KeptPipeline[Math.Clamp(count, 1, 16) - 1];
+        for (var index = 0; index < older.Length; index++)
+        {
+            older[index] = new KeptPipeline();
+        }
+
+        return older;
+    }
+
+    private bool TryTakeOlderPipeline(in PipelineKey key, in RenderingState rendering, out PipelineHandle handle)
+    {
+        for (var index = 0; index < _olderPipelines.Length; index++)
+        {
+            var older = _olderPipelines[index];
+            if (older.Valid && older.Key == key && older.Rendering.Equals(rendering))
+            {
+                // The hit becomes the most recent; the previous most recent takes its place.
+                _olderPipelines[index] = _pipeline;
+                _pipeline = older;
+                handle = older.Handle;
+                return true;
+            }
+        }
+
+        handle = default;
+        return false;
+    }
+
+    private void KeepPipeline(in PipelineKey key, in RenderingState rendering, PipelineHandle handle)
+    {
+        var kept = _pipeline;
+        if (_olderPipelines.Length != 0 && kept.Valid)
+        {
+            // The previous most recent moves to the older entries over the oldest one, whose object takes the new key.
+            var reused = _olderPipelines[_olderPipelineNext];
+            _olderPipelines[_olderPipelineNext] = kept;
+            _olderPipelineNext = (_olderPipelineNext + 1) % _olderPipelines.Length;
+            _pipeline = kept = reused;
+        }
+
+        kept.Key = key;
+        kept.Rendering = rendering;
+        kept.Handle = handle;
+        kept.Valid = true;
+    }
+
+    // [local] For tests: the key of the most recent kept pipeline and the valid older ones.
+    internal int KeptPipelineEntries
+    {
+        get
+        {
+            var count = _pipeline.Valid ? 1 : 0;
+            foreach (var older in _olderPipelines)
+            {
+                if (older.Valid) count++;
+            }
+
+            return count;
+        }
     }
 
     // [local] SHARPEMU_ASYNC_GRAPHICS_PIPELINES=1 compiles a new graphics pipeline on a worker and leaves out the draws

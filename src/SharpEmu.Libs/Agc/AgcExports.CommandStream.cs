@@ -427,6 +427,7 @@ public static partial class AgcExports
         {
             if (indexed) RecordIndexedDrawState(in indexedArguments, drawRegisters);
             else RecordAutoDrawState(in autoArguments, drawRegisters);
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.Snapshots); // [local] SHARPEMU_DRAWCOST_PROBE
             if (!TryRunExecutorDraw(submitId, RequireCurrent(), banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs))
                 throw _host.Fatal("The command stream has no render executor.");
         }
