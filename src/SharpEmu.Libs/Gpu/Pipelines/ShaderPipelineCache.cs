@@ -383,8 +383,12 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         if (TryKeepGraphicsPrograms(banks, keptGraphics, programsStamp, vertexUserDataStamp, pixelUserDataStamp, interfaceStamp, targetExportMapping, pixelActive, depthBound, startInstanceUserData, out var keptPrograms))
         {
             _graphicsKept.Increment();
+            Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.ProgramKept); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.ProgramKept);
             return keptPrograms;
         }
+
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.ProgramKept); // [local] SHARPEMU_FRONTCOST_PROBE
 
         return ResolveGraphicsPrograms(banks, targetExportMapping, pixelActive, depthBound, startInstanceUserData,
             programsStamp, vertexUserDataStamp, pixelUserDataStamp, interfaceStamp, keptGraphics, null);
@@ -431,11 +435,13 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         vertexUserDataScope.Dispose();
         var vertexSource = PrepareSource(vertex.ExportAddress, tessellated ? ShaderStage.TessellationEvaluation : mesh is null ? ShaderStage.Vertex : ShaderStage.Mesh, vertexLabel, vertexUserData,
             VertexUserDataBase, ref pair.VertexHeader, out var vertexHeader, vertex.GeometryUserDataAddress);
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.VertexSource); // [local] SHARPEMU_FRONTCOST_PROBE
         var vertexInfo = tessellated ? new VertexInputInfo { PositionExportControl = shaderInterface.VertexOutputControl }
             : mesh is null
             ? PrepareVertexInput(vertexSource, vertexHeader, shaderInterface, context, _vertexInput = pair.VertexInput, startInstanceUserData)
             : new VertexInputInfo();
         vertexInfo.IeeeMode = vertex.GeometryResource1.IeeeMode;
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.VertexInput); // [local] SHARPEMU_FRONTCOST_PROBE
         ShaderSource? pixelSource = null;
         PixelInputInfo? pixelInfo = null;
         Gen5PixelOutputBinding[] pixelOutputs = [];
@@ -448,6 +454,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
                 pixel.UserScalars, pixel.Resource2.UserScalarCount, pixel.Address, "pixel");
             pixelUserDataScope.Dispose();
             pixelSource = PrepareSource(pixel.Address, ShaderStage.Pixel, "pixel", pixelUserData, userDataBase: 0, ref pair.PixelHeader, out var pixelHeader);
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PixelSource); // [local] SHARPEMU_FRONTCOST_PROBE
             if (RenderTrace.Enabled)
                 RenderTrace.Write($"PixelDrawState shader=0x{pixelSource.Address:X16} hash=0x{pixelSource.Hash:X16} " +
                     $"user_data=[{string.Join(",", pixelSource.UserData.Select(word => $"{word:X8}"))}]");
@@ -456,6 +463,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             pixelInfo = PreparePixelInput(banks, pixelSource, pixelHeader, targetExportMapping, depthBound, pair.PixelInput,
                 out pixelOutputs, out attributeCount, out dropUnwritten);
             pixelInfo.IeeeMode = pixel.Resource1.IeeeMode;
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PixelInput); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
         ShaderProgram vertexProgram;
@@ -1201,6 +1209,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         Diagnostics.FrameMissProbe.CountOnRender(Diagnostics.FrameMissProbe.Counter.RenderComputePreps); // [local]
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ProgramRebind); // [local] SHARPEMU_DRAWCOST_PROBE
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.ComputeSource); // [local] SHARPEMU_FRONTCOST_PROBE
         var pushDataCursor = 0u;
         var options = new StageCompileOptions { ComputeInfo = input, ComputeSystemRegisters = kept.SystemRegisters };
         bool prepared;
@@ -1299,6 +1308,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         }
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ProgramRebind); // [local] SHARPEMU_DRAWCOST_PROBE
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.ComputeSource); // [local] SHARPEMU_FRONTCOST_PROBE
         if (source.Registered.Frontend is { } frontend &&
             frontend.TryResolveImageCopy(_context, source.Registered, source.UserData, input, systemRegisters, dimensionX, dimensionY, dimensionZ,
                 out var copySource, out var copyDestination))

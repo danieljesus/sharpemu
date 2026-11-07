@@ -244,6 +244,15 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool NeedsBackRead(ulong address, ulong size)
         {
+            var timer = Diagnostics.FrontCostProbe.TimerStart(); // [local] SHARPEMU_FRONTCOST_PROBE
+            var needs = NeedsBackReadCore(address, size);
+            Diagnostics.FrontCostProbe.TimerEnd(Diagnostics.FrontCostProbe.Timer.ReadCheck, timer);
+            Diagnostics.FrontCostProbe.Count(needs ? Diagnostics.FrontCostProbe.Counter.BackReads : Diagnostics.FrontCostProbe.Counter.DirectReads);
+            return needs;
+        }
+
+        private bool NeedsBackReadCore(ulong address, ulong size)
+        {
             if (!FrontSyncedReads || size == 0)
                 return false;
             // [local] A read of bytes a queued WriteGuestNow has not applied yet (overlay mode 2):
@@ -588,9 +597,12 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (SkipFrontPreparation(key))
             {
+                Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepSkipped); // [local] SHARPEMU_FRONTCOST_PROBE
                 inputs = default;
                 return null;
             }
+
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PrepSkip); // [local] SHARPEMU_FRONTCOST_PROBE
 
             var result = TryPrepareOnFront(prepare, out inputs);
             NoteFrontPreparation(key, result is null);
@@ -600,7 +612,12 @@ internal static unsafe partial class VulkanVideoPresenter
         internal ComputeProgram? TryPrepareComputeOnFront(ulong key, Func<ComputeProgram?> prepare, bool? speculate = null)
         {
             if (SkipFrontPreparation(key))
+            {
+                Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepSkipped); // [local] SHARPEMU_FRONTCOST_PROBE
                 return null;
+            }
+
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PrepSkip); // [local] SHARPEMU_FRONTCOST_PROBE
             var result = TryPrepareComputeOnFront(prepare, speculate);
             // [local] SHARPEMU_FRONT_SPECULATE: a speculated one counts when the render thread has replayed its reads.
             if (result is null || !FrontSpeculation.Pending)
@@ -622,6 +639,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             catch (DeferPreparationException)
             {
+                Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepDeferred); // [local] SHARPEMU_FRONTCOST_PROBE
                 Interlocked.Increment(ref DeferredPreparations);
                 Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.FrontDeferredPreps); // [local]
                 inputs = default;
@@ -655,6 +673,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
             catch (DeferPreparationException)
             {
+                Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepDeferred); // [local] SHARPEMU_FRONTCOST_PROBE
                 Interlocked.Increment(ref DeferredPreparations);
                 Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.FrontDeferredPreps); // [local]
                 return null;

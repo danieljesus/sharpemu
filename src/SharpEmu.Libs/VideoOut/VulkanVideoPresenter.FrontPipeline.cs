@@ -291,6 +291,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             if (FrontProfile.LoopEnabled) FrontProfile.Enqueues++;
+            Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.Enqueues); // [local] SHARPEMU_FRONTCOST_PROBE
             using var enqueueScope = FrontProfile.Measure(FrontProfile.Phase.Enqueue);
             bool wasEmpty;
             lock (_gate)
@@ -298,6 +299,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (_items.Count >= capacity && _failure is null)
                 {
                     using var backpressureScope = FrontProfile.Measure(FrontProfile.Phase.Backpressure);
+                    Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
                     beforeWait?.Invoke();
                     var waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                     while (_items.Count >= capacity && _failure is null)
@@ -307,6 +309,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     WaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
                     afterWait?.Invoke();
+                    Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Backpressure); // [local] SHARPEMU_FRONTCOST_PROBE
                 }
 
                 if (_failure is { } failure)
@@ -370,6 +373,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (!completion.Done && _failure is null)
                 {
                     using var syncScope = FrontProfile.Measure(FrontProfile.Phase.SyncWait);
+                    Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
                     beforeWait?.Invoke();
                     var waitStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                     while (!completion.Done && _failure is null)
@@ -379,6 +383,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     SyncWaitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - waitStarted;
                     afterWait?.Invoke();
+                    Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.SyncWait); // [local] SHARPEMU_FRONTCOST_PROBE
                 }
 
                 if (completion.Error is { } error)
@@ -603,6 +608,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             snapshot.CopyFrom(live);
+            Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.Snapshots); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Snapshot);
             return snapshot;
         }
 
@@ -616,7 +623,10 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!_geometrySnapshots)
                 return null;
             using var profileScope = FrontProfile.Measure(FrontProfile.Phase.DrawRegisters);
-            return AgcExports.DrawShaderRegisters(presenter.CommandStream.GetInterpreter(_queueId));
+            var registers = AgcExports.DrawShaderRegisters(presenter.CommandStream.GetInterpreter(_queueId));
+            Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.DrawRegisters); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.DrawRegisters);
+            return registers;
         }
 
         public void DrawIndexed(ulong submitId, in DrawIndexedArguments arguments)
@@ -650,6 +660,8 @@ internal static unsafe partial class VulkanVideoPresenter
             var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), prepareOnFront, out var inputs);
             var prepPages = Presenter.TakePrepPages(); // [local] SHARPEMU_FRONT_PREP_RANGES
             tableMark = Presenter.EndTableMark(tableMark);
+            if (prepared is null) Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepEmpty); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PrepEnd);
             var copy = arguments;
             queue.Enqueue(() =>
             {
@@ -674,6 +686,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     _snapshots.Push(snapshot);
                 }
             }, _pauseAlias, _resumeAlias);
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
         public void DrawAuto(ulong submitId, in DrawAutoArguments arguments)
@@ -707,6 +720,8 @@ internal static unsafe partial class VulkanVideoPresenter
             var prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), prepareOnFront, out var inputs);
             var prepPages = Presenter.TakePrepPages(); // [local] SHARPEMU_FRONT_PREP_RANGES
             tableMark = Presenter.EndTableMark(tableMark);
+            if (prepared is null) Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepEmpty); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PrepEnd);
             var copy = arguments;
             queue.Enqueue(() =>
             {
@@ -731,6 +746,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     _snapshots.Push(snapshot);
                 }
             }, _pauseAlias, _resumeAlias);
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
         public void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
@@ -775,6 +791,8 @@ internal static unsafe partial class VulkanVideoPresenter
             var speculated = frontPrepares ? FrontSpeculation.Take() : null; // [local]
             tableMark = Presenter.EndTableMark(tableMark);
             computeScope.Dispose();
+            if (prepared is null) Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepEmpty); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PrepEnd);
             queue.Enqueue(() =>
             {
                 try
@@ -801,6 +819,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     _snapshots.Push(snapshot);
                 }
             }, _pauseAlias, _resumeAlias);
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
         public bool ResolvesIndirectDispatchOnGpu => presenter.ResolvesIndirectDispatchOnGpu;
@@ -838,6 +857,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     _snapshots.Push(snapshot);
                 }
             }, _pauseAlias, _resumeAlias);
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
         public bool ResolvesIndirectDrawOnGpu => presenter.ResolvesIndirectDrawOnGpu;
@@ -852,6 +872,8 @@ internal static unsafe partial class VulkanVideoPresenter
             byte[] bytes;
             using (FrontProfile.Measure(FrontProfile.Phase.WriteCopy))
                 bytes = source.ToArray();
+            Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.LabelWrites); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.WriteCopy);
             var labelSerial = PendingLabels.Enabled ? presenter.FrontLabels.Add(address, bytes) : 0;
             if (labelSerial != 0)
             {
@@ -861,6 +883,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 else
                     presenter.CommandStream.RetryBlocked();
             }
+
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.LabelPending); // [local] SHARPEMU_FRONTCOST_PROBE
             if (LabelTrace.Enabled && LabelTrace.IsWatched(address))
             {
                 var traced = TraceValue(bytes);
@@ -900,6 +924,8 @@ internal static unsafe partial class VulkanVideoPresenter
             var writeScope = FrontProfile.Measure(FrontProfile.Phase.WriteCopy);
             var bytes = source.ToArray();
             writeScope.Dispose();
+            Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.LabelWrites); // [local] SHARPEMU_FRONTCOST_PROBE
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.WriteCopy);
             if (!WriteOverlay)
             {
                 FrontSyncStats.Note(2);
@@ -917,6 +943,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 presenter.NoteGuestWriteApplied(address, bytes.Length);
                 presenter.FrontOverlay.Retire(address, bytes.Length, serial);
             }, _pauseAlias, _resumeAlias);
+            Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
         private static bool WriteOverlay => PendingWriteOverlay.Mode != 0;
@@ -1079,6 +1106,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             SharpEmu.HLE.Host.HostLaneReservation.ApplyToFrontThread();
             FrontProfile.BindFrontThread();
+            Diagnostics.FrontCostProbe.BindThread(); // [local] SHARPEMU_FRONTCOST_PROBE
             var pendingBlockedTicks = 0L; // [local] SHARPEMU_PROFILE_FRONT: idle with every head blocked, since the last progress
             try
             {
@@ -1104,6 +1132,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         PauseFrontAliasAccess();
                         var sliceTicks = System.Diagnostics.Stopwatch.GetTimestamp() - sliceStarted;
                         Interlocked.Add(ref _frontBusyTicks, sliceTicks);
+                        Diagnostics.FrontCostProbe.NoteSlice(sliceTicks); // [local] SHARPEMU_FRONTCOST_PROBE
                         if ((Interlocked.Increment(ref _frontSlices) & (FrontCpuSampleSlices - 1)) == 0)
                         {
                             SampleFrontCpuTime();

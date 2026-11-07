@@ -353,6 +353,7 @@ public sealed partial class GpuCommandInterpreter
             }
 
             var packetAddress = cursor.Address + ((ulong)cursor.Offset * sizeof(uint));
+            Diagnostics.FrontCostProbe.Begin(); // [local] SHARPEMU_FRONTCOST_PROBE: the packet's decode starts here
             uint header;
             PacketWindow? window;
             using (FrontProfile.Measure(FrontProfile.Phase.StreamRead)) // [local] SHARPEMU_PROFILE_FRONT
@@ -446,6 +447,9 @@ public sealed partial class GpuCommandInterpreter
 
             var packet = new PacketContext(header & ~1u, packetAddress, offset, remaining, total);
             uint consumed;
+            Diagnostics.FrontCostProbe.Classify(opcode, header); // [local] SHARPEMU_FRONTCOST_PROBE: decoded
+            if (opcode == PacketOpcode.IndirectBuffer)
+                Diagnostics.FrontCostProbe.End(); // [local] the packets it runs are items of their own
             if (FrontProfile.LoopEnabled) FrontProfile.Packets++;
             var probePacketStart = Diagnostics.LabelLatencyProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
             var handlerStarted = SharpEmu.Libs.Diagnostics.PacketHandlerTally.Enabled ? Stopwatch.GetTimestamp() : 0;
@@ -464,6 +468,8 @@ public sealed partial class GpuCommandInterpreter
                 SharpEmu.Libs.Diagnostics.PacketHandlerTally.Note(opcode, header,
                     Stopwatch.GetTimestamp() - handlerStarted - (SharpEmu.Libs.Diagnostics.PacketHandlerTally.WaitedTicks - waitedBefore));
             }
+
+            Diagnostics.FrontCostProbe.End(); // [local] SHARPEMU_FRONTCOST_PROBE
             if (consumed > remaining)
             {
                 throw _host.Fatal($"The handler consumed more than the buffer holds: consumed={consumed} remaining={remaining} header=0x{header:X8} address=0x{packetAddress:X16}.");
