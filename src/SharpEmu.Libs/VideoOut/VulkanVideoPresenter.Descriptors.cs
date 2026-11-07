@@ -1361,6 +1361,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (Gpu.Buffers.ConservativeRecords.Mode == 2 && Gpu.Buffers.ConservativeRecords.IsVerifiedProgram(program.Hash)) // [local]
                     Gpu.Buffers.ConservativeRecords.VerifyBinding(index, descriptor.RecordCount, requested, _bufferCache.ContainingBufferExtent(descriptor.Address, ulong.MaxValue, 0));
                 requested = ConservativeRequested(program.Hash, descriptor, requested); // [local] SHARPEMU_CONSERVATIVE_RECORDS
+                // [local] SHARPEMU_LITE_OBTAIN_PROBE: the light lookup in shadow, before the real one below.
+                var liteProbed = Diagnostics.LiteObtainProbe.Enabled && !_worker && Diagnostics.LiteObtainProbe.Owns;
+                var liteCause = Diagnostics.LiteObtainProbe.Cause.Unmapped;
+                ResourceSlotIdentifier liteBuffer = default;
+                long liteTicks = 0, liteEpoch = 0;
+                if (liteProbed)
+                {
+                    var liteStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+                    liteCause = _bufferCache.LiteFind(descriptor.Address, requested, out liteBuffer);
+                    liteTicks = System.Diagnostics.Stopwatch.GetTimestamp() - liteStarted;
+                    liteEpoch = _bufferCache.RegistryEpoch;
+                }
+
                 var remembered = known || (memo.Address == descriptor.Address && memo.Requested == requested && memo.Spans == spans);
                 var ringReused = !remembered && ringSlotReuse && ReusesRingSlot(in memo, descriptor.Address, requested, spans, mapping); // [local] SHARPEMU_RING_SLOT_REUSE
                 var size = remembered ? memo.Size : ringReused ? requested : ClampMappedSize(descriptor.Address, requested, prepared, index);
@@ -1405,6 +1418,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                 }
 
+                // [local] A registry change only counts against the light answer when the real one is another buffer (an
+                // image publication above may register buffers elsewhere).
+                if (liteProbed && Diagnostics.LiteObtainProbe.NoteFind(liteCause, liteBuffer == sources[index].Buffer,
+                        _bufferCache.RegistryEpoch != liteEpoch && liteBuffer != sources[index].Buffer, liteTicks) == Diagnostics.LiteObtainProbe.Outcome.FastWrong &&
+                    Diagnostics.LiteObtainProbe.TakeDump())
+                    Console.Error.WriteLine($"[GPU][LITE_OBTAIN_WRONG] kind=find hash=0x{program.Hash:X16} slot={index} address=0x{descriptor.Address:X} requested=0x{requested:X} " +
+                        $"size=0x{sources[index].MappedSize:X} lite={liteBuffer} real={sources[index].Buffer} created={_bufferCache.RegistryEpoch != liteEpoch}");
                 if (Gpu.Buffers.RayQueryHle.Instance is { } rayQuery && prepared.Resources.Info.Buffers[index].Written) // [local] SHARPEMU_RQ_MAP
                     rayQuery.NoteWrite(program.Hash, descriptor.Address, size);
                 ProbeBvhRefitBuffer(program.Hash, index, descriptor, requested, size, prepared); // [local]
@@ -2028,6 +2048,8 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             memoryOffset = 0;
             var address = descriptor.Address;
+            if (Diagnostics.LiteObtainProbe.Enabled && !_worker) // [local] SHARPEMU_LITE_OBTAIN_PROBE: the slot's access class
+                Diagnostics.LiteObtainProbe.NoteSlot(program.Hash, resource.Written, resource.Formatted, resource.Atomic);
             // [local] FindBuffers bound an unreadable or unresident start as a null source (size 0) in this same
             // preparation: no second pair of page lookups per buffer here.
             if (address == 0 || size == 0)

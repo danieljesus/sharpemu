@@ -48,6 +48,42 @@ public sealed class RegisterBanks
     public ulong Stamp(RegisterStamp first, RegisterStamp second, RegisterStamp third) =>
         Math.Max(Math.Max(_stamps[(int)first], _stamps[(int)second]), _stamps[(int)third]);
 
+    // [local] SHARPEMU_PLAN_PROBE: the context group value hashes (PlanRegisterShadow). A bank keeps a shadow once it
+    // is written; a snapshot carries the hashes of its source. A bank whose typed context came from somewhere the
+    // shadow does not know (CopyFrom a snapshot) starts its shadow from unique hashes, so it equals no other state
+    // until the context is next reset or cleared.
+    private PlanRegisterShadow? _planShadow;
+    private PlanRegisterShadow? _savedPlanShadow;
+    private PlanGroupHashes _planHashes;
+    private PlanGroupHashes _savedPlanHashes;
+    private bool _planBaseUnknown;
+    private static long _planUnknownBases;
+
+    public PlanGroupHashes PlanHashes => _planShadow?.Hashes ?? _planHashes;
+
+    internal void NotePlanContextWrite(uint offset, ReadOnlySpan<uint> values)
+    {
+        if (_planShadow is null)
+        {
+            _planShadow = new PlanRegisterShadow();
+            // A bank without a shadow holds either its base hashes (zero: nothing written since a reset) or the
+            // hashes of a state it copied without its dwords.
+            _planShadow.Hashes = _planBaseUnknown || !_planHashes.Equals(default)
+                ? PlanRegisterShadow.UniqueHashes(Interlocked.Increment(ref _planUnknownBases))
+                : default;
+            _planBaseUnknown = false;
+        }
+
+        _planShadow.Write(offset, values);
+    }
+
+    private void ClearPlanShadow()
+    {
+        _planShadow?.Clear();
+        _planHashes = default;
+        _planBaseUnknown = false;
+    }
+
     public ulong ContextStamp =>
         Math.Max(
             Math.Max(_stamps[(int)RegisterStamp.ColorTargets], _stamps[(int)RegisterStamp.DepthTargets]),
@@ -289,6 +325,9 @@ public sealed class RegisterBanks
             UserDataMarker = UserDataMarker,
             IndexTypeAndSize = IndexTypeAndSize,
             _stamps = _stamps,
+            _planShadow = _planShadow?.Copy(), // [local] SHARPEMU_PLAN_PROBE
+            _planHashes = _planHashes,
+            _planBaseUnknown = _planBaseUnknown,
         };
         return clone;
     }
@@ -305,6 +344,20 @@ public sealed class RegisterBanks
         IndexTypeAndSize = source.IndexTypeAndSize;
         _stamps = source._stamps;
         ForgetRaw(); // [local] SHARPEMU_STAMP_ON_CHANGE: the typed state came from elsewhere
+        if (PlanRegisterShadow.Enabled) // [local] SHARPEMU_PLAN_PROBE: the source's dwords when it has them
+        {
+            if (source._planShadow is { } shadow)
+            {
+                (_planShadow ??= new PlanRegisterShadow()).CopyFrom(shadow);
+                _planBaseUnknown = false;
+            }
+            else
+            {
+                _planShadow = null;
+                _planHashes = source._planHashes;
+                _planBaseUnknown = source._planBaseUnknown || !source._planHashes.Equals(default);
+            }
+        }
     }
 
     // The parts a snapshot shares with these banks; each is copied before its next write here.
@@ -343,6 +396,12 @@ public sealed class RegisterBanks
         snapshot.UserDataMarker = UserDataMarker;
         snapshot.IndexTypeAndSize = IndexTypeAndSize;
         snapshot._stamps = _stamps;
+        if (PlanRegisterShadow.Enabled) // [local] SHARPEMU_PLAN_PROBE: the hashes only; a snapshot is not written
+        {
+            snapshot._planShadow = null;
+            snapshot._planHashes = PlanHashes;
+        }
+
         SharpEmu.Libs.Diagnostics.RegisterCopyTally.NoteSnapshot();
         _contextShared = _vertexShared = _pixelShared = _computeShared = _userConfigShared = true;
         _pixelScalarsShared = _hullScalarsShared = _geometryScalarsShared = _legacyVertexScalarsShared = _exportScalarsShared = _computeScalarsShared = true;
@@ -638,6 +697,8 @@ public sealed class RegisterBanks
         IndexTypeAndSize = 0;
         if (StampProbe) ProbeForget(); // [local]
         ForgetRaw(); // [local] SHARPEMU_STAMP_ON_CHANGE
+        _savedPlanShadow = null; // [local] SHARPEMU_PLAN_PROBE
+        ClearPlanShadow();
         MarkWritten(RegisterStamps.AllBits);
     }
 
@@ -649,6 +710,7 @@ public sealed class RegisterBanks
             case ContextStateOperation.Clear:
                 OwnContext(new ContextRegisters());
                 CompositeDepthSizeXy = null;
+                ClearPlanShadow(); // [local] SHARPEMU_PLAN_PROBE
                 break;
             case ContextStateOperation.Push:
                 Push();
@@ -663,11 +725,16 @@ public sealed class RegisterBanks
                 CompositeDepthSizeXy = _savedCompositeDepthSizeXy;
                 _savedContext = null;
                 _savedCompositeDepthSizeXy = null;
+                _planShadow = _savedPlanShadow; // [local] SHARPEMU_PLAN_PROBE
+                _planHashes = _savedPlanHashes;
+                _savedPlanShadow = null;
                 break;
             case ContextStateOperation.PushClear:
                 Push();
                 OwnContext(new ContextRegisters());
                 CompositeDepthSizeXy = null;
+                _planShadow = null; // [local] SHARPEMU_PLAN_PROBE: the saved one is the pushed copy
+                ClearPlanShadow();
                 break;
             default:
                 throw Fatal($"The context state operation is unknown: operation={(uint)operation}.");
@@ -694,5 +761,7 @@ public sealed class RegisterBanks
 
         _savedContext = Context.Copy();
         _savedCompositeDepthSizeXy = CompositeDepthSizeXy;
+        _savedPlanShadow = _planShadow?.Copy(); // [local] SHARPEMU_PLAN_PROBE
+        _savedPlanHashes = _planHashes;
     }
 }

@@ -93,6 +93,7 @@ internal sealed class ResolvedDraw
     public ulong ContextStamp;
     public ulong DynamicStamp;
     public uint TargetVersion;
+    public GpuCommands.Registers.PlanGroupHashes PlanGroups; // [local] SHARPEMU_PLAN_PROBE
     public DynamicDrawState Dynamic;
     public bool WritesMemory;
     public PipelineStageFlags WriteStages;
@@ -137,6 +138,7 @@ internal sealed class ResolvedDraw
         ContextStamp = 0;
         DynamicStamp = 0;
         TargetVersion = 0;
+        PlanGroups = default; // [local] SHARPEMU_PLAN_PROBE
         Dynamic = default;
         WritesMemory = false;
         WriteStages = default;

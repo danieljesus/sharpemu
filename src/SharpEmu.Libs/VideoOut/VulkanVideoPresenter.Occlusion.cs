@@ -40,11 +40,13 @@ internal static unsafe partial class VulkanVideoPresenter
             if (OnCommandThread)
             {
                 if (!_guestPublications.HasOverlap(address, size, includeLabels, skipGpuSlots)) return;
+                Diagnostics.LiteObtainProbe.NotePublicationWork(); // [local] SHARPEMU_LITE_OBTAIN_PROBE
                 CompletePublicationsOnRenderThread(address, size, includeLabels, skipGpuSlots);
                 return;
             }
             var tick = _guestPublications.OverlapTick(address, size, includeLabels, skipGpuSlots);
             if (tick == 0) return;
+            Diagnostics.LiteObtainProbe.NotePublicationWork(); // [local] SHARPEMU_LITE_OBTAIN_PROBE
             _scheduler.Wait(tick);
             _scheduler.RunCompletedOperations();
         }
@@ -193,7 +195,9 @@ internal static unsafe partial class VulkanVideoPresenter
                     var source = (block == 0 ? (ulong)dump.GpuSlot : VulkanOcclusionQueries.ReadySlotOffset) + (first - blockAddress);
                     regions[count++] = new BufferCopy(source, targetOffset + (first - address), end - first);
                 }
-                if (count != 0) RecordDumpOverlay(queries.DumpValues, target, regions[..count]);
+                if (count == 0) continue;
+                Diagnostics.LiteObtainProbe.NotePublicationWork(); // [local] SHARPEMU_LITE_OBTAIN_PROBE
+                RecordDumpOverlay(queries.DumpValues, target, regions[..count]);
             }
         }
 
