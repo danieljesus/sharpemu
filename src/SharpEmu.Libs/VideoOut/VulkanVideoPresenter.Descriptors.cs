@@ -1432,7 +1432,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // invariant SHARPEMU_MAPPED_SIZE_KEEP relies on). Render thread only. =2 clamps and looks the buffer up again on
         // every reuse and counts the answers that differ ([PERF][STAGE_MEMO] ring_slots=).
         internal static readonly int RingSlotReuseMode =
-            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RING_SLOT_REUSE"), out var ringSlot) ? ringSlot : 0;
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RING_SLOT_REUSE"), out var ringSlot) ? ringSlot : 1; // [local] on by default (kAa/kAb 2026-11-07: bind_memo_buffers -0.37 us/draw; cv1: 467k reuses verified, 0 mismatches)
         private static long _ringSlotReuses, _ringSlotWindows, _ringSlotVerified, _ringSlotMismatches;
         private static int _ringSlotLogs;
 
