@@ -1,6 +1,6 @@
 # Registro de interruptores SHARPEMU_* (GTA V en SharpEmu)
 
-Fecha: 2026-11-07. Rama de referencia: `gta/integracion-pipe` = `fork/main` = `d4c3582d` (2026-11-06), apoyada directamente en `origin/main` `39eb7cb1` (2026-11-04, punta de upstream ese día).
+Fecha: 2026-11-07 (altas del 2026-11-07/08 en su subsección al final de la sección 1). Rama de referencia: `gta/integracion-pipe` = `fork/main` = `d4c3582d` (2026-11-06), apoyada directamente en `origin/main` `39eb7cb1` (2026-11-04, punta de upstream ese día).
 
 **Para el agente de revisión diaria:** antes de proponer una idea, búscala aquí (por nombre de interruptor, por técnica en la sección 2 y por rama en la sección 3). Si figura como **Descartado** o con una medida, no la repropongas salvo que traigas algo nuevo (otro mecanismo, otra condición de medida) y lo digas expresamente.
 
@@ -548,6 +548,28 @@ Las medidas de la bitácora no se hacen con los valores por defecto puros: el la
 | `WAIT_PROBE` | off | Sonda | sonda | Sitios de llamada que hacen esperar a la CPU por la GPU en TickTimeline.Wait, con ms | Diagnóstico: las 36 ms venían de VulkanAsyncReadback.Wait (lecturas CPU de memoria escrita por GPU) [bitácora L732] | Libs/Gpu/Scheduling/TickTimeline.cs:15 |
 | `WINDOW_AUDIT_SECONDS` | off | Sonda | sonda | Repite cada N s el recorrido de regiones ajenas en la ventana del guest (asignaciones del host tardías). | sin medir Razón: Repite el recorrido de regiones ajenas para ver asignaciones del host tardías; apoya la hipótesis del crash de mapeo (PRERESERVE_MIN). | Core/Memory/PhysicalVirtualMemory.cs:279 |
 | `WRITE_DIFF`(+_EVERY, _MAX, _EXACT) | off | Sonda | sonda | Copia antes/después cada rango obtenido escrito en 1 de cada 16 dispatches (≤64 MiB) y registra lo que cambió | Cuesta mucho (paneo a ~20 FPS), solo diagnóstico (2026-11-01) [bitácora L2500, commit 5fd7219d] **Incoherencia:** _EXACT (=1) solo está en el comentario L18: ningún código lee SHARPEMU_WRITE_DIFF_EXACT; _MAX se parsea en hexadecimal | Libs/Gpu/Buffers/WriteDiffProbe.cs:22 |
+
+### Altas y cambios del 2026-11-07/08 (objetivo 20 FPS en abierto; fork/main db4a0c5b)
+
+| Interruptor | Def. | Estado | Tipo | Qué hace | Por qué | Dónde |
+|---|---|---|---|---|---|---|
+| `READBACK_GUEST_SUBMIT` | on | ON | rendimiento | El envío de las lecturas GPU→CPU sale del hilo de render | Exacto; base del paquete de relevo (2026-11-07) [bitácora, commit a6e66240] | Libs/Gpu/Buffers/GuestBufferCache.cs |
+| `MODIFIED_TREE_READS` | on | ON | rendimiento | HasGpuDirtyBytes consulta el conjunto en vez de reconstruir la instantánea de rangos modificados en el hilo de la cola | mt0b/mt1b: snapshot_rebuilds 269 → 0/f, cierre 42,7 → 20,6 µs, **≈ −11 ms/f, exacto** (2026-11-07) [bitácora, commit a6e66240] | Libs/Gpu/Buffers/GuestBufferCache.cs |
+| `RING_SLOT_REUSE` | 1 | ON | rendimiento | Reutiliza la ranura del anillo cuando el contenido coincide | kAa/kAb: bind_memo_buffers 1,31 → 0,93 µs/draw (−0,37); cv1: 467k reutilizaciones, 0 discrepancias (2026-11-07) [bitácora, commit db4a0c5b] | Libs/VideoOut/VulkanVideoPresenter.Descriptors.cs |
+| `SDL_POLL_MS` | 0 | OFF (en confirmación) | rendimiento | Ver fila en presentación | En abierto con main db4a0c5b: 6,65 → 8,94 y 8,17 → 9,78 FPS con =16 (2026-11-07); parejas con orden invertido q7c/q7d pendientes antes de encenderlo [bitácora] | Libs/VideoOut/SdlHostWindow.cs:32 |
+| `LITE_OBTAIN` | 0 | OFF (en medida) | rendimiento | Adquisición ligera de búferes de lectura (sin cerrojo ni búsqueda cuando el gránulo no cambió); =2 verifica | Real ~0,2-0,4 µs/draw frente a 2,4 proyectados (find contado dos veces y absorbido por RING_SLOT_REUSE); las 2 «discrepancias» de =2 eran carreras (testigo CpuDirtyPublications). A/B limpia lb* en medida [bitácora] | rama gta/liteobtain 5e724624 |
+| `FRONT_READ_MEMO` | 0 | OFF (exacto, aparcado) | rendimiento | En el front, respuesta de «escrito alguna vez» por gránulo de 4 KB con la versión del conjunto; =2 verifica | fc*: read_check 155 → 65 ns/draw, µs/draw −0,1-0,2, ≈ −0,5-1 ms/f de front; fcV =2: **0 discrepancias** en ~1,4 M verificaciones/ventana. El front no es el cuello hoy (2026-11-08) [bitácora] | rama gta/frontcost 621f73ad |
+| `FRONT_POOLED_ITEMS` | 0 | Descartado | rendimiento | Draws y dispatches del front como objetos reutilizados en vez de closures | fc*: −10-14 % bytes/draw, sin efecto en µs ni en GC gen0 (2026-11-08) [bitácora] | rama gta/frontcost 621f73ad |
+| `FAST_OUTPUT_REUSE` | 0 | Descartado | rendimiento | Reutiliza la salida de materialización rápida | Neutro en el render (k*: program_materialize 9,1/7,8 frente a 7,6) y en el front (fcOa/fcOb) [bitácora] | — |
+| `FAST_MATERIALIZE_MEMO` | 0 | Descartado | rendimiento | Memo de la materialización rápida de dispatches | memo_hit 0,18/dispatch; 7,45/8,0 frente a 7,6 µs: neutro [bitácora] | — |
+| `TABLE_WORD_MEMO_FAST_HIT` | 0 | Descartado | rendimiento | Atajo de acierto del memo de palabras de tabla | 7,1/8,3 frente a 7,6 µs: neutro [bitácora] | — |
+| `WRITTEN_OBTAIN_MEMO` | 0 | Descartado | rendimiento | Memo de obtains de rangos escritos | written_memo_hits = 0: nunca actúa [bitácora] | — |
+| `KEPT_PIPELINES` | 0 | Descartado | rendimiento | Guarda los N últimos pipelines | pipeline_kept_older = 0: la clave cambia de draw a draw (sellos de contexto) [bitácora] | — |
+| `IMAGE_LOOKUP_HISTORY` | 0 | Descartado | rendimiento | Ranuras del historial de búsquedas de imágenes (LookupEventSlots) | 1024: neutro [bitácora] | rama gta/lookuphist 43e264bf |
+| `MATERIALIZE_CHURN_LEARN` | — | Descartado (retirado) | rendimiento | Aprender la rotación de materializaciones | 2 discrepancias en walk_device_ranges (PROGRAM_GATE_VERIFY) y sin ganancia [bitácora] | — |
+| `FRONT_SLICES` (3a-3e) | 0 | Descartado | rendimiento | Grabación en paralelo por rodajas | Render 128-182 ms frente a 136: los cortes por etiquetas WriteGuest (93 %) parten los segmentos [bitácora] | rama gta/parres f5662a50 |
+| `READBACK_GUEST_COMPLETE` | 0 | Descartado (no exacto) | rendimiento | Cerrar las lecturas en el hilo del juego | El render marca escrituras GPU sin cerrojo; se perdería una escritura nueva [bitácora] | rama gta/relay |
+| `DRAWCOST_PROBE`, `REPEAT_PROBE`, `RELAY_PROBE`, `PLAN_PROBE`, `LITE_OBTAIN_PROBE`, `FRONTCOST_PROBE` | 0 | Sonda | sonda | Coste por paso de draw/dispatch, repetición entre fotogramas, desglose del relevo, puerta del rediseño, coste por paquete del front | Herramientas del 2026-11-07; scripts dc.py, plan.py, fc.py en el scratchpad de la sesión | main (DRAWCOST/REPEAT), ramas gta/* |
 
 ## 2. Ideas ya probadas o descartadas
 
