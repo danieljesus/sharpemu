@@ -238,6 +238,8 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
         }
 
         var ran = false;
+        var probeStarted = SharpEmu.Libs.Diagnostics.RelayProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_RELAY_PROBE
+        var drained = 0;
         while (HasPendingCommands)
         {
             Action command;
@@ -275,14 +277,17 @@ public sealed class GpuWorkerRelay : IGpuQueueRelay
             }
 
             ran = true;
+            drained++;
         }
 
         while (TryTakeNestable(out var work))
         {
             work();
             ran = true;
+            drained++;
         }
 
+        if (probeStarted != 0) SharpEmu.Libs.Diagnostics.RelayProbe.NoteDrain(drained, System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted);
         return ran;
     }
 

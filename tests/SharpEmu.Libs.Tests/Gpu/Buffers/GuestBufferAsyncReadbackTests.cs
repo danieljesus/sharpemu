@@ -344,6 +344,68 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         harness.Shutdown();
     }
 
+    // SHARPEMU_READBACK_GUEST_SUBMIT: the first copy finds no slot with staging and is handed back to the queue thread,
+    // which allocates it; later copies are recorded and submitted by the guest thread itself.
+    [Fact]
+    public void AGuestReadSubmitsItsOwnCopyOnceASlotHasStaging()
+    {
+        if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        using var fatal = new FatalScope();
+        Attach(harness, _vulkan);
+        harness.Cache.ForceGuestSubmit = true;
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        for (uint round = 0; round < 6; round++)
+        {
+            var value = 0xC0000000u + round;
+            GpuWrite(harness, address, value);
+
+            Assert.True(harness.Cache.DownloadToCpu(address + 4, 4));
+
+            Assert.Equal(value, BitConverter.ToUInt32(harness.Read(address + 0x80, 4)));
+            Assert.False(harness.Cache.HasGpuDirtyBytes(address, 0x100));
+            Assert.Equal(((long)round + 1, 0L), (harness.Cache.PendingReadbacksApplied, harness.Cache.PendingReadbacksRetried));
+            Assert.Equal((1L, (long)round), (harness.Cache.GuestSubmitFallbacks, harness.Cache.GuestSubmittedReadbacks));
+        }
+
+        Detach(harness);
+        harness.Shutdown();
+    }
+
+    // A GPU write recorded between the relayed begin and the guest's own submit: the copy still waits only for the
+    // first writer, so its bytes may be the old ones; they are never published, and the read returns the new value.
+    [Fact]
+    public void AWriteBetweenTheBeginAndTheGuestSubmitIsNeverServedStale()
+    {
+        if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        using var fatal = new FatalScope();
+        Attach(harness, _vulkan);
+        harness.Cache.ForceGuestSubmit = true;
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        GpuWrite(harness, address, 0x01010101);
+        Assert.True(harness.Cache.DownloadToCpu(address, 4));
+        GpuWrite(harness, address, 0x02020202);
+        var rewritten = false;
+        harness.Cache.BeforeGuestSubmit = () =>
+        {
+            if (rewritten) return;
+            rewritten = true;
+            GpuWrite(harness, address, 0x03030303);
+        };
+
+        Assert.True(harness.Cache.DownloadToCpu(address + 8, 4));
+
+        Assert.True(rewritten);
+        Assert.Equal(0x03030303u, BitConverter.ToUInt32(harness.Read(address + 0x40, 4)));
+        Assert.False(harness.Cache.HasGpuDirtyBytes(address, 0x100));
+        Assert.True(harness.Cache.StalePiecesKept >= 1);
+        Assert.True(harness.Cache.GuestSubmittedReadbacks >= 2);
+        harness.Cache.BeforeGuestSubmit = null;
+        Detach(harness);
+        harness.Shutdown();
+    }
+
     [Fact]
     public void RepeatedGuestReadsReuseTheReadbackSlots()
     {
