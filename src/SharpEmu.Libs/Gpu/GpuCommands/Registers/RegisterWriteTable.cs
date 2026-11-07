@@ -29,11 +29,14 @@ public static class RegisterWriteTable
     public static uint WriteContextPacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values)
     {
         banks.PrepareContextWrite();
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.RegPrepare); // [local] SHARPEMU_FRONTCOST_PROBE
         if (RegisterBanks.StampProbe) banks.ProbeContextWrite(offset, values); // [local]
         var consumed = WritePacket(banks, in packet, offset, values, Context, ContextIndirect, "context", emptyIsHandled: true);
         banks.MarkWritten(RegisterBanks.StampOnChange && consumed <= (uint)values.Length // [local] SHARPEMU_STAMP_ON_CHANGE
             ? banks.ContextBitsChanged(offset, values[..(int)consumed])
             : RegisterStamps.ContextBitsFor(offset, consumed));
+        Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.RegisterValues, consumed); // [local] SHARPEMU_FRONTCOST_PROBE
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.RegWrite);
         if (Rendering.RenderTrace.Enabled)
         {
             for (var index = 0; index < values.Length && index < consumed; index++)
@@ -49,11 +52,14 @@ public static class RegisterWriteTable
     public static uint WriteShaderPacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values)
     {
         banks.PrepareShaderWrite(offset, (uint)values.Length);
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.RegPrepare); // [local] SHARPEMU_FRONTCOST_PROBE
         if (RegisterBanks.StampProbe) banks.ProbeShaderWrite(offset, values); // [local]
         var consumed = WritePacket(banks, in packet, offset, values, Shader, ShaderIndirect, "shader", emptyIsHandled: false);
         banks.MarkWritten(RegisterBanks.StampOnChange && consumed <= (uint)values.Length // [local] SHARPEMU_STAMP_ON_CHANGE
             ? banks.ShaderBitsChanged(offset, values[..(int)consumed])
             : RegisterStamps.ShaderBitsFor(offset, consumed));
+        Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.RegisterValues, consumed); // [local] SHARPEMU_FRONTCOST_PROBE
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.RegWrite);
         if (Rendering.RenderTrace.Enabled)
         {
             for (var index = 0; index < values.Length && index < consumed; index++)
@@ -65,8 +71,11 @@ public static class RegisterWriteTable
     public static uint WriteUserConfigPacket(RegisterBanks banks, in PacketContext packet, uint offset, ReadOnlySpan<uint> values)
     {
         banks.PrepareUserConfigWrite();
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.RegPrepare); // [local] SHARPEMU_FRONTCOST_PROBE
         var consumed = WritePacket(banks, in packet, offset, values, UserConfig, UserConfigIndirect, "user-config", emptyIsHandled: true);
         banks.MarkWritten(RegisterStamps.UserConfigBits);
+        Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.RegisterValues, consumed); // [local] SHARPEMU_FRONTCOST_PROBE
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.RegWrite);
         return consumed;
     }
 

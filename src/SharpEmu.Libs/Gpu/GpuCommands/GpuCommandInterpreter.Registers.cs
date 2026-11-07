@@ -266,6 +266,8 @@ public sealed partial class GpuCommandInterpreter
                         capturedBeforeSynchronization ? beforeSynchronization[..blockBytes] : default,
                         tableBlock[..blockBytes]);
                 }
+
+                Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.TableRead); // [local] SHARPEMU_FRONTCOST_PROBE
             }
 
             var entryOffset = blockEntry * entryBytes;
@@ -344,6 +346,9 @@ public sealed partial class GpuCommandInterpreter
                     break;
             }
         }
+
+        Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.TableEntries, count); // [local] SHARPEMU_FRONTCOST_PROBE
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.RegWrite);
     }
 
     private void TraceRegisterTableRead(RegisterBank bank, in PacketContext packet, ulong tableAddress,

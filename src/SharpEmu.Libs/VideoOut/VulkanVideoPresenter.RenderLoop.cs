@@ -512,6 +512,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 PerfOverlay.RecordPresent();
                 RenderPhaseProfile.RecordFrame();
                 Diagnostics.DrawCostProbe.NoteFrame(); // [local] SHARPEMU_DRAWCOST_PROBE
+                Diagnostics.FrontCostProbe.NoteFrame(); // [local] SHARPEMU_FRONTCOST_PROBE
                 CollectCompletedGuestSubmissions(waitForOldest: false);
                 _imageInitialized[imageIndex] = true;
                 _currentFrameSlot = (frameSlot + 1) % MaxFramesInFlight;
@@ -557,6 +558,7 @@ internal static unsafe partial class VulkanVideoPresenter
             PerfOverlay.RecordPresent();
             RenderPhaseProfile.RecordFrame();
             Diagnostics.DrawCostProbe.NoteFrame(); // [local] SHARPEMU_DRAWCOST_PROBE
+            Diagnostics.FrontCostProbe.NoteFrame(); // [local] SHARPEMU_FRONTCOST_PROBE
             if (_swapchainReadbackPending)
             {
                 // Diagnostics read back GPU memory and need this frame done.

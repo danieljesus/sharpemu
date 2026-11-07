@@ -677,6 +677,9 @@ internal sealed class ShaderProgramCache
             entry = FindEntry(source, options, out key);
         }
 
+        Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.Stages); // [local] SHARPEMU_FRONTCOST_PROBE
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.StageKey);
+
         var sourceWasCached = entry is not null;
         if (RenderTrace.Enabled && RenderTrace.Pipeline())
         {
@@ -851,6 +854,7 @@ internal sealed class ShaderProgramCache
         }
 
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ProgramMaterialize); // [local] SHARPEMU_DRAWCOST_PROBE
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.StageMaterialize); // [local] SHARPEMU_FRONTCOST_PROBE
         ulong[] callArguments = [];
         ulong[] callTargets = [];
         (ulong Target, ulong Argument)[]? callRecords = null;
@@ -1029,8 +1033,10 @@ internal sealed class ShaderProgramCache
             Volatile.Write(ref entry.LastPermutation, permutation);
         }
 
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.StagePermutation); // [local] SHARPEMU_FRONTCOST_PROBE
         stage = CreateStageResources(permutation.Program, snapshot, source, options, callArguments, callTargets, callRecords, callRecordRanges);
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ProgramStage); // [local] SHARPEMU_DRAWCOST_PROBE
+        Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.StageResources); // [local] SHARPEMU_FRONTCOST_PROBE
         if (entry.RuntimeCallRecords)
         {
             lock (_callGate)

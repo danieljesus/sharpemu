@@ -207,9 +207,12 @@ public static partial class AgcExports
             {
                 using (SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramInputs))
                     inputs = RenderExecutor.ResolveProgramInputs(banks, _renderHost.FormatSupport, _renderHost.Limits, _renderHost.Fatal);
+                Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.ProgramInputs); // [local] SHARPEMU_FRONTCOST_PROBE
                 using var sourceScope = SharpEmu.Libs.VideoOut.FrontProfile.Measure(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramSource);
                 // No start-instance user data from the registers alone (-1); a draw that carries one rejects these.
-                return _pipelines.GetGraphicsPrograms(banks, inputs.ExportMapping, inputs.PixelActive, inputs.DepthBound, inputs.StartInstanceUserData);
+                var programs = _pipelines.GetGraphicsPrograms(banks, inputs.ExportMapping, inputs.PixelActive, inputs.DepthBound, inputs.StartInstanceUserData);
+                Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.ProgramTail); // [local] SHARPEMU_FRONTCOST_PROBE
+                return programs;
             }
             catch (Exception)
             {
@@ -224,7 +227,9 @@ public static partial class AgcExports
             if (_pipelines is null || banks.Shader.Compute.Address == 0) return null;
             try
             {
-                return _pipelines.GetComputeProgram(banks.Shader.Compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+                var program = _pipelines.GetComputeProgram(banks.Shader.Compute, banks.Context.ShaderInterface, dispatchInitiator, groupsX, groupsY, groupsZ);
+                Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.ProgramTail); // [local] SHARPEMU_FRONTCOST_PROBE
+                return program;
             }
             catch (Exception)
             {
