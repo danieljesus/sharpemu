@@ -159,9 +159,22 @@ internal static class DrawCostProbe
         ScopeBegin,
         ScopeEnd,
         RingRecords,
+        // [local] What the program resolution's materialization did: the fast path (MaterializeFast), its memo
+        // (SHARPEMU_FAST_MATERIALIZE_MEMO: answered, recorded, gated off), the cache's hits and its full walks.
+        MaterializeFast,
+        FastMemoHit,
+        FastMemoRecorded,
+        FastMemoSkipped,
+        MaterializeCacheHit,
+        MaterializeFull,
         AllocatedBytes,
         Count,
     }
+
+    // [local] SHARPEMU_DRAWCOST_ALLOC=1 (with the probe): the bytes the thread allocated in each step, reported among the
+    // counts as alloc_<step>=<bytes per timed item>. One more counter read per lap.
+    private static readonly bool AllocPerStep = Enabled && Environment.GetEnvironmentVariable("SHARPEMU_DRAWCOST_ALLOC") == "1";
+    private static long _lastAllocated;
 
     private static readonly string[] StepNames = Names<Step>((int)Step.Count);
     private static readonly string[] CounterNames = Names<Counter>((int)Counter.Count);
@@ -172,6 +185,7 @@ internal static class DrawCostProbe
 
     private static readonly long[] _stepTicks = new long[Kinds * Steps];
     private static readonly long[] _stepPasses = new long[Kinds * Steps];
+    private static readonly long[] _stepBytes = new long[Kinds * Steps]; // [local] SHARPEMU_DRAWCOST_ALLOC
     private static readonly long[] _counts = new long[Kinds * Counters];
     private static readonly long[] _items = new long[Kinds];
     private static readonly long[] _timed = new long[Kinds];
@@ -288,6 +302,7 @@ internal static class DrawCostProbe
         _kind = kind;
         _start = _last = now != 0 ? now : Stopwatch.GetTimestamp();
         _allocated = GC.GetAllocatedBytesForCurrentThread();
+        _lastAllocated = _allocated;
         _ring = Gpu.Vulkan.CommandRing.Active?.Produced ?? 0;
     }
 
@@ -313,6 +328,12 @@ internal static class DrawCostProbe
         _stepTicks[slot] += now - _last;
         _stepPasses[slot]++;
         _last = now;
+        if (AllocPerStep) // [local]
+        {
+            var allocated = GC.GetAllocatedBytesForCurrentThread();
+            _stepBytes[slot] += allocated - _lastAllocated;
+            _lastAllocated = allocated;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -479,12 +500,20 @@ internal static class DrawCostProbe
                     line.Append(FormattableString.Invariant($"{CounterNames[counter]}={count / (double)Math.Max(timed, 1):F2}"));
                 }
 
+                for (var step = 0; AllocPerStep && step < Steps; step++) // [local] SHARPEMU_DRAWCOST_ALLOC
+                {
+                    var bytes = _stepBytes[kind * Steps + step];
+                    if (bytes != 0)
+                        line.Append(FormattableString.Invariant($",alloc_{StepNames[step]}={bytes / (double)Math.Max(timed, 1):F2}"));
+                }
+
                 Console.Error.WriteLine(line.ToString());
             }
         }
 
         Array.Clear(_stepTicks);
         Array.Clear(_stepPasses);
+        Array.Clear(_stepBytes);
         Array.Clear(_counts);
         Array.Clear(_items);
         Array.Clear(_timed);
@@ -533,6 +562,7 @@ internal static class DrawCostProbe
         _sequence = 0;
         Array.Clear(_stepTicks);
         Array.Clear(_stepPasses);
+        Array.Clear(_stepBytes);
         Array.Clear(_counts);
         Array.Clear(_items);
         Array.Clear(_timed);

@@ -64,6 +64,44 @@ internal static class TableWordMemo
 
     public static void NoteHit() => Interlocked.Increment(ref _hits);
 
+    // [local] SHARPEMU_TABLE_WORD_MEMO_FAST_HIT (=1 on, off by default): a hit answered without waiting (Mode 1) took the lock
+    // twice (TryGet, then NoteAnsweredHit) and read the clock on every hit for the 20 s learning report (MaybeReportLocked);
+    // the open world answers ~4,400 table words a frame this way on the render thread. TryAnswer does the lookup, the hit
+    // count, the speculation check and the audit sampling under one hold, in the same order, and looks at the clock once
+    // every 1,024 hits. The same value, the same audits (the sample counter advances exactly as before): only the
+    // learning report's cadence changes. The reader also asks the GPU-modified set once for the word instead of twice.
+    internal static readonly bool FastHit = Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_FAST_HIT") == "1";
+    private static int _answeredSinceReport;
+
+    public static bool TryAnswer(ulong address, out uint value, out bool audit, out bool speculated)
+    {
+        lock (_lock)
+        {
+            if (!_values.TryGetValue(address, out value))
+            {
+                audit = speculated = false;
+                Interlocked.Increment(ref _misses);
+                return false;
+            }
+
+            Interlocked.Increment(ref _hits);
+            speculated = false;
+            if (LearnThreshold == 0 && AuditRate == 0)
+            {
+                audit = false;
+                return true;
+            }
+
+            speculated = _speculated.Contains(address);
+            if (speculated)
+                _learnHits++;
+            if ((++_answeredSinceReport & 1023) == 0)
+                MaybeReportLocked();
+            audit = AuditRate > 0 && _auditSeen++ % AuditRate == 0;
+            return true;
+        }
+    }
+
     public static void NoteMiss() => Interlocked.Increment(ref _misses);
 
     public static void Store(ulong address, uint value)

@@ -794,6 +794,8 @@ internal sealed class ShaderProgramCache
 
             MaterializationTally.Note(materialized ? outcome : MaterializationTally.Outcome.Failed,
                 System.Diagnostics.Stopwatch.GetTimestamp() - started, materialized ? snapshot : null);
+            if (Diagnostics.DrawCostProbe.Timing) // [local] SHARPEMU_DRAWCOST_PROBE: what the materialization did
+                CountMaterialization(outcome);
             // [local] For the probes below, a hit is a cache hit or a fast materialization that kept its last result.
             var hit = outcome is MaterializationTally.Outcome.FastHit or MaterializationTally.Outcome.FastMemoHit || (materializations is not null && materializations.Hits != hitsBefore);
             if (coldStarted != 0) // [local] SHARPEMU_COLDRES_PROBE
@@ -1161,6 +1163,37 @@ internal sealed class ShaderProgramCache
         inputs.ShaderBase = source.Address;
         inputs.ComputeState = computeState;
         return inputs;
+    }
+
+    // [local] SHARPEMU_DRAWCOST_PROBE: the materialization's outcome and its fast memo's action, among the item's counts.
+    private static void CountMaterialization(MaterializationTally.Outcome outcome)
+    {
+        switch (outcome)
+        {
+            case MaterializationTally.Outcome.FastHit or MaterializationTally.Outcome.FastMiss or MaterializationTally.Outcome.FastFallback or
+                MaterializationTally.Outcome.FastMemoHit:
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MaterializeFast);
+                switch (ResourceMaterializer.LastFastMemoAction)
+                {
+                    case ResourceMaterializer.FastMemoAction.Hit:
+                        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.FastMemoHit);
+                        break;
+                    case ResourceMaterializer.FastMemoAction.Recorded:
+                        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.FastMemoRecorded);
+                        break;
+                    case ResourceMaterializer.FastMemoAction.Skipped:
+                        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.FastMemoSkipped);
+                        break;
+                }
+
+                break;
+            case MaterializationTally.Outcome.CacheHit or MaterializationTally.Outcome.CacheRebaseHit or MaterializationTally.Outcome.TableRefresh:
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MaterializeCacheHit);
+                break;
+            default:
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MaterializeFull);
+                break;
+        }
     }
 
     private bool MaterializeWith(ResourceMaterializationCache? materializations, ProgramSourceEntry entry, ResourceRuntimeInputs inputs,

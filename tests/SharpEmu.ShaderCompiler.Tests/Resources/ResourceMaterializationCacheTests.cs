@@ -73,7 +73,7 @@ public sealed class ResourceMaterializationCacheTests
     private static ShaderResourcePlan Plan() =>
         ShaderResourcePlan.Extract(DirectImageTableTests.CreateWaveIndexedDescriptorProgram(), ShaderStage.Compute, Hash, 0, 2);
 
-    internal static bool Run(ResourceMaterializationCache cache, ShaderResourcePlan plan, Heap heap, uint[] userData,
+    private static bool Run(ResourceMaterializationCache cache, ShaderResourcePlan plan, Heap heap, uint[] userData,
         out ResourceSnapshot snapshot, out ResourceSpecialization specialization, ulong shaderBase = 0, bool readsDirty = false)
     {
         snapshot = new ResourceSnapshot();
@@ -320,10 +320,10 @@ public sealed class ResourceMaterializationCacheTests
     }
 
     // A plan whose only use of s[0:1] is as the base of its descriptor reads.
-    internal static ShaderResourcePlan DirectPlan() =>
+    private static ShaderResourcePlan DirectPlan() =>
         ShaderResourcePlan.Extract(DirectImageTableTests.CreateProgram(), ShaderStage.Compute, Hash, 0, 2);
 
-    internal static Heap DirectHeap()
+    private static Heap DirectHeap()
     {
         var heap = new Heap();
         heap.Words.Clear();
@@ -409,7 +409,7 @@ public sealed class ResourceMaterializationCacheTests
 
     // A buffer descriptor assembled in the shader from the pointer in s[0:1]: the shader sets
     // the stride and record count, user data supplies the base address.
-    internal static ShaderResourcePlan PointerBufferPlan() =>
+    private static ShaderResourcePlan PointerBufferPlan() =>
         ShaderResourcePlan.Extract(Program(
             MoveScalar(0, 2, 64),
             MoveScalar(4, 3, 0x2C004000),

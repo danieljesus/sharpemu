@@ -20,6 +20,11 @@ namespace SharpEmu.ShaderCompiler.Resources;
 // output assembly or the specialization memo search. A plan with a frontend normalizer is not memoized (the normalizers
 // can depend on other state). =2 runs the program on every hit as well and counts the ones that differ
 // ([PERF][FAST_MEMO] in the fast report). Settable for tests (per async flow).
+// [local] Round 2 (open world, cv1): 22 % hits over all threads, and the misses paid the recording (a wrapped reader per
+// read, a stored entry of six arrays per run), so the switch did not pay. A plan whose stored runs hit less than one time
+// in MemoGateRatio over MemoGateStores stores is no longer recorded for its next calls (MemoSkipFirst, doubling up to
+// MemoSkipMax while it keeps failing): those runs take the plain path at its own cost. An entry's arrays are reused
+// when its slot is overwritten. LastFastMemoAction tells the caller what the memo did (SHARPEMU_DRAWCOST_PROBE counts).
 public static partial class ResourceMaterializer
 {
     public static int FastMemoMode
@@ -33,6 +38,19 @@ public static partial class ResourceMaterializer
     private static readonly AsyncLocal<int?> FastMemoOverride = new();
 
     private const int MemoEntries = 4;
+    private const int MemoGateStores = 32;
+    private const int MemoGateRatio = 4;
+    private const int MemoSkipFirst = 256;
+    private const int MemoSkipMax = 16384;
+
+    public enum FastMemoAction : byte { None, Hit, Recorded, ReplayMiss, Skipped, Nested, Refused }
+
+    [ThreadStatic] private static FastMemoAction _lastFastMemoAction;
+
+    // [local] What the memo did on this thread's last MaterializeFast (None when it was off or not asked).
+    public static FastMemoAction LastFastMemoAction => _lastFastMemoAction;
+
+    private static readonly ThreadCounter _fastMemoSkipped = new();
     private const int MemoMaxReads = 512;
     private const int MemoMaxBytes = 16384;
 
@@ -47,7 +65,7 @@ public static partial class ResourceMaterializer
     internal static string TakeFastMemoReport() => FormattableString.Invariant(
         $"fast_memo_hits={_fastMemoHits.Take()} fast_memo_misses={_fastMemoMisses.Take()} fast_memo_replay_misses={_fastMemoReplayMisses.Take()} ") +
         FormattableString.Invariant(
-            $"fast_memo_stored={_fastMemoStored.Take()} fast_memo_refused={_fastMemoRefused.Take()} fast_memo_verified={Interlocked.Exchange(ref _fastMemoVerified, 0)} fast_memo_mismatches={Interlocked.Read(ref _fastMemoMismatches)}");
+            $"fast_memo_stored={_fastMemoStored.Take()} fast_memo_refused={_fastMemoRefused.Take()} fast_memo_skipped={_fastMemoSkipped.Take()} fast_memo_verified={Interlocked.Exchange(ref _fastMemoVerified, 0)} fast_memo_mismatches={Interlocked.Read(ref _fastMemoMismatches)}");
 
     internal static long FastMemoMismatches => Interlocked.Read(ref _fastMemoMismatches);
 
@@ -57,24 +75,32 @@ public static partial class ResourceMaterializer
 
     private readonly record struct MemoRead(MemoReadKind Kind, ulong Address, int Offset, int Length, bool Clean, bool Ok, uint Word);
 
+    // Overwritten in place when its slot comes round again (the arrays grow, never shrink; the counts say how much is used).
     private sealed class MemoEntry
     {
-        public required int UserDataCount;
-        public required int[] UsedIndices;
-        public required uint[] UsedValues;
-        public required ulong ShaderBase;
-        public required ComputeSelectorState? ComputeState;
-        public required bool ReadsClean;
-        public required MemoRead[] Reads;
-        public required byte[] Bytes;
-        public required ResourceSnapshot Snapshot;
-        public required ResourceSpecialization Specialization;
+        public int UserDataCount;
+        public int[] UsedIndices = [];
+        public uint[] UsedValues = [];
+        public int UsedCount;
+        public ulong ShaderBase;
+        public ComputeSelectorState? ComputeState;
+        public bool ReadsClean;
+        public MemoRead[] Reads = [];
+        public int ReadCount;
+        public byte[] Bytes = [];
+        public ResourceSnapshot Snapshot = null!;
+        public ResourceSpecialization Specialization = null!;
     }
 
     private sealed class MemoSet
     {
         public readonly MemoEntry?[] Entries = new MemoEntry?[MemoEntries];
         public int Next;
+        // The gate: stores and hits since the last verdict, and the calls left to skip.
+        public int Stores;
+        public int Hits;
+        public int Skip;
+        public int SkipPeriod = MemoSkipFirst;
     }
 
     [ThreadStatic] private static Dictionary<ShaderResourcePlan, MemoSet>? _memoSets;
@@ -222,13 +248,13 @@ public static partial class ResourceMaterializer
             return false;
         if (userData is uint[] words)
         {
-            for (var index = 0; index < entry.UsedIndices.Length; index++)
+            for (var index = 0; index < entry.UsedCount; index++)
                 if (words[entry.UsedIndices[index]] != entry.UsedValues[index])
                     return false;
             return true;
         }
 
-        for (var index = 0; index < entry.UsedIndices.Length; index++)
+        for (var index = 0; index < entry.UsedCount; index++)
             if (userData[entry.UsedIndices[index]] != entry.UsedValues[index])
                 return false;
         return true;
@@ -237,8 +263,9 @@ public static partial class ResourceMaterializer
     // Replays the entry's reads through the caller's readers, in order; false at the first different answer.
     private static bool Replay(MemoEntry entry, ResourceRuntimeInputs inputs)
     {
-        foreach (var read in entry.Reads)
+        for (var readIndex = 0; readIndex < entry.ReadCount; readIndex++)
         {
+            var read = entry.Reads[readIndex];
             switch (read.Kind)
             {
                 case MemoReadKind.Word:
@@ -292,10 +319,10 @@ public static partial class ResourceMaterializer
         Origin = new FastOrigin(plan, inputs),
     };
 
-    private static bool TryFastMemoHit(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, out MemoEntry? hit)
+    private static bool TryFastMemoHit(MemoSet? set, ResourceRuntimeInputs inputs, out MemoEntry? hit)
     {
         hit = null;
-        if (_memoSets is not { } sets || !sets.TryGetValue(plan, out var set))
+        if (set is null)
         {
             _fastMemoMisses.Increment();
             return false;
@@ -311,6 +338,7 @@ public static partial class ResourceMaterializer
             if (Replay(entry, inputs))
             {
                 hit = entry;
+                set.Hits++;
                 _fastMemoHits.Increment();
                 return true;
             }
@@ -327,45 +355,81 @@ public static partial class ResourceMaterializer
         return false;
     }
 
-    private static void StoreFastMemo(ShaderResourcePlan plan, MemoRecorder recorder, ResourceRuntimeInputs inputs, ResourceSnapshot snapshot,
+    private static MemoSet? MemoSetOf(ShaderResourcePlan plan) =>
+        _memoSets is { } sets && sets.TryGetValue(plan, out var set) ? set : null;
+
+    private static MemoSet CreateMemoSet(ShaderResourcePlan plan)
+    {
+        var sets = _memoSets ??= new Dictionary<ShaderResourcePlan, MemoSet>(ReferenceEqualityComparer.Instance);
+        if (sets.Count >= 4096)
+            sets.Clear();
+        var set = new MemoSet();
+        sets.Add(plan, set);
+        return set;
+    }
+
+    private static void StoreFastMemo(MemoSet set, MemoRecorder recorder, ResourceRuntimeInputs inputs, ResourceSnapshot snapshot,
         ResourceSpecialization specialization)
     {
         if (recorder.Overflowed)
         {
             _fastMemoRefused.Increment();
+            _lastFastMemoAction = FastMemoAction.Refused;
             return;
         }
 
-        var used = new List<int>();
-        for (var index = 0; index < inputs.UserData.Count; index++)
+        var entry = set.Entries[set.Next] ??= new MemoEntry();
+        var userData = inputs.UserData;
+        var used = 0;
+        for (var index = 0; index < userData.Count; index++)
             if ((index >> 6) < recorder.Used.Length && (recorder.Used[index >> 6] & (1UL << (index & 63))) != 0)
-                used.Add(index);
-        var values = new uint[used.Count];
-        for (var index = 0; index < values.Length; index++)
-            values[index] = inputs.UserData[used[index]];
-        var sets = _memoSets ??= new Dictionary<ShaderResourcePlan, MemoSet>(ReferenceEqualityComparer.Instance);
-        if (!sets.TryGetValue(plan, out var set))
+                used++;
+        if (entry.UsedIndices.Length < used)
         {
-            if (sets.Count >= 4096)
-                sets.Clear();
-            sets.Add(plan, set = new MemoSet());
+            entry.UsedIndices = new int[used];
+            entry.UsedValues = new uint[used];
         }
 
-        set.Entries[set.Next] = new MemoEntry
+        var cursor = 0;
+        for (var index = 0; index < userData.Count; index++)
         {
-            UserDataCount = inputs.UserData.Count,
-            UsedIndices = used.ToArray(),
-            UsedValues = values,
-            ShaderBase = inputs.ShaderBase,
-            ComputeState = inputs.ComputeState,
-            ReadsClean = inputs.ReadsClean,
-            Reads = recorder.Reads.ToArray(),
-            Bytes = recorder.Bytes.AsSpan(0, recorder.ByteCount).ToArray(),
-            Snapshot = snapshot,
-            Specialization = specialization,
-        };
+            if ((index >> 6) >= recorder.Used.Length || (recorder.Used[index >> 6] & (1UL << (index & 63))) == 0)
+                continue;
+            entry.UsedIndices[cursor] = index;
+            entry.UsedValues[cursor++] = userData[index];
+        }
+
+        entry.UsedCount = used;
+        entry.UserDataCount = userData.Count;
+        entry.ShaderBase = inputs.ShaderBase;
+        entry.ComputeState = inputs.ComputeState;
+        entry.ReadsClean = inputs.ReadsClean;
+        if (entry.Reads.Length < recorder.Reads.Count)
+            entry.Reads = new MemoRead[Math.Max(recorder.Reads.Count, 8)];
+        recorder.Reads.CopyTo(entry.Reads);
+        entry.ReadCount = recorder.Reads.Count;
+        if (entry.Bytes.Length < recorder.ByteCount)
+            entry.Bytes = new byte[recorder.ByteCount];
+        recorder.Bytes.AsSpan(0, recorder.ByteCount).CopyTo(entry.Bytes);
+        entry.Snapshot = snapshot;
+        entry.Specialization = specialization;
         set.Next = (set.Next + 1) % MemoEntries;
         _fastMemoStored.Increment();
+        _lastFastMemoAction = FastMemoAction.Recorded;
+        if (++set.Stores < MemoGateStores)
+            return;
+        // The verdict: a plan whose runs do not repeat stops paying the recording for a while.
+        if (set.Hits * MemoGateRatio < set.Stores)
+        {
+            set.Skip = set.SkipPeriod;
+            set.SkipPeriod = Math.Min(set.SkipPeriod * 2, MemoSkipMax);
+        }
+        else
+        {
+            set.SkipPeriod = MemoSkipFirst;
+        }
+
+        set.Stores = set.Hits = 0;
     }
 
     // MaterializeFast's program path with the memo in front: a hit returns the remembered result, a miss runs the program
@@ -376,8 +440,27 @@ public static partial class ResourceMaterializer
         ran = true;
         failure = ResourceMaterializationFailure.Other;
         var mode = FastMemoMode;
-        if (TryFastMemoHit(plan, inputs, out var hit))
+        var set = MemoSetOf(plan);
+        if (set is { Skip: > 0 })
         {
+            // The gate: this plan's runs did not repeat; the plain path, no recording.
+            set.Skip--;
+            _fastMemoSkipped.Increment();
+            if (!EvaluateInto(plan, inputs, output))
+            {
+                ran = false;
+                return false;
+            }
+
+            NoteProgramRun();
+            _lastFastMemoAction = FastMemoAction.Skipped;
+            return MaterializeFromOutput(plan, inputs, output, ref snapshot, ref specialization, out failure);
+        }
+
+        _lastFastMemoAction = FastMemoAction.ReplayMiss;
+        if (TryFastMemoHit(set, inputs, out var hit))
+        {
+            _lastFastMemoAction = FastMemoAction.Hit;
             if (mode != 2)
             {
                 snapshot = SnapshotFor(hit!, plan, inputs);
@@ -418,7 +501,7 @@ public static partial class ResourceMaterializer
             }
 
             NoteProgramRun();
-
+            _lastFastMemoAction = FastMemoAction.Nested;
             return MaterializeFromOutput(plan, inputs, output, ref snapshot, ref specialization, out failure);
         }
 
@@ -437,7 +520,7 @@ public static partial class ResourceMaterializer
 
             if (!MaterializeFromOutput(plan, inputs, output, ref snapshot, ref specialization, out failure))
                 return false;
-            StoreFastMemo(plan, recorder, inputs, snapshot, specialization);
+            StoreFastMemo(MemoSetOf(plan) ?? CreateMemoSet(plan), recorder, inputs, snapshot, specialization);
             return true;
         }
         finally
