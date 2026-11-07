@@ -17,7 +17,10 @@ namespace SharpEmu.Libs.Diagnostics;
 //   (the batch being recorded, so a cut; in flight; completed) and their pieces and bytes;
 // - the copy submits on the queue thread and off it (SHARPEMU_READBACK_GUEST_SUBMIT) with their time, and the copies
 //   handed back to the queue thread;
-// - completes applied and not clean (retried), with the pieces they published and kept stale.
+// - completes applied and not clean (retried), with the pieces they published and kept stale, and the complete hop
+//   split (CompleteCurrentPieces): check = the pieces' writer ticks, copy = staging to backing, ranges = the
+//   GPU-modified set, pages = clearing GPU-dirty pages (unprotection); the rest of complete= is the clean check,
+//   the readback record and releasing the buffers.
 internal static class RelayProbe
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_RELAY_PROBE") == "1";
@@ -39,6 +42,7 @@ internal static class RelayProbe
         public long Pieces, Bytes;
         public long QueueSubmits, QueueSubmitTicks, GuestSubmits, GuestSubmitTicks, GuestFallbacks;
         public long Applied, NotClean, PublishedPieces, StalePieces;
+        public long SplitCompletes, CheckTicks, CopyTicks, RangeTicks, PageTicks;
     }
 
     private static readonly object Gate = new();
@@ -130,6 +134,19 @@ internal static class RelayProbe
         }
     }
 
+    public static void NoteCompleteSplit(long check, long copy, long ranges, long pages)
+    {
+        lock (Gate)
+        {
+            var counters = _counters;
+            counters.SplitCompletes++;
+            counters.CheckTicks += check;
+            counters.CopyTicks += copy;
+            counters.RangeTicks += ranges;
+            counters.PageTicks += pages;
+        }
+    }
+
     // Called once per presented frame (FpsLog.FramePresented, on the render thread).
     public static void NoteFrame()
     {
@@ -191,6 +208,8 @@ internal static class RelayProbe
             $"submits=queue:{Pf(c.QueueSubmits):F1}/{Ms(c.QueueSubmitTicks):F3}ms/{Us(c.QueueSubmitTicks, c.QueueSubmits):F1}us,guest:{Pf(c.GuestSubmits):F1}/{Ms(c.GuestSubmitTicks):F3}ms/{Us(c.GuestSubmitTicks, c.GuestSubmits):F1}us,handed_back:{Pf(c.GuestFallbacks):F2} ");
         text.Append(CultureInfo.InvariantCulture,
             $"completes=applied:{Pf(c.Applied):F1},not_clean:{Pf(c.NotClean):F2},published_pieces:{Pf(c.PublishedPieces):F1},stale_pieces:{Pf(c.StalePieces):F2}");
+        text.Append(CultureInfo.InvariantCulture,
+            $" complete_us=check:{Us(c.CheckTicks, c.SplitCompletes):F1},copy:{Us(c.CopyTicks, c.SplitCompletes):F1},ranges:{Us(c.RangeTicks, c.SplitCompletes):F1},pages:{Us(c.PageTicks, c.SplitCompletes):F1}");
         return text.ToString();
     }
 }

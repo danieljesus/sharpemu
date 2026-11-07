@@ -27,6 +27,8 @@ public sealed class RelayProbeTests
             Drains = 40, Drain1 = 30, Drain2 = 8, Drain3Plus = 2, Commands = 56, CommandTicks = Stopwatch.Frequency / 100,
             Begins = 20, BeginTicks = Stopwatch.Frequency / 1000, Completes = 20, CompleteTicks = Stopwatch.Frequency / 500,
             Pieces = 30, Bytes = 20 * 4096, GuestSubmits = 18, GuestFallbacks = 2, Applied = 19, NotClean = 1,
+            SplitCompletes = 10, CheckTicks = Stopwatch.Frequency / 100_000, CopyTicks = Stopwatch.Frequency / 10_000,
+            RangeTicks = 0, PageTicks = Stopwatch.Frequency / 50_000,
         };
         counters.SourceBegins[(int)GuestMemoryProfile.ReadbackSource.StoreDownload] = 16;
         counters.SourceBegins[(int)GuestMemoryProfile.ReadbackSource.CpuWriteInvalidation] = 4;
@@ -45,5 +47,6 @@ public sealed class RelayProbeTests
         Assert.Contains("guest:1.8/", line);
         Assert.Contains("handed_back:0.20", line);
         Assert.Contains("completes=applied:1.9,not_clean:0.10", line);
+        Assert.EndsWith("complete_us=check:1.0,copy:10.0,ranges:0.0,pages:2.0", line);
     }
 }

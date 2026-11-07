@@ -4514,12 +4514,14 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             var copies = pending.Copies;
             var current = new bool[copies.Count];
             var published = 0;
+            var probeStarted = SharpEmu.Libs.Diagnostics.RelayProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_RELAY_PROBE
             for (var index = 0; index < copies.Count; index++)
             {
                 current[index] = IsPieceCurrent(pending, index);
                 published += current[index] ? 1 : 0;
             }
 
+            var probeChecked = probeStarted != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var splitSample = pending.Ticket.Observe; // [local] SHARPEMU_LABEL_POLL_SPLIT
             readback.Complete(pending.Ticket, published == 0 ? null : (index, bytes) =>
             {
@@ -4538,6 +4540,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                     throw SubmissionScheduler.Fatal($"Could not write the required direct backing: addr=0x{copies[index].Address:X16} size=0x{(ulong)bytes.Length:X16}");
                 }
             });
+            var probeCopied = probeStarted != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             for (var index = 0; index < copies.Count; index++)
             {
                 if (current[index])
@@ -4546,6 +4549,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 }
             }
 
+            var probeRemoved = probeStarted != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var windowSize = pending.WindowEnd - pending.WindowBegin;
             if (published == copies.Count && !_gpuModifiedRanges.Overlaps(pending.WindowBegin, windowSize))
             {
@@ -4564,6 +4568,9 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 }
             }
 
+            if (probeStarted != 0)
+                SharpEmu.Libs.Diagnostics.RelayProbe.NoteCompleteSplit(probeChecked - probeStarted, probeCopied - probeChecked,
+                    probeRemoved - probeCopied, System.Diagnostics.Stopwatch.GetTimestamp() - probeRemoved);
             var stale = copies.Count - published;
             StalePiecesKept += stale;
             Interlocked.Add(ref _reportedPublishedPieces, published);
