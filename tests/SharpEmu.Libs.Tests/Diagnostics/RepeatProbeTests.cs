@@ -186,6 +186,41 @@ public sealed class RepeatProbeTests : IDisposable
     }
 
     [Fact]
+    public void TargetsHashTheirResolutionAndDepth()
+    {
+        static ulong Targets(ulong colorAddress, ulong depthAddress)
+        {
+            var record = new ResolvedDraw { Kind = ResolvedDrawKind.Draw };
+            ref var state = ref record.State;
+            var request = new SharpEmu.Libs.Gpu.Images.ImageRequest(SharpEmu.Libs.Gpu.Images.ImageDescription.Create(),
+                SharpEmu.Libs.Gpu.Images.ImageViewDescription.Default, SharpEmu.Libs.Gpu.Images.ImageRole.ColorTarget);
+            request.Description.Data = new SharpEmu.HLE.GpuMemory.GuestSpan(colorAddress, 0x10000);
+            var resolution = new SharpEmu.Libs.Gpu.Images.ColorTargetResolution(request, colorAddress, 0x10000,
+                new Silk.NET.Vulkan.Extent2D(64, 64), 0, 0, 1, default, false, false, default);
+            state.Colors[0] = new ColorTargetState(in resolution, 0, default);
+            state.ColorCount = 1;
+            var depth = default(SharpEmu.Libs.Gpu.Images.DepthTargetResolution) with
+            {
+                Format = Silk.NET.Vulkan.Format.D32Sfloat,
+                Width = 64,
+                Height = 64,
+                Samples = 1,
+                DepthAddress = depthAddress,
+                DepthSize = 0x4000,
+            };
+            state.Depth = new DepthAttachmentState(new DepthTargetState(depth, default), default);
+            state.DepthResolved = true;
+            var parts = default(RepeatProbe.Parts);
+            RepeatProbe.HashTargets(ref parts, ref state);
+            return parts.Targets;
+        }
+
+        Assert.Equal(Targets(0x10_0000, 0x20_0000), Targets(0x10_0000, 0x20_0000));
+        Assert.NotEqual(Targets(0x10_0000, 0x20_0000), Targets(0x11_0000, 0x20_0000));
+        Assert.NotEqual(Targets(0x10_0000, 0x20_0000), Targets(0x10_0000, 0x21_0000));
+    }
+
+    [Fact]
     public void MatchPairsOccurrencesInOrderAsAMultiset()
     {
         var matcher = new RepeatProbe.Matcher();
