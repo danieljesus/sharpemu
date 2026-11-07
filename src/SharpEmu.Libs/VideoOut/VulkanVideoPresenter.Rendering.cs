@@ -2112,13 +2112,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (_worker)
+            if (_worker && !Gpu.Rendering.RenderRecorder.SliceThreadIndirect)
             {
                 throw Serial("indirect thread dispatch");
             }
 
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
-            var (buffer, offset) = _bufferCache.ObtainBuffer(argumentsAddress, 3u * sizeof(uint), false);
+            var (buffer, offset) = _worker // [local] SHARPEMU_SLICE_THREAD_INDIRECT: as TryDispatchIndirect on a worker
+                ? ObtainBufferForSlice(argumentsAddress, 3u * sizeof(uint), isWritten: false, isTexelBuffer: false)
+                : _bufferCache.ObtainBuffer(argumentsAddress, 3u * sizeof(uint), false);
             var shaderData = prepared.Descriptors.ShaderData;
             var command = BeginBatchedGuestCommands();
             var before = new BufferMemoryBarrier2
@@ -2166,9 +2168,9 @@ internal static unsafe partial class VulkanVideoPresenter
             var vkProbe1260 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(_vk, command, &afterInfo); // [local]
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe1260); // [local]
-            if (ArgsWriterProbe.Enabled && ArgsWriterProbe.CurrentProgram == ArgsWriterProbe.ConsumerHash) // [local]
+            if (!_worker && ArgsWriterProbe.Enabled && ArgsWriterProbe.CurrentProgram == ArgsWriterProbe.ConsumerHash) // [local]
                 _presenter.RecordArgsConsumerProbe(command, buffer.Handle, offset, argumentsAddress);
-            var (threadsBuffer, threadsOffset) = IndirectArgsProbe.Enabled // [local] SHARPEMU_INDIRECT_ARGS_PROBE
+            var (threadsBuffer, threadsOffset) = !_worker && IndirectArgsProbe.Enabled // [local] SHARPEMU_INDIRECT_ARGS_PROBE
                 ? _presenter.RecordIndirectArgsProbe(command, buffer.Handle, offset, argumentsAddress, threadUnits: true)
                 : (buffer.Handle, offset);
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation); // [local] as TryDispatchIndirect

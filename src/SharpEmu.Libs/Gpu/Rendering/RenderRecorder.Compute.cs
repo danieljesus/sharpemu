@@ -39,6 +39,13 @@ internal sealed partial class RenderRecorder
 
     private static int _dispatchExecLogs; // [local] SHARPEMU_DISPATCH_EXEC_LOG
 
+    // [local] SHARPEMU_SLICE_THREAD_INDIRECT=1 (off by default): a slice worker records the thread-unit indirect dispatches
+    // (SHARPEMU_GPU_THREAD_INDIRECT) as it records the group-unit ones: the counts' buffer is a slice use
+    // (ObtainBufferForSlice, validated and synchronized at the join), the copy into the dispatch's own shader data and
+    // the indirect dispatch go into the worker's command buffer, in the same order and with the same barriers as on the
+    // render thread. Without it the worker hands each one back (Serial "indirect thread dispatch"), which ends its segment.
+    internal static readonly bool SliceThreadIndirect = Environment.GetEnvironmentVariable("SHARPEMU_SLICE_THREAD_INDIRECT") == "1";
+
     private void RecordDispatch(ResolvedDispatch record)
     {
         using var setupScope = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchRecordSetup); // [local]
@@ -54,7 +61,8 @@ internal sealed partial class RenderRecorder
 
         // [local] SHARPEMU_GPU_THREAD_INDIRECT: the host records it on the render thread only (TryDispatchIndirectThreads
         // throws there otherwise); handing it back before anything is recorded keeps the rest of the slice on the worker.
-        if (OnWorker && record.IndirectThreads && !record.Skipped)
+        // SHARPEMU_SLICE_THREAD_INDIRECT=1 lets the worker record it (TryDispatchIndirectThreads on a worker).
+        if (OnWorker && record.IndirectThreads && !record.Skipped && !SliceThreadIndirect)
         {
             throw new VideoOut.SerialRequiredException("indirect thread dispatch", resumable: true);
         }
