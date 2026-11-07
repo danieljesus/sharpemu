@@ -20,7 +20,9 @@ namespace SharpEmu.Libs.Diagnostics;
 // - completes applied and not clean (retried), with the pieces they published and kept stale, and the complete hop
 //   split (CompleteCurrentPieces): check = the pieces' writer ticks, copy = staging to backing, ranges = the
 //   GPU-modified set, pages = clearing GPU-dirty pages (unprotection); the rest of complete= is the clean check,
-//   the readback record and releasing the buffers.
+//   the readback record and releasing the buffers;
+// - the rebuilds of the lock-free GPU-modified snapshot (GuestBufferCache.GpuModifiedSnapshot) on the GPU queue thread
+//   and off it, their time and the ranges they copied.
 internal static class RelayProbe
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_RELAY_PROBE") == "1";
@@ -43,6 +45,7 @@ internal static class RelayProbe
         public long QueueSubmits, QueueSubmitTicks, GuestSubmits, GuestSubmitTicks, GuestFallbacks;
         public long Applied, NotClean, PublishedPieces, StalePieces;
         public long SplitCompletes, CheckTicks, CopyTicks, RangeTicks, PageTicks;
+        public long QueueRebuilds, QueueRebuildTicks, OtherRebuilds, OtherRebuildTicks, RebuildRanges;
     }
 
     private static readonly object Gate = new();
@@ -147,6 +150,26 @@ internal static class RelayProbe
         }
     }
 
+    public static void NoteSnapshotRebuild(bool onQueue, int ranges, long ticks)
+    {
+        lock (Gate)
+        {
+            var counters = _counters;
+            if (onQueue)
+            {
+                counters.QueueRebuilds++;
+                counters.QueueRebuildTicks += ticks;
+            }
+            else
+            {
+                counters.OtherRebuilds++;
+                counters.OtherRebuildTicks += ticks;
+            }
+
+            counters.RebuildRanges += ranges;
+        }
+    }
+
     // Called once per presented frame (FpsLog.FramePresented, on the render thread).
     public static void NoteFrame()
     {
@@ -210,6 +233,9 @@ internal static class RelayProbe
             $"completes=applied:{Pf(c.Applied):F1},not_clean:{Pf(c.NotClean):F2},published_pieces:{Pf(c.PublishedPieces):F1},stale_pieces:{Pf(c.StalePieces):F2}");
         text.Append(CultureInfo.InvariantCulture,
             $" complete_us=check:{Us(c.CheckTicks, c.SplitCompletes):F1},copy:{Us(c.CopyTicks, c.SplitCompletes):F1},ranges:{Us(c.RangeTicks, c.SplitCompletes):F1},pages:{Us(c.PageTicks, c.SplitCompletes):F1}");
+        var rebuilds = c.QueueRebuilds + c.OtherRebuilds;
+        text.Append(CultureInfo.InvariantCulture,
+            $" snapshot_rebuilds=queue:{Pf(c.QueueRebuilds):F1}/{Ms(c.QueueRebuildTicks):F3}ms,other:{Pf(c.OtherRebuilds):F1}/{Ms(c.OtherRebuildTicks):F3}ms,ranges:{(rebuilds == 0 ? 0 : (double)c.RebuildRanges / rebuilds):F0}");
         return text.ToString();
     }
 }

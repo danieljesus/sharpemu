@@ -451,11 +451,15 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             return current;
         }
 
+        var rebuildStarted = SharpEmu.Libs.Diagnostics.RelayProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_RELAY_PROBE
         _gpuModifiedGate.EnterReadLock();
         try
         {
             // Publish before clearing the flag: a lock-free reader that sees it clear must also see this snapshot.
             var snapshot = _gpuModifiedRanges.Snapshot();
+            if (rebuildStarted != 0)
+                SharpEmu.Libs.Diagnostics.RelayProbe.NoteSnapshotRebuild(_relay.IsGpuQueueThread, snapshot.Count,
+                    System.Diagnostics.Stopwatch.GetTimestamp() - rebuildStarted);
             Volatile.Write(ref _gpuModifiedSnapshot, snapshot);
             _gpuModifiedSnapshotStale = false;
             return snapshot;
@@ -2231,8 +2235,24 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             Environment.FailFast($"The address range is invalid: 0x{guestAddress:X16}, 0x{size:X16}.");
         }
 
+        if ((ModifiedTreeReads || ForceModifiedTreeReads) && _relay.IsGpuQueueThread) // [local] SHARPEMU_MODIFIED_TREE_READS
+        {
+            return _gpuModifiedRanges.Overlaps(guestAddress, size);
+        }
+
         return GpuModifiedSnapshot().Overlaps(guestAddress, size); // [local]
     }
+
+    // [local] SHARPEMU_MODIFIED_TREE_READS=1 (off by default): on the GPU queue thread HasGpuDirtyBytes asks the
+    // GPU-modified set itself instead of its lock-free snapshot. The snapshot is rebuilt (every range copied into two
+    // new arrays) on the first read after each change, and every guest read's completion changes the set
+    // (RemoveGpuModified) and then asks it (the clean check), so each completion paid a rebuild. Exact: the queue thread
+    // is the only one that changes the set (Add in ObtainBuffer and RemoveGpuModified, both under the write lock), and it
+    // already reads it without a lock (_gpuModifiedRanges.Contains in ObtainBuffer and IsPieceCurrent); other threads
+    // keep the snapshot.
+    internal static readonly bool ModifiedTreeReads = Environment.GetEnvironmentVariable("SHARPEMU_MODIFIED_TREE_READS") == "1";
+
+    internal bool ForceModifiedTreeReads { get; set; }
 
     public bool EverGpuWritten(ulong guestAddress, ulong size) => _tracker.MayHaveGpuWrittenPages(guestAddress, size);
 

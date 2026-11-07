@@ -406,6 +406,49 @@ public sealed class GuestBufferAsyncReadbackTests(HeadlessVulkanFixture fixture)
         harness.Shutdown();
     }
 
+    // SHARPEMU_MODIFIED_TREE_READS: the GPU queue thread's answer from the GPU-modified set itself is the one the
+    // snapshot gives every other thread, through writes, a partial read and a whole read.
+    [Fact]
+    public void TheQueueThreadReadsTheModifiedSetAsTheSnapshotDoes()
+    {
+        if (_vulkan is null || !GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        using var fatal = new FatalScope();
+        Attach(harness, _vulkan);
+        harness.Cache.ForceModifiedTreeReads = true;
+        harness.Cache.ForceGuestSubmit = true;
+        var address = harness.MapBacked(0x40000, ReadWrite);
+        CoverWithOneBuffer(harness, address, 0x40000);
+        ulong[] probes = [address, address + 0xFC, address + 0x100, address + 0x18000, address + 0x20000, address + 0x200FF, address + 0x3FFF0];
+
+        void AssertAgree(string stage)
+        {
+            foreach (var probe in probes)
+            {
+                var queue = harness.Worker.Run(() => harness.Cache.HasGpuDirtyBytes(probe, 4));
+                Assert.True(harness.Cache.HasGpuDirtyBytes(probe, 4) == queue, $"{stage}: 0x{probe - address:X}");
+            }
+        }
+
+        AssertAgree("clean");
+        GpuWrite(harness, address, 0x01010101);
+        GpuWrite(harness, address + 0x20000, 0x02020202);
+        AssertAgree("written");
+        Assert.True(harness.Worker.Run(() => harness.Cache.HasGpuDirtyBytes(address + 0x20000, 4)));
+
+        Assert.True(harness.Cache.DownloadToCpu(address + 8, 4));
+        AssertAgree("first read");
+        Assert.False(harness.Worker.Run(() => harness.Cache.HasGpuDirtyBytes(address, 0x100)));
+        Assert.True(harness.Worker.Run(() => harness.Cache.HasGpuDirtyBytes(address + 0x20000, 0x100)));
+
+        Assert.True(harness.Cache.DownloadToCpu(address + 0x20010, 4));
+        AssertAgree("second read");
+        Assert.Equal(0x02020202u, BitConverter.ToUInt32(harness.Read(address + 0x200F0, 4)));
+        Assert.Equal(0x01010101u, BitConverter.ToUInt32(harness.Read(address + 0x40, 4)));
+        Detach(harness);
+        harness.Shutdown();
+    }
+
     [Fact]
     public void RepeatedGuestReadsReuseTheReadbackSlots()
     {

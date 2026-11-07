@@ -7,6 +7,8 @@ public sealed class SpanSnapshot(ulong[] starts, ulong[] ends)
 {
     public static readonly SpanSnapshot Empty = new([], []);
 
+    internal int Count => starts.Length; // [local] SHARPEMU_RELAY_PROBE
+
     public bool Contains(ulong address, ulong size)
     {
         var index = Array.BinarySearch(starts, address);
