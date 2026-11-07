@@ -1458,13 +1458,14 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     // [local] SHARPEMU_LITE_OBTAIN=2: the light answer, then the real path, whose answer is used. A light "clean" the
     // real path disagreed with (another buffer or offset, an upload, a stream copy, a registry change, a publication or
-    // an image copy) is raced when the CPU dirtied a page of the range's blocks in between, otherwise wrong.
+    // an image copy) is raced when a page of the range's blocks was published CPU-dirty in between
+    // (CpuDirtyPublicationsOf, sampled before the light check), otherwise wrong.
     private (GpuBuffer Buffer, ulong Offset) ObtainBufferLiteVerified(ulong guestAddress, ulong size, bool isTexelBuffer,
         ResourceSlotIdentifier bufferIdentifier, ulong traceShaderHash, bool allowStream, bool requiresDeviceAddress)
     {
         LiteObtainUse.Obtains++;
         var guarded = LiteObtainGuarded(guestAddress, size);
-        var dirtyings = guarded ? 0 : _tracker.CpuDirtyingsOf(guestAddress, size);
+        var dirtiedBefore = guarded ? 0 : _tracker.CpuDirtyPublicationsOf(guestAddress, size);
         var cause = Diagnostics.LiteObtainProbe.Cause.Unmapped;
         GpuBuffer? liteBuffer = null;
         ulong liteOffset = 0;
@@ -1490,10 +1491,12 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 (Diagnostics.LiteObtainProbe.ImageCopies != imageCopies ? Diagnostics.LiteObtainProbe.Work.ImageCopy : 0);
             if (!ReferenceEquals(liteBuffer, result.Buffer) || liteOffset != result.Offset || work != Diagnostics.LiteObtainProbe.Work.None)
             {
-                var raced = _tracker.CpuDirtyingsOf(guestAddress, size) != dirtyings;
+                var dirtied = _tracker.CpuDirtyPublicationsOf(guestAddress, size);
+                var raced = dirtied != dirtiedBefore;
                 if (LiteObtainUse.NoteMismatch(raced))
                     Console.Error.WriteLine(
-                        $"[GPU][LITE_OBTAIN_WRONG] kind=verify range=0x{guestAddress:X}+0x{size:X} texel={isTexelBuffer} work={work} " +
+                        $"[GPU][LITE_OBTAIN_WRONG] kind=verify range=0x{guestAddress:X}+0x{size:X} texel={isTexelBuffer} work={work} dirty_publications={dirtiedBefore}->{dirtied} " +
+                        $"cpu_dirty_now={_tracker.MayHaveCpuDirtyPages(guestAddress, size)} " +
                         $"lite=0x{liteBuffer?.CpuAddress ?? 0:X}+0x{liteBuffer?.Size ?? 0:X}@0x{liteOffset:X} real=0x{result.Buffer.CpuAddress:X}+0x{result.Buffer.Size:X}@0x{result.Offset:X} " +
                         $"same_buffer={ReferenceEquals(liteBuffer, result.Buffer)} stream={ReferenceEquals(result.Buffer, _stream)} prefound={bufferIdentifier.IsValid} tick={_scheduler.CurrentTick}");
             }
@@ -1550,7 +1553,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     private (GpuBuffer Buffer, ulong Offset) ObtainBufferProbed(ulong guestAddress, ulong size, bool isTexelBuffer, ResourceSlotIdentifier bufferIdentifier,
         ulong traceShaderHash, bool allowStream, bool requiresDeviceAddress)
     {
-        var dirtyings = _tracker.CpuDirtyingsOf(guestAddress, size); // [local] a CPU write in between: raced (see LiteObtainUse)
+        var dirtiedBefore = _tracker.CpuDirtyPublicationsOf(guestAddress, size); // [local] a CPU-dirty change in between: raced (see LiteObtainUse)
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         var cause = LiteObtain(guestAddress, size, isTexelBuffer, out var liteBuffer, out var liteOffset);
         var lite = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -1572,7 +1575,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 $"[GPU][LITE_OBTAIN_WRONG] kind=obtain range=0x{guestAddress:X}+0x{size:X} texel={isTexelBuffer} work={work} " +
                 $"lite=0x{liteBuffer?.CpuAddress ?? 0:X}+0x{liteBuffer?.Size ?? 0:X}@0x{liteOffset:X} real=0x{result.Buffer.CpuAddress:X}+0x{result.Buffer.Size:X}@0x{result.Offset:X} " +
                 $"same_buffer={ReferenceEquals(liteBuffer, result.Buffer)} stream={ReferenceEquals(result.Buffer, _stream)} prefound={bufferIdentifier.IsValid} " +
-                $"raced={_tracker.CpuDirtyingsOf(guestAddress, size) != dirtyings} tick={_scheduler.CurrentTick}");
+                $"raced={_tracker.CpuDirtyPublicationsOf(guestAddress, size) != dirtiedBefore} tick={_scheduler.CurrentTick}");
         return result;
     }
 

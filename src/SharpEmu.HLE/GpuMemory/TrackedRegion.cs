@@ -73,6 +73,17 @@ public sealed class TrackedRegion
     // page it leaves clean). Written under the lock; the deferred upload verify reads it.
     public long CpuDirtyings => Volatile.Read(ref _cpuDirtyings);
 
+    // [local] SHARPEMU_LITE_OBTAIN=2: times a page of the region turned CPU-dirty, counted after the bits and the block
+    // summary were published (CpuDirtyings moves before them, and CpuDirtyVersion on cleans too). Written under the lock.
+    private long _cpuDirtyPublications;
+
+    public long CpuDirtyPublications => Volatile.Read(ref _cpuDirtyPublications);
+
+    // [local] SHARPEMU_LITE_OBTAIN tests only: runs on the marking thread inside ChangeState after CpuDirtyings moved and
+    // before the dirty bits, the block summary and CpuDirtyVersion are published (a lock-free reader there sees clean).
+    [ThreadStatic]
+    internal static Action? AfterCpuDirtyingCountedForTests;
+
     public ulong BaseAddress { get; }
 
     public bool IsModified(WriteOrigin side, ulong offset, ulong size)
@@ -218,6 +229,11 @@ public sealed class TrackedRegion
         if (enable || side == WriteOrigin.Gpu)
         {
             Volatile.Write(ref _cpuDirtyings, _cpuDirtyings + 1); // [local]
+        }
+
+        if (enable && side == WriteOrigin.Cpu)
+        {
+            AfterCpuDirtyingCountedForTests?.Invoke(); // [local] SHARPEMU_LITE_OBTAIN tests: counted, not yet published
         }
 
         if (enable && side == WriteOrigin.Cpu)
@@ -506,9 +522,10 @@ public sealed class TrackedRegion
         var changed = _cpuDirty ^ _publishedCpuDirty;
         if (changed.Any)
         {
-            if (_summary is not null && (_cpuDirty & changed).Any)
+            if ((_cpuDirty & changed).Any)
             {
-                _summary.NoteDirtied();
+                _summary?.NoteDirtied();
+                Volatile.Write(ref _cpuDirtyPublications, _cpuDirtyPublications + 1); // [local] SHARPEMU_LITE_OBTAIN=2
             }
 
             _publishedCpuDirty = _cpuDirty;

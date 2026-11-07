@@ -171,10 +171,12 @@ public sealed class GuestPageTracker
 
     public long CpuDirtyEpoch => _cpuDirtySummary.Epoch;
 
-    // [local] SHARPEMU_LITE_OBTAIN=2: the sum of TrackedRegion.CpuDirtyings over the range's blocks, lock-free. It moves
-    // when a page of those blocks turns CPU-dirty (a write fault, an emulator write, returned pages) or changes GPU
-    // ownership, never when an upload cleans one; a block without a region counts 0.
-    public long CpuDirtyingsOf(ulong vaddr, ulong size)
+    // [local] SHARPEMU_LITE_OBTAIN=2: the sum of TrackedRegion.CpuDirtyPublications over the range's blocks, lock-free. A
+    // region bumps it after it published a page turning CPU-dirty in its bits and its block summary (UpdateCpuProtection),
+    // so a lock-free reader that saw a range clean while a dirtying was in flight sees the sum move afterwards
+    // (CpuDirtyings moves before the bits: a reader between the two saw it moved and the range clean). Cleans do not
+    // move it. A block without a region counts 0.
+    public long CpuDirtyPublicationsOf(ulong vaddr, ulong size)
     {
         ValidateRange(vaddr, size);
         var sum = 0L;
@@ -183,7 +185,7 @@ public sealed class GuestPageTracker
         {
             if (Volatile.Read(ref _regions[index]) is { } region)
             {
-                sum += region.CpuDirtyings;
+                sum += region.CpuDirtyPublications;
             }
         }
 

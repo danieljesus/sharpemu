@@ -138,6 +138,65 @@ public sealed class LiteObtainTests : IClassFixture<HeadlessVulkanFixture>, IDis
         harness.Shutdown();
     }
 
+    // The lo2 case (0x141E297E0+0x800, prefound, work=Stream, counted unraced): a write fault is marking the range on
+    // another thread when the light check runs. CpuDirtyings has already moved but the bits and the block summary are
+    // not published, so the lock-free check reads clean; the real path then waits for the region lock, sees the page
+    // dirty and streams. CpuDirtyPublications moves only after the light check, so =2 counts it raced.
+    [Fact]
+    public void DirtyingInFlightAtTheLightCheckIsRaced()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var (harness, address, buffer) = CleanBuffer(_vulkan!);
+        using var disposer = harness;
+        const ulong offset = 0x17E0, size = 0x800;
+        var identifier = harness.Cache.FindBuffer(address, 8);
+        var latest = Pattern((int)size, 9);
+        using var inFlight = new ManualResetEventSlim();
+        using var go = new ManualResetEventSlim();
+        using var marked = new ManualResetEventSlim();
+        var marker = new Thread(() =>
+        {
+            TrackedRegionHook(() =>
+            {
+                inFlight.Set();
+                go.Wait(TimeSpan.FromSeconds(30));
+            });
+            try
+            {
+                harness.Store.MarkCpuWrite(address + offset, size);
+                harness.Write(address + offset, latest);
+            }
+            finally
+            {
+                TrackedRegionHook(null);
+                marked.Set();
+            }
+        }) { IsBackground = true };
+        marker.Start();
+        Assert.True(inFlight.Wait(TimeSpan.FromSeconds(30)));
+        harness.Cache.LiteObtainMode = 2;
+        harness.Cache.LiteVerifyBetweenForTests = () =>
+        {
+            go.Set();
+            marked.Wait(TimeSpan.FromSeconds(30));
+        };
+
+        var (real, realOffset) = harness.Worker.Run(() =>
+            harness.Cache.ObtainBuffer(address + offset, size, isWritten: false, bufferIdentifier: identifier));
+
+        marker.Join();
+        Assert.Equal(harness.Cache.GetUtilityBuffer(GpuBufferUsage.Stream).Handle.Handle, real.Handle.Handle);
+        Assert.NotSame(buffer, real);
+        Assert.Equal(latest, real.Mapped.Slice((int)realOffset, (int)size).ToArray());
+        Assert.Equal(1, LiteObtainUse.Verified);
+        Assert.Equal(1, LiteObtainUse.Raced);
+        Assert.Equal(0, LiteObtainUse.Wrong);
+        Assert.Equal(0, LiteObtainUse.WrongTotal);
+        harness.Shutdown();
+
+        static void TrackedRegionHook(Action? hook) => SharpEmu.HLE.GpuMemory.TrackedRegion.AfterCpuDirtyingCountedForTests = hook;
+    }
+
     [Fact]
     public void VerifyWithoutAnInterveningWriteAgrees()
     {

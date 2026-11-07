@@ -26,10 +26,14 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 //
 // =2 runs the light answer and the real path on every read obtain and light V#, uses the real answer and counts
 // mismatches (the first ones are printed as [GPU][LITE_OBTAIN_WRONG] kind=verify|find_verify). A light "clean" that a
-// CPU write of the range's 4 MB blocks overtook between the two (TrackedRegion.CpuDirtyings moved) is counted as raced:
-// that write was not ordered before the submission being recorded (CpuDirtySummary), so the real path answering a
-// moment later sees it by timing only. The shadow probe (SHARPEMU_LITE_OBTAIN_PROBE) had the same window and printed
-// its four races as fast_wrong. wrong (unraced) must be 0.
+// CPU write of the range's 4 MB blocks overtook between the two is counted as raced: that write was not ordered before
+// the submission being recorded (CpuDirtySummary; a write fault marks the page before the store retries), so the real
+// path answering a moment later sees it by timing only. The witness is TrackedRegion.CpuDirtyPublications, which a
+// region bumps after it published a page turning dirty in its bits and its block summary, sampled before the light
+// check and after the real path. (The first cut used CpuDirtyings, which ChangeState bumps before the bits: a dirtying
+// in flight at the light check read as unraced, the likely cause of the two wrongs of lo2 at the most CPU-written
+// range, 0x141E297E0.) The shadow probe (SHARPEMU_LITE_OBTAIN_PROBE) had the same window and printed its races as
+// fast_wrong. wrong (unraced) must be 0.
 //
 // [PERF][LITE_OBTAIN_USE] mode=1 obtains=N lite=N slow=pub:N,cpu:N,img:N,hot:N,cross:N,unmapped:N,guard:N finds=N
 //     find_lite=N find_slow=N verified=N wrong=N raced=N wrong_total=N find_verified=N find_wrong=N find_wrong_total=N
