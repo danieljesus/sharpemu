@@ -416,3 +416,33 @@ Medido el 06-11 en partida (ventanas de 5 s, `y2a`/`y2b`/`y2c` en `%TEMP%\gta`),
   - SDN: SD + `SHARPEMU_SLICE_DCC_NATIVE=1` (solo si `lookup_detail` muestra `dcc_metadata_native`);
   - SB: SD + `SHARPEMU_FRONT_SLICE_DISPATCHES=1`;
   - SB6: SB con `SHARPEMU_RENDER_WORKERS=6`.
+
+### 3b medido, suelo serie y 3c (07-11, tarde)
+- **Medido** (`sba`/`sd1`/`sbx1`, ventanas estables, por fotograma) [V]. Hilo de render = `draw_ms + dispatch_ms + slice_handoff + slice_join_wait + slice_join + slice_inline`:
+  - A: 136 ms (23,8 µs/ítem); SD: 122 ms; SB: 142 ms (`join_wait` 28,7, `join` 14,5 en ~700 segmentos, `inline` 54 con 1.177 `short` y 577 `serial`, de ellos 530 `indirect_thread_dispatch`); SB6 peor (151,8).
+- **Suelo serie** (lo que queda si toda espera y todo ítem en línea desaparecen) [V, `sbx1` 31–47]:
+  - draw tomado: `draw_ms/draws` = 19,6/4.330 = **4,5 µs** (A resuelve a 3,3: +1,2 µs de captura, incluido `MarkPendingWrites`, que en serie no corre porque la secuencia es 0);
+  - dispatch tomado: `dispatch_ms/dispatches` ≈ **14 µs** (11,8–16,4; A sin grabar 10,7);
+  - otros ítems: 1,1 µs × ~1.700 = 1,9 ms; reparto ~1 ms;
+  - unión: **18 µs/segmento** en `sbx1` (12,5/690, segmentos pequeños) y 32–45 en `sd1` (con su `FlushDeferred` cada uno);
+  - a 4.500 draws y 1.200 dispatches: 20,3 + 16,8 + 1,9 + 1 + (92 a 340 segmentos × 32 µs = 3–11) = **43–51 ms**. Por debajo de 60: el suelo no cierra la línea, pero 50 ms exige además quitar el coste de captura y de unión por segmento (3d).
+  - Trabajadores: grabar cuesta 20–27 µs/ítem en ellos y en línea; 5.700 ítems / 4 = 29–38 ms de pared, por debajo del suelo del hilo de render si se solapan.
+  - Fuera de los cubos de `PARRES` quedan ~16 ms por fotograma (143 ms de pared frente a 126,6 sumados en `sbx1` w35).
+- **Corrección:** los 530–700 `indirect_thread_dispatch` no son `DispatchIndirectDeferred` (con `SHARPEMU_GPU_THREAD_INDIRECT` por defecto los indirectos por hilos van como `FrontDispatch` con dirección de argumentos). Son `FrontDispatch` tomados que el trabajador devuelve (`RenderRecorder.Compute.cs`, `TryDispatchIndirectThreads`).
+- **`SHARPEMU_SLICE_THREAD_INDIRECT=1`** (apagado): el trabajador los graba como ya graba los indirectos por grupos (`TryDispatchIndirect`): el búfer de cuentas es un uso del slice (`ObtainBufferForSlice`, validado y sincronizado en la unión) y la copia a los datos del shader del propio dispatch y el dispatch indirecto van a su búfer, con las mismas barreras. Las sondas de argumentos ya obligan a serie (`NeedsSerialDispatch`).
+- **`SHARPEMU_FRONT_SLICE_DEFER=1`** (3c, apagado):
+  - Lo que hace exacto un ítem que no se toma es que corra tras unir todo, porque toca estado del host (memoria del guest, caché de búferes, estado de imágenes) que leen la unión y la grabación de lo abierto. Grabarlo ya en su propio búfer no es exacto: sus transiciones de imagen y subidas se calcularían sobre el estado anterior a los slices sin unir. **3c no graba el ítem de corte ahora: lo deja en su sitio y lo corre el hilo de render al unir**.
+  - Eso vale para los *posts* de upstream: lo que el hilo de comandos de upstream manda al de render sin esperar (`Post`): `Flush`, `FlushFrame`, el contexto de cola de `BeginSubmission`, `RecordEndOfPipe` y `TriggerInterrupt`. Van como `FrontPost`, y el slice los toma como unidades de render: el trabajador cierra ahí su segmento (Serial «render unit») y sigue, y la unión los corre entre el segmento anterior y el siguiente. La parte de `BeginSubmission` que lee la resolución de lo que sigue (el estado de traducción) corre al tomarla, como en upstream.
+  - Los posts con rango (`WriteGuest`, `FillBuffer`, `CopyBuffer`: `PostRange` en upstream, con sombras y esperas por rango) y todo lo demás siguen uniendo antes de correr.
+  - Unión perezosa: los slices llenos se unen en cuanto su trabajador acaba (`JoinReady` tras cada ítem tomado), y el más viejo se espera si hay más de `SHARPEMU_FRONT_SLICE_AHEAD` (2 × trabajadores) pendientes.
+  - Todas las guardas de 3a/3b siguen (lectura que solapa una escritura pendiente, comprobación de preparación con un escritor abierto, ítem no tomado, fin de `RunPending`, `AfterItem`).
+- **Sonda nueva** (con `PARRES_PROBE`):
+  - `slice_capture=draws:n/prep_us/mark_us/exec_us/post_us,dispatches:…`: dónde va el coste por ítem tomado (comprobación de la preparación, `MarkPendingWrites`, resto de la resolución y captura, y lo que hace `RunCaptured` después);
+  - `slice_cuts=[método:n]`: qué ítems no tomados unen lo abierto. Es el censo que decide cuánto puede quitar 3c: solo quita los cortes que sean posts.
+- **Brazos** (con `SHARPEMU_RENDER_PIPELINE=1 SHARPEMU_PARRES_PROBE=1 SHARPEMU_FPS_LOG=1 SHARPEMU_FRONT_SLICES=1 SHARPEMU_SLICE_STENCIL_PLANE=1 SHARPEMU_FRONT_SLICE_DISPATCHES=1`, 4 trabajadores):
+  - SB: tal cual (da el censo `slice_cuts` y `slice_capture` sobre 3b);
+  - SBT: SB + `SHARPEMU_SLICE_THREAD_INDIRECT=1`;
+  - SBTD: SBT + `SHARPEMU_FRONT_SLICE_DEFER=1`.
+- **Esperado [E]** (con la advertencia de que las estimaciones anteriores salieron ~2× optimistas):
+  - SBT: −530–630 ítems `serial` y otros tantos segmentos: `inline` −10 a −15 ms y `join` −8 a −10 ms;
+  - SBTD: depende del censo. Si los posts son la mayoría de los ~250 cortes por fotograma, desaparecen con ellos `join_wait` y los `short` de esos cortes; si dominan `WriteGuest` u otros, ganancia pequeña. Puerta de Daniel: hilo de render ≤ 90 ms con ~4.500/1.200 y 4 trabajadores.

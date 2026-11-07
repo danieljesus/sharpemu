@@ -342,6 +342,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
             void Run(Action work);
 
+            // [local] SHARPEMU_FRONT_SLICE_DEFER: after a taken item ran and was timed.
+            void AfterTaken();
+
             void Flush(FrontSliceFlush reason);
         }
 
@@ -541,6 +544,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 if (probeStarted != 0) ParallelResolveProbe.EndItem(work, System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted); // [local]
+                if (taken) // [local] SHARPEMU_FRONT_SLICE_DEFER: the slices that are done join here, outside the item's timing
+                {
+                    try
+                    {
+                        slicer!.AfterTaken();
+                    }
+                    catch (Exception exception)
+                    {
+                        Fail(exception);
+                        throw;
+                    }
+                }
                 if (Lookahead is { } offer) // [local] only once the item ran: what follows sees its effects
                 {
                     var aheadStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
@@ -654,12 +669,50 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             _queueId = queueId;
             _geometrySnapshots = geometrySnapshots is not null;
+            if (PostsDeferred) // [local] SHARPEMU_FRONT_SLICE_DEFER: the translation state at once, the queue context in order
+            {
+                var post = new FrontPost(() => presenter.BeginSubmission(queueId, submissionId, geometrySnapshots),
+                    now: () => presenter.BeginSubmissionTranslation(queueId, submissionId, geometrySnapshots),
+                    later: () => presenter.BeginSubmissionInOrder(queueId, submissionId));
+                queue.Enqueue(post.Run);
+                return;
+            }
+
             queue.Enqueue(() => presenter.BeginSubmission(queueId, submissionId, geometrySnapshots));
         }
 
-        public void Flush() => queue.Enqueue(_flush, _pauseAlias, _resumeAlias);
+        public void Flush() => queue.Enqueue(PostsDeferred ? _flushPost : _flush, _pauseAlias, _resumeAlias);
 
-        public void FlushFrame() => queue.Enqueue(_flushFrame, _pauseAlias, _resumeAlias);
+        public void FlushFrame() => queue.Enqueue(PostsDeferred ? _flushFramePost : _flushFrame, _pauseAlias, _resumeAlias);
+
+        // [local] SHARPEMU_FRONT_SLICE_DEFER: the items upstream's command thread posts to the render thread without waiting
+        // (Flush, EndFrame, BeginSubmissionContext, RecordEndOfPipe, TriggerInterrupt) are queued as FrontPost, which the
+        // front slices take as render units instead of joining (FrontSlices.Defer).
+        private static readonly bool PostsDeferred = FrontSlicesEnabled && FrontSlices.Defer;
+
+        private readonly Action _flushPost = new FrontPost(presenter.Flush).Run;
+        private readonly Action _flushFramePost = new FrontPost(presenter.FlushFrame).Run;
+
+        // [local] SHARPEMU_FRONT_SLICE_DEFER: a post. Not taken (nothing open, or the slices are off), Run does all of it here.
+        // Taken, RunNow does at once what the resolution of the items after it reads, and Work (`later`, or all of it) runs
+        // in stream order when the slice it sits in is joined.
+        internal sealed class FrontPost
+        {
+            private readonly Action _run;
+            private readonly Action? _now;
+            internal readonly FrontPostWork Work;
+
+            public FrontPost(Action run, Action? now = null, Action? later = null)
+            {
+                _run = run;
+                _now = now;
+                Work = new FrontPostWork(later ?? run);
+            }
+
+            public void Run() => _run();
+
+            public void RunNow() => _now?.Invoke();
+        }
 
         public void FlushAndWait() { FrontSyncStats.Note(3); queue.Run(() => { presenter.FlushAndWait(); return true; }, _pauseAlias, _resumeAlias); }
 
@@ -692,12 +745,24 @@ internal static unsafe partial class VulkanVideoPresenter
             if (LabelTrace.Enabled && (write.EventId != 0 || write.Kind is EndOfPipeWriteKind.InterruptOnly || LabelTrace.IsWatched(write.Destination)))
                 LabelTrace.Note(LabelTrace.Kind.EopFront, _queueId, write.Destination, write.Value, (ulong)write.Kind | ((ulong)(uint)write.EventId << 8));
             var copy = write;
+            if (PostsDeferred) // [local] SHARPEMU_FRONT_SLICE_DEFER
+            {
+                queue.Enqueue(new FrontPost(() => presenter.RecordEndOfPipe(in copy)).Run, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             queue.Enqueue(() => presenter.RecordEndOfPipe(in copy), _pauseAlias, _resumeAlias);
         }
 
         public void TriggerInterrupt(int eventId, uint contextId)
         {
             if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.FrontTrigger, _queueId, 0, (ulong)(uint)eventId, contextId);
+            if (PostsDeferred) // [local] SHARPEMU_FRONT_SLICE_DEFER
+            {
+                queue.Enqueue(new FrontPost(() => presenter.TriggerInterrupt(eventId, contextId)).Run, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             queue.Enqueue(() => presenter.TriggerInterrupt(eventId, contextId), _pauseAlias, _resumeAlias);
         }
 
@@ -794,6 +859,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     var rangesVerify = false; // [local] SHARPEMU_FRONT_PREP_RANGES=2
                     var lent = Prepared;
+                    var prepStarted = ParallelResolveProbe.CaptureKind >= 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] slice_capture
                     if (Prepared is null)
                         FrontPrepReads.Release(PrepPages);
                     else if (!host.Presenter.BeforeFrontPreparationCheck(PrepPages) || // [local] SHARPEMU_FRONT_SLICE_DISPATCHES
@@ -802,6 +868,8 @@ internal static unsafe partial class VulkanVideoPresenter
                         Prepared = null;
                         Inputs = default;
                     }
+
+                    if (prepStarted != 0) ParallelResolveProbe.AddPrepTicks(System.Diagnostics.Stopwatch.GetTimestamp() - prepStarted);
 
                     if (Prepared is not null && (FrontPrepVerify.Enabled || rangesVerify)) // [local] SHARPEMU_FRONT_PREP_VERIFY
                         Prepared = Presenter.VerifyGraphics(Prepared, ref Inputs, Prepare, rangesVerify);
@@ -839,11 +907,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     var presenter = host.Presenter;
                     var rangesVerify = false;
+                    var prepStarted = ParallelResolveProbe.CaptureKind >= 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] slice_capture
                     if (Prepared is null)
                         FrontPrepReads.Release(PrepPages);
                     else if (!presenter.BeforeFrontPreparationCheck(PrepPages) ||
                              !presenter.FrontPreparationStillValid(version, PrepPages, out rangesVerify) || !presenter.TablesStillValid(tableMark))
                         Prepared = null;
+                    if (prepStarted != 0) ParallelResolveProbe.AddPrepTicks(System.Diagnostics.Stopwatch.GetTimestamp() - prepStarted);
                     if (Prepared is not null && (FrontPrepVerify.Enabled || rangesVerify))
                         Prepared = Presenter.VerifyCompute(Prepared, prepareOnFront, rangesVerify);
                     if (Speculated is not null)

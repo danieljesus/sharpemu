@@ -16,8 +16,10 @@ public sealed partial class RenderExecutor
         record.Sequence = _recorder.NextSequence();
         if (record.Sequence != 0)
         {
+            var probeStarted = VideoOut.ParallelResolveProbe.CaptureKind >= 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] slice_capture
             using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.ExecMark)) // [local]
                 MarkPendingWrites(record);
+            if (probeStarted != 0) VideoOut.ParallelResolveProbe.AddMarkTicks(System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted);
         }
 
         _recorder.Record(record);
@@ -28,7 +30,9 @@ public sealed partial class RenderExecutor
         record.Sequence = _recorder.NextSequence();
         if (record.Sequence != 0)
         {
+            var probeStarted = VideoOut.ParallelResolveProbe.CaptureKind >= 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] slice_capture
             MarkPendingWrites(record);
+            if (probeStarted != 0) VideoOut.ParallelResolveProbe.AddMarkTicks(System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted);
         }
 
         _recorder.Record(record);

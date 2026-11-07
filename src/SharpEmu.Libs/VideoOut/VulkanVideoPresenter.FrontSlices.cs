@@ -40,6 +40,14 @@ internal static unsafe partial class VulkanVideoPresenter
         internal Action FrontSliceRelay => RunRelayBetweenCommandItems;
     }
 
+    // [local] SHARPEMU_FRONT_SLICE_DEFER: a queued item the slices take without joining (FrontPost): the render thread runs
+    // `Run` in stream order when it joins the slice the item sits in, between the segment before it and the one after it.
+    // A worker never records it: it ends its segment there (Serial "render unit") and goes on with the next item.
+    internal sealed record FrontPostWork(Action Run) : AgcExports.DeferredWork
+    {
+        public override int CostKind => Diagnostics.ItemCostTally.Other;
+    }
+
     // [local] SHARPEMU_FRONT_SLICES: the queued item whose banks a captured record reads.
     internal interface IFrontSliceOwner
     {
@@ -53,6 +61,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // The draw whose banks the record reads; set on the last record of the draw.
         public IFrontSliceOwner? Owner;
+
+        // [local] A taken dispatch: it writes memory (FrontSlices.OpenWriters until it ends).
+        public bool Writer;
     }
 
     // [local] SHARPEMU_FRONT_SLICES=1 (increment 3a of docs/plan-parallel-resolution-open-world.md §10), on the render
@@ -91,6 +102,26 @@ internal static unsafe partial class VulkanVideoPresenter
         // A worker records the dispatch as upstream's slices do (Serial for what needs the render thread); ordering in the
         // command buffers is the stream order, segment by segment.
         internal static readonly bool Dispatches = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_DISPATCHES") == "1";
+
+        // [local] SHARPEMU_FRONT_SLICE_DEFER=1 (step 3c, off by default): the render thread joins only where it must.
+        //  - Posts (FrontCommandStreamHost.FrontPost: Flush, FlushFrame, the queue context of BeginSubmission, end-of-pipe
+        //    writes and interrupts) no longer join what is open: they are added to the open run as render units. The
+        //    render thread runs one in stream order when it joins the slice it sits in, after the segment before it and
+        //    before the one after it (the worker ends its segment there, Serial "render unit"), so what it records lands in
+        //    the command buffers exactly where it would in serial. What a post changes that the resolution of the items
+        //    after it reads runs at once instead (BeginSubmission's translation state), as upstream's command thread runs
+        //    it before it posts the rest (VulkanVideoPresenter.CommandStream.cs, OnCommandThread). The posts are the ones
+        //    upstream's command thread posts to the render thread without waiting (Post); the ranged ones (PostRange:
+        //    WriteGuest, FillBuffer, CopyBuffer) and everything else still join first.
+        //  - Full slices are joined as soon as their workers are done (JoinReady after each taken item), and the oldest
+        //    one is waited for when more than SHARPEMU_FRONT_SLICE_AHEAD (2 x workers) are pending, instead of all of them
+        //    at the next item that is not taken.
+        //  - Every guard of 3a/3b stays: a guest read overlapping a pending write, a preparation check with a taken writer
+        //    open, an item not taken, the end of RunPending and AfterItem join everything first.
+        internal static readonly bool Defer = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_DEFER") == "1";
+
+        internal static readonly int Ahead =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_AHEAD"), out var ahead) && ahead > 0 ? ahead : 0;
 
         private readonly Presenter _presenter;
         private readonly Action _barrier;
@@ -131,8 +162,37 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            if (Defer && work.Target is FrontCommandStreamHost.FrontPost && _cutter.HasOpen && _presenter.SlicesEnabled)
+            {
+                return true;
+            }
+
+            if (ParallelResolveProbe.Enabled && _cutter.HasOpen) // [local] SHARPEMU_PARRES_PROBE: slice_cuts
+            {
+                NoteCut(work);
+            }
+
             Flush(FrontSliceFlush.Item);
             return false;
+        }
+
+        private readonly Dictionary<System.Reflection.MethodInfo, string> _cutNames = new();
+
+        private void NoteCut(Action work)
+        {
+            if (work.Target is FrontCommandStreamHost.FrontDraw)
+            {
+                FrontSliceStats.Shared.NoteCut("FrontDraw");
+                return;
+            }
+
+            if (!_cutNames.TryGetValue(work.Method, out var name))
+            {
+                name = $"{work.Method.DeclaringType?.Name}.{work.Method.Name}";
+                _cutNames[work.Method] = name;
+            }
+
+            FrontSliceStats.Shared.NoteCut(name);
         }
 
         public void Run(Action work)
@@ -151,7 +211,24 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (work.Target is FrontCommandStreamHost.FrontPost post)
+            {
+                post.RunNow();
+                _cutter.Add(NewItem(post.Work, 0, null));
+                return;
+            }
+
             _cutter.Add(NewItem(AgcExports.GlobalBarrierWork.Instance, 0, null));
+        }
+
+        // [local] SHARPEMU_FRONT_SLICE_DEFER: after a taken item, outside its probe timing (the joins have their own buckets):
+        // the full slices whose workers are done, in order (FrontSliceCutter.JoinReady).
+        public void AfterTaken()
+        {
+            if (Defer && _cutter.PendingSlices != 0)
+            {
+                _ = _cutter.JoinReady(Ahead > 0 ? Ahead : 2 * Math.Max(_presenter.WorkerCount, 1));
+            }
         }
 
         public void Flush(FrontSliceFlush reason)
@@ -163,11 +240,27 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        // [local] A taken writer ended (joined or run here): with SHARPEMU_FRONT_SLICE_DEFER the run it was in may stay open.
+        private void EndWriter(FrontSliceItem item)
+        {
+            if (item.Writer)
+            {
+                item.Writer = false;
+                if (_openWriters > 0)
+                {
+                    _openWriters--;
+                }
+            }
+        }
+
         private void RunCaptured(Action work, IFrontSliceOwner? owner)
         {
             _thread = Environment.CurrentManagedThreadId;
             _captured.Clear();
             var translation = _presenter._translation;
+            var kind = owner is null ? 1 : 0;
+            var probeStarted = ParallelResolveProbe.Enabled ? Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE: slice_capture
+            if (probeStarted != 0) ParallelResolveProbe.CaptureKind = kind;
             translation.BeginSliceCapture(_captured);
             try
             {
@@ -176,8 +269,27 @@ internal static unsafe partial class VulkanVideoPresenter
             finally
             {
                 translation.EndSliceCapture();
+                ParallelResolveProbe.CaptureKind = -1;
             }
 
+            var workDone = probeStarted != 0 ? Stopwatch.GetTimestamp() : 0;
+            try
+            {
+                SortCaptured(owner);
+            }
+            finally
+            {
+                if (probeStarted != 0)
+                {
+                    ParallelResolveProbe.CaptureItems[kind]++;
+                    ParallelResolveProbe.CaptureWorkTicks[kind] += workDone - probeStarted;
+                    ParallelResolveProbe.CapturePostTicks[kind] += Stopwatch.GetTimestamp() - workDone;
+                }
+            }
+        }
+
+        private void SortCaptured(IFrontSliceOwner? owner)
+        {
             if (_captured.Count == 0)
             {
                 owner?.ReleaseSnapshot();
@@ -191,12 +303,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 var last = index == _captured.Count - 1 ? owner : null;
                 if (!inline && AgcExports.CommandStreamTranslation.IsSliceableRecord(captured, Dispatches))
                 {
+                    var item = NewItem(captured, AgcExports.CommandStreamTranslation.SequenceOf(captured), last);
                     if (captured.IsDispatch)
                     {
                         _openWriters++;
+                        item.Writer = true;
                     }
 
-                    _cutter.Add(NewItem(captured, AgcExports.CommandStreamTranslation.SequenceOf(captured), last));
+                    _cutter.Add(item);
                     continue;
                 }
 
@@ -264,9 +378,10 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var item = _spare.Count != 0 ? _spare.Pop() : new FrontSliceItem();
             item.Item.Work = work;
-            item.Item.IsDraw = work is not AgcExports.GlobalBarrierWork && !work.IsDispatch;
+            item.Item.IsDraw = work is not (AgcExports.GlobalBarrierWork or FrontPostWork) && !work.IsDispatch;
             item.Item.Sequence = sequence;
             item.Owner = owner;
+            item.Writer = false;
             return item;
         }
 
@@ -275,6 +390,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // that item as soon as it has the segment. NewItem only reuses items after every slice of the flush finished.
         private void Return(FrontSliceItem item)
         {
+            EndWriter(item);
             item.Owner?.ReleaseSnapshot();
             item.Owner = null;
             _spare.Push(item);
@@ -283,7 +399,10 @@ internal static unsafe partial class VulkanVideoPresenter
         private void RunWork(AgcExports.DeferredWork work)
         {
             var started = Stopwatch.GetTimestamp();
-            _presenter.RunFrontSliceWork(work);
+            if (work is FrontPostWork post) // [local] SHARPEMU_FRONT_SLICE_DEFER: a render unit, in stream order
+                post.Run();
+            else
+                _presenter.RunFrontSliceWork(work);
             ParallelResolveProbe.SliceInlineTicks += Stopwatch.GetTimestamp() - started;
             ParallelResolveProbe.SliceInlineItems++;
         }
@@ -315,6 +434,8 @@ internal static unsafe partial class VulkanVideoPresenter
             slice.Done.Set();
             return true;
         }
+
+        bool FrontSliceCutter<FrontSliceItem, RenderSlice>.IBackend.IsDone(RenderSlice slice) => slice.Done.IsSet;
 
         bool FrontSliceCutter<FrontSliceItem, RenderSlice>.IBackend.NextSegment(RenderSlice slice, out FrontSliceSegment segment)
         {

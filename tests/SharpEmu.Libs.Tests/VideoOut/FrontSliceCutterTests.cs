@@ -20,6 +20,7 @@ public sealed class FrontSliceCutterTests
         public bool Stolen;
         public readonly HashSet<int> Invalid = new();
         public bool Finished;
+        public bool Done;
     }
 
     private sealed class Backend : FrontSliceCutter<int, FakeSlice>.IBackend
@@ -53,6 +54,8 @@ public sealed class FrontSliceCutterTests
         }
 
         public bool TryClaim(FakeSlice slice) => slice.Stolen;
+
+        public bool IsDone(FakeSlice slice) => slice.Done;
 
         // Read on each segment wait: whether the cutter says the slice was handed out at the cut.
         public Func<bool>? JoiningRest;
@@ -400,6 +403,108 @@ public sealed class FrontSliceCutterTests
         Assert.True(FrontSliceGuards.PreparationNeedsJoin(pages, (address, size) => PendingAt(0x40000, address, size)));
     }
 
+    // [local] SHARPEMU_FRONT_SLICE_DEFER: a full slice whose worker is done is joined before the items after it are flushed;
+    // one that is not stays pending, and the flush joins it in order before the later slices.
+    [Fact]
+    public void JoinReadyJoinsTheDoneSlicesInOrderAndStopsAtTheFirstNotDone()
+    {
+        var (cutter, backend, _) = Create(sliceItems: 10);
+        var dispatched = 0;
+        backend.Script = slice =>
+        {
+            slice.Done = dispatched++ != 1;
+            slice.Segments.Enqueue(new FrontSliceSegment(0, slice.Count, false, null, null));
+        };
+        AddRange(cutter, 30);
+        Assert.Equal(3, cutter.PendingSlices);
+
+        Assert.Equal(1, cutter.JoinReady(ahead: 8));
+        Assert.Equal(Enumerable.Range(0, 10), backend.Ended);
+        Assert.Equal(2, cutter.PendingSlices);
+        Assert.True(cutter.HasOpen);
+
+        AddRange(cutter, 30, 35);
+        cutter.Flush(FrontSliceFlush.Item);
+        Assert.Equal(Enumerable.Range(0, 35), backend.Ended);
+        Assert.Equal(new[] { "short 30", "short 31", "short 32", "short 33", "short 34" }, backend.Log.TakeLast(5));
+        Assert.All(backend.Slices, slice => Assert.True(slice.Finished));
+        Assert.Equal(0, cutter.PendingSlices);
+        Assert.False(cutter.HasOpen);
+    }
+
+    // [local] SHARPEMU_FRONT_SLICE_DEFER: with more than `ahead` pending, the oldest is joined even if its worker is not done.
+    [Fact]
+    public void JoinReadyJoinsTheOldestWhenTooManyArePending()
+    {
+        var (cutter, backend, _) = Create(sliceItems: 4);
+        AddRange(cutter, 16);
+        Assert.Equal(4, cutter.PendingSlices);
+
+        Assert.Equal(2, cutter.JoinReady(ahead: 2));
+        Assert.Equal(Enumerable.Range(0, 8), backend.Ended);
+        Assert.Equal(0, cutter.JoinReady(ahead: 2));
+
+        cutter.Flush(FrontSliceFlush.Exit);
+        Assert.Equal(Enumerable.Range(0, 16), backend.Ended);
+    }
+
+    // [local] SHARPEMU_FRONT_SLICE_DEFER: render units (posts) sit in the slices; the worker ends a segment at each one (Serial,
+    // resumable) and the render thread runs it between the segments around it. Across partial joins, a stolen slice and a
+    // rest split at the flush, every item ends once and in stream order.
+    [Fact]
+    public void RenderUnitsRunBetweenTheirSegmentsAcrossPartialJoins()
+    {
+        static bool IsUnit(int item) => item % 7 == 3;
+        var (cutter, backend, stats) = Create(sliceItems: 12, minimumItems: 4);
+        var dispatched = 0;
+        backend.Script = slice =>
+        {
+            slice.Done = true;
+            if (dispatched++ == 2)
+            {
+                slice.Stolen = true;
+                return;
+            }
+
+            var first = 0;
+            for (var index = 0; index < slice.Count; index++)
+            {
+                if (IsUnit(slice.Start + index))
+                {
+                    slice.Segments.Enqueue(new FrontSliceSegment(first, index - first, true, "render unit", null));
+                    first = index + 1;
+                }
+            }
+
+            if (first < slice.Count)
+            {
+                slice.Segments.Enqueue(new FrontSliceSegment(first, slice.Count - first, false, null, null));
+            }
+            else
+            {
+                slice.Resume = slice.Count;
+            }
+        };
+
+        for (var item = 0; item < 60; item++)
+        {
+            cutter.Add(item);
+            _ = cutter.JoinReady(ahead: 4);
+        }
+
+        cutter.Flush(FrontSliceFlush.Exit);
+
+        Assert.Equal(Enumerable.Range(0, 60), backend.Ended);
+        foreach (var unit in Enumerable.Range(0, 60).Where(IsUnit).Where(unit => unit is < 24 or >= 36))
+        {
+            Assert.Contains($"serial {unit}", backend.Log);
+        }
+
+        Assert.Contains("stolen 24", backend.Log);
+        Assert.Equal(0, stats.Inline[(int)FrontSliceInline.Short]);
+        Assert.All(backend.Slices, slice => Assert.True(slice.Finished));
+    }
+
     private sealed class ReentrantBackend(Backend inner, Action onEnd) : FrontSliceCutter<int, FakeSlice>.IBackend
     {
         public int Workers => inner.Workers;
@@ -407,6 +512,8 @@ public sealed class FrontSliceCutterTests
         public FakeSlice Dispatch(List<int> items, int start, int count) => inner.Dispatch(items, start, count);
 
         public bool TryClaim(FakeSlice slice) => inner.TryClaim(slice);
+
+        public bool IsDone(FakeSlice slice) => inner.IsDone(slice);
 
         public bool NextSegment(FakeSlice slice, out FrontSliceSegment segment) => inner.NextSegment(slice, out segment);
 

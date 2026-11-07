@@ -889,9 +889,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     var probeStarted = started; // [local] SHARPEMU_PARRES_PROBE: after BeginSegment
                     try
                     {
-                        if (!_presenter._translation.CanRecordDeferred(slice.Items[index].Work!))
+                        var renderUnit = slice.Items[index].Work is FrontPostWork; // [local] SHARPEMU_FRONT_SLICE_DEFER: the render thread runs it
+                        if (renderUnit || !_presenter._translation.CanRecordDeferred(slice.Items[index].Work!))
                         {
-                            const string reason = "unresolved draw";
+                            var reason = renderUnit ? "render unit" : "unresolved draw";
                             Interlocked.Increment(ref _serialReasons.GetOrAdd(reason, static _ => new StrongBox<long>()).Value);
                             if (segment is null)
                             {

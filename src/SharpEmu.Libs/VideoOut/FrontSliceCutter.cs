@@ -68,6 +68,12 @@ internal sealed class FrontSliceStats
     public readonly long[] Flushes = new long[(int)FrontSliceFlush.Count];
     public readonly Dictionary<string, long> SerialReasons = new();
 
+    // [local] SHARPEMU_PARRES_PROBE: the items that were not taken while something was open (each one joins everything),
+    // by the queued work's method.
+    public readonly Dictionary<string, long> Cuts = new();
+
+    public void NoteCut(string name) => Cuts[name] = Cuts.GetValueOrDefault(name) + 1;
+
     public void NoteSerial(string? reason)
     {
         var key = reason ?? "unknown";
@@ -87,6 +93,9 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
 
         // True when no worker started the slice: this thread runs its items.
         bool TryClaim(TSlice slice);
+
+        // [local] SHARPEMU_FRONT_SLICE_DEFER: the slice's worker is done with it, so joining it does not wait.
+        bool IsDone(TSlice slice);
 
         // The slice's next finished segment in order; false once its worker is done with it.
         bool NextSegment(TSlice slice, out FrontSliceSegment segment);
@@ -115,6 +124,9 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
     private int _cutStart;
     private bool _joining;
 
+    // [local] SHARPEMU_FRONT_SLICE_DEFER: the slices handed out at full size that were joined before the flush (JoinReady).
+    private int _joined;
+
     public const int SplitItems = 32;
     public const int PartItems = 16;
 
@@ -136,6 +148,45 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
     public bool JoiningRest { get; private set; }
 
     public int OpenItems => _items.Count;
+
+    // [local] SHARPEMU_FRONT_SLICE_DEFER: slices handed out and not joined yet.
+    public int PendingSlices => _slices.Count - _joined;
+
+    // [local] SHARPEMU_FRONT_SLICE_DEFER: joins, in stream order and before any later slice, the oldest slices handed out at
+    // full size whose workers are done, and the oldest one even if its worker is not when more than `ahead` are pending.
+    // The items after them stay open: they are joined by a later JoinReady or the flush. Nothing else is touched, so the
+    // order every item ends in is the same as with a flush at the end. Returns the number of slices joined.
+    public int JoinReady(int ahead)
+    {
+        if (_joining || _joined == _slices.Count)
+        {
+            return 0;
+        }
+
+        var joined = 0;
+        _joining = true;
+        try
+        {
+            while (_joined < _slices.Count)
+            {
+                var (slice, start, count, _) = _slices[_joined];
+                if (_slices.Count - _joined <= ahead && !_backend.IsDone(slice))
+                {
+                    break;
+                }
+
+                _joined++;
+                Join(slice, start, count);
+                joined++;
+            }
+        }
+        finally
+        {
+            _joining = false;
+        }
+
+        return joined;
+    }
 
     public void Add(TItem item)
     {
@@ -187,8 +238,9 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
                 }
             }
 
-            foreach (var (slice, start, count, isRest) in _slices)
+            for (var index = _joined; index < _slices.Count; index++)
             {
+                var (slice, start, count, isRest) = _slices[index];
                 JoiningRest = isRest;
                 Join(slice, start, count);
             }
@@ -203,6 +255,7 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
             _slices.Clear();
             _items.Clear();
             _cutStart = 0;
+            _joined = 0;
             _joining = false;
             JoiningRest = false;
         }

@@ -40,7 +40,14 @@ public sealed class FrontSliceBackQueueTests
         {
             Log.Add("take " + Names[work]);
             _open++;
+            _last = Names[work];
         }
+
+        // [local] SHARPEMU_FRONT_SLICE_DEFER: AfterTaken follows each taken item, kept apart from Log.
+        public readonly List<string> After = new();
+        private string? _last;
+
+        public void AfterTaken() => After.Add(_last!);
 
         public void Flush(FrontSliceFlush reason)
         {
@@ -72,6 +79,18 @@ public sealed class FrontSliceBackQueueTests
             "take D3",
             "join exit 1",
         }, slicer.Log);
+    }
+
+    [Fact]
+    public void AfterTakenFollowsEveryTakenItemAndNoOther()
+    {
+        var slicer = new Slicer();
+        var queue = new VulkanVideoPresenter.BackQueue(static () => { }, 64) { Slicer = slicer };
+        foreach (var name in new[] { "D1", "D2", "B1", "X", "B2", "D3" })
+            queue.Enqueue(slicer.Item(name));
+
+        Assert.Equal(6, queue.RunPending(long.MaxValue));
+        Assert.Equal(new[] { "D1", "D2", "B1", "D3" }, slicer.After);
     }
 
     [Fact]

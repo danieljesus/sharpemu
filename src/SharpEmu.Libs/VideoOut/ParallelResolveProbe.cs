@@ -132,6 +132,43 @@ internal static class ParallelResolveProbe
     // [local] Render thread: the items it ran after all (slice_inline) and the joins caused by the front's preparation check.
     internal static long SliceInlineItems;
 
+    // [local] SHARPEMU_FRONT_SLICES, render thread: where a captured draw's or dispatch's time goes (slice_capture=). `prep`
+    // is the front preparation's check at the item (BeforeFrontPreparationCheck, FrontPreparationStillValid,
+    // TablesStillValid, including the joins it causes), `mark` the executor's MarkPendingWrites, `exec` the rest of the
+    // item's work (ExecuteQueuedDraw/Dispatch: resolution and capture), `post` what RunCaptured does after it (sorting the
+    // records, the cutter's Add with the hand-offs it makes). Indexed by 0 = draw, 1 = dispatch.
+    internal static readonly long[] CaptureItems = new long[2], CaptureWorkTicks = new long[2], CapturePostTicks = new long[2];
+    internal static long CapturePrepTicks0, CapturePrepTicks1, CaptureMarkTicks0, CaptureMarkTicks1;
+    internal static int CaptureKind = -1;
+
+    internal static void AddPrepTicks(long ticks)
+    {
+        if (CaptureKind == 0) CapturePrepTicks0 += ticks;
+        else if (CaptureKind == 1) CapturePrepTicks1 += ticks;
+    }
+
+    internal static void AddMarkTicks(long ticks)
+    {
+        if (CaptureKind == 0) CaptureMarkTicks0 += ticks;
+        else if (CaptureKind == 1) CaptureMarkTicks1 += ticks;
+    }
+
+    private static void AppendCapture(StringBuilder text, double frames)
+    {
+        text.Append(" slice_capture=");
+        for (var kind = 0; kind < 2; kind++)
+        {
+            var items = CaptureItems[kind];
+            var prep = kind == 0 ? CapturePrepTicks0 : CapturePrepTicks1;
+            var mark = kind == 0 ? CaptureMarkTicks0 : CaptureMarkTicks1;
+            text.Append(kind == 0 ? "draws:" : ",dispatches:").Append(CultureInfo.InvariantCulture,
+                $"{items / frames:F0}/prep_us:{PerUnit(prep, items)}/mark_us:{PerUnit(mark, items)}/exec_us:{PerUnit(CaptureWorkTicks[kind] - prep - mark, items)}/post_us:{PerUnit(CapturePostTicks[kind], items)}");
+            CaptureItems[kind] = CaptureWorkTicks[kind] = CapturePostTicks[kind] = 0;
+        }
+
+        CapturePrepTicks0 = CapturePrepTicks1 = CaptureMarkTicks0 = CaptureMarkTicks1 = 0;
+    }
+
     private static string PerUnit(long ticks, long count) =>
         (count == 0 ? 0 : ticks * 1_000_000.0 / Stopwatch.Frequency / count).ToString("F1", CultureInfo.InvariantCulture);
 
@@ -302,6 +339,12 @@ internal static class ParallelResolveProbe
             stats.Flushes[index] = 0;
         }
 
+        AppendCapture(text, frames);
+        text.Append(" slice_cuts=[");
+        text.AppendJoin(",", stats.Cuts.OrderByDescending(pair => pair.Value).Take(12)
+            .Select(pair => string.Create(CultureInfo.InvariantCulture, $"{pair.Key}:{pair.Value / frames:F1}")));
+        text.Append(']');
+        stats.Cuts.Clear();
         text.Append(" slice_serial=[");
         text.AppendJoin(",", stats.SerialReasons.OrderByDescending(pair => pair.Value).Take(8)
             .Select(pair => string.Create(CultureInfo.InvariantCulture, $"{pair.Key.Replace(' ', '_')}:{pair.Value / frames:F1}")));

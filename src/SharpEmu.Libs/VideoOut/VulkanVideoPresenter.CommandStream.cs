@@ -822,6 +822,13 @@ internal static unsafe partial class VulkanVideoPresenter
             _translation.BeginSubmission(queueId, submissionId, geometrySnapshots, _commandStream.GetInterpreter(queueId));
         }
 
+        // [local] SHARPEMU_FRONT_SLICE_DEFER: BeginSubmission in two parts, as the command thread splits it above: the
+        // translation state when the front's item is taken, the queue context in stream order (FrontPost).
+        internal void BeginSubmissionTranslation(int queueId, ulong submissionId, object? geometrySnapshots) =>
+            _translation.BeginSubmission(queueId, submissionId, geometrySnapshots, _commandStream.GetInterpreter(queueId));
+
+        internal void BeginSubmissionInOrder(int queueId, ulong submissionId) => BeginSubmissionContext(queueId, submissionId);
+
         private void BeginSubmissionContext(int queueId, ulong submissionId)
         {
             if (_occlusionQueueId != queueId)
