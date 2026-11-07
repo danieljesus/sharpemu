@@ -219,6 +219,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var (_, guest, _) = RequireGuestMemory("command stream");
             _guestMemory = guest;
+            if (Diagnostics.RepeatProbe.Enabled) Diagnostics.RepeatProbe.Reader = guest.TryRead; // [local] SHARPEMU_REPEAT_PROBE: raw reads, no synchronization
             _endOfPipe = new EndOfPipe(_endOfPipeEvents, this);
             _recording = new RecordingHost(this);
             _translation = AgcExports.CreateCommandStreamTranslation(((ICommandStreamHost)this).Memory, this);
@@ -1398,6 +1399,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // Copies the display surface through the store; presentation shows the copy once its tick retires.
         internal void CaptureFlip(int handle, int index, ulong requestId, int flipMode, long flipArg)
         {
+            Diagnostics.RepeatProbe.NoteFlip(); // [local] SHARPEMU_REPEAT_PROBE: a guest frame ends
             var publication = _capturePublication ?? _guestPublications.LastRecorded(0);
             // A no-buffer flip has no image to capture; its completion still retires in order.
             if (index == -1)

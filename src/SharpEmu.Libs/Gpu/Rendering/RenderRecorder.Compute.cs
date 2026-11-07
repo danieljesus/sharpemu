@@ -133,6 +133,11 @@ internal sealed partial class RenderRecorder
         using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchEndRendering)) // [local]
             _host.EndRendering();
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchEndRendering); // [local] SHARPEMU_DRAWCOST_PROBE
+        if (Diagnostics.RepeatProbe.Enabled && !OnWorker) // [local] SHARPEMU_REPEAT_PROBE: the dispatch's inputs, before its preparation
+        {
+            Diagnostics.RepeatProbe.NoteDispatch(record, computeProgram);
+        }
+
         using (_host.BeginPreparation())
         {
             Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.PrepBegin); // [local]

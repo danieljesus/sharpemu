@@ -497,6 +497,11 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             vertexInput.Stage = meshStage;
         }
 
+        if (Diagnostics.RepeatProbe.Enabled && !OnWorker) // [local] SHARPEMU_REPEAT_PROBE: the draw's inputs, before its bindings
+        {
+            Diagnostics.RepeatProbe.NoteDraw(record, ref state, vertexInput, state.PixelActive ? pixelInput : null);
+        }
+
         IPreparedBindings vertexBindings;
         IPreparedBindings? pixelBindings;
         try
@@ -582,6 +587,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         }
 
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawPipeline); // [local] SHARPEMU_DRAWCOST_PROBE
+        if (Diagnostics.RepeatProbe.Enabled && !OnWorker) Diagnostics.RepeatProbe.NotePipeline(pipeline.Pipeline); // [local] SHARPEMU_REPEAT_PROBE
         if (record.SetBindDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x100);

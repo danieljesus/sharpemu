@@ -234,6 +234,11 @@ internal static class DrawCostProbe
         {
             BeginCore(kind);
         }
+
+        if (RepeatProbe.Enabled) // [local] SHARPEMU_REPEAT_PROBE: the same items, timed on their own
+        {
+            RepeatProbe.Begin(kind == Kind.Dispatch);
+        }
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -327,6 +332,11 @@ internal static class DrawCostProbe
         if (Enabled)
         {
             EndCore();
+        }
+
+        if (RepeatProbe.Enabled) // [local] SHARPEMU_REPEAT_PROBE
+        {
+            RepeatProbe.End();
         }
     }
 
