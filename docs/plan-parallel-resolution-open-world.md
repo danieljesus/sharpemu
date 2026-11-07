@@ -172,7 +172,7 @@ Cada paso va tras un `SHARPEMU_*` apagado por defecto, se mide por mecanismo (ms
 - **Corrección.** El neto de 8–14 ms que preveía este paso estaba mal por ~2×. El frente ya prepara los programas de cada draw, así que en el hilo de render la resolución de draws es como mucho ~9 ms brutos, y esos 9 ms incluyen el cuerpo de la closure y la puerta de la sonda. El grueso es la grabación, que es el paso 3.
 - **El valor del paso ahora:**
   - (a) la tubería que el paso 3 también necesita: draws tipados en la cola (`FrontDraw`), números de secuencia, unión en su posición y lecturas de trabajador sin `CommandThread`;
-  - (b) alivio del frente: los draws del pool se saltan `TryPrepareOnFront`.
+  - (b) ~~alivio del frente: los draws del pool se saltan `TryPrepareOnFront`~~. Retirado el 07-11: se saltaba la preparación de *todos* los draws, no solo de los del pool, y era el coste del brazo C (§9).
 - **Cómo funciona:**
   1. El frente encola un objeto `FrontDraw` (instantánea de bancos, argumentos y registros) en lugar de la closure.
   2. Cuando un ítem ya se ha ejecutado, el hilo de render ofrece al pool los siguientes de la cola, hasta `SHARPEMU_FRONT_RESOLVE_AHEAD` (8 por defecto), mientras pasen la puerta (`DrawHasTargets && DrawKnownNotToWrite`). El recorrido se para en el primer ítem que no la pase: escritura, fill, copia, dispatch, barrera o draw que escribe memoria. Así ningún trabajador resuelve más allá de algo que cambie la memoria.
@@ -181,7 +181,7 @@ Cada paso va tras un `SHARPEMU_*` apagado por defecto, se mide por mecanismo (ms
   5. Las marcas de `PendingWrites` de los draws del pool llevan secuencias crecientes y se liberan al grabarse.
 - **Coste fijo:** un objeto por draw (sustituye a la closure) y un recorrido de ≤8 ítems bajo el cerrojo de la cola por ítem.
 - **Abandono, reanclado:**
-  - con el pool sin trabajadores (brazo C), la tubería no puede costar más de 1 ms/fotograma en el hilo de render (`draw_ms` de la sonda, A frente a C). Ojo: C además quita la preparación en el frente, así que mezcla las dos cosas;
+  - con el pool sin trabajadores (brazo C), la tubería no puede costar más de 1 ms/fotograma en el hilo de render (`draw_ms` de la sonda, A frente a C). Desde el 07-11 C ya no quita la preparación en el frente (§9);
   - con el pool encendido (brazo B), hace falta un neto ≥3 ms/fotograma frente a A, con `invalid` ≤5 % de `deferred` y `join_wait_ms` ≤3 ms/fotograma. Si no, queda solo como tubería para el paso 3, siempre que C cumpla lo anterior.
 - **Brazos** (todos con `SHARPEMU_RENDER_PIPELINE=1 SHARPEMU_PARRES_PROBE=1 SHARPEMU_FPS_LOG=1`):
   - A: base;
@@ -238,3 +238,129 @@ Cada paso va tras un `SHARPEMU_*` apagado por defecto, se mide por mecanismo (ms
   - fracción apta = `gate ok_ms / draw_ms`;
   - techo del paso 3 ≈ `runs ms≥16 × (1−1/N)` − unión;
   - techo del paso 2 ≈ `draw_resolve_ms` de los aptos.
+
+## 9. Paso 2 revisado (07-11): por qué C costaba ~10 µs/draw y B no sacaba la resolución del hilo de render
+
+Medido el 06-11 en partida (ventanas de 5 s, `y2a`/`y2b`/`y2c` en `%TEMP%\gta`), cifras por fotograma de `[PERF][PARRES]`, y `[PERF][RESOLVE_POOL]` dividido por `frames` [V]:
+
+| | draws | `draw_resolve_ms` | µs/draw | `join_wait` | `serial_ms` | serie |
+|---|---|---|---|---|---|---|
+| A `y2a` | 6.157 | 21,8 | 3,5 | — | — | — |
+| B `y2b` (ventana de 26 fot.) | 4.216 | 19,7 | 4,7 | 6,5 | 8,5 | 638 `gpu_owned_read` (15 %) |
+| B `y2b` (ventana sin serie) | 3.383 | 10,4 | 3,1 | 6,3 | 0 | 0 |
+| C `y2c` | 5.846 | 77,9 | 13,3 | — | — | — |
+
+### Brazo C: la preparación del frente desaparecía para todos los draws [V]
+- `be09d9dc`, `FrontCommandStreamHost.DrawIndexed/DrawAuto`: con `FRONT_RESOLVE_POOL=1` saltaban a `EnqueueFrontDraw`, que no llamaba a `TryPrepareOnFront`, y `FrontDraw.Run` ejecutaba los no diferidos con `ExecuteQueuedDraw(..., prepared: null, ...)`. El hilo de render preparaba entonces cada draw en `RenderExecutor` (`GetGraphicsPrograms`, `RenderExecutor.cs:1024`), también los que nunca iban al pool. Con 0 trabajadores, todos.
+- La diferencia C − A es 13,3 − 3,5 = **9,8 µs/draw**. La preparación del frente cuesta eso mismo: en `gcMa1` (`[PERF][FRONT_PHASES]`, 150 fotogramas, 155k draws), ProgramInputs + Source + Lookup + Tail + Vertex/PixelInputs + SourceIdentity + ProgramKey + Materialize + Permutation suman ~1,6–1,9 s, es decir **10–12 µs por draw**.
+- No era la tubería: con 0 trabajadores, `TryDeferFrontDraw` sale en la primera comprobación, y el recorrido es un cerrojo y un elemento por ítem.
+
+### Brazo B: el hilo de render esperaba y repetía [V]
+- La resolución sí salía del hilo para ~99 % de los draws (`deferred` ≈ draws, `invalid=0`). Lo que quedaba en `draw_resolve_ms` era: 6,5 ms de `join_wait` + 8,5 ms de resolución en serie + ~4,7 ms (1,1 µs/draw) de registro de estado, validación y unión.
+- **Serie:** el 15 % de los diferidos volvía con `gpu_owned_read` (`ReadOnResolveWorker`, `VulkanVideoPresenter.CommandStream.cs:359`). El hilo de render primero esperaba a que el trabajador fallara y luego resolvía `ResolveOnThisThread` **sin** programas preparados: 8,5 ms / 638 = 13,3 µs, el coste del brazo C.
+- **Espera:** el trabajador también resolvía sin preparación del frente (~13 µs por draw). El recorrido se para en cada ítem que no es draw apto y solo se reanuda cuando ese ítem ha corrido, así que el primer draw de cada corrida (~190–200 corridas por fotograma, `runs n`) se ofrecía sin ninguna ventaja. Para ese draw, la unión esperaba despertar + 13 µs: 200 × ~30 µs ≈ 6 ms. Además, `Dispatch` encaminaba por par de shaders y solo desbordaba con `>32` en cola, algo que la ventana de 8 nunca alcanza. Las 8 de una corrida del mismo par iban a un solo trabajador.
+- **Coste oculto:** `OfferAhead` corre después de `EndItem`, así que su tiempo no cae en ningún cubo de la sonda. Por draw diferido, en el hilo de render, incluía una copia completa de `RegisterBanks` (`banks.Snapshot`, ~1,3 µs según `FRONT_PHASES` Snapshot 262 ms / 198k), el hash del par y `BlockingCollection.Add` (`SemaphoreSlim.Release`, que despierta al trabajador si duerme).
+
+### Cambios (commit de este paso; todo tras `FRONT_RESOLVE_POOL`, apagado por defecto)
+1. **El frente prepara siempre**, como sin el pool (`EnqueueFrontDraw`). `FrontDraw` lleva `Prepared`, `Inputs`, `version`, `PrepPages` y `TableMark`, y `Run` repite en su posición las comprobaciones de la closure en línea (`FrontPreparationStillValid`, `TablesStillValid`, `VerifyGraphics`).
+2. **El trabajador resuelve con esa preparación** (`DeferredDraw.Prepared`, sobrecargas `DrawIndexed/DrawAuto(..., prepared, inputs)`). Si la posición la descarta, `JoinDeferredDraw(preparationHeld: false)` resuelve otra vez en orden con lo que valga allí (`front_prep_discarded`).
+3. **`ResolveOnThisThread` usa la preparación del frente** cuando sigue valiendo, así que una resolución en serie cuesta ~3,5 µs y no ~13.
+4. **En línea, sin pasar por el pool**, y el recorrido sigue detrás de ellos:
+   - el draw que corre a continuación (`next`: nada ofrecido delante; `front_inline_next`);
+   - los pares que acaban de volver con motivo serie, durante los 64 draws siguientes del par (`FrontSerialPairSkip`; `front_inline_serial_pair`).
+
+   Seguir detrás de un draw en línea que no escribe memoria descansa en la misma suposición que ya hacía el pool entre diferidos: sus marcas son solo de render targets.
+5. **El diferido toma prestada la instantánea del frente** (`Banks = snapshot`): ninguna copia en el hilo de render. La instantánea vuelve a la pila del frente en el `finally` de `Run`, después de la unión, y los diferidos del frente tienen su propia reserva (`_spareFrontDeferred`).
+6. **El pool del frente desborda con 2 en cola** en lugar de 32 (`FrontSpillQueueLength`).
+7. **El recorrido rellena** cuando ha corrido la mitad de lo ofrecido, no tras cada ítem: el salto inicial es O(ofrecidos).
+8. **Sonda:**
+   - `[PERF][PARRES]` gana `lookahead_ms` (el recorrido entero, fuera de los ítems), `slice_runs` y `draw_barrier_runs` (§10);
+   - `[PERF][RESOLVE_POOL]` gana `front_inline_next`, `front_inline_serial_pair` y `front_prep_discarded`.
+
+### Esperado y cómo medirlo
+- **C** ≈ A + `lookahead_ms` (un cerrojo y una puerta por ítem) **[E] ≤0,5 ms/fotograma**. El frente vuelve a costar lo de A: ya no se ahorra la preparación.
+- **B**, por draw diferido, en el hilo de render: ~1,1 µs (estado + validación + unión) frente a 3,5 en línea, o sea −2,4 µs × ~3.800 ≈ **−9 ms [E]**. Hay que restar `lookahead_ms` (hash + `Add`/despertar por diferido: 0,5–2 µs × 3.800 = 2–8 ms **[E]**, la incógnita) y la espera que quede (~1 ms). El neto va de **0 a 7 ms [E]**: hay que medirlo.
+  - Si `lookahead_ms` se come la ganancia, la siguiente palanca es la entrega: una señal por recorrido y trabajador en vez de por draw, o trabajadores que giran un poco antes de dormir.
+- **Brazos** (todos con `SHARPEMU_RENDER_PIPELINE=1 SHARPEMU_PARRES_PROBE=1 SHARPEMU_FPS_LOG=1`):
+  - A: base;
+  - B: `SHARPEMU_FRONT_RESOLVE_POOL=1` (4 trabajadores);
+  - B16 y B32: B con `SHARPEMU_FRONT_RESOLVE_AHEAD=16` o `32`;
+  - C: `SHARPEMU_FRONT_RESOLVE_POOL=1 SHARPEMU_RESOLVE_WORKERS=0`.
+- **Cuentas:**
+  - hilo de render en draws = `draw_ms + lookahead_ms` (frente a `draw_ms` de A);
+  - puertas: C − A ≤ 1 ms; A − B ≥ 3 ms con `join_wait_ms/frames` ≤ 3;
+  - `front_inline_next` debería rondar `runs n` × `frames`;
+  - si `front_inline_serial_pair` es grande y `serial=` pequeño, la memoria de pares funciona.
+
+## 10. Paso 3: diseño de `SHARPEMU_FRONT_SLICES` (grabación en paralelo)
+
+### Lo que hay que mover [V, `y2a`]
+- Por fotograma (cifras del encargo, 4.458 draws): `draw_record` 84,7 ms y `dispatch_record` 55,6 ms. Son **~140 ms de grabación** frente a 16,2 + 22,6 = ~39 ms de resolución, sobre ~176 ms de hilo de render.
+- **Qué corta hoy las corridas** (`breakers`, última ventana): `EmitGlobalBarrier` 156/fotograma y `WriteGuest` 27. El resto es despreciable.
+  - Upstream graba la barrera global **dentro** del slice (`GlobalBarrierWork` → `RecordGuestCacheFlush`) y no corta. Con la barrera tipada, solo cortaría `WriteGuest` (y las etiquetas y lecturas síncronas que lleve).
+  - Las corridas medias pasarían de 31 draws a varios cientos de ítems **[E]**. Los campos nuevos `slice_runs` (draws + dispatches + barreras; un dispatch corta solo si `NeedsSerialDispatch`) y `draw_barrier_runs` (draws + barreras; un dispatch corta) dan la cifra en la próxima sesión, sin código nuevo.
+- `scope_changes` ≈ 444 por fotograma de la sonda: cortar en cada cambio de ámbito (secundarios con `RENDER_PASS_CONTINUE`) daría corridas de ~14. **No es la forma.**
+
+### Forma
+1. **Ítems tipados en la cola del fondo:**
+   - `FrontDraw` (existe);
+   - `FrontDispatch` (nuevo, con la misma comprobación de la preparación del frente);
+   - la barrera: el delegado `_barrier` es una instancia única, así que se reconoce por referencia, como en la sonda.
+
+   El resto de ítems siguen siendo closures, y cada una corta el slice.
+2. **El hilo de render resuelve en orden y deja de grabar.** Cada ítem tipado de la corrida se resuelve con el ejecutor y un sumidero que captura el registro (como `CapturingSink`), con secuencia `++_frontSequence`, o se toma del pool del paso 2 cuando lo haya. El resultado se añade a un `RenderSlice` como `DeferredWork` de upstream (`ResolvedDrawWork`, `ResolvedDispatchWork`, `GlobalBarrierWork`).
+3. **Cierre y reparto:** el slice se cierra a 64 ítems o en un corte, y se reparte al `RenderWorkerPool` de upstream (`RecordingHost(worker: true)`, `RecordSlice`).
+4. **Unión:** antes de ejecutar el ítem que corta, el hilo de render une en orden con `NextSegment`/`JoinSegment` de upstream (validación, prólogo de subidas y transiciones, `FlushDeferred`). Con `RunInline` si el segmento salió `Serial(...)` o no valida.
+5. **Tubería:** el hilo de render resuelve el slice k+1 mientras los trabajadores graban el k, con hasta 2×N slices por delante (como `FillUnits`), y une el más viejo en cuanto termina.
+
+### Búferes de comandos
+- **3a: primarios por segmento.** El código de upstream, sin cambios en Vulkan. Coste: un `FlushDeferred` por segmento.
+- **3d: secundarios que abren su propio `vkCmdBeginRendering`.** Sin `RENDER_PASS_CONTINUE`, así que no hace falta cortar en cada cambio de ámbito. El hilo de render los ejecuta con `vkCmdExecuteCommands` en su búfer de lote, detrás del prólogo. Se ahorra el envío por segmento, y el orden queda dentro de un solo primario.
+  - Dentro del secundario valen las barreras fuera de la instancia de render y las consultas de oclusión que empiezan y terminan en él.
+  - Pool de comandos por trabajador (`VkCommandPool` se sincroniza por fuera).
+  - Solo merece la pena si `join_ms` de 3a supera ~20 % de lo grabado.
+
+### Riesgos
+1. **Orden de lecturas frente a escrituras de la GPU:** un registro resuelto antes de que lo anterior esté grabado puede leer un rango que escribe un dispatch aún sin unir. Ejemplos: argumentos indirectos (D9800) o palabras de tabla (994A).
+   - Con secuencias reales en `PendingWrites` (las del paso 2), la resolución en el hilo de render tiene que comprobar `HasPendingBetween(Released, seq)` mientras haya slices sin unir. Si acierta: cortar, unir todo lo pendiente y resolver en línea. Hoy esa comprobación no existe en el camino del hilo de render, porque con `Producing` falso las marcas llevan secuencia 0.
+   - Etiquetas, `WriteGuest`, lecturas síncronas y readbacks son cortes duros y exigen todo unido y enviado.
+2. **Barreras:**
+   - `RecordGuestCacheFlush` del trabajador usa `BatchBarriers`/`DeferGlobalBarriers`;
+   - nuestro `SCOPE_BARRIER` (mode=2, poda ~6.600 de ~8.800 ámbitos por ventana de 5 s) vive en el host principal: o va por host, o la unión aplica la poda;
+   - cada segmento empieza con `GlobalMemoryBarrier` (`BeginSegment`). Es correcto, pero cuesta barreras en GPU: con 64 ítems son ~110 por fotograma, frente a ~600 barreras completas hoy (`full_barriers`=12.353 por ventana de ~20 fotogramas en `SCOPE_BARRIER`).
+3. **Cortes de ámbito:** `EndSegment` cierra el render. Cada segmento vuelve a abrir sus adjuntos (LOAD) y pierde la fusión de ámbitos y `ATTACH_REPEAT` (que ya se niega en trabajadores). Es coste de GPU; se mide con `[PERF][SCOPE_BARRIER]` y el tiempo de GPU.
+4. **Descriptores y seguridad entre hilos:**
+   - los push descriptors van en el búfer del trabajador, y cada `RecordingHost(worker)` tiene sus pools;
+   - el bindless y la arena son sitios `Serial` en upstream;
+   - nuestros memos `[local]` del host principal se auditan uno a uno, y o pasan a ser por host o se niegan en el trabajador: `STAGE_MEMO`, `TARGET_MEMO`, `TABLE_WORD_MEMO.ProgramScope`, `BindingShadow`, `DA_ZERO_PAGE_BRANCH`, `ATTACH_REPEAT` (ya negado), `RECORD_FILL`, `PRECISE_WRITE_TICKS`;
+   - `SubmissionScheduler.MarkReadOnlyThread` ya convierte en `Serial("unguarded …")` toda operación sin guarda.
+5. **Cachés:** imagen o búfer no encontrado = `Serial(..., resumable)`. En fotogramas calientes debería ser raro, pero nadie lo ha medido en GTA (el paso 0 sigue pendiente). Es la incógnita grande.
+6. **La resolución sigue en el hilo de render** (~39 ms) mientras el paso 2 no gane.
+
+### Esperado [E]
+- **Grabación que se va a los trabajadores:**
+  - suponiendo 85 % apta en corridas ≥16 (a confirmar con `slice_runs`), son ~119 de los 140 ms;
+  - con N=4, ~30 ms de pared, solapados con la resolución.
+- **Unión con primarios:** ~40 µs por segmento (validación + prólogo + `FlushDeferred`) × ~150 segmentos ≈ **6 ms**. Con secundarios, ~2 ms.
+- **Cortes `Serial(...)` del grabador:** desconocidos. Si el 15 % de lo grabado vuelve en línea, son **+18 ms**.
+- **Hilo de render:** 176 − 119 + 6 + 18 ≈ **80 ms** (~12 FPS); con el pool del paso 2 y secundarios, ~65 ms. Bajar a 50 ms (20 FPS) exige además el suelo serie del paso 4 (`QueueRelay`, limpieza).
+
+### Primer incremento mínimo (3a, ~3–4 días)
+- **Alcance:**
+  - solo draws aptos y barreras tipadas;
+  - un dispatch o cualquier otro ítem corta, así que dentro de un slice no hay riesgo de lectura pendiente: los draws aptos no escriben memoria, la misma suposición que el paso 2;
+  - la resolución de la corrida entera (hasta 64 ítems) en el hilo de render, a `ResolvedDrawWork` con la preparación del frente;
+  - las corridas ≥32 se parten en `min(N, len/16)` slices para que graben a la vez;
+  - unión en orden antes del ítem que corta, sin tubería entre corridas;
+  - primarios por segmento: el código de upstream tal cual.
+- **Interruptor:** `SHARPEMU_FRONT_SLICES=1` (exige `RENDER_PIPELINE=1`), con N = `SHARPEMU_RENDER_WORKERS`. Hay que arrancar `CreateRenderWorkers` en el camino del frente, que hoy no lo hace.
+- **Antes de escribirlo:** una sesión A con la sonda nueva. Seguir si `draw_barrier_runs` en ≥16 da ≥60 ms/fotograma. Si da menos, pero `slice_runs` en ≥16 sí los da, saltar directamente a 3b.
+- **Puertas:**
+  - neto en el hilo de render ≥10 ms/fotograma;
+  - validación + prólogo + envío ≤30 % de los ms grabados;
+  - segmentos inválidos ≤5 %;
+  - capturas iguales bit a bit en la marca fija.
+- **Después:**
+  - 3b: dispatches dentro de los slices, con la regla de corte por `PendingWrites`;
+  - 3c: tubería de K slices por delante;
+  - 3d: secundarios.
