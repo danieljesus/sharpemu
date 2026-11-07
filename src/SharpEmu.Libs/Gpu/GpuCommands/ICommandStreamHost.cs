@@ -261,6 +261,9 @@ public interface ICommandStreamHost
     // draw still has to capture; the interpreter answers its own last write itself.
     void WriteGuest(ulong address, ReadOnlySpan<byte> source) => WriteCommandData(address, source);
 
+    // [local] SHARPEMU_PARRES_PROBE: the same write with the interpreter method that made it (slice_write_sites).
+    void WriteGuest(ulong address, ReadOnlySpan<byte> source, string caller) => WriteGuest(address, source);
+
     // Writes guest memory the stream reads back at once (write-data, copies, dumps): a host
     // that interprets ahead first lets the queued work capture what the write replaces.
     void WriteGuestNow(ulong address, ReadOnlySpan<byte> source) => WriteGuest(address, source);

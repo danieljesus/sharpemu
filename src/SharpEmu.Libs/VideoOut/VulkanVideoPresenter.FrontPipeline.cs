@@ -688,7 +688,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // [local] SHARPEMU_FRONT_SLICE_DEFER: the items upstream's command thread posts to the render thread without waiting
         // (Flush, EndFrame, BeginSubmissionContext, RecordEndOfPipe, TriggerInterrupt) are queued as FrontPost, which the
         // front slices take as render units instead of joining (FrontSlices.Defer).
-        private static readonly bool PostsDeferred = FrontSlicesEnabled && FrontSlices.Defer;
+        private static readonly bool PostsDeferred = FrontSlicesEnabled && FrontSlices.TakesPosts;
 
         private readonly Action _flushPost = new FrontPost(presenter.Flush).Run;
         private readonly Action _flushFramePost = new FrontPost(presenter.FlushFrame).Run;
@@ -1196,7 +1196,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // A label or event store lands after the work queued before it, so the guest cannot
         // reuse memory a queued draw still has to capture.
-        public void WriteGuest(ulong address, ReadOnlySpan<byte> source)
+        public void WriteGuest(ulong address, ReadOnlySpan<byte> source) => WriteGuest(address, source, "?");
+
+        public void WriteGuest(ulong address, ReadOnlySpan<byte> source, string caller)
         {
             FrontProfile.NoteStreamWrite(address, 1);
             byte[] bytes;
@@ -1227,6 +1229,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (FrontSlicesEnabled) // [local] SHARPEMU_FRONT_SLICES: typed, for the slice census and SHARPEMU_FRONT_SLICE_WRITES
+            {
+                queue.Enqueue(new FrontWrite(presenter, address, bytes, labelSerial, caller).Run, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             if (labelSerial != 0)
             {
                 queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
@@ -1234,6 +1242,24 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
+        }
+
+        // [local] SHARPEMU_FRONT_SLICES: a queued WriteGuest (a label, end-of-pipe or event store, an occlusion or GDS dump) as an
+        // object the front slices recognize (FrontSlices.Take). Run does what the closure did: the device-ordered command
+        // write, the pending label retired, the waiting heads told. With SHARPEMU_FRONT_SLICE_WRITES the slices take it as a
+        // render unit: Run then happens when the slice it sits in is joined, between the segment before it and the one after.
+        internal sealed class FrontWrite(Presenter presenter, ulong address, byte[] bytes, long labelSerial, string caller)
+        {
+            internal ulong Address => address;
+            internal int Length => bytes.Length;
+            internal string Caller => caller;
+
+            public void Run()
+            {
+                presenter.WriteGuest(address, bytes);
+                presenter.FrontLabels.Retire(address, labelSerial);
+                presenter.NoteGuestWriteApplied(address, bytes.Length);
+            }
         }
 
         // [local] SHARPEMU_FRONT_PENDING_LABELS=1: a memory wait also sees the label writes this front queued and the

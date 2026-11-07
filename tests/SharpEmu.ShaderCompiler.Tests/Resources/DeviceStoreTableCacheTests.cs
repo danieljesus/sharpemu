@@ -69,4 +69,35 @@ public sealed class DeviceStoreTableCacheTests
         DeviceStoreTablePlanner.InvalidateTables(table, 16, DeviceStoreTablePlanner.InvalidationSource.CpuFault);
         Assert.True(DeviceStoreTablePlanner.AppliedGeneration >= before + 4);
     }
+    // [local] SHARPEMU_FRONT_SLICE_WRITES: a render-thread write applied after its stream position does there what its
+    // InvalidateTables would: the generations move, unless a cached table holds its bytes (then it is refused).
+    [Fact]
+    public void InvalidateAheadRefusesAWriteIntoACachedTable()
+    {
+        const ulong table = 0x8A0000000;
+        Assert.True(DeviceStoreTablePlanner.CommitScan(table, 0x1000, DeviceStoreTablePlanner.BeginScan(table, 0x1000), Ranges(0x5000)));
+
+        Assert.False(DeviceStoreTablePlanner.InvalidateAhead(table + 0x40, 8, DeviceStoreTablePlanner.InvalidationSource.CommandRender));
+        Assert.True(DeviceStoreTablePlanner.TryGetCached(table, 0x1000, out _));
+    }
+
+    [Fact]
+    public void InvalidateAheadMovesTheGenerationsForAWriteNoCachedTableHolds()
+    {
+        const ulong table = 0x8B0000000;
+        var generation = DeviceStoreTablePlanner.BeginScan(table, 0x1000);
+        var before = DeviceStoreTablePlanner.AppliedGeneration;
+
+        Assert.True(DeviceStoreTablePlanner.MayInvalidate(table + 0x80, 8));
+        Assert.True(DeviceStoreTablePlanner.InvalidateAhead(table + 0x80, 8, DeviceStoreTablePlanner.InvalidationSource.CommandRender));
+        Assert.True(DeviceStoreTablePlanner.AppliedGeneration > before);
+        Assert.False(DeviceStoreTablePlanner.CommitScan(table, 0x1000, generation, Ranges(0x6000)));
+    }
+
+    [Fact]
+    public void AnEmptyWriteOrOneNoTableHoldsNeedsNothingAhead()
+    {
+        Assert.False(DeviceStoreTablePlanner.MayInvalidate(0x8B0000000, 0));
+        Assert.True(DeviceStoreTablePlanner.InvalidateAhead(0x10, 8, DeviceStoreTablePlanner.InvalidationSource.CommandRender));
+    }
 }

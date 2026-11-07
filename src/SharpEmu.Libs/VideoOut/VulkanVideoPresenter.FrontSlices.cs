@@ -37,6 +37,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         internal void RunFrontSliceWork(AgcExports.DeferredWork work) => RunDeferredWork(work);
 
+        // [local] SHARPEMU_PARRES_PROBE: whether a command write there records a device copy (WriteCommandData).
+        internal bool IsCommandWriteRegistered(ulong address, ulong size) => size != 0 && _bufferCache.IsRegionRegistered(address, size);
+
         internal Action FrontSliceRelay => RunRelayBetweenCommandItems;
     }
 
@@ -120,6 +123,28 @@ internal static unsafe partial class VulkanVideoPresenter
         //    open, an item not taken, the end of RunPending and AfterItem join everything first.
         internal static readonly bool Defer = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_DEFER") == "1";
 
+        // [local] SHARPEMU_FRONT_SLICE_WRITES=1 (off by default; the last step of the slices line, §10): the front's WriteGuest
+        // (FrontCommandStreamHost.FrontWrite: labels, end-of-pipe and event stores, occlusion and GDS dumps), 93 % of the
+        // cuts in GTA V (`sbt`), no longer joins what is open. It is taken as a render unit, as SHARPEMU_FRONT_SLICE_DEFER
+        // takes the posts (and it takes them too: a label is followed by its end-of-pipe post, which would cut instead):
+        //  - the render thread applies it (WriteCommandData: guest memory, or both copies of a registered range with the
+        //    device copy recorded then) when it joins the slice it sits in, after the segment before it was validated,
+        //    its prologue uploaded what it reads from guest memory and it was submitted, and before the segment after it.
+        //    So the GPU sees it, and the guest and the front read it, exactly where they would in serial, and an upload
+        //    of an earlier item never sees it, nor a later item's upload miss it;
+        //  - the resolution of the items after it runs before it is applied: a render-thread read of its bytes (every read
+        //    BeforeRead guards: the command memory, TryReadGuest, the materializer's table words before TABLE_WORD_MEMO,
+        //    clean and resident reads) joins everything first (flush `write`), as for a pending GPU write;
+        //  - the device store table planner: what the write would do there at its position runs at once (its generations
+        //    move, InvalidateAhead), unless a cached table holds its bytes (refusal `tables`: it cuts, as before);
+        //  - a CP write moves no first-GPU-write version, so the front preparations' check (FrontPreparationStillValid)
+        //    sees in serial what it sees here; TABLE_WORD_MEMO is updated when it is applied, and only read after BeforeRead.
+        // JoinReady stays with SHARPEMU_FRONT_SLICE_DEFER: without it the writes are applied at the next cut or flush.
+        internal static readonly bool Writes = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_WRITES") == "1";
+
+        // [local] The posts are taken as render units (SHARPEMU_FRONT_SLICE_DEFER or SHARPEMU_FRONT_SLICE_WRITES).
+        internal static readonly bool TakesPosts = Defer || Writes;
+
         internal static readonly int Ahead =
             int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_AHEAD"), out var ahead) && ahead > 0 ? ahead : 0;
 
@@ -131,6 +156,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly Action _betweenItems;
         private int _thread = -1;
         private int _openWriters;
+        private readonly FrontSliceWrites _writes = new(); // [local] SHARPEMU_FRONT_SLICE_WRITES
 
         public FrontSlices(Presenter presenter, FrontCommandStreamHost front)
         {
@@ -162,7 +188,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
-            if (Defer && work.Target is FrontCommandStreamHost.FrontPost && _cutter.HasOpen && _presenter.SlicesEnabled)
+            if (TakesPosts && work.Target is FrontCommandStreamHost.FrontPost && _cutter.HasOpen && _presenter.SlicesEnabled)
+            {
+                return true;
+            }
+
+            if (work.Target is FrontCommandStreamHost.FrontWrite write && _cutter.HasOpen && TakeWrite(write))
             {
                 return true;
             }
@@ -174,6 +205,25 @@ internal static unsafe partial class VulkanVideoPresenter
 
             Flush(FrontSliceFlush.Item);
             return false;
+        }
+
+        // [local] SHARPEMU_FRONT_SLICE_WRITES: whether a command write met while something is open is taken; with the probe, the
+        // census of those writes (slice_writes, slice_write_sites).
+        private bool TakeWrite(FrontCommandStreamHost.FrontWrite write)
+        {
+            var size = (ulong)write.Length;
+            var enabled = Writes && _presenter.SlicesEnabled;
+            var inTables = enabled && SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.MayInvalidate(write.Address, size);
+            var refusal = FrontSliceGuards.WriteRefusal(enabled,
+                inTables && !SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateAhead(write.Address, size,
+                    SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidationSource.CommandRender));
+            if (ParallelResolveProbe.Enabled)
+            {
+                FrontSliceStats.Shared.NoteWrite(write.Caller, write.Length, refusal, inTables,
+                    _presenter.IsCommandWriteRegistered(write.Address, size), PendingOverlap(write.Address, size));
+            }
+
+            return refusal is null;
         }
 
         private readonly Dictionary<System.Reflection.MethodInfo, string> _cutNames = new();
@@ -218,6 +268,18 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (work.Target is FrontCommandStreamHost.FrontWrite write) // [local] SHARPEMU_FRONT_SLICE_WRITES: a render unit
+            {
+                var token = _writes.Add(write.Address, (ulong)write.Length);
+                var writes = _writes;
+                _cutter.Add(NewItem(new FrontPostWork(() =>
+                {
+                    write.Run();
+                    writes.Applied(token);
+                }), 0, null));
+                return;
+            }
+
             _cutter.Add(NewItem(AgcExports.GlobalBarrierWork.Instance, 0, null));
         }
 
@@ -237,6 +299,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!_cutter.HasOpen)
             {
                 _openWriters = 0;
+                _writes.Clear();
             }
         }
 
@@ -368,9 +431,9 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            if (PendingOverlap(address, size))
+            if (FrontSliceGuards.ReadNeedsJoin(address, size, _pendingOverlap ??= PendingOverlap, _writes) is { } reason)
             {
-                JoinBeforeRead(FrontSliceFlush.Read);
+                JoinBeforeRead(reason);
             }
         }
 

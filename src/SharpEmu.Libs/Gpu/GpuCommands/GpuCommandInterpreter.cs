@@ -815,7 +815,7 @@ public sealed partial class GpuCommandInterpreter
             return;
         }
 
-        _host.WriteGuest(address, source);
+        _host.WriteGuest(address, source, caller); // [local] the caller names the write in the slice census
         NoteOwnWrite(address, source, caller);
     }
 

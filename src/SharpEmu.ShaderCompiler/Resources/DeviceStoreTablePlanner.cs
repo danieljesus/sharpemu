@@ -515,6 +515,36 @@ public static class DeviceStoreTablePlanner
     internal static bool TryGetCached(ulong tableBase, ulong tableBytes, out List<DeviceAddressRange>? ranges) =>
         Cache.Entries.TryGetValue((tableBase, tableBytes), out ranges);
 
+    // [local] SHARPEMU_FRONT_SLICE_WRITES: whether InvalidateTables for this range would do anything (the same cheap test):
+    // false means a write there neither moves the generations nor drops a cached table.
+    public static bool MayInvalidate(ulong address, ulong size) =>
+        size != 0 && address < Volatile.Read(ref _tableEnd) && address + size > Volatile.Read(ref _tableBegin);
+
+    // [local] SHARPEMU_FRONT_SLICE_WRITES: the part of InvalidateTables a render-thread write applied later than its stream
+    // position does at that position: the generations move (scans running now do not commit, preparations checked from
+    // here on see the change) when no cached table holds its bytes. False when one does: the write must land in place.
+    // The write's own InvalidateTables still runs when it is applied.
+    public static bool InvalidateAhead(ulong address, ulong size, int source)
+    {
+        if (!MayInvalidate(address, size))
+            return true;
+        TableCache[] caches;
+        lock (AllCaches) caches = AllCaches.ToArray();
+        foreach (var cache in caches)
+        {
+            foreach (var (key, _) in cache.Entries)
+            {
+                if (address < key.Base + key.Bytes && key.Base < address + size)
+                    return false;
+            }
+        }
+
+        Interlocked.Increment(ref _scanGeneration);
+        if (source is InvalidationSource.CpuFault or InvalidationSource.CommandRender or InvalidationSource.FillRender or InvalidationSource.CopyRender)
+            Interlocked.Increment(ref _appliedGeneration);
+        return true;
+    }
+
     public static void InvalidateTables(ulong address, ulong size, int source = 0) // [local]
     {
         // Cheap reject first: this runs on every command-processor write, and IsEmpty/Keys on a

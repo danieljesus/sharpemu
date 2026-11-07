@@ -28,6 +28,7 @@ internal enum FrontSliceFlush
     Record,
     After,
     Prep, // [local] SHARPEMU_FRONT_SLICE_DISPATCHES: a front preparation checked while a taken dispatch is open
+    Write, // [local] SHARPEMU_FRONT_SLICE_WRITES: a render-thread read of bytes a taken command write has not applied yet
     Count,
 }
 
@@ -53,6 +54,110 @@ internal static class FrontSliceGuards
 
         return false;
     }
+
+    // [local] SHARPEMU_FRONT_SLICE_WRITES: why a command write met while something is open is not taken (null: taken).
+    //  - "off": the switch is off or the workers are not running;
+    //  - "tables": its bytes may hold a device store table (DeviceStoreTablePlanner.MayInvalidate). Applying it moves the
+    //    planner's applied generation and drops its cached tables, which the resolution of the next items reads at once
+    //    (TablesStillValid, the cached plans), so it must land where it lands in serial.
+    public static string? WriteRefusal(bool enabled, bool mayInvalidateTables) =>
+        !enabled ? "off" : mayInvalidateTables ? "tables" : null;
+
+    // [local] Whether a render-thread read must join everything open first: it overlaps a pending GPU write of a taken
+    // draw or dispatch (`pending`) or a taken command write not applied yet.
+    public static FrontSliceFlush? ReadNeedsJoin(ulong address, ulong size, Func<ulong, ulong, bool> pending, FrontSliceWrites writes)
+    {
+        if (size == 0)
+        {
+            return null;
+        }
+
+        if (pending(address, size))
+        {
+            return FrontSliceFlush.Read;
+        }
+
+        return writes.Overlaps(address, size) ? FrontSliceFlush.Write : null;
+    }
+}
+
+// [local] SHARPEMU_FRONT_SLICE_WRITES: the command writes (FrontWrite) the slices took and have not applied yet. A taken
+// write is applied when the slice it sits in is joined, so until then a render-thread read of its bytes (the resolution
+// of a later item) must join first, as for a pending GPU write. Pages give a cheap reject; the ranges decide. Render
+// thread only.
+internal sealed class FrontSliceWrites
+{
+    private readonly List<(ulong Address, ulong Size, bool Applied)> _writes = new();
+    private readonly HashSet<ulong> _pages = new();
+    private int _pending;
+
+    // Taken writes not applied yet.
+    public int Pending => _pending;
+
+    public int Add(ulong address, ulong size)
+    {
+        _writes.Add((address, size, false));
+        _pending++;
+        if (size != 0)
+        {
+            for (var page = address >> 12; page <= (address + size - 1) >> 12; page++)
+            {
+                _pages.Add(page);
+            }
+        }
+
+        return _writes.Count - 1;
+    }
+
+    public void Applied(int token)
+    {
+        if ((uint)token >= (uint)_writes.Count || _writes[token].Applied)
+        {
+            return;
+        }
+
+        _writes[token] = _writes[token] with { Applied = true };
+        _pending--;
+    }
+
+    public bool Overlaps(ulong address, ulong size)
+    {
+        if (_pending == 0 || size == 0)
+        {
+            return false;
+        }
+
+        var first = address >> 12;
+        var last = (address + size - 1) >> 12;
+        var hit = last - first >= 64; // a long read: the ranges decide
+        for (var page = first; !hit && page <= last; page++)
+        {
+            hit = _pages.Contains(page);
+        }
+
+        if (!hit)
+        {
+            return false;
+        }
+
+        foreach (var (start, length, applied) in _writes)
+        {
+            if (!applied && address < start + length && start < address + size)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Everything taken ended (the cutter has nothing open): every write was applied.
+    public void Clear()
+    {
+        _writes.Clear();
+        _pages.Clear();
+        _pending = 0;
+    }
 }
 
 // One recorded run of a slice's items: [First, First + Count); Serial when the item at First + Count needs this thread.
@@ -73,6 +178,32 @@ internal sealed class FrontSliceStats
     public readonly Dictionary<string, long> Cuts = new();
 
     public void NoteCut(string name) => Cuts[name] = Cuts.GetValueOrDefault(name) + 1;
+
+    // [local] SHARPEMU_PARRES_PROBE: the command writes (FrontWrite) met while something was open: how many, taken
+    // (SHARPEMU_FRONT_SLICE_WRITES), refused because a cached store table holds their bytes, inside the planner's table
+    // bounds, over a registered buffer (a device copy is recorded), over a pending GPU write of an open item; and by the
+    // interpreter method that made them and their size (WriteSites, "caller/size").
+    public long WritesOpen, WritesTaken, WritesTables, WritesInBounds, WritesRegistered, WritesPending;
+    public readonly Dictionary<string, long> WriteSites = new();
+    private readonly Dictionary<(string, int), string> _siteNames = new();
+
+    public void NoteWrite(string caller, int length, string? refusal, bool inBounds, bool registered, bool pending)
+    {
+        WritesOpen++;
+        if (refusal is null) WritesTaken++;
+        else if (refusal == "tables") WritesTables++;
+        if (inBounds) WritesInBounds++;
+        if (registered) WritesRegistered++;
+        if (pending) WritesPending++;
+        var size = length is 4 or 8 ? length : length <= 64 ? 64 : 65;
+        if (!_siteNames.TryGetValue((caller, size), out var name))
+        {
+            name = $"{caller}/{(size == 64 ? "le64" : size == 65 ? "gt64" : size.ToString(System.Globalization.CultureInfo.InvariantCulture))}";
+            _siteNames[(caller, size)] = name;
+        }
+
+        WriteSites[name] = WriteSites.GetValueOrDefault(name) + 1;
+    }
 
     public void NoteSerial(string? reason)
     {

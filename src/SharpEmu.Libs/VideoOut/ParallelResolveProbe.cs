@@ -310,7 +310,7 @@ internal static class ParallelResolveProbe
     private static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
 
     private static readonly string[] InlineNames = ["short", "stolen", "invalid", "serial", "tail"];
-    private static readonly string[] FlushNames = ["item", "exit", "read", "record", "after", "prep"];
+    private static readonly string[] FlushNames = ["item", "exit", "read", "record", "after", "prep", "write"];
 
     // [local] SHARPEMU_FRONT_SLICES, per frame: slices handed out and their mean items, items joined (recorded by a worker),
     // the render thread's ms per part, the workers' ms, items recorded here after all by reason, joins by what caused them,
@@ -345,6 +345,15 @@ internal static class ParallelResolveProbe
             .Select(pair => string.Create(CultureInfo.InvariantCulture, $"{pair.Key}:{pair.Value / frames:F1}")));
         text.Append(']');
         stats.Cuts.Clear();
+        // [local] SHARPEMU_FRONT_SLICE_WRITES: the command writes met while something was open (FrontSliceStats.NoteWrite).
+        text.Append(CultureInfo.InvariantCulture,
+            $" slice_writes=open:{stats.WritesOpen / frames:F1},taken:{stats.WritesTaken / frames:F1},tables:{stats.WritesTables / frames:F1},in_bounds:{stats.WritesInBounds / frames:F1},registered:{stats.WritesRegistered / frames:F1},pending:{stats.WritesPending / frames:F1}");
+        text.Append(" slice_write_sites=[");
+        text.AppendJoin(",", stats.WriteSites.OrderByDescending(pair => pair.Value).Take(8)
+            .Select(pair => string.Create(CultureInfo.InvariantCulture, $"{pair.Key}:{pair.Value / frames:F1}")));
+        text.Append(']');
+        stats.WriteSites.Clear();
+        stats.WritesOpen = stats.WritesTaken = stats.WritesTables = stats.WritesInBounds = stats.WritesRegistered = stats.WritesPending = 0;
         text.Append(" slice_serial=[");
         text.AppendJoin(",", stats.SerialReasons.OrderByDescending(pair => pair.Value).Take(8)
             .Select(pair => string.Create(CultureInfo.InvariantCulture, $"{pair.Key.Replace(' ', '_')}:{pair.Value / frames:F1}")));
