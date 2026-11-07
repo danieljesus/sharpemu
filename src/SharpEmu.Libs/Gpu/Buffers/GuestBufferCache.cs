@@ -1204,6 +1204,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     public ResourceSlotIdentifier FindBuffer(ulong guestAddress, ulong size)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferCacheLookup);
+        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.FindBuffer); // [local] SHARPEMU_DRAWCOST_PROBE
         if (guestAddress == 0)
         {
             return NullBufferId;
@@ -1335,6 +1336,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         if (isWritten && ImageClearTrace.Enabled) ImageCache?.TraceGuestWrite("shader-buffer-write", guestAddress, size, shaderHash: traceShaderHash);
         if (MeshDrawTrace.Active) MeshDrawTrace.Range("buffer-obtain", guestAddress, size, $"written={isWritten} texel={isTexelBuffer} hash=0x{traceShaderHash:X16}", remember: true);
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferAcquisitionChecks);
+        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.Obtain); // [local] SHARPEMU_DRAWCOST_PROBE
+        if (isWritten) Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ObtainWritten); // [local]
         if (CpWriteDeferProbe.Enabled) CpWriteDeferProbe.OnRead(guestAddress, size); // [local]
         if (isWritten && SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.Enabled) SharpEmu.Libs.Gpu.Vulkan.ScopeBarrierTracker.NoteWrite(); // [local]
         var command = _scheduler.Current;
@@ -1385,6 +1388,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             {
                 TouchBuffer(memo.Identifier);
                 OverlayGuestPublications?.Invoke(kept, memo.Offset, guestAddress, size);
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ObtainReadMemo); // [local] SHARPEMU_DRAWCOST_PROBE
                 return (kept, memo.Offset);
             }
         }
@@ -1412,6 +1416,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 if (ObservationGated && _streamCopyShares.TryShare(guestAddress, size, _observation, tick, publications, out var sharedOffset))
                 {
                     _obtainCounts[bufferIdentifier.IsValid ? (int)ObtainOutcome.StreamPrefound : (int)ObtainOutcome.Stream]++; // [local]
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ObtainStream); // [local] SHARPEMU_DRAWCOST_PROBE
                     return (_stream, sharedOffset);
                 }
 
@@ -1427,6 +1432,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                     }
 
                     _obtainCounts[bufferIdentifier.IsValid ? (int)ObtainOutcome.StreamPrefound : (int)ObtainOutcome.Stream]++; // [local]
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ObtainStream); // [local] SHARPEMU_DRAWCOST_PROBE
                     return (_stream, streamOffset);
                 }
             }
@@ -1446,6 +1452,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             bufferIdentifier = FindBuffer(guestAddress, size);
             buffer = _registry.GetBuffer(bufferIdentifier);
             _obtainCounts[(int)ObtainOutcome.CachedLookup]++;
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ObtainLookup); // [local] SHARPEMU_DRAWCOST_PROBE
         }
         else
         {

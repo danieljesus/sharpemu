@@ -106,6 +106,8 @@ public sealed partial class RenderExecutor
                     ?? _pipelines.GetComputeProgram(banks, dispatchInitiator, groupsX, groupsY, groupsZ, indirectArgumentsAddress != 0);
         }
 
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchProgram); // [local] SHARPEMU_DRAWCOST_PROBE
+
         if (gpuThreadIndirect && computeProgram.ImageCopy is null && computeProgram.Available && !computeProgram.Consumed &&
             !CanDispatchThreadsOnGpu(computeProgram.Input)) // [local]
         {
@@ -248,6 +250,7 @@ public sealed partial class RenderExecutor
             program.Bindings?.Find(ShaderCompiler.Resources.DescriptorBindingKind.GlobalDataShare) is not null,
             record.MetadataClear is not null || record.ConstantFill is not null || record.BoundedFill is not null || record.BoundedCopy is not null || record.ImageClear is not null,
             computeProgram.KnownWrite is not null);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchDecode); // [local]
         Record(record);
     }
 

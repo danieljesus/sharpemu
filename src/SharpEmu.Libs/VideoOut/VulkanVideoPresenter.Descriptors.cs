@@ -412,6 +412,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 memo = last;
                 Interlocked.Increment(ref _stageMemoHits);
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MemoLast); // [local] SHARPEMU_DRAWCOST_PROBE
                 return true;
             }
 
@@ -425,6 +426,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 set.Last = found;
                 memo = found;
                 Interlocked.Increment(ref _stageMemoContentHits);
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MemoContent); // [local] SHARPEMU_DRAWCOST_PROBE
                 return true;
             }
 
@@ -519,6 +521,8 @@ internal static unsafe partial class VulkanVideoPresenter
             descriptors.Samplers = Scratch.Samplers.Rent(memo.SamplerHandles.Length);
             memo.SamplerHandles.CopyTo(descriptors.Samplers, 0);
             rentScope.Dispose();
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoRent); // [local] SHARPEMU_DRAWCOST_PROBE
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.Textures, memo.Textures.Length); // [local]
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemoImages)) // [local]
             foreach (var texture in memo.Textures)
             {
@@ -530,6 +534,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 BindImage(texture.ImageIdentifier, texture.IsStorage);
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoImages); // [local] SHARPEMU_DRAWCOST_PROBE
             var layout = program.Bindings!;
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingShaderData)) // [local]
             {
@@ -540,8 +545,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoShaderData); // [local] SHARPEMU_DRAWCOST_PROBE
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingDeviceRanges)) // [local]
                 FindDeviceAddressBuffers(prepared);
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoRanges); // [local]
             using var buffersScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemoBuffers); // [local]
             var spans = GuestGpuMemoryHook.Current?.SpanVersion ?? 0;
             var sameBuffers = memo.Spans == spans && SameWords(memo.Buffers, stage.Resources.Buffers);
@@ -560,6 +567,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!sameBuffers || memo.RegistrationSerial != _bufferCache.RegistrationSerial)
             {
                 Interlocked.Increment(ref sameBuffers ? ref _stageMemoBufferRefinds : ref _stageMemoBufferChanges); // [local]
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MemoBuffersChanged); // [local] SHARPEMU_DRAWCOST_PROBE
                 FindBuffers(prepared);
                 prepared.BufferSources.CopyTo(memo.Sources, 0);
                 memo.Buffers = stage.Resources.Buffers;
@@ -572,6 +580,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 memo.Sources.CopyTo(prepared.BufferSources, 0);
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoBuffers); // [local] SHARPEMU_DRAWCOST_PROBE
             return prepared;
         }
 
@@ -981,16 +990,20 @@ internal static unsafe partial class VulkanVideoPresenter
 
             StagePreparationMemo? memo = null;
             preludeScope.Dispose();
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindPrelude); // [local] SHARPEMU_DRAWCOST_PROBE
             var memoScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingMemo); // [local]
             var memoFound = StageMemoEnabled && frontendReady && !movieActive && !Gpu.Images.ImageClearTrace.Enabled && !MeshDrawTrace.Active && // [local] SHARPEMU_STAGE_MEMO
                 TryFindStagePreparation(preparations, snapshot, stage.ShaderBase, out memo);
             memoScope.Dispose();
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMemoFind); // [local] SHARPEMU_DRAWCOST_PROBE
             if (memoFound)
             {
                 return ReuseStagePreparation(preparation, stage, program, memo!);
             }
 
             Interlocked.Increment(ref _stageMemoMisses);
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.MemoMiss); // [local]
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.Textures, info.Images.Count); // [local]
             using var setupScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingSetup); // [local]
             var prepared = RentStage(stage, program);
             // Register ownership before preparation can fail halfway through.
@@ -1070,6 +1083,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     $"samplers={info.Samplers.Count} userData={snapshot.UserData.Length} flattened={snapshot.FlattenedResourceTable.Length} shaderData={shaderData.Length}");
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.BindMiss); // [local] SHARPEMU_DRAWCOST_PROBE
             return prepared;
         }
 
@@ -1902,9 +1916,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.BindBuffers, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
                 using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingBuffers)) // [local]
                     BindBuffers(stage);
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResBuffers); // [local] SHARPEMU_DRAWCOST_PROBE
                 using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ObtainAddressRanges, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
                 using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingDeviceRanges)) // [local]
                     ObtainDeviceAddressRanges(stage);
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResRanges); // [local]
             }
             finally
             {
@@ -1914,6 +1930,10 @@ internal static unsafe partial class VulkanVideoPresenter
                         _bufferCache.EndUploadBatch();
                 }
             }
+
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResUploadEnd); // [local] SHARPEMU_DRAWCOST_PROBE
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.StorageBuffers, info.Buffers.Count); // [local]
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DeviceRanges, stage.Stage.Resources.DeviceAddressRanges.Length); // [local]
 
             if (KeepsTextureSet(stage))
             {
@@ -1928,6 +1948,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _preparedTextures.Add(stage.Textures);
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResImages); // [local] SHARPEMU_DRAWCOST_PROBE
         }
 
         // Textures bound for the draw being prepared; cleared when its preparation closes.
@@ -2846,8 +2867,11 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                 }
 
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.CommitBuild); // [local] SHARPEMU_DRAWCOST_PROBE
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DescriptorWrites, writeIndex); // [local]
                 if (hasPushData)
                 {
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PushConstants); // [local]
                     var pushStages = bindPoint == PipelineBindPoint.Graphics
                         ? ((entry.Description?.VertexStage.Stage == ShaderStageKind.Mesh
                             ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
@@ -2861,6 +2885,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (writeIndex != 0 && DescriptorsAlreadyBound(command, bindPoint, entry.Layout, writes[..writeIndex])) // SHARPEMU_NATIVE_STATE_REUSE
                 {
                     Interlocked.Increment(ref _descriptorsShadowed);
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DescriptorShadowed); // [local] SHARPEMU_DRAWCOST_PROBE
                 }
                 else if (writeIndex != 0)
                 {
@@ -2876,6 +2901,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             }
                             AcceptOwnBind(); // [local] the VkRecord bind advanced the native binding epoch
                             ShaderCacheCounters.CountPushSet();
+                            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DescriptorPush); // [local] SHARPEMU_DRAWCOST_PROBE
                         }
                         else
                         {
@@ -2899,6 +2925,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             }
                             AcceptOwnBind(); // [local]
                             ShaderCacheCounters.CountHeapSet();
+                            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.DescriptorHeap); // [local] SHARPEMU_DRAWCOST_PROBE
                         }
                     }
                 }
@@ -2914,6 +2941,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.CommitPush); // [local] SHARPEMU_DRAWCOST_PROBE
             var spare = _worker ? null : _presenter._spareSubmissionResources ??= new Stack<SubmissionUploadResources>();
             var uploads = spare is { Count: not 0 } ? spare.Pop() : new SubmissionUploadResources();
             uploads.DebugName = bindPoint == PipelineBindPoint.Compute ? Presenter.DispatchDebugName : Presenter.DrawDebugName;
@@ -2937,6 +2965,8 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 RenderTrace.Write($"Bindings committed bindPoint={bindPoint} pipeline={pipeline.Pipeline} writes={writeIndex} push={entry.UsesPushDescriptors} pushData={hasPushData}");
             }
+
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.CommitTail); // [local] SHARPEMU_DRAWCOST_PROBE
         }
     }
 }

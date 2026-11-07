@@ -333,6 +333,7 @@ public sealed partial class RenderExecutor
             indexType);
         ref var state = ref record.State;
         state.Begin(arguments.StartInstanceUserData);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecPrelude); // [local] SHARPEMU_DRAWCOST_PROBE
         if (!TryResolveDrawTargets(banks, in draw, ref state, record))
         {
             TraceDisposition("no-targets");
@@ -342,6 +343,7 @@ public sealed partial class RenderExecutor
         }
 
         record.TargetsResolved = true;
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecTargets); // [local]
         if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
         {
             Record(record);
@@ -350,9 +352,11 @@ public sealed partial class RenderExecutor
         }
 
         ResolveShaderPrograms(banks, ref state, indexed: true);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecPrograms); // [local]
         var adaptScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecAdaptations); // [local]
         var adapted = ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, true, arguments, default), record);
         adaptScope.Dispose();
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecAdapt); // [local]
         if (!adapted)
         {
             TraceDisposition("adapted");
@@ -376,6 +380,7 @@ public sealed partial class RenderExecutor
         record.PacketAddress = tracePacket;
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecFill)) // [local]
             FillDraw(record, banks, in draw, ref state, topology, in emission, in indexSource, primitiveRestart, setBindDebug: true, setAutoDebug: false);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecFill); // [local]
         TraceDisposition("recorded");
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecRecord)) // [local]
             Record(record);
@@ -505,6 +510,7 @@ public sealed partial class RenderExecutor
         var draw = new DrawCall("DrawAuto", RecordedOperation.DrawIndexAuto, arguments.VertexCount, arguments.InstanceCount, arguments.FirstInstance);
         ref var state = ref record.State;
         state.Begin(arguments.StartInstanceUserData);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecPrelude); // [local] SHARPEMU_DRAWCOST_PROBE
         if (!TryResolveDrawTargets(banks, in draw, ref state, record))
         {
             TraceDrawTargets(banks, "no-targets");
@@ -514,6 +520,7 @@ public sealed partial class RenderExecutor
         }
 
         record.TargetsResolved = true;
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecTargets); // [local]
         if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
         {
             Record(record);
@@ -531,6 +538,7 @@ public sealed partial class RenderExecutor
         }
 
         ResolveShaderPrograms(banks, ref state);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecPrograms); // [local]
         var vertexInput = state.Programs.VertexInput;
         var pixelInput = state.Programs.PixelInput;
         var rectangleList = topology == PrimitiveTopology.PatchList;
@@ -549,7 +557,9 @@ public sealed partial class RenderExecutor
             return;
         }
 
-        if (!ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, false, default, arguments), record))
+        var autoAdapted = ApplyProgramAdaptations(banks, in draw, ref state, new TargetlessDrawArguments(submitId, false, default, arguments), record);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecAdapt); // [local]
+        if (!autoAdapted)
         {
             TraceDrawTargets(banks, "adapted");
             record.ResetBindings = true;
@@ -570,6 +580,7 @@ public sealed partial class RenderExecutor
             arguments.IndirectArgumentsAddress);
         record.PacketAddress = arguments.PacketAddress;
         FillDraw(record, banks, in draw, ref state, topology, in emission, default, primitiveRestart: false, setBindDebug: false, setAutoDebug: true);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecFill); // [local]
         TraceDrawTargets(banks, "recorded");
         Record(record);
     }
