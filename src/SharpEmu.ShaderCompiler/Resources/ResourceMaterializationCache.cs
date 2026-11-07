@@ -1091,7 +1091,9 @@ public sealed partial class ResourceMaterializationCache
     private const int DrawHistoryCapacity = 65536;
     private readonly Dictionary<ulong, uint[]> _drawHistories = new();
 
-    private void NoteChurn(ulong drawKey, IReadOnlyList<uint> userData, ulong[]? learned, AddressRebase rebase)
+    // [local] True when the draw differs from the draw key's previous one in exactly one used word that the rebase could
+    // still learn (churn_learnable), for SHARPEMU_MATERIALIZE_CHURN_LEARN.
+    private bool NoteChurn(ulong drawKey, IReadOnlyList<uint> userData, ulong[]? learned, AddressRebase rebase)
     {
         if (!_drawHistories.TryGetValue(drawKey, out var previous) || previous.Length != userData.Count)
         {
@@ -1101,7 +1103,7 @@ public sealed partial class ResourceMaterializationCache
             for (var index = 0; index < copy.Length; index++)
                 copy[index] = userData[index];
             _drawHistories[drawKey] = copy;
-            return;
+            return false;
         }
 
         var differing = 0;
@@ -1121,17 +1123,60 @@ public sealed partial class ResourceMaterializationCache
         {
             if (differing > 1)
                 _totalChurnMulti.Increment();
-            return;
+            return false;
         }
 
         if (rebase.IsLearnable(changed))
+        {
             _totalChurnLearnable.Increment();
-        else
-            _totalChurnUnlearnable.Increment();
+            return true;
+        }
+
+        _totalChurnUnlearnable.Increment();
+        return false;
+    }
+
+    // [local] SHARPEMU_MATERIALIZE_CHURN_LEARN (=1 on, off by default): with the churn limit (the per-thread caches), a key
+    // seen for the first time is walked without recording, and only a key seen twice in a row of its slot is recorded.
+    // A draw key whose user data change in one rebasable word on every lookup (GTA V's 0x4481 in the open world: about
+    // 31 lookups a frame, each a new key, churn_learnable ~ every lookup) is then never recorded, so AddressRebase,
+    // which learns from recorded walks only, never confirms the word, and the key keeps churning: every lookup is a full
+    // unrecorded walk. With this on, such a first sighting is recorded instead, as the second sighting (or a cache
+    // without the churn limit) would record it, up to ChurnLearnBudget recorded first sightings per draw key; once the
+    // word is confirmed it leaves the key and the lookups are served by the rebase hits. Exact: the hit path is the
+    // cache's own (Validate at the moved addresses, then the rebased base dwords), the one every limit-free cache uses;
+    // SHARPEMU_PROGRAM_GATE_VERIFY=2 checks every hit against a fresh walk. A rejected or activated word is not learnable,
+    // so those keys go back to the unrecorded first sightings. Settable for tests (per async flow).
+    internal static int ChurnLearnMode
+    {
+        get => ChurnLearnOverride.Value ?? ChurnLearnDefault;
+        set => ChurnLearnOverride.Value = value;
+    }
+
+    private static readonly int ChurnLearnDefault =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_MATERIALIZE_CHURN_LEARN"), out var churnLearn) ? churnLearn : 0;
+    private static readonly AsyncLocal<int?> ChurnLearnOverride = new();
+    internal const int ChurnLearnBudget = 8;
+    private readonly Dictionary<ulong, int> _churnLearnWalks = new();
+    private static readonly ThreadCounter _totalChurnRecorded = new();
+    public long ChurnRecorded { get; private set; }
+
+    // [local] Whether this first sighting of a churning key is recorded (and counts against the draw key's budget).
+    private bool TakeChurnLearnWalk(ulong drawKey)
+    {
+        var walks = _churnLearnWalks.GetValueOrDefault(drawKey);
+        if (walks >= ChurnLearnBudget)
+            return false;
+        if (_churnLearnWalks.Count >= DrawHistoryCapacity)
+            _churnLearnWalks.Clear();
+        _churnLearnWalks[drawKey] = walks + 1;
+        ChurnRecorded++;
+        _totalChurnRecorded.Increment();
+        return true;
     }
 
     private static string TakeChurnReport() =>
-        FormattableString.Invariant($" churn_learnable={_totalChurnLearnable.Take()} churn_unlearnable={_totalChurnUnlearnable.Take()} churn_multi={_totalChurnMulti.Take()}") +
+        FormattableString.Invariant($" churn_learnable={_totalChurnLearnable.Take()} churn_unlearnable={_totalChurnUnlearnable.Take()} churn_multi={_totalChurnMulti.Take()} churn_recorded={_totalChurnRecorded.Take()}") +
         AddressRebase.TakeLearnReport();
 
     private static readonly ThreadCounter _totalRevalidated = new();
@@ -1675,8 +1720,8 @@ public sealed partial class ResourceMaterializationCache
         else if (_sightings is { } sightings)
         {
             ref var sighting = ref sightings[key & (SightingSlots - 1)];
-            NoteChurn(drawKey, inputs.UserData, learned, rebase);
-            if (sighting != key)
+            var learnable = NoteChurn(drawKey, inputs.UserData, learned, rebase);
+            if (sighting != key && !(learnable && ChurnLearnMode != 0 && TakeChurnLearnWalk(drawKey))) // [local] SHARPEMU_MATERIALIZE_CHURN_LEARN
             {
                 _outcome = MaterializeOutcome.FirstSighting;
                 sighting = key;
@@ -1684,7 +1729,8 @@ public sealed partial class ResourceMaterializationCache
                 return MaterializeUnrecorded(plan, inputs, ref snapshot, ref specialization, out failure);
             }
 
-            sighting = 0;
+            if (sighting == key) // [local] a recorded first sighting leaves another key's slot alone
+                sighting = 0;
         }
         else
         {

@@ -256,7 +256,8 @@ public static partial class ResourceMaterializer
     private static readonly ThreadCounter _fastStatisticsHits = new();
 
     public static string TakeFastReport() => FormattableString.Invariant(
-        $"fast_materializations={_fastMaterializations.Take()} fast_specialization_hits={_fastSpecializationHits.Take()} fast_statistics_hits={_fastStatisticsHits.Take()}");
+        $"fast_materializations={_fastMaterializations.Take()} fast_specialization_hits={_fastSpecializationHits.Take()} fast_statistics_hits={_fastStatisticsHits.Take()}") +
+        (FastMemoMode != 0 ? " " + TakeFastMemoReport() : ""); // [local] SHARPEMU_FAST_MATERIALIZE_MEMO
 
     private sealed record FastOrigin(ShaderResourcePlan Plan, ResourceRuntimeInputs Inputs);
 
@@ -470,6 +471,15 @@ public static partial class ResourceMaterializer
         var output = TakeOutput();
         try
         {
+            if (FastMemoMode != 0 && Memoizable(plan)) // [local] SHARPEMU_FAST_MATERIALIZE_MEMO
+            {
+                var memoized = MaterializeFastMemoized(plan, inputs, output, ref snapshot, ref specialization, out failure, out var ran);
+                if (ran)
+                    return memoized;
+                _programFallbacks.Increment();
+                return MaterializeFastFromSnapshot(plan, inputs, ref snapshot, ref specialization, out failure);
+            }
+
             if (!EvaluateInto(plan, inputs, output))
             {
                 _programFallbacks.Increment();

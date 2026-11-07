@@ -1,0 +1,490 @@
+// Copyright (C) 2026 SharpEmu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using SharpEmu.HLE.Diagnostics;
+
+namespace SharpEmu.ShaderCompiler.Resources;
+
+// [local] SHARPEMU_FAST_MATERIALIZE_MEMO (=1 on, =2 verify, off by default): a plan the fast path materializes (no cache,
+// MaterializeFast) runs its program on every draw and dispatch. A run is a function of the user data words it reads, the
+// shader base, the compute state and the guest words it reads, nothing else: the memo remembers, per thread and plan,
+// the last MemoEntries runs with the user data words they read (index and value), and every guest read they made, in
+// order, with its answer. A later run whose read user data words are equal replays those reads through the same readers,
+// in the same order: while every answer is equal the program would have issued the same reads (each read's address is a
+// function of the user data and the answers before it), so it would produce the same snapshot and specialization, which
+// the memo returns with the draw's own user data. The first different answer ends the replay and the program runs (the
+// reads already replayed are read again, as any re-read is). The replay pays the reads but not the program's steps, its
+// output assembly or the specialization memo search. A plan with a frontend normalizer is not memoized (the normalizers
+// can depend on other state). =2 runs the program on every hit as well and counts the ones that differ
+// ([PERF][FAST_MEMO] in the fast report). Settable for tests (per async flow).
+public static partial class ResourceMaterializer
+{
+    public static int FastMemoMode
+    {
+        get => FastMemoOverride.Value ?? FastMemoDefault;
+        set => FastMemoOverride.Value = value;
+    }
+
+    private static readonly int FastMemoDefault =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FAST_MATERIALIZE_MEMO"), out var fastMemo) ? fastMemo : 0;
+    private static readonly AsyncLocal<int?> FastMemoOverride = new();
+
+    private const int MemoEntries = 4;
+    private const int MemoMaxReads = 512;
+    private const int MemoMaxBytes = 16384;
+
+    private static readonly ThreadCounter _fastMemoHits = new();
+    private static readonly ThreadCounter _fastMemoMisses = new();
+    private static readonly ThreadCounter _fastMemoReplayMisses = new();
+    private static readonly ThreadCounter _fastMemoStored = new();
+    private static readonly ThreadCounter _fastMemoRefused = new();
+    private static long _fastMemoVerified, _fastMemoMismatches;
+    private static int _fastMemoMismatchLogs;
+
+    internal static string TakeFastMemoReport() => FormattableString.Invariant(
+        $"fast_memo_hits={_fastMemoHits.Take()} fast_memo_misses={_fastMemoMisses.Take()} fast_memo_replay_misses={_fastMemoReplayMisses.Take()} ") +
+        FormattableString.Invariant(
+            $"fast_memo_stored={_fastMemoStored.Take()} fast_memo_refused={_fastMemoRefused.Take()} fast_memo_verified={Interlocked.Exchange(ref _fastMemoVerified, 0)} fast_memo_mismatches={Interlocked.Read(ref _fastMemoMismatches)}");
+
+    internal static long FastMemoMismatches => Interlocked.Read(ref _fastMemoMismatches);
+
+    private static bool Memoizable(ShaderResourcePlan plan) => plan.NormalizeBufferDescriptor is null && plan.NormalizeImageDescriptor is null;
+
+    private enum MemoReadKind : byte { Word, CleanWord, Resident }
+
+    private readonly record struct MemoRead(MemoReadKind Kind, ulong Address, int Offset, int Length, bool Clean, bool Ok, uint Word);
+
+    private sealed class MemoEntry
+    {
+        public required int UserDataCount;
+        public required int[] UsedIndices;
+        public required uint[] UsedValues;
+        public required ulong ShaderBase;
+        public required ComputeSelectorState? ComputeState;
+        public required bool ReadsClean;
+        public required MemoRead[] Reads;
+        public required byte[] Bytes;
+        public required ResourceSnapshot Snapshot;
+        public required ResourceSpecialization Specialization;
+    }
+
+    private sealed class MemoSet
+    {
+        public readonly MemoEntry?[] Entries = new MemoEntry?[MemoEntries];
+        public int Next;
+    }
+
+    [ThreadStatic] private static Dictionary<ShaderResourcePlan, MemoSet>? _memoSets;
+    [ThreadStatic] private static MemoRecorder? _memoRecorder;
+    [ThreadStatic] private static byte[]? _memoReplayBytes;
+
+    // Records the user data words and guest reads of one program run; taken out of its slot while in use (a guest read can
+    // materialize another draw on this thread).
+    private sealed class MemoRecorder : IReadOnlyList<uint>
+    {
+        private readonly GuestWordReader _readWord;
+        private readonly GuestWordReader _readCleanWord;
+        private readonly ResidentGuestBytesReader _readResident;
+        private ResourceRuntimeInputs? _inner;
+        private ResourceRuntimeInputs? _wrapped;
+        public IReadOnlyList<uint> UserData = [];
+        public ulong[] Used = new ulong[4];
+        public readonly List<MemoRead> Reads = new();
+        public byte[] Bytes = new byte[256];
+        public int ByteCount;
+        public bool Overflowed;
+
+        public MemoRecorder()
+        {
+            _readWord = ReadWord;
+            _readCleanWord = ReadCleanWord;
+            _readResident = ReadResident;
+        }
+
+        // The inputs the run sees: the caller's, with this recorder in front of the user data and the readers. The caller's
+        // inputs object is refilled per lookup (one per thread), so the wrapper is rebuilt only when another one comes.
+        public ResourceRuntimeInputs Wrap(ResourceRuntimeInputs inputs)
+        {
+            if (!ReferenceEquals(_inner, inputs) || _wrapped is null)
+            {
+                _inner = inputs;
+                _wrapped = new ResourceRuntimeInputs
+                {
+                    ReadMemory = inputs.ReadMemory is null ? null : _readWord,
+                    ReadCleanMemory = inputs.ReadCleanMemory is null ? null : _readCleanWord,
+                    TraceImageCandidate = inputs.TraceImageCandidate,
+                    TablePhase = inputs.TablePhase,
+                    ReadResidentMemory = inputs.ReadResidentMemory is null ? null : _readResident,
+                    CompareTableChunk = inputs.CompareTableChunk,
+                    ReadsClean = inputs.ReadsClean,
+                    SynchronizeRanges = inputs.SynchronizeRanges,
+                    SynchronizeTableRange = inputs.SynchronizeTableRange,
+                };
+            }
+
+            UserData = inputs.UserData;
+            Array.Clear(Used);
+            Reads.Clear();
+            ByteCount = 0;
+            Overflowed = false;
+            _wrapped.UserData = this;
+            _wrapped.ShaderBase = inputs.ShaderBase;
+            _wrapped.ComputeState = inputs.ComputeState;
+            return _wrapped;
+        }
+
+        public void Release()
+        {
+            UserData = [];
+            if (_wrapped is not null)
+                _wrapped.UserData = [];
+        }
+
+        public uint this[int index]
+        {
+            get
+            {
+                var value = UserData[index];
+                if ((index >> 6) >= Used.Length)
+                    Array.Resize(ref Used, (index >> 6) + 1);
+                Used[index >> 6] |= 1UL << (index & 63);
+                return value;
+            }
+        }
+
+        public int Count => UserData.Count;
+
+        public IEnumerator<uint> GetEnumerator()
+        {
+            for (var index = 0; index < Count; index++)
+                yield return this[index];
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+        private bool ReadWord(ulong address, out uint word)
+        {
+            var ok = _inner!.ReadMemory!(address, out word);
+            Note(new MemoRead(MemoReadKind.Word, address, 0, 0, false, ok, ok ? word : 0));
+            return ok;
+        }
+
+        private bool ReadCleanWord(ulong address, out uint word)
+        {
+            var ok = _inner!.ReadCleanMemory!(address, out word);
+            Note(new MemoRead(MemoReadKind.CleanWord, address, 0, 0, false, ok, ok ? word : 0));
+            return ok;
+        }
+
+        private bool ReadResident(ulong address, Span<byte> destination, bool clean)
+        {
+            var ok = _inner!.ReadResidentMemory!(address, destination, clean);
+            var offset = ByteCount;
+            if (ok)
+            {
+                if (ByteCount + destination.Length > MemoMaxBytes)
+                {
+                    Overflowed = true;
+                }
+                else
+                {
+                    if (Bytes.Length < ByteCount + destination.Length)
+                        Array.Resize(ref Bytes, Math.Max(Bytes.Length * 2, ByteCount + destination.Length));
+                    destination.CopyTo(Bytes.AsSpan(ByteCount));
+                    ByteCount += destination.Length;
+                }
+            }
+
+            Note(new MemoRead(MemoReadKind.Resident, address, offset, destination.Length, clean, ok, 0));
+            return ok;
+        }
+
+        private void Note(MemoRead read)
+        {
+            if (Reads.Count >= MemoMaxReads)
+            {
+                Overflowed = true;
+                return;
+            }
+
+            Reads.Add(read);
+        }
+    }
+
+    private static bool SameUsedUserData(MemoEntry entry, ResourceRuntimeInputs inputs)
+    {
+        var userData = inputs.UserData;
+        if (userData.Count != entry.UserDataCount || entry.ShaderBase != inputs.ShaderBase || entry.ReadsClean != inputs.ReadsClean ||
+            !Nullable.Equals(entry.ComputeState, inputs.ComputeState))
+            return false;
+        if (userData is uint[] words)
+        {
+            for (var index = 0; index < entry.UsedIndices.Length; index++)
+                if (words[entry.UsedIndices[index]] != entry.UsedValues[index])
+                    return false;
+            return true;
+        }
+
+        for (var index = 0; index < entry.UsedIndices.Length; index++)
+            if (userData[entry.UsedIndices[index]] != entry.UsedValues[index])
+                return false;
+        return true;
+    }
+
+    // Replays the entry's reads through the caller's readers, in order; false at the first different answer.
+    private static bool Replay(MemoEntry entry, ResourceRuntimeInputs inputs)
+    {
+        foreach (var read in entry.Reads)
+        {
+            switch (read.Kind)
+            {
+                case MemoReadKind.Word:
+                case MemoReadKind.CleanWord:
+                {
+                    var reader = read.Kind == MemoReadKind.Word ? inputs.ReadMemory : inputs.ReadCleanMemory;
+                    if (reader is null)
+                        return false;
+                    var ok = reader(read.Address, out var word);
+                    if (ok != read.Ok || (ok && word != read.Word))
+                        return false;
+                    break;
+                }
+                default:
+                {
+                    if (inputs.ReadResidentMemory is not { } resident)
+                        return false;
+                    var bytes = _memoReplayBytes is { } scratch && scratch.Length >= read.Length
+                        ? scratch : _memoReplayBytes = new byte[Math.Max(read.Length, 256)];
+                    _memoReplayBytes = null; // a nested materialization takes its own
+                    try
+                    {
+                        var span = bytes.AsSpan(0, read.Length);
+                        var ok = resident(read.Address, span, read.Clean);
+                        if (ok != read.Ok || (ok && !span.SequenceEqual(entry.Bytes.AsSpan(read.Offset, read.Length))))
+                            return false;
+                    }
+                    finally
+                    {
+                        _memoReplayBytes = bytes;
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    // The memoized result for this draw: the entry's snapshot with the draw's own user data and origin.
+    private static ResourceSnapshot SnapshotFor(MemoEntry entry, ShaderResourcePlan plan, ResourceRuntimeInputs inputs) => new()
+    {
+        Buffers = entry.Snapshot.Buffers,
+        Images = entry.Snapshot.Images,
+        Samplers = entry.Snapshot.Samplers,
+        FlattenedResourceTable = entry.Snapshot.FlattenedResourceTable,
+        UserData = inputs.UserData is uint[] array ? array : inputs.UserData.ToArray(),
+        DeviceAddressRanges = entry.Snapshot.DeviceAddressRanges,
+        MipStatistics = entry.Snapshot.MipStatistics,
+        Origin = new FastOrigin(plan, inputs),
+    };
+
+    private static bool TryFastMemoHit(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, out MemoEntry? hit)
+    {
+        hit = null;
+        if (_memoSets is not { } sets || !sets.TryGetValue(plan, out var set))
+        {
+            _fastMemoMisses.Increment();
+            return false;
+        }
+
+        var replays = 0;
+        for (var offset = 0; offset < MemoEntries; offset++)
+        {
+            // Newest first.
+            var entry = set.Entries[(set.Next - 1 - offset + MemoEntries * 2) % MemoEntries];
+            if (entry is null || !SameUsedUserData(entry, inputs))
+                continue;
+            if (Replay(entry, inputs))
+            {
+                hit = entry;
+                _fastMemoHits.Increment();
+                return true;
+            }
+
+            // Each replay reads again what the program will read; one more is the bound.
+            if (++replays == 2)
+                break;
+        }
+
+        if (replays != 0)
+            _fastMemoReplayMisses.Increment();
+        else
+            _fastMemoMisses.Increment();
+        return false;
+    }
+
+    private static void StoreFastMemo(ShaderResourcePlan plan, MemoRecorder recorder, ResourceRuntimeInputs inputs, ResourceSnapshot snapshot,
+        ResourceSpecialization specialization)
+    {
+        if (recorder.Overflowed)
+        {
+            _fastMemoRefused.Increment();
+            return;
+        }
+
+        var used = new List<int>();
+        for (var index = 0; index < inputs.UserData.Count; index++)
+            if ((index >> 6) < recorder.Used.Length && (recorder.Used[index >> 6] & (1UL << (index & 63))) != 0)
+                used.Add(index);
+        var values = new uint[used.Count];
+        for (var index = 0; index < values.Length; index++)
+            values[index] = inputs.UserData[used[index]];
+        var sets = _memoSets ??= new Dictionary<ShaderResourcePlan, MemoSet>(ReferenceEqualityComparer.Instance);
+        if (!sets.TryGetValue(plan, out var set))
+        {
+            if (sets.Count >= 4096)
+                sets.Clear();
+            sets.Add(plan, set = new MemoSet());
+        }
+
+        set.Entries[set.Next] = new MemoEntry
+        {
+            UserDataCount = inputs.UserData.Count,
+            UsedIndices = used.ToArray(),
+            UsedValues = values,
+            ShaderBase = inputs.ShaderBase,
+            ComputeState = inputs.ComputeState,
+            ReadsClean = inputs.ReadsClean,
+            Reads = recorder.Reads.ToArray(),
+            Bytes = recorder.Bytes.AsSpan(0, recorder.ByteCount).ToArray(),
+            Snapshot = snapshot,
+            Specialization = specialization,
+        };
+        set.Next = (set.Next + 1) % MemoEntries;
+        _fastMemoStored.Increment();
+    }
+
+    // MaterializeFast's program path with the memo in front: a hit returns the remembered result, a miss runs the program
+    // with its reads recorded and remembers the result.
+    private static bool MaterializeFastMemoized(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, MaterializationProgram.Output output,
+        ref ResourceSnapshot snapshot, ref ResourceSpecialization specialization, out ResourceMaterializationFailure failure, out bool ran)
+    {
+        ran = true;
+        failure = ResourceMaterializationFailure.Other;
+        var mode = FastMemoMode;
+        if (TryFastMemoHit(plan, inputs, out var hit))
+        {
+            if (mode != 2)
+            {
+                snapshot = SnapshotFor(hit!, plan, inputs);
+                specialization = hit!.Specialization;
+                _lastFastOutcome = MaterializationTally.Outcome.FastMemoHit;
+                failure = ResourceMaterializationFailure.None;
+                return true;
+            }
+
+            // =2: the program's own answer, compared with the memo's.
+            var checkedSnapshot = snapshot;
+            var checkedSpecialization = specialization;
+            if (!EvaluateInto(plan, inputs, output))
+            {
+                ran = false;
+                return false;
+            }
+
+            NoteProgramRun();
+
+            var result = MaterializeFromOutput(plan, inputs, output, ref checkedSnapshot, ref checkedSpecialization, out failure);
+            if (result)
+                NoteFastMemoVerify(plan, SnapshotFor(hit!, plan, inputs), hit!.Specialization, checkedSnapshot, checkedSpecialization);
+            snapshot = checkedSnapshot;
+            specialization = checkedSpecialization;
+            return result;
+        }
+
+        var recorder = _memoRecorder;
+        _memoRecorder = null;
+        if (recorder is null && _memoRecorderInUse)
+        {
+            // A nested materialization: no recording.
+            if (!EvaluateInto(plan, inputs, output))
+            {
+                ran = false;
+                return false;
+            }
+
+            NoteProgramRun();
+
+            return MaterializeFromOutput(plan, inputs, output, ref snapshot, ref specialization, out failure);
+        }
+
+        recorder ??= new MemoRecorder();
+        _memoRecorderInUse = true;
+        try
+        {
+            var recording = recorder.Wrap(inputs);
+            if (!EvaluateInto(plan, recording, output))
+            {
+                ran = false;
+                return false;
+            }
+
+            NoteProgramRun();
+
+            if (!MaterializeFromOutput(plan, inputs, output, ref snapshot, ref specialization, out failure))
+                return false;
+            StoreFastMemo(plan, recorder, inputs, snapshot, specialization);
+            return true;
+        }
+        finally
+        {
+            recorder.Release();
+            _memoRecorderInUse = false;
+            _memoRecorder = recorder;
+        }
+    }
+
+    [ThreadStatic] private static bool _memoRecorderInUse;
+
+    // The counters and outcome MaterializeFast notes before MaterializeFromOutput.
+    private static void NoteProgramRun()
+    {
+        _programRuns.Increment();
+        _fastMaterializations.Increment();
+        _lastFastOutcome = MaterializationTally.Outcome.FastMiss;
+    }
+
+    private static void NoteFastMemoVerify(ShaderResourcePlan plan, ResourceSnapshot memo, ResourceSpecialization memoSpecialization,
+        ResourceSnapshot fresh, ResourceSpecialization freshSpecialization)
+    {
+        Interlocked.Increment(ref _fastMemoVerified);
+        var difference = !memoSpecialization.Equals(freshSpecialization) ? "specialization"
+            : !SameWordArrays(memo.Buffers, fresh.Buffers) ? "buffers"
+            : !SameWordArrays(memo.Images, fresh.Images) ? "images"
+            : !SameWordArrays(memo.Samplers, fresh.Samplers) ? "samplers"
+            : !memo.FlattenedResourceTable.AsSpan().SequenceEqual(fresh.FlattenedResourceTable) ? "table"
+            : !memo.DeviceAddressRanges.AsSpan().SequenceEqual(fresh.DeviceAddressRanges) ? "ranges"
+            : !memo.UserData.AsSpan().SequenceEqual(fresh.UserData) ? "user_data"
+            : !(memo.MipStatistics ?? []).AsSpan().SequenceEqual(fresh.MipStatistics ?? []) ? "mip_statistics"
+            : null;
+        if (difference is null)
+            return;
+        Interlocked.Increment(ref _fastMemoMismatches);
+        if (Interlocked.Increment(ref _fastMemoMismatchLogs) <= 40)
+            Console.Error.WriteLine($"[FAST_MEMO_MISMATCH] plan=0x{plan.Hash:X16} part={difference}");
+    }
+
+    private static bool SameWordArrays(uint[][] left, uint[][] right)
+    {
+        if (left.Length != right.Length)
+            return false;
+        for (var index = 0; index < left.Length; index++)
+            if (!left[index].AsSpan().SequenceEqual(right[index]))
+                return false;
+        return true;
+    }
+}

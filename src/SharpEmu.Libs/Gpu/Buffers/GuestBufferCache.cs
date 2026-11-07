@@ -1205,6 +1205,28 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         return Math.Min(limit, buffer.CpuAddress + buffer.Size - address);
     }
 
+    // [local] SHARPEMU_RING_SLOT_REUSE: the registered buffer that FindBuffer would answer for the range without creating
+    // one (default when none holds it whole).
+    internal ResourceSlotIdentifier FindContainingBuffer(ulong guestAddress, ulong size) => _registry.FindContainingBuffer(guestAddress, size);
+
+    // [local] SHARPEMU_RING_SLOT_REUSE: whether [address, address + size) lies inside the window [start, end).
+    internal static bool WindowCovers(ulong start, ulong end, ulong address, ulong size) =>
+        end > start && address >= start && address < end && size != 0 && size <= end - address;
+
+    // [local] SHARPEMU_RING_SLOT_REUSE: the guest range a registered buffer covers, when it is still registered.
+    internal bool TryGetRegisteredExtent(ResourceSlotIdentifier identifier, out ulong address, out ulong size)
+    {
+        if (_registry.TryGetRegisteredBuffer(identifier) is { } buffer)
+        {
+            address = buffer.CpuAddress;
+            size = buffer.Size;
+            return true;
+        }
+
+        address = size = 0;
+        return false;
+    }
+
     public ResourceSlotIdentifier FindBuffer(ulong guestAddress, ulong size)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BufferCacheLookup);

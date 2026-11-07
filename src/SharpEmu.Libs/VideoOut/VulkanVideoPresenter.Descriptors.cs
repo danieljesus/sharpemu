@@ -47,6 +47,7 @@ internal static unsafe partial class VulkanVideoPresenter
         FormattableString.Invariant($"stale={Interlocked.Exchange(ref _stageMemoStale, 0)} invalidations={Interlocked.Exchange(ref _stageMemoInvalidations, 0)} acquire_reuses={Interlocked.Exchange(ref _stageMemoAcquireReuses, 0)} ") +
         FormattableString.Invariant($"content_hits={Interlocked.Exchange(ref _stageMemoContentHits, 0)} evictions={Interlocked.Exchange(ref _stageMemoEvictions, 0)} ") +
         FormattableString.Invariant($"buffer_refinds={Interlocked.Exchange(ref _stageMemoBufferRefinds, 0)} buffer_changes={Interlocked.Exchange(ref _stageMemoBufferChanges, 0)} ") +
+        RecordingHost.TakeRingSlotReport() + // [local] SHARPEMU_RING_SLOT_REUSE
         FormattableString.Invariant($"source_table=hits:{Interlocked.Exchange(ref _bufferSourceTableHits, 0)},misses:{Interlocked.Exchange(ref _bufferSourceTableMisses, 0)},verified:{Interlocked.Exchange(ref _bufferSourceTableVerified, 0)},mismatches:{Interlocked.Exchange(ref _bufferSourceTableMismatches, 0)},clears:{Interlocked.Exchange(ref _bufferSourceTableClears, 0)} ") + // [local] SHARPEMU_BUFFER_SOURCE_MEMO
         (PublicationsReport?.Invoke() ?? ""); // [local]
 
@@ -272,7 +273,10 @@ internal static unsafe partial class VulkanVideoPresenter
         private const int ImageBindingMemoCapacity = 1 << 16;
         private Dictionary<ImageBindingKey, ImageBindingMemo>? _imageBindingMemos;
 
-        private readonly record struct BufferSourceMemo(ulong Address, ulong Requested, long RegionStamp, long Spans, long Mapping, ResourceSlotIdentifier Buffer, ulong Size);
+        // [local] WindowStart/WindowEnd (SHARPEMU_RING_SLOT_REUSE): the owner buffer's guest range, found readable in full at
+        // Mapping; empty when not checked.
+        private readonly record struct BufferSourceMemo(ulong Address, ulong Requested, long RegionStamp, long Spans, long Mapping, ResourceSlotIdentifier Buffer, ulong Size,
+            ulong WindowStart = 0, ulong WindowEnd = 0);
         private readonly record struct BufferSourceKey(ulong Program, int Slot, ulong Address, ulong Requested); // [local] SHARPEMU_BUFFER_SOURCE_MEMO
         private Dictionary<BufferSourceKey, BufferSourceMemo>? _bufferSourceTable;
         private Dictionary<ShaderProgramInfo, BufferSourceMemo[]>? _bufferSourceMemos;
@@ -1309,6 +1313,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var spans = GuestGpuMemoryHook.Current?.SpanVersion ?? 0;
             var mapping = _guestMemory.MappingGeneration; // [local]
             var sourceMemoMode = BufferSourceMemoMode; // [local] SHARPEMU_BUFFER_SOURCE_MEMO, once per stage
+            var ringSlotReuse = RingSlotReuseMode != 0 && !_worker && mapping != long.MinValue; // [local] SHARPEMU_RING_SLOT_REUSE
             for (var index = 0; index < sources.Length; index++)
             {
                 var words = snapshot.Buffers[index];
@@ -1357,7 +1362,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     Gpu.Buffers.ConservativeRecords.VerifyBinding(index, descriptor.RecordCount, requested, _bufferCache.ContainingBufferExtent(descriptor.Address, ulong.MaxValue, 0));
                 requested = ConservativeRequested(program.Hash, descriptor, requested); // [local] SHARPEMU_CONSERVATIVE_RECORDS
                 var remembered = known || (memo.Address == descriptor.Address && memo.Requested == requested && memo.Spans == spans);
-                var size = remembered ? memo.Size : ClampMappedSize(descriptor.Address, requested, prepared, index);
+                var ringReused = !remembered && ringSlotReuse && ReusesRingSlot(in memo, descriptor.Address, requested, spans, mapping); // [local] SHARPEMU_RING_SLOT_REUSE
+                var size = remembered ? memo.Size : ringReused ? requested : ClampMappedSize(descriptor.Address, requested, prepared, index);
+                if (ringReused && RingSlotReuseMode == 2) // [local] the reused answer against the lookup it replaces
+                    VerifyRingSlot(in memo, descriptor.Address, requested, prepared, index);
                 PublishImagesUnderWrite(prepared.Resources.Info.Buffers[index], descriptor.Address, size);
                 if (remembered && memo.RegionStamp == _bufferCache.RegionStamp(descriptor.Address, requested))
                 {
@@ -1378,9 +1386,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
                 else
                 {
-                    var buffer = FindBuffer(descriptor.Address, size);
+                    var buffer = ringReused ? memo.Buffer : FindBuffer(descriptor.Address, size);
                     sources[index] = (descriptor, buffer, size);
-                    memo = new BufferSourceMemo(descriptor.Address, requested, _bufferCache.RegionStamp(descriptor.Address, requested), spans, mapping, buffer, size);
+                    var (windowStart, windowEnd) = ringReused ? (memo.WindowStart, memo.WindowEnd)
+                        : ringSlotReuse && size == requested ? RingSlotWindow(buffer) : (0UL, 0UL); // [local] SHARPEMU_RING_SLOT_REUSE
+                    memo = new BufferSourceMemo(descriptor.Address, requested, _bufferCache.RegionStamp(descriptor.Address, requested), spans, mapping, buffer, size,
+                        windowStart, windowEnd);
                     if (sourceMemoMode != 0 && mapping != long.MinValue) // [local] SHARPEMU_BUFFER_SOURCE_MEMO
                     {
                         var table = _bufferSourceTable ??= new Dictionary<BufferSourceKey, BufferSourceMemo>();
@@ -1407,6 +1418,55 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             prepared.BufferSources = sources;
+        }
+
+        // [local] SHARPEMU_RING_SLOT_REUSE (=1 on, =2 verify, off by default): GTA V moves most buffer slots of a program from
+        // one draw to the next inside the same per-frame ring ([PERF][STAGE_MEMO] buffer_changes ~ hits), so the slot's memo
+        // misses and the slot pays the clamp to the mapped size (a fully-mapped set lookup, a per-frame map lookup, a
+        // readability check and an insert into one of them) and a buffer lookup, for a range inside the buffer the slot had.
+        // A slot memo now keeps that owner's guest range when the whole of it was readable (checked once, when the memo
+        // comes from a lookup). A moved descriptor whose range lies inside that window, with the same mapping generation and
+        // guest spans, that the registry still answers with the same buffer (FindContainingBuffer: what FindBuffer returns
+        // before it would create one; registered buffers are disjoint) takes that buffer and its requested size. That is
+        // the clamp's answer: readability only shrinks with an unmap or a clear, and both move the mapping generation (the
+        // invariant SHARPEMU_MAPPED_SIZE_KEEP relies on). Render thread only. =2 clamps and looks the buffer up again on
+        // every reuse and counts the answers that differ ([PERF][STAGE_MEMO] ring_slots=).
+        internal static readonly int RingSlotReuseMode =
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_RING_SLOT_REUSE"), out var ringSlot) ? ringSlot : 0;
+        private static long _ringSlotReuses, _ringSlotWindows, _ringSlotVerified, _ringSlotMismatches;
+        private static int _ringSlotLogs;
+
+        internal static string TakeRingSlotReport() => RingSlotReuseMode == 0 ? "" : FormattableString.Invariant(
+            $"ring_slots=reuses:{Interlocked.Exchange(ref _ringSlotReuses, 0)},windows:{Interlocked.Exchange(ref _ringSlotWindows, 0)},verified:{Interlocked.Exchange(ref _ringSlotVerified, 0)},mismatches:{Interlocked.Read(ref _ringSlotMismatches)} ");
+
+        private bool ReusesRingSlot(in BufferSourceMemo memo, ulong address, ulong requested, long spans, long mapping)
+        {
+            if (!memo.Buffer.IsValid || memo.Mapping != mapping || memo.Spans != spans || !GuestBufferCache.WindowCovers(memo.WindowStart, memo.WindowEnd, address, requested) ||
+                _bufferCache.FindContainingBuffer(address, requested) != memo.Buffer)
+                return false;
+            _ringSlotReuses++;
+            return true;
+        }
+
+        private (ulong Start, ulong End) RingSlotWindow(ResourceSlotIdentifier buffer)
+        {
+            if (!buffer.IsValid || !_bufferCache.TryGetRegisteredExtent(buffer, out var start, out var size) || size == 0 ||
+                size > ulong.MaxValue - start || !_guestMemory.CanRead(start, size))
+                return (0, 0);
+            _ringSlotWindows++;
+            return (start, start + size);
+        }
+
+        private void VerifyRingSlot(in BufferSourceMemo memo, ulong address, ulong requested, PreparedStageBindings prepared, int index)
+        {
+            _ringSlotVerified++;
+            var checkedSize = ClampMappedSize(address, requested, prepared, index);
+            var checkedBuffer = FindBuffer(address, checkedSize);
+            if (checkedSize == requested && checkedBuffer == memo.Buffer)
+                return;
+            Interlocked.Increment(ref _ringSlotMismatches);
+            if (_ringSlotLogs++ < 20)
+                Console.Error.WriteLine($"[RING_SLOT_MISMATCH] hash=0x{prepared.Program.Hash:X16} slot={index} address=0x{address:X} requested=0x{requested:X} reused={memo.Buffer} now={checkedBuffer}/0x{checkedSize:X}");
         }
 
         // [local] SHARPEMU_CONSERVATIVE_RECORDS: a descriptor sized by the sentinel record count spans the rest of the cache

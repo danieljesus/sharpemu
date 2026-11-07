@@ -795,7 +795,7 @@ internal sealed class ShaderProgramCache
             MaterializationTally.Note(materialized ? outcome : MaterializationTally.Outcome.Failed,
                 System.Diagnostics.Stopwatch.GetTimestamp() - started, materialized ? snapshot : null);
             // [local] For the probes below, a hit is a cache hit or a fast materialization that kept its last result.
-            var hit = outcome == MaterializationTally.Outcome.FastHit || (materializations is not null && materializations.Hits != hitsBefore);
+            var hit = outcome is MaterializationTally.Outcome.FastHit or MaterializationTally.Outcome.FastMemoHit || (materializations is not null && materializations.Hits != hitsBefore);
             if (coldStarted != 0) // [local] SHARPEMU_COLDRES_PROBE
             {
                 Diagnostics.FrameMissProbe.AddPhase(hit ? RenderPhaseProfile.Phase.ColdMaterializeHit : RenderPhaseProfile.Phase.ColdMaterializeMiss,
@@ -848,6 +848,7 @@ internal sealed class ShaderProgramCache
             }
         }
 
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ProgramMaterialize); // [local] SHARPEMU_DRAWCOST_PROBE
         ulong[] callArguments = [];
         ulong[] callTargets = [];
         (ulong Target, ulong Argument)[]? callRecords = null;
@@ -1027,6 +1028,7 @@ internal sealed class ShaderProgramCache
         }
 
         stage = CreateStageResources(permutation.Program, snapshot, source, options, callArguments, callTargets, callRecords, callRecordRanges);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ProgramStage); // [local] SHARPEMU_DRAWCOST_PROBE
         if (entry.RuntimeCallRecords)
         {
             lock (_callGate)

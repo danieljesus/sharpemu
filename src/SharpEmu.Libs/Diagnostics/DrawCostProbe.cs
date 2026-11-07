@@ -60,6 +60,12 @@ internal static class DrawCostProbe
         ExecPrograms,
         ExecAdapt,
         ExecFill,
+        // Both, inside the program resolution (draws: ExecPrograms, dispatches: DispatchProgram): the user data and stage
+        // input of a rebound or resolved compute program, the resource materialization (with its guest reads), the
+        // permutation and stage resources. What follows them up to the lap below is the step that holds them.
+        ProgramRebind,
+        ProgramMaterialize,
+        ProgramStage,
         // Dispatch: the executor's resolution.
         DispatchProgram,
         DispatchDecode,

@@ -1200,6 +1200,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
         kept.Source = source;
         Diagnostics.FrameMissProbe.CountOnRender(Diagnostics.FrameMissProbe.Counter.RenderComputePreps); // [local]
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ProgramRebind); // [local] SHARPEMU_DRAWCOST_PROBE
         var pushDataCursor = 0u;
         var options = new StageCompileOptions { ComputeInfo = input, ComputeSystemRegisters = kept.SystemRegisters };
         bool prepared;
@@ -1297,6 +1298,7 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
             }
         }
         var input = ComputeStageInputResolver.Resolve(compute, source.Registered, dispatchInitiator, !_host.ComputeWave64Supported, dimensionX, dimensionY, dimensionZ);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ProgramRebind); // [local] SHARPEMU_DRAWCOST_PROBE
         if (source.Registered.Frontend is { } frontend &&
             frontend.TryResolveImageCopy(_context, source.Registered, source.UserData, input, systemRegisters, dimensionX, dimensionY, dimensionZ,
                 out var copySource, out var copyDestination))
