@@ -86,7 +86,7 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
     private readonly int _sliceItems;
     private readonly int _minimumItems;
     private readonly List<TItem> _items = new();
-    private readonly List<(TSlice Slice, int Start, int Count)> _slices = new();
+    private readonly List<(TSlice Slice, int Start, int Count, bool AtCut)> _slices = new();
     private int _cutStart;
     private bool _joining;
 
@@ -107,12 +107,15 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
     // True while the open items are being joined or run; nothing may cut then.
     public bool Joining => _joining;
 
+    // While joining: whether the slice being joined was handed out at the cut (the rest), not closed full.
+    public bool JoiningRest { get; private set; }
+
     public int OpenItems => _items.Count;
 
     public void Add(TItem item)
     {
         _items.Add(item);
-        if (_items.Count - _cutStart >= _sliceItems && DispatchRange(_cutStart, _items.Count - _cutStart))
+        if (_items.Count - _cutStart >= _sliceItems && DispatchRange(_cutStart, _items.Count - _cutStart, rest: false))
         {
             _cutStart = _items.Count;
         }
@@ -154,13 +157,14 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
                 for (var part = 0; part < parts; part++)
                 {
                     var end = _cutStart + (int)((long)rest * (part + 1) / parts);
-                    _ = DispatchRange(start, end - start);
+                    _ = DispatchRange(start, end - start, rest: true);
                     start = end;
                 }
             }
 
-            foreach (var (slice, start, count) in _slices)
+            foreach (var (slice, start, count, isRest) in _slices)
             {
+                JoiningRest = isRest;
                 Join(slice, start, count);
             }
 
@@ -175,17 +179,18 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
             _items.Clear();
             _cutStart = 0;
             _joining = false;
+            JoiningRest = false;
         }
     }
 
-    private bool DispatchRange(int start, int count)
+    private bool DispatchRange(int start, int count, bool rest)
     {
         if (_backend.Workers <= 0)
         {
             return false;
         }
 
-        _slices.Add((_backend.Dispatch(_items, start, count), start, count));
+        _slices.Add((_backend.Dispatch(_items, start, count), start, count, rest));
         _stats.Slices++;
         _stats.Items += count;
         return true;

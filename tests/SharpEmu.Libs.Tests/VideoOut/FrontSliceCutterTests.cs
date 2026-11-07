@@ -54,7 +54,19 @@ public sealed class FrontSliceCutterTests
 
         public bool TryClaim(FakeSlice slice) => slice.Stolen;
 
-        public bool NextSegment(FakeSlice slice, out FrontSliceSegment segment) => slice.Segments.TryDequeue(out segment);
+        // Read on each segment wait: whether the cutter says the slice was handed out at the cut.
+        public Func<bool>? JoiningRest;
+        public readonly List<(int Start, bool AtCut)> Waits = new();
+
+        public bool NextSegment(FakeSlice slice, out FrontSliceSegment segment)
+        {
+            if (JoiningRest is { } rest)
+            {
+                Waits.Add((slice.Start, rest()));
+            }
+
+            return slice.Segments.TryDequeue(out segment);
+        }
 
         public bool JoinSegment(FakeSlice slice, in FrontSliceSegment segment) => segment.Count != 0 && !slice.Invalid.Contains(segment.First);
 
@@ -125,6 +137,18 @@ public sealed class FrontSliceCutterTests
         Assert.All(backend.Log.Where(entry => !entry.StartsWith("dispatch", StringComparison.Ordinal)), entry => Assert.StartsWith("joined", entry));
         Assert.All(backend.Slices, slice => Assert.True(slice.Finished));
         Assert.False(cutter.HasOpen);
+    }
+
+    [Fact]
+    public void OnlyTheSlicesHandedOutAtTheCutAreJoinedAsTheRest()
+    {
+        var (cutter, backend, _) = Create();
+        backend.JoiningRest = () => cutter.JoiningRest;
+        AddRange(cutter, 100);
+        cutter.Flush(FrontSliceFlush.Item);
+
+        Assert.Equal(new[] { (0, false), (0, false), (64, true), (64, true), (82, true), (82, true) }, backend.Waits);
+        Assert.False(cutter.JoiningRest);
     }
 
     [Fact]

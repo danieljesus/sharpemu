@@ -56,7 +56,7 @@ internal static unsafe partial class VulkanVideoPresenter
             int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_ITEMS"), out var items) && items > 0 ? Math.Min(items, 1024) : 64;
 
         internal static readonly int MinimumItems =
-            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_MIN"), out var minimum) && minimum > 0 ? minimum : 8;
+            int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_MIN"), out var minimum) && minimum > 0 ? minimum : 32;
 
         private readonly Presenter _presenter;
         private readonly Action _barrier;
@@ -225,7 +225,9 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var started = Stopwatch.GetTimestamp();
             var next = _presenter.NextSegment(slice, _betweenItems);
-            ParallelResolveProbe.SliceWaitTicks += Stopwatch.GetTimestamp() - started;
+            var waited = Stopwatch.GetTimestamp() - started;
+            ParallelResolveProbe.SliceWaitTicks += waited;
+            if (_cutter.JoiningRest) ParallelResolveProbe.SliceRestWaitTicks += waited;
             segment = next is null ? default : new FrontSliceSegment(next.First, next.Count, next.SerialReason is not null, next.SerialReason, next);
             return next is not null;
         }

@@ -122,6 +122,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 // keep the window loop pumping instead of tearing the presenter down.
                 if (!TryMarkDeviceLost(exception))
                 {
+                    // [local] The presenter's disposal can fail too and hide this exception from the caller's log.
+                    Console.Error.WriteLine($"[LOADER][ERROR] Vulkan VideoOut frame failed: {exception}");
                     throw;
                 }
             }

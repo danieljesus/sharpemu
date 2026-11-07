@@ -117,7 +117,7 @@ internal static class ParallelResolveProbe
 
     // [local] SHARPEMU_FRONT_SLICES (render thread): handing slices to the workers, waiting for their segments (with the
     // relays run meanwhile), joining them, and the taken items recorded here after all. The workers' recording, any thread.
-    internal static long SliceHandoffTicks, SliceWaitTicks, SliceJoinTicks, SliceInlineTicks;
+    internal static long SliceHandoffTicks, SliceWaitTicks, SliceRestWaitTicks, SliceJoinTicks, SliceInlineTicks;
     private static long _sliceWorkerTicks;
 
     public static void AddSliceWorkerTicks(long ticks) => Interlocked.Add(ref _sliceWorkerTicks, ticks);
@@ -249,7 +249,7 @@ internal static class ParallelResolveProbe
         text.Append(CultureInfo.InvariantCulture,
             $" front_slices=n:{stats.Slices / frames:F1},items_mean:{(stats.Slices == 0 ? 0 : stats.Items / (double)stats.Slices):F1},items:{stats.Items / frames:F0},joined:{stats.Joined / frames:F0},segments:{stats.Segments / frames:F1}");
         text.Append(CultureInfo.InvariantCulture,
-            $" slice_handoff_ms={Ms(SliceHandoffTicks) / frames:F2} slice_join_wait_ms={Ms(SliceWaitTicks) / frames:F2} slice_join_ms={Ms(SliceJoinTicks) / frames:F2} slice_inline_ms={Ms(SliceInlineTicks) / frames:F2} slice_worker_ms={Ms(Interlocked.Exchange(ref _sliceWorkerTicks, 0)) / frames:F2}");
+            $" slice_handoff_ms={Ms(SliceHandoffTicks) / frames:F2} slice_join_wait_ms={Ms(SliceWaitTicks) / frames:F2} slice_rest_wait_ms={Ms(SliceRestWaitTicks) / frames:F2} slice_join_ms={Ms(SliceJoinTicks) / frames:F2} slice_inline_ms={Ms(SliceInlineTicks) / frames:F2} slice_worker_ms={Ms(Interlocked.Exchange(ref _sliceWorkerTicks, 0)) / frames:F2}");
         text.Append(" slice_inline=");
         for (var index = 0; index < InlineNames.Length; index++)
         {
@@ -270,7 +270,10 @@ internal static class ParallelResolveProbe
         text.Append(']');
         stats.SerialReasons.Clear();
         stats.Slices = stats.Items = stats.Joined = stats.Segments = 0;
-        SliceHandoffTicks = SliceWaitTicks = SliceJoinTicks = SliceInlineTicks = 0;
+        SliceHandoffTicks = SliceWaitTicks = SliceRestWaitTicks = SliceJoinTicks = SliceInlineTicks = 0;
+        // [local] Why the workers' image lookups failed (totals for the window); with PROFILE_RENDER the slice report takes them.
+        if (!RenderPhaseProfile.Enabled)
+            text.Append(' ').Append(SharpEmu.Libs.Gpu.Images.GuestImageCache.TakeSliceLookupReport());
     }
 
     private static void Report(long now)

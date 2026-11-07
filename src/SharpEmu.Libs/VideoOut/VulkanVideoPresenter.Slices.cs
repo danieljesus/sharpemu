@@ -779,7 +779,16 @@ internal static unsafe partial class VulkanVideoPresenter
             slice.Chunks = [];
             if (slice.Submitted)
             {
-                _scheduler.QueueCompletionAction(() => chunks.ForEach(_arenaPool!.Return));
+                // [local] The action can run after StopRenderWorkers (the scheduler's Finish at shutdown), when the pool is
+                // gone and its Dispose already released every chunk.
+                var pool = _arenaPool!;
+                _scheduler.QueueCompletionAction(() =>
+                {
+                    if (ReferenceEquals(_arenaPool, pool))
+                    {
+                        chunks.ForEach(pool.Return);
+                    }
+                });
             }
             else
             {
