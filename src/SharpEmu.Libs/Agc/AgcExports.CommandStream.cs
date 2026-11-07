@@ -339,9 +339,10 @@ public static partial class AgcExports
 
             public void Record(ResolvedDispatch record)
             {
-                if (owner._sliceCapture is not null) // [local] SHARPEMU_FRONT_SLICES captures draws only
+                if (owner._sliceCapture is { } capture) // [local] SHARPEMU_FRONT_SLICES: the front's dispatches (SHARPEMU_FRONT_SLICE_DISPATCHES)
                 {
-                    throw owner._host.Fatal("A dispatch was resolved while the front slices captured a draw.");
+                    capture.Add(new ResolvedDispatchWork(record));
+                    return;
                 }
 
                 if (!owner.Producing)
@@ -371,12 +372,20 @@ public static partial class AgcExports
 
         internal void EndSliceCapture() => _sliceCapture = null;
 
+        // [local] SHARPEMU_FRONT_SLICES: see ShaderPipelineCache.HoldsGates.
+        internal bool PipelineGatesHeld => _pipelines?.HoldsGates == true;
+
         // [local] A captured record a slice worker may record: a draw (or a skipped one) that writes no memory, so what
         // the stream resolves after it cannot read anything it writes except its render targets (pending writes).
         internal static bool IsSliceableDraw(DeferredWork work) =>
             work is ResolvedDrawWork { Record: { WritesMemory: false, Kind: ResolvedDrawKind.Draw or ResolvedDrawKind.Skipped } };
 
-        internal static long SequenceOf(DeferredWork work) => work is ResolvedDrawWork draw ? draw.Record.Sequence : 0;
+        // [local] SHARPEMU_FRONT_SLICE_DISPATCHES: or any captured dispatch; its writes are marked pending until it is joined.
+        internal static bool IsSliceableRecord(DeferredWork work, bool dispatches) =>
+            IsSliceableDraw(work) || (dispatches && work is ResolvedDispatchWork);
+
+        internal static long SequenceOf(DeferredWork work) =>
+            work is ResolvedDrawWork draw ? draw.Record.Sequence : work is ResolvedDispatchWork dispatch ? dispatch.Record.Sequence : 0;
 
         public void RunDeferred(DeferredWork work)
         {

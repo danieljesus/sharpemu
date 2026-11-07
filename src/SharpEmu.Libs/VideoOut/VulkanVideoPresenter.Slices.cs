@@ -1141,7 +1141,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     _sliceUseHits.Increment();
                     NoteSliceWrite(cached, isWritten);
-                    Requests.AddBuffer(new BufferSliceUse(address, size, isWritten, isTexelBuffer, invalidateImages, cached));
+                    Requests.AddBuffer(new BufferSliceUse(address, size, isWritten, isTexelBuffer, invalidateImages, cached, isWritten ? Gpu.Buffers.TableWordMemo.CurrentProgram : 0)); // [local]
                     return (cached, cached.Offset(address), cached.Size - cached.Offset(address));
                 }
 
@@ -1180,7 +1180,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             entry = new SliceUseEntry(address, size, isWritten, isTexelBuffer, invalidateImages, _buffers, buffer);
             NoteSliceWrite(buffer, isWritten);
-            Requests.AddBuffer(new BufferSliceUse(address, size, isWritten, isTexelBuffer, invalidateImages, buffer));
+            Requests.AddBuffer(new BufferSliceUse(address, size, isWritten, isTexelBuffer, invalidateImages, buffer, isWritten ? Gpu.Buffers.TableWordMemo.CurrentProgram : 0)); // [local]
             return (buffer, buffer.Offset(address), buffer.Size - buffer.Offset(address));
         }
 

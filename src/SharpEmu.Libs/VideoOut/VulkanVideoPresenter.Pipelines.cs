@@ -991,6 +991,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            BeforeFrontSliceRead(address, sizeof(uint)); // [local] SHARPEMU_FRONT_SLICES: a pending write of a taken draw or dispatch is joined first
             word = 0;
             CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             var synchronized = false;
@@ -1257,6 +1258,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            BeforeFrontSliceRead(address, sizeof(uint)); // [local] SHARPEMU_FRONT_SLICES: a pending write of a taken draw or dispatch is joined first
             word = 0;
             CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             if (!_guestMemory.CanRead(address, sizeof(uint)))
@@ -1547,6 +1549,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            BeforeFrontSliceRead(address, size); // [local] SHARPEMU_FRONT_SLICES
             if (!ResidentReadAllowed(address, size, clean))
             {
                 return false;

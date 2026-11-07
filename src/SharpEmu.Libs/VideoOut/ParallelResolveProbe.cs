@@ -273,7 +273,7 @@ internal static class ParallelResolveProbe
     private static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
 
     private static readonly string[] InlineNames = ["short", "stolen", "invalid", "serial", "tail"];
-    private static readonly string[] FlushNames = ["item", "exit", "read", "record", "after"];
+    private static readonly string[] FlushNames = ["item", "exit", "read", "record", "after", "prep"];
 
     // [local] SHARPEMU_FRONT_SLICES, per frame: slices handed out and their mean items, items joined (recorded by a worker),
     // the render thread's ms per part, the workers' ms, items recorded here after all by reason, joins by what caused them,

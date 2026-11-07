@@ -5,6 +5,7 @@ namespace SharpEmu.Libs.VideoOut;
 
 using System.Diagnostics;
 using SharpEmu.Libs.Agc;
+using SharpEmu.Libs.Gpu.Scheduling;
 
 internal static unsafe partial class VulkanVideoPresenter
 {
@@ -22,18 +23,36 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        // [local] SHARPEMU_FRONT_SLICE_DISPATCHES: before a front preparation is checked at its item (FrontPreparationStillValid).
+        // Always true; see FrontSlices.BeforePreparationCheck.
+        internal bool BeforeFrontPreparationCheck(FrontPrepReads.Pages? pages)
+        {
+            if (_frontSlicer is { OpenWriters: true } slices)
+            {
+                slices.BeforePreparationCheck(pages);
+            }
+
+            return true;
+        }
+
         internal void RunFrontSliceWork(AgcExports.DeferredWork work) => RunDeferredWork(work);
 
         internal Action FrontSliceRelay => RunRelayBetweenCommandItems;
     }
 
-    // [local] SHARPEMU_FRONT_SLICES: a draw record or global barrier the render thread resolved and a worker records.
+    // [local] SHARPEMU_FRONT_SLICES: the queued item whose banks a captured record reads.
+    internal interface IFrontSliceOwner
+    {
+        void ReleaseSnapshot();
+    }
+
+    // [local] SHARPEMU_FRONT_SLICES: a draw or dispatch record or global barrier the render thread resolved and a worker records.
     private sealed class FrontSliceItem
     {
         public readonly CommandThread.Item Item = new() { Kind = CommandThread.Kind.Deferred };
 
         // The draw whose banks the record reads; set on the last record of the draw.
-        public FrontCommandStreamHost.FrontDraw? Owner;
+        public IFrontSliceOwner? Owner;
     }
 
     // [local] SHARPEMU_FRONT_SLICES=1 (increment 3a of docs/plan-parallel-resolution-open-world.md §10), on the render
@@ -58,6 +77,21 @@ internal static unsafe partial class VulkanVideoPresenter
         internal static readonly int MinimumItems =
             int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_MIN"), out var minimum) && minimum > 0 ? minimum : 32;
 
+        // [local] SHARPEMU_FRONT_SLICE_DISPATCHES=1 (step 3b, off by default): the front's direct dispatches (FrontDispatch) are
+        // taken too, unless a local dispatch hook needs the render thread (NeedsSerialDispatch). A captured dispatch writes
+        // memory, so what the render thread does after it, before its slice is joined, must not see stale memory:
+        //  - every guest read on the render thread (TryReadGuest, the command memory, the table words of the materializer,
+        //    clean and resident reads) joins everything taken first when it overlaps a pending write (BeforeRead), as for
+        //    the draws' render targets; the pending writes are the dispatch's own marks (MarkPendingWrites);
+        //  - a front preparation is checked at its item against the ranges first GPU-written since it was made
+        //    (FrontPreparationStillValid), which a dispatch adds only once it is joined: while a taken dispatch is open, a
+        //    preparation that read a page with a pending write, or whose pages are not known, joins everything first
+        //    (BeforePreparationCheck, flush `prep`), so the check sees what it sees in serial;
+        //  - any other item, and a draw or dispatch that is not taken, joins everything before it runs, as before.
+        // A worker records the dispatch as upstream's slices do (Serial for what needs the render thread); ordering in the
+        // command buffers is the stream order, segment by segment.
+        internal static readonly bool Dispatches = Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICE_DISPATCHES") == "1";
+
         private readonly Presenter _presenter;
         private readonly Action _barrier;
         private readonly FrontSliceCutter<FrontSliceItem, RenderSlice> _cutter;
@@ -65,6 +99,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly Stack<FrontSliceItem> _spare = new();
         private readonly Action _betweenItems;
         private int _thread = -1;
+        private int _openWriters;
 
         public FrontSlices(Presenter presenter, FrontCommandStreamHost front)
         {
@@ -76,9 +111,17 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public bool HasOpen => _cutter.HasOpen;
 
+        // A taken dispatch is open (SHARPEMU_FRONT_SLICE_DISPATCHES).
+        public bool OpenWriters => _openWriters != 0;
+
         public bool Take(Action work)
         {
             if (work.Target is FrontCommandStreamHost.FrontDraw draw && _presenter.SlicesEnabled && _presenter._translation.DrawPassesSliceGate(draw.Banks))
+            {
+                return true;
+            }
+
+            if (Dispatches && work.Target is FrontCommandStreamHost.FrontDispatch && _presenter.SlicesEnabled && !Gpu.Rendering.RenderRecorder.NeedsSerialDispatch)
             {
                 return true;
             }
@@ -88,7 +131,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
-            _cutter.Flush(FrontSliceFlush.Item);
+            Flush(FrontSliceFlush.Item);
             return false;
         }
 
@@ -96,25 +139,39 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (work.Target is FrontCommandStreamHost.FrontDraw draw)
             {
-                RunDraw(draw);
+                draw.HoldSnapshot = true;
+                RunCaptured(work, draw);
+                return;
+            }
+
+            if (work.Target is FrontCommandStreamHost.FrontDispatch)
+            {
+                // A dispatch record keeps no reference to the banks: they go back to the front when Run ends.
+                RunCaptured(work, null);
                 return;
             }
 
             _cutter.Add(NewItem(AgcExports.GlobalBarrierWork.Instance, 0, null));
         }
 
-        public void Flush(FrontSliceFlush reason) => _cutter.Flush(reason);
+        public void Flush(FrontSliceFlush reason)
+        {
+            _cutter.Flush(reason);
+            if (!_cutter.HasOpen)
+            {
+                _openWriters = 0;
+            }
+        }
 
-        private void RunDraw(FrontCommandStreamHost.FrontDraw draw)
+        private void RunCaptured(Action work, IFrontSliceOwner? owner)
         {
             _thread = Environment.CurrentManagedThreadId;
             _captured.Clear();
-            draw.HoldSnapshot = true;
             var translation = _presenter._translation;
             translation.BeginSliceCapture(_captured);
             try
             {
-                draw.Run();
+                work();
             }
             finally
             {
@@ -123,33 +180,70 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (_captured.Count == 0)
             {
-                draw.ReleaseSnapshot();
+                owner?.ReleaseSnapshot();
                 return;
             }
 
             var inline = false;
             for (var index = 0; index < _captured.Count; index++)
             {
-                var work = _captured[index];
-                var owner = index == _captured.Count - 1 ? draw : null;
-                if (!inline && AgcExports.CommandStreamTranslation.IsSliceableDraw(work))
+                var captured = _captured[index];
+                var last = index == _captured.Count - 1 ? owner : null;
+                if (!inline && AgcExports.CommandStreamTranslation.IsSliceableRecord(captured, Dispatches))
                 {
-                    _cutter.Add(NewItem(work, AgcExports.CommandStreamTranslation.SequenceOf(work), owner));
+                    if (captured.IsDispatch)
+                    {
+                        _openWriters++;
+                    }
+
+                    _cutter.Add(NewItem(captured, AgcExports.CommandStreamTranslation.SequenceOf(captured), last));
                     continue;
                 }
 
                 if (!inline)
                 {
                     inline = true;
-                    _cutter.Flush(FrontSliceFlush.Record);
+                    Flush(FrontSliceFlush.Record);
                 }
 
-                RunWork(work);
-                owner?.ReleaseSnapshot();
+                RunWork(captured);
+                last?.ReleaseSnapshot();
             }
 
             _captured.Clear();
         }
+
+        // While a taken dispatch is open: a front preparation that read a page the open items may write, or whose pages are
+        // not known, joins them first, so FrontPreparationStillValid sees the ranges they write first, as in serial.
+        public void BeforePreparationCheck(FrontPrepReads.Pages? pages)
+        {
+            if (_cutter.Joining || Environment.CurrentManagedThreadId != _thread)
+            {
+                return;
+            }
+
+            if (FrontSliceGuards.PreparationNeedsJoin(pages, _presenter._translation.PendingWrites is null ? null : _pendingOverlap ??= PendingOverlap))
+            {
+                JoinBeforeRead(FrontSliceFlush.Prep);
+            }
+        }
+
+        // A join from inside a read waits for the workers; inside a gate they may take, it would wait forever.
+        private void JoinBeforeRead(FrontSliceFlush reason)
+        {
+            if (_presenter._translation.PipelineGatesHeld)
+            {
+                throw SubmissionScheduler.Fatal($"SHARPEMU_FRONT_SLICES: a guest read must join the taken items inside a pipeline gate (flush {reason}).");
+            }
+
+            Flush(reason);
+        }
+
+        private Func<ulong, ulong, bool>? _pendingOverlap;
+
+        private bool PendingOverlap(ulong address, ulong size) =>
+            _presenter._translation.PendingWrites is { } pending && pending.MayHavePending(address, size) &&
+            pending.HasPendingBetween(address, size, pending.Released, long.MaxValue);
 
         // Joins everything taken when the read overlaps a pending write of a taken draw: in stream order the draw is
         // recorded before what reads after it.
@@ -160,18 +254,17 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            if (_presenter._translation.PendingWrites is { } pending && pending.MayHavePending(address, size) &&
-                pending.HasPendingBetween(address, size, pending.Released, long.MaxValue))
+            if (PendingOverlap(address, size))
             {
-                _cutter.Flush(FrontSliceFlush.Read);
+                JoinBeforeRead(FrontSliceFlush.Read);
             }
         }
 
-        private FrontSliceItem NewItem(AgcExports.DeferredWork work, long sequence, FrontCommandStreamHost.FrontDraw? owner)
+        private FrontSliceItem NewItem(AgcExports.DeferredWork work, long sequence, IFrontSliceOwner? owner)
         {
             var item = _spare.Count != 0 ? _spare.Pop() : new FrontSliceItem();
             item.Item.Work = work;
-            item.Item.IsDraw = work is not AgcExports.GlobalBarrierWork;
+            item.Item.IsDraw = work is not AgcExports.GlobalBarrierWork && !work.IsDispatch;
             item.Item.Sequence = sequence;
             item.Owner = owner;
             return item;

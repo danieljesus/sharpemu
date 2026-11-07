@@ -764,7 +764,7 @@ internal static unsafe partial class VulkanVideoPresenter
         // The front prepares its programs as for any queued draw; a worker resolves with that preparation, and the draw's
         // position checks it as the inline path does (a preparation discarded there sends the draw to a resolve in order).
         internal sealed class FrontDraw(FrontCommandStreamHost host, ulong submitId, RegisterBanks snapshot, bool indexed,
-            DrawIndexedArguments indexedArguments, DrawAutoArguments autoArguments, KeyValuePair<uint, uint>[]? registers, long version)
+            DrawIndexedArguments indexedArguments, DrawAutoArguments autoArguments, KeyValuePair<uint, uint>[]? registers, long version) : IFrontSliceOwner
         {
             private AgcExports.DeferredDraw? _deferred;
             internal GraphicsPrograms? Prepared;
@@ -778,7 +778,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             internal RegisterBanks Banks => snapshot;
 
-            internal void ReleaseSnapshot() => host._snapshots.Push(snapshot);
+            public void ReleaseSnapshot() => host._snapshots.Push(snapshot);
 
             // The lookahead's offer; false ends the scan. `next` is the item the render thread runs next.
             public bool Offer(bool next)
@@ -796,7 +796,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     var lent = Prepared;
                     if (Prepared is null)
                         FrontPrepReads.Release(PrepPages);
-                    else if (!host.Presenter.FrontPreparationStillValid(version, PrepPages, out rangesVerify) || !host.Presenter.TablesStillValid(TableMark))
+                    else if (!host.Presenter.BeforeFrontPreparationCheck(PrepPages) || // [local] SHARPEMU_FRONT_SLICE_DISPATCHES
+                             !host.Presenter.FrontPreparationStillValid(version, PrepPages, out rangesVerify) || !host.Presenter.TablesStillValid(TableMark))
                     {
                         Prepared = null;
                         Inputs = default;
@@ -821,6 +822,47 @@ internal static unsafe partial class VulkanVideoPresenter
 
             internal (GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs) Prepare() =>
                 host.Presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default;
+        }
+
+        // [local] SHARPEMU_FRONT_SLICE_DISPATCHES: the queued direct dispatch of the inline path below as an object the
+        // front slices recognize (FrontSlices.Take); Run does what that closure does.
+        internal sealed class FrontDispatch(FrontCommandStreamHost host, ulong submitId, RegisterBanks snapshot, uint groupsX, uint groupsY, uint groupsZ,
+            uint dispatchInitiator, ulong indirectArgumentsAddress, long version, int timelineQueue, long tableMark, Func<ComputeProgram?> prepareOnFront)
+        {
+            internal ComputeProgram? Prepared;
+            internal FrontPrepReads.Pages? PrepPages;
+            internal FrontSpeculation.Reads? Speculated;
+
+            public void Run()
+            {
+                try
+                {
+                    var presenter = host.Presenter;
+                    var rangesVerify = false;
+                    if (Prepared is null)
+                        FrontPrepReads.Release(PrepPages);
+                    else if (!presenter.BeforeFrontPreparationCheck(PrepPages) ||
+                             !presenter.FrontPreparationStillValid(version, PrepPages, out rangesVerify) || !presenter.TablesStillValid(tableMark))
+                        Prepared = null;
+                    if (Prepared is not null && (FrontPrepVerify.Enabled || rangesVerify))
+                        Prepared = Presenter.VerifyCompute(Prepared, prepareOnFront, rangesVerify);
+                    if (Speculated is not null)
+                    {
+                        if (Prepared is null) Interlocked.Increment(ref FrontSpeculation.Invalidated);
+                        Prepared = presenter.ArmSpeculation(snapshot.Shader.Compute.Address, Prepared, Speculated, prepareOnFront);
+                        Speculated = null;
+                    }
+                    Diagnostics.LabelTimeline.RenderQueue = timelineQueue;
+                    presenter.ExecuteQueuedDispatch(submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, Prepared);
+                    Diagnostics.LabelTimeline.RenderQueue = -1;
+                }
+                finally
+                {
+                    Prepared = null;
+                    PrepPages = null;
+                    host._snapshots.Push(snapshot);
+                }
+            }
         }
 
         internal Presenter Presenter => presenter; // [local]
@@ -1005,6 +1047,14 @@ internal static unsafe partial class VulkanVideoPresenter
             var speculated = frontPrepares ? FrontSpeculation.Take() : null; // [local]
             tableMark = Presenter.EndTableMark(tableMark);
             computeScope.Dispose();
+            if (FrontSlicesEnabled && FrontSlices.Dispatches) // [local] SHARPEMU_FRONT_SLICE_DISPATCHES
+            {
+                var dispatch = new FrontDispatch(this, submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, version,
+                    timelineQueue, tableMark, prepareOnFront) { Prepared = prepared, PrepPages = prepPages, Speculated = speculated };
+                queue.Enqueue(dispatch.Run, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             queue.Enqueue(() =>
             {
                 try

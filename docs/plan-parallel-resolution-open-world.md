@@ -387,3 +387,31 @@ Medido el 06-11 en partida (ventanas de 5 s, `y2a`/`y2b`/`y2c` en `%TEMP%\gta`),
   - `slice_inline=short,stolen,invalid,serial,tail`, `slice_flushes=item,exit,read,record,after` y `slice_serial=[motivo:n]`.
   - Con slices, `draw_record_ms` solo cuenta lo que se graba por el sumidero del ejecutor, y `draw_ms` incluye las uniones `read` que caen dentro de un draw.
 - **Brazos** (con `SHARPEMU_RENDER_PIPELINE=1 SHARPEMU_PARRES_PROBE=1 SHARPEMU_FPS_LOG=1`): A base; S `SHARPEMU_FRONT_SLICES=1` (N = `SHARPEMU_RENDER_WORKERS`; por defecto, procesadores/4 entre 1 y 6; desde el 07-11 tarde el resto de un corte por debajo de `SHARPEMU_FRONT_SLICE_MIN`=32 corre en línea, =8 da el reparto original); S0 = S con `SHARPEMU_RENDER_WORKERS=0`, que debe dar lo mismo que A (nada se toma).
+
+### 3a medido y 3b implementado (07-11 noche)
+- **3a medido** (`sca`/`sc1`/`sc6`, por fotograma) [V]: neutro. Hilo de render en draws 82,3 ms (A) frente a 79,4 (S, 4 trabajadores) y 83,5 (6). El trabajador cuesta ~26–28 µs por ítem unido con 4 y con 6 (no es contención). En `sc1`:
+  - `segments` 326 ≈ `front_slices n` 100 + `serial` 246: cada corte `Serial(resumable)` termina un segmento y abre otro;
+  - `depth_target_acquire` 200,6 = `lookup_fail depth_stencil` 5.616 / 28 fotogramas: todas las negativas de profundidad son la comparación de `Stencil` en `TryPrepareDepthTargetViewForSlice`;
+  - `image_lookup` 38 = (`dcc_clear` 1.043 + `no_candidate` 20) / 28: todas son `DccClearMaterializationIsNoop`, rol color;
+  - `slice_inline` 1.662 ítems (31 ms): `short` 1.014 (restos < 32 entre ~199 cortes), `stolen` 295 (restos que el trabajador aún no había empezado), `serial` 246, `tail` 108. `join_wait` 28 ms es la espera por el resto de cada corte;
+  - el cuello no es el coste por ítem del trabajador sino los cortes: ~199/fotograma por dispatches no tomados (`dispatch_record_ms` 65,7 sigue en el hilo de render).
+- **Profundidad con stencil** (`SHARPEMU_SLICE_STENCIL_PLANE=1`, apagado por defecto): `AcquireDepthTargetCore` guarda `StencilPlaneOfImage(imagen, petición)`, que para una vista de menos capas que la imagen ensancha el plano a todas las capas. El trabajador comparaba con el tramo de la petición, que en ese caso nunca coincide. Ahora compara con el plano que dejaría la adquisición en serie: si coinciden, esa asignación no cambia nada (exacto). `lookup_detail=stencil_unset|stencil_layers|stencil_address` dice qué caso era, y `stencil_plane_matched` cuántas acepta el cambio.
+- **DCC** (`SHARPEMU_SLICE_DCC_NATIVE=1`, apagado): `MaterializeDccClear` vuelve sin tocar nada con `NativeColorClear`; el trabajador exigía además metadatos iguales. `lookup_detail=dcc_metadata|dcc_metadata_native|dcc_layout|dcc_dirty|dcc_read|dcc_key` separa las negativas; `dcc_dirty` (lectura de GPU) y `dcc_key` (borrado pendiente) son serie de verdad.
+- **Sonda del trabajador** (siempre con `PARRES_PROBE`): `slice_worker=segments:n/begin_us/end_us,items:n/us,dispatches:n/us,serial:n/us,scopes:n,attach:n/us,kept:n,lookups:n/us` y `slice_inline_us` (coste por ítem en línea del hilo de render).
+- **3b** (`SHARPEMU_FRONT_SLICE_DISPATCHES=1`, exige `FRONT_SLICES=1`; apagado):
+  - los dispatches directos del frente van en un `FrontDispatch` (lo mismo que la closure) y se toman salvo `NeedsSerialDispatch`. Su registro se captura (`ResolvedDispatchWork`) con secuencia propia, así que `MarkPendingWrites` marca sus escrituras hasta la unión. Lo graba un trabajador con el código de upstream (`Serial` para lo que necesita el hilo de render: rellenos, copias de imagen, indirectos por hilos);
+  - lecturas del hilo de render que solapan una escritura pendiente unen antes: además de `TryReadGuest` y la memoria de comandos, ahora `TryReadGuestWord` (palabras de tabla del materializador, antes de la memoria de `TABLE_WORD_MEMO`), `TryReadCleanGuestWord` y `TryReadResidentGuestBytes`;
+  - preparación del frente: la versión de rangos escritos por primera vez solo cambia al unir. Con un dispatch tomado abierto, una preparación que leyó una página con escritura pendiente, o cuyas páginas no se conocen, une antes de `FrontPreparationStillValid` (corte `prep`). Así la comprobación ve lo mismo que en serie;
+  - `TABLE_WORD_MEMO`: la unión aplica cada uso escrito como escritura del programa que lo preparó en el trabajador (`BufferSliceUse.Program`), igual que en serie; si no, el refit 5981 dejaría de estar en la lista blanca;
+  - una unión desde una lectura dentro de una puerta del caché de pipelines (`_gate`, `_pipelineGate`) esperaría a un trabajador que la necesita: es un `Fatal` explícito y no un bloqueo;
+  - el orden en los búferes de comandos es el del flujo, segmento a segmento. Pruebas: `FrontSliceCutterTests` (mezcla con `Serial`, robado, `tail` y corte `prep`; `FrontSliceGuards`).
+- **Esperado [E]:**
+  - 3a + profundidad: −200 segmentos y −200 ítems en línea por fotograma, ~−4 a −6 ms;
+  - 3b: los cortes pasan de ~199 por dispatches a los ~364 ítems «otros» de `slice_runs`. Pero el 94 % de los ítems está en corridas ≥32 (6.022 de 6.395 en `sc1`), y la grabación de dispatches (65,7 ms) sale del hilo de render. Si los dispatches no vuelven en serie en masa, el hilo de render en draws+dispatches baja de ~160 a 60–90 ms;
+  - la incógnita son los `Serial` no reanudables de dispatches (`dcc fill`, `image clear`, `frontend image copy`), que mandan el resto del slice a `tail`: leer `slice_serial` y `slice_inline=tail`.
+- **Brazos** (acumulativos, con `SHARPEMU_RENDER_PIPELINE=1 SHARPEMU_PARRES_PROBE=1 SHARPEMU_FPS_LOG=1 SHARPEMU_FRONT_SLICES=1`):
+  - S: 3a tal cual (la sonda nueva y `lookup_detail` ya salen);
+  - SD: S + `SHARPEMU_SLICE_STENCIL_PLANE=1`;
+  - SDN: SD + `SHARPEMU_SLICE_DCC_NATIVE=1` (solo si `lookup_detail` muestra `dcc_metadata_native`);
+  - SB: SD + `SHARPEMU_FRONT_SLICE_DISPATCHES=1`;
+  - SB6: SB con `SHARPEMU_RENDER_WORKERS=6`.

@@ -36,7 +36,7 @@ public sealed class FrontSliceCutterTests
 
         public FakeSlice Dispatch(List<int> items, int start, int count)
         {
-            Assert.Equal(start, items[start]);
+            Assert.Equal(start, items[start] - items[0]);
             var slice = new FakeSlice { Start = start, Count = count, Resume = count };
             if (Script is { } script)
             {
@@ -324,6 +324,80 @@ public sealed class FrontSliceCutterTests
         Assert.Equal(Enumerable.Range(0, 40), backend.Ended);
         Assert.Equal(0, stats.Flushes[(int)FrontSliceFlush.Read]);
         Assert.Equal(1, stats.Flushes[(int)FrontSliceFlush.Item]);
+    }
+
+    // [local] SHARPEMU_FRONT_SLICE_DISPATCHES: draws, dispatches and barriers are one stream of items to the cutter. Across
+    // full slices, a stolen one, a worker that stops at a dispatch and resumes, one that gives up, and the joins a
+    // preparation check causes, every item ends once and in stream order.
+    [Fact]
+    public void MixedDrawsDispatchesAndBarriersEndInStreamOrderAcrossPrepJoins()
+    {
+        var (cutter, backend, stats) = Create(sliceItems: 16);
+        var dispatched = 0;
+        backend.Script = slice =>
+        {
+            switch (dispatched++)
+            {
+                case 0:
+                    slice.Segments.Enqueue(new FrontSliceSegment(0, 6, true, "indirect thread dispatch", null));
+                    slice.Segments.Enqueue(new FrontSliceSegment(7, slice.Count - 7, false, null, null));
+                    break;
+                case 1:
+                    slice.Stolen = true;
+                    break;
+                case 2:
+                    slice.Segments.Enqueue(new FrontSliceSegment(0, 3, true, "frontend image copy", null));
+                    slice.Resume = 4;
+                    break;
+                default:
+                    slice.Segments.Enqueue(new FrontSliceSegment(0, slice.Count, false, null, null));
+                    break;
+            }
+        };
+
+        // Items 0-39 (a draw, a dispatch, a barrier, repeating), a preparation join, then 40-99 and the exit.
+        AddRange(cutter, 40);
+        cutter.Flush(FrontSliceFlush.Prep);
+        Assert.False(cutter.HasOpen);
+        AddRange(cutter, 40, 100);
+        cutter.Flush(FrontSliceFlush.Exit);
+
+        Assert.Equal(Enumerable.Range(0, 100), backend.Ended);
+        Assert.Equal(1, stats.Flushes[(int)FrontSliceFlush.Prep]);
+        Assert.Equal(1, stats.Flushes[(int)FrontSliceFlush.Exit]);
+        Assert.Contains("serial 6", backend.Log);
+        Assert.Contains("stolen 16", backend.Log);
+        Assert.Contains("serial 35", backend.Log);
+        Assert.Contains("tail 36", backend.Log);
+        Assert.All(backend.Slices, slice => Assert.True(slice.Finished));
+    }
+
+    [Fact]
+    public void APreparationWithUnknownPagesJoins()
+    {
+        Assert.True(FrontSliceGuards.PreparationNeedsJoin(null, static (_, _) => false));
+        Assert.True(FrontSliceGuards.PreparationNeedsJoin(new FrontPrepReads.Pages { Overflow = true }, static (_, _) => false));
+        Assert.True(FrontSliceGuards.PreparationNeedsJoin(new FrontPrepReads.Pages(), null));
+        Assert.False(FrontSliceGuards.PreparationNeedsJoin(new FrontPrepReads.Pages(), static (_, _) => true));
+    }
+
+    [Fact]
+    public void APreparationJoinsOnlyWhenAPageItReadHasAPendingWrite()
+    {
+        var pages = new FrontPrepReads.Pages();
+        pages.Runs.Add((0x10, 0x11));
+        pages.Runs.Add((0x40, 0x40));
+        var asked = new List<(ulong Address, ulong Size)>();
+        bool PendingAt(ulong pendingAddress, ulong address, ulong size)
+        {
+            asked.Add((address, size));
+            return address <= pendingAddress && pendingAddress < address + size;
+        }
+
+        Assert.False(FrontSliceGuards.PreparationNeedsJoin(pages, (address, size) => PendingAt(0x30000, address, size)));
+        Assert.Equal(new[] { (0x10000UL, 0x2000UL), (0x40000UL, 0x1000UL) }, asked);
+        Assert.True(FrontSliceGuards.PreparationNeedsJoin(pages, (address, size) => PendingAt(0x11FFF, address, size)));
+        Assert.True(FrontSliceGuards.PreparationNeedsJoin(pages, (address, size) => PendingAt(0x40000, address, size)));
     }
 
     private sealed class ReentrantBackend(Backend inner, Action onEnd) : FrontSliceCutter<int, FakeSlice>.IBackend

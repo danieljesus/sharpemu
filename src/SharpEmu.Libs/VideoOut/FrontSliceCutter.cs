@@ -27,7 +27,32 @@ internal enum FrontSliceFlush
     Read,
     Record,
     After,
+    Prep, // [local] SHARPEMU_FRONT_SLICE_DISPATCHES: a front preparation checked while a taken dispatch is open
     Count,
+}
+
+// [local] SHARPEMU_FRONT_SLICE_DISPATCHES: whether a front preparation checked while a taken dispatch is open must wait for
+// everything taken to be joined: when its pages are not known (none noted, too many) or a run of them may be written by
+// an open item (`pending`: a range has a pending write; null when the writes are not tracked).
+internal static class FrontSliceGuards
+{
+    public static bool PreparationNeedsJoin(FrontPrepReads.Pages? pages, Func<ulong, ulong, bool>? pending)
+    {
+        if (pages is null || pages.Overflow || pending is null)
+        {
+            return true;
+        }
+
+        foreach (var (first, last) in pages.Runs)
+        {
+            if (pending(first << 12, (last - first + 1) << 12))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }
 
 // One recorded run of a slice's items: [First, First + Count); Serial when the item at First + Count needs this thread.
