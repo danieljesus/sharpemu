@@ -59,9 +59,10 @@ public sealed unsafe partial class GuestBufferCache
         Diagnostics.DccWriterTrace.Enabled || Diagnostics.TableDirtyProbe.Enabled || ImageClearTrace.Enabled || MeshDrawTrace.Active ||
         CpWriteDeferProbe.Enabled || SubmissionScheduler.ReadOnlyThread || _scheduler.Current.IsInvalid;
 
-    // A written range obtained earlier in this tick under the same key: Hit after the effects listed in BdaWriteMemo (size =
-    // the clamped size of the first obtain), Verified (=2) after the real path ran and was compared, Miss otherwise (the
-    // caller clamps and obtains through ObtainBdaWrite). `mapping` and `resets` are the guest mapping generation and the
+    // A written range obtained earlier under the same key: Hit after the effects listed in BdaWriteMemo (size = the clamped
+    // size of the first obtain; an entry of an earlier tick also marks the write at this tick, see BdaWriteMemo's re-tick),
+    // Verified (=2) after the real path ran and was compared, Miss otherwise (the caller clamps and obtains through
+    // ObtainBdaWrite). `mapping` and `resets` are the guest mapping generation and the
     // presenter's per-frame clamp resets, read before the clamp of the first obtain and now.
     internal BdaRepeat TryRepeatBdaWrite(ulong address, ulong requested, bool conservative, ulong traceShaderHash, long mapping, long resets,
         out ulong size)
@@ -91,7 +92,16 @@ public sealed unsafe partial class GuestBufferCache
         }
 
         var tick = _scheduler.CurrentTick;
-        if (entry.Tick != tick)
+        if (tick != BdaWriteMemo.LastTick)
+        {
+            BdaWriteMemo.LastTick = tick;
+            BdaWriteMemo.Ticks++;
+        }
+
+        var retick = entry.Tick != tick;
+        if (retick)
+            BdaWriteMemo.NoteRetick();
+        if (retick && !BdaWriteMemo.Retick)
         {
             entry.Valid = false;
             BdaWriteMemo.NoteMiss(BdaWriteMemo.Miss.Tick);
@@ -140,10 +150,14 @@ public sealed unsafe partial class GuestBufferCache
             entry.Removals = removals;
         }
 
-        BdaWriteMemo.Hits++;
+        if (retick)
+            BdaWriteMemo.HitsRetick++;
+        else
+            BdaWriteMemo.Hits++;
         if (mode == 2)
         {
-            VerifyBdaWrite(ref entry, address, size, conservative, traceShaderHash, tick);
+            VerifyBdaWrite(ref entry, address, size, conservative, traceShaderHash, tick, retick);
+            entry.Tick = tick;
             return BdaRepeat.Verified;
         }
 
@@ -154,7 +168,15 @@ public sealed unsafe partial class GuestBufferCache
         }
 
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteWrite();
-        buffer.NoteRepeatedGpuWrite(entry.Offset, size);
+        if (retick)
+        {
+            // The real call: the write ticks, LastGpuWriteTick and the WriteTickMap move to this tick (a chunk pruned since
+            // is created again), with the count, the observer, the history entry and the mapped flag of the repeat.
+            buffer.NoteGpuWrite(entry.Offset, size);
+            entry.Tick = tick;
+        }
+        else
+            buffer.NoteRepeatedGpuWrite(entry.Offset, size);
         if (TableWordMemo.Enabled && (entry.TrustSerial != TableWordMemo.TrustSerial || entry.Program != TableWordMemo.CurrentProgram))
         {
             entry.TrustSerial = TableWordMemo.TrustSerial;
@@ -212,7 +234,10 @@ public sealed unsafe partial class GuestBufferCache
     }
 
     // =2: the preconditions of the skipped steps, then the real path, then what it changed.
-    private void VerifyBdaWrite(ref BdaWriteEntry entry, ulong address, ulong size, bool conservative, ulong traceShaderHash, ulong tick)
+    // A re-tick hit skips the write-tick precondition (the real path moves the ticks, as the memo's NoteGpuWrite does) and
+    // checks after it that the real path left them at this tick.
+    private void VerifyBdaWrite(ref BdaWriteEntry entry, ulong address, ulong size, bool conservative, ulong traceShaderHash, ulong tick,
+        bool retick)
     {
         BdaWriteMemo.Verified++;
         var buffer = entry.Buffer!;
@@ -237,11 +262,13 @@ public sealed unsafe partial class GuestBufferCache
             reason = "not_precise";
         else if (!everWritten)
             reason = "not_ever_written";
-        else if (!buffer.WriteTicksHold(entry.Offset, size, tick))
+        else if (!retick && !buffer.WriteTicksHold(entry.Offset, size, tick))
             reason = "write_ticks";
         else if (entry.CollectionTick == _retirementPolicy.CurrentTick && _registry.UseTickForTests(identifier) < _retirementPolicy.CurrentTick)
             reason = "use_tick";
 
+        if (retick && _tracker.MayHaveCpuDirtyPages(address, size))
+            BdaWriteMemo.RetickCpuDirty++;
         var skipsTable = TableWordMemo.Enabled && entry.TrustSerial == TableWordMemo.TrustSerial && entry.Program == TableWordMemo.CurrentProgram;
         var uploads = _syncUploads;
         var version = Volatile.Read(ref _gpuModifiedVersion);
@@ -264,11 +291,13 @@ public sealed unsafe partial class GuestBufferCache
                 reason = "table";
             else if (buffer.GpuWrites != writes + 1)
                 reason = "writes";
+            else if (!buffer.WriteTicksHold(entry.Offset, size, tick))
+                reason = retick ? "retick_ticks" : "ticks_after";
         }
 
         if (reason is not null)
             BdaWriteMemo.NoteWrong(reason, address, size, FormattableString.Invariant(
-                $"conservative={conservative} buffer=0x{buffer.CpuAddress:X}+0x{buffer.Size:X}@0x{entry.Offset:X} real=0x{real.CpuAddress:X}+0x{real.Size:X}@0x{offset:X} tick={tick} program=0x{TableWordMemo.CurrentProgram:X16}"));
+                $"retick={retick} entry_tick={entry.Tick} conservative={conservative} buffer=0x{buffer.CpuAddress:X}+0x{buffer.Size:X}@0x{entry.Offset:X} real=0x{real.CpuAddress:X}+0x{real.Size:X}@0x{offset:X} tick={tick} program=0x{TableWordMemo.CurrentProgram:X16}"));
 
         entry.CollectionTick = _retirementPolicy.CurrentTick;
         entry.TrustSerial = TableWordMemo.TrustSerial;
