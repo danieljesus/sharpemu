@@ -2910,6 +2910,12 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // The upload half of SynchronizeBuffersInRange, for a range that may hold CPU-dirty pages.
     private void UploadDirtyBuffersInRange(ulong guestAddress, ulong size)
     {
+        if (BdaPageRuns != 0)
+        {
+            UploadDirtyBuffersByPageRuns(guestAddress, size);
+            return;
+        }
+
         var callbackStarted = Diagnostics.BdaWalkProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
         var visitedBefore = Diagnostics.BdaWalkProbe.Buffers;
         var end = guestAddress + size;
@@ -2929,6 +2935,78 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         }
 
         if (callbackStarted != 0) Diagnostics.BdaWalkProbe.NoteRange(callbackStarted, size, Diagnostics.BdaWalkProbe.Buffers == visitedBefore); // [local]
+    }
+
+    // [local] SHARPEMU_BDA_PAGE_RUNS (0 off by default, 1 on, 2 verify): the sweep looks up only the buffers over the
+    // range's CPU-dirty pages. A possibly-dirty run is whole 4 MiB blocks, and a block with one dirty page made every
+    // buffer in it pay a registry step and a MayHaveCpuDirtyPages (bw02/bw03: ~5,330 visits per sweep for ~50-100
+    // synchronizations, 5-6 ms per frame). The buffers over a dirty page are gathered first and then visited in registry
+    // order with the same test and the same synchronized range as the visit of every buffer, so the same buffers
+    // synchronize in the same order: a buffer over no dirty page fails the test anyway. =2 also runs the visit of every
+    // buffer afterwards and counts the buffers the page runs did not gather that it still finds dirty (and synchronizes them).
+    private static readonly int BdaPageRuns =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_PAGE_RUNS"), out var bdaPageRuns) ? bdaPageRuns : 0;
+    private readonly List<int> _pageRunIndices = new();
+    private Action<ulong, ulong>? _gatherPageRunBuffers;
+    private static long _pageRunVerifyChecks, _pageRunVerifyMisses, _pageRunVerifyWindow = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private void UploadDirtyBuffersByPageRuns(ulong guestAddress, ulong size)
+    {
+        _pageRunIndices.Clear();
+        _tracker.ForEachMaybeCpuDirtyPageRun(guestAddress, size, _gatherPageRunBuffers ??= GatherPageRunBuffers);
+        if (_pageRunIndices.Count > 1)
+            _pageRunIndices.Sort();
+        var end = guestAddress + size;
+        var previous = -1;
+        foreach (var index in CollectionsMarshal.AsSpan(_pageRunIndices))
+        {
+            if (index == previous)
+                continue;
+            previous = index;
+            var buffer = _registry.GetBuffer(_registry.GetRegisteredIdentifier(index));
+            var start = Math.Max(buffer.CpuAddress, guestAddress);
+            var finish = Math.Min(buffer.CpuAddress + buffer.Size, end);
+            if (start < finish && _tracker.MayHaveCpuDirtyPages(start, finish - start))
+                _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: BdaPreserveHot);
+        }
+
+        if (BdaPageRuns == 2)
+            VerifyPageRuns(guestAddress, size);
+    }
+
+    private void GatherPageRunBuffers(ulong runAddress, ulong runSize)
+    {
+        var end = runAddress + runSize;
+        var index = _registry.FindFirstOverlappingIndex(runAddress);
+        for (; index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end; index++)
+            _pageRunIndices.Add(index);
+    }
+
+    private void VerifyPageRuns(ulong guestAddress, ulong size)
+    {
+        var end = guestAddress + size;
+        var index = _registry.FindFirstOverlappingIndex(guestAddress);
+        for (; index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end; index++)
+        {
+            var buffer = _registry.GetBuffer(_registry.GetRegisteredIdentifier(index));
+            var start = Math.Max(buffer.CpuAddress, guestAddress);
+            var finish = Math.Min(buffer.CpuAddress + buffer.Size, end);
+            if (start >= finish || _pageRunIndices.BinarySearch(index) >= 0)
+                continue;
+            _pageRunVerifyChecks++;
+            if (_tracker.MayHaveCpuDirtyPages(start, finish - start))
+            {
+                _pageRunVerifyMisses++;
+                _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: BdaPreserveHot);
+            }
+        }
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (now - _pageRunVerifyWindow >= 5 * System.Diagnostics.Stopwatch.Frequency)
+        {
+            _pageRunVerifyWindow = now;
+            Console.Error.WriteLine(FormattableString.Invariant($"[PERF][BDA_PAGE_RUNS] checks={_pageRunVerifyChecks} missed={_pageRunVerifyMisses}"));
+        }
     }
 
     // A visited buffer's copies wait for the end of the sweep. The tracker has protected its pages

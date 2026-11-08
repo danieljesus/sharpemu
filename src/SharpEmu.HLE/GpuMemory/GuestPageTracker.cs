@@ -143,6 +143,38 @@ public sealed class GuestPageTracker
         return region.ExtendCpuDirtyRun(vaddr, size, lowerBound, upperBound, preserveHotPages, budgetPages);
     }
 
+    // [local] SHARPEMU_BDA_PAGE_RUNS: visits the runs of the range whose pages may be CPU-dirty, at page granularity
+    // where the block has a region; a block without one is visited whole (it starts all dirty, as MayHaveCpuDirtyPages
+    // answers for it). Lock-free like MayHaveCpuDirtyPages: every page it would find dirty is visited.
+    public void ForEachMaybeCpuDirtyPageRun(ulong vaddr, ulong size, Action<ulong, ulong> visit)
+    {
+        if (size == 0)
+        {
+            return;
+        }
+
+        if (!new GuestSpan(vaddr, size).IsValid)
+        {
+            visit(vaddr, size);
+            return;
+        }
+
+        var remaining = size;
+        var index = vaddr / BlockBytes;
+        var offset = vaddr % BlockBytes;
+        while (remaining != 0)
+        {
+            var bytes = Math.Min(BlockBytes - offset, remaining);
+            if (Volatile.Read(ref _regions[index]) is not { } region)
+                visit(index * BlockBytes + offset, bytes);
+            else
+                region.ForEachCpuDirtyRun(offset, bytes, visit);
+            remaining -= bytes;
+            offset = 0;
+            index++;
+        }
+    }
+
     public bool MayHaveCpuDirtyPages(ulong vaddr, ulong size)
     {
         if (IsKnownCpuClean(vaddr, size))

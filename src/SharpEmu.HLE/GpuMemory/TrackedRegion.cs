@@ -92,6 +92,15 @@ public sealed class TrackedRegion
         return GetDirtyMask(side).AnyInRange(start, end);
     }
 
+    // [local] SHARPEMU_BDA_PAGE_RUNS: the runs of CPU-dirty pages of a range, as guest addresses. Read without the lock,
+    // as IsModified is by GuestPageTracker.MayHaveCpuDirtyPages.
+    public void ForEachCpuDirtyRun(ulong offset, ulong size, Action<ulong, ulong> visit)
+    {
+        var (start, end) = GetPageRange(BaseAddress + offset, size);
+        foreach (var (first, last) in new PageMask(_cpuDirty, start, end))
+            visit(BaseAddress + (ulong)first * PageBytes, (ulong)(last - first) * PageBytes);
+    }
+
     public bool WasGpuWritten(ulong offset, ulong size)
     {
         var (start, end) = GetPageRange(BaseAddress + offset, size);
