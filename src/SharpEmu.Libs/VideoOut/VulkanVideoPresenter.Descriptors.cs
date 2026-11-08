@@ -2420,6 +2420,29 @@ internal static unsafe partial class VulkanVideoPresenter
                     continue;
                 }
 
+                // [local] SHARPEMU_BDA_WRITE_MEMO: a written range obtained earlier in this tick answers from the memo (see
+                // BdaWriteMemo), the clamp included; the image copies are invalidated as on the real path.
+                long bdaMapping = 0, bdaResets = 0;
+                var bdaMemo = range.Written && !_worker && _bufferCache.BdaWriteMemoMode != 0;
+                if (bdaMemo)
+                {
+                    bdaMapping = _guestMemory.MappingGeneration;
+                    bdaResets = Volatile.Read(ref _presenter._mappedSizesResetRequests);
+                    Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.RangeCheck);
+                    var repeat = _bufferCache.TryRepeatBdaWrite(range.Base, range.Size, range.Conservative, program.Hash, bdaMapping, bdaResets, out var repeated);
+                    if (repeat != GuestBufferCache.BdaRepeat.Miss)
+                    {
+                        if (repeat == GuestBufferCache.BdaRepeat.Verified)
+                            GuestBufferCache.NoteBdaWriteClamp(range.Base, range.Size, repeated, ClampMappedSize(range.Base, range.Size));
+                        if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TracesExtra(range.Base, repeated)) SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(range.Base, repeated, $"bda-written-range hash=0x{program.Hash:X16} submission_tick={_scheduler.CurrentTick} memo={repeat}");
+                        Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.WObtain);
+                        _imageCache.InvalidateMemoryCopiesFromGpu(range.Base, repeated);
+                        Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.WInvalidate);
+                        Diagnostics.BdaCostProbe.NoteRange(written: true, repeated);
+                        continue;
+                    }
+                }
+
                 var size = ClampMappedSize(range.Base, range.Size);
                 Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.RangeCheck); // [local] SHARPEMU_BDA_COST_PROBE
                 if (range.Written)
@@ -2432,7 +2455,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                     else
                     {
-                        _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true, traceShaderHash: program.Hash, conservativeWrite: range.Conservative); // [local] conservativeWrite
+                        if (bdaMemo) // [local] SHARPEMU_BDA_WRITE_MEMO: the same obtain, remembered for the tick
+                            _bufferCache.ObtainBdaWrite(range.Base, range.Size, size, range.Conservative, program.Hash, bdaMapping, bdaResets);
+                        else
+                            _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true, traceShaderHash: program.Hash, conservativeWrite: range.Conservative); // [local] conservativeWrite
                         Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.WObtain); // [local] SHARPEMU_BDA_COST_PROBE
                         _imageCache.InvalidateMemoryCopiesFromGpu(range.Base, size);
                         Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.WInvalidate); // [local]

@@ -40,6 +40,7 @@ internal static class TableWordMemo
     {
         lock (_lock)
         {
+            Interlocked.Increment(ref _trustSerial); // [local] SHARPEMU_BDA_WRITE_MEMO
             _values.Clear();
             _sorted = [];
             _dirtySort = false;
@@ -119,6 +120,7 @@ internal static class TableWordMemo
 
     private static void StoreLocked(ulong address, uint value)
     {
+        Interlocked.Increment(ref _trustSerial); // [local] SHARPEMU_BDA_WRITE_MEMO
         _stores++;
         if (_values.TryAdd(address, value))
         {
@@ -143,6 +145,7 @@ internal static class TableWordMemo
         _mismatches++;
         if (LearnThreshold > 0) // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN: =2 found the memo wrong
         {
+            Interlocked.Increment(ref _trustSerial); // [local] SHARPEMU_BDA_WRITE_MEMO
             _banned.Add(address);
             _pendingDrops.Remove(address);
             _auditMismatches++;
@@ -150,6 +153,14 @@ internal static class TableWordMemo
         if (_mismatchLogs++ < 40)
             Console.Error.WriteLine($"[TABLE_WORD_MEMO] mismatch address=0x{address:X} memo=0x{memo:X8} synchronized=0x{synchronized:X8} speculated={_speculated.Contains(address)}");
     }
+
+    // [local] SHARPEMU_BDA_WRITE_MEMO: bumped by every store (a word that a GPU write may drop again) and every ban (a word
+    // whose trust a program lost), never by a drop: while it stays and the program is the same, a second NoteGpuWrite of a
+    // range drops nothing (the first one dropped every untrusted word in it). GpuDrops counts the calls that dropped any.
+    private static long _trustSerial;
+    private static long _gpuDrops;
+    internal static long TrustSerial => Interlocked.Read(ref _trustSerial);
+    internal static long GpuDrops => Interlocked.Read(ref _gpuDrops);
 
     // A GPU write marked over [address, address+size) by the current program.
     public static void NoteGpuWrite(ulong address, ulong size)
@@ -159,6 +170,7 @@ internal static class TableWordMemo
         lock (_lock)
         if (LearnThreshold > 0 ? InvalidateUntrusted(address, size, CurrentProgram) : Invalidate(address, size, 'g', CurrentProgram))
         {
+            Interlocked.Increment(ref _gpuDrops); // [local] SHARPEMU_BDA_WRITE_MEMO
             _invalidGpu++;
             _invalidByWriter[CurrentProgram] = _invalidByWriter.GetValueOrDefault(CurrentProgram) + 1;
         }
@@ -295,6 +307,7 @@ internal static class TableWordMemo
             if (memo == device)
                 return;
             _auditMismatches++;
+            Interlocked.Increment(ref _trustSerial); // [local] SHARPEMU_BDA_WRITE_MEMO
             _banned.Add(address);
             _pendingDrops.Remove(address);
             if (_values.ContainsKey(address))
