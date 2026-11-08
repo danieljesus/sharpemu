@@ -391,6 +391,7 @@ internal sealed unsafe class VulkanAsyncReadback : IDisposable
             VideoOut.GpuWaitSiteProfile.End(waitStart);
             if (VideoOut.Render2Probe.Enabled) VideoOut.Render2Probe.NoteBlocked(VideoOut.Render2Probe.SpinSite.Readback, System.Diagnostics.Stopwatch.GetTimestamp() - probeStart); // [local]
             VideoOut.RenderWaitProbe.Record("readback", probeStart, (long)ticket.WaitTick - (long)probeCompleted);
+            if (SharpEmu.Libs.Diagnostics.SyncReadProbe.Active) SharpEmu.Libs.Diagnostics.SyncReadProbe.NoteWait(System.Diagnostics.Stopwatch.GetTimestamp() - probeStart); // [local] SHARPEMU_DRAWCOST_PROBE
             if (Diagnostics.LabelTimeline.Enabled) Diagnostics.LabelTimeline.NoteWait(probeStart, ticket.WaitTick, 1, Scheduling.GpuWorkerRelay.OnAnyGpuQueueThread); // [local]
         }
         finally

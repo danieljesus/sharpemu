@@ -5673,16 +5673,20 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
         // The last writer is still in the buffer being recorded; submit it (without
         // waiting) so the readback queue has a signal to wait for.
+        var syncFlushStarted = Diagnostics.SyncReadProbe.Active ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_DRAWCOST_PROBE
+        var syncWriter = syncFlushStarted == 0 ? 0 : waitTick >= _scheduler.CurrentTick ? 0 : waitTick > _scheduler.Timeline.CompletedTick ? 1 : 2;
         if (waitTick >= _scheduler.CurrentTick)
         {
             Diagnostics.ReadbackOriginProbe.NoteFlush(); // [local]
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
                 _scheduler.Flush();
+            if (syncFlushStarted != 0) Diagnostics.SyncReadProbe.NoteFlush(System.Diagnostics.Stopwatch.GetTimestamp() - syncFlushStarted, syncWriter); // [local]
         }
         else
         {
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ReadbackFlush)) // [local]
                 _scheduler.EnsureSubmitted(waitTick);
+            if (syncFlushStarted != 0) Diagnostics.SyncReadProbe.NoteFlush(System.Diagnostics.Stopwatch.GetTimestamp() - syncFlushStarted, syncWriter); // [local]
         }
 
         var pieces = new ReadbackPiece[copies.Count];

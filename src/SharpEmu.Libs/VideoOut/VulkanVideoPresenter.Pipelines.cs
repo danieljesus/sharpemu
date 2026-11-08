@@ -1083,6 +1083,25 @@ internal static unsafe partial class VulkanVideoPresenter
                         return true;
                     }
                 }
+                else if (gpuDirty && Gpu.Buffers.TableWordMemo.Enabled && Gpu.Buffers.TableWordMemo.LocalHits != 0 && Gpu.Buffers.TableWordMemo.Mode == 1 &&
+                         Gpu.Buffers.TableWordMemo.TryAnswerLocal(address, out memoValue, out var localAudit, out var localSpeculated)) // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS
+                {
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordMemo); // [local] SHARPEMU_DRAWCOST_PROBE
+                    Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadMemo); // [local]
+                    if (localAudit)
+                    {
+                        _bufferCache.AuditMemoWord(address, memoValue, localSpeculated);
+                        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordAudit); // [local]
+                        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadAudit); // [local]
+                    }
+
+                    if (localSpeculated && Gpu.Buffers.CutPolicy.Words)
+                        _bufferCache.NoteCutWord(address);
+                    if (localSpeculated && Gpu.Buffers.TableWordMemo.LearnFlush)
+                        Gpu.Buffers.TableWordMemo.NoteLearnFlush(_bufferCache.FlushOpenWriter(address, sizeof(uint)));
+                    word = memoValue;
+                    return true;
+                }
                 else if (gpuDirty && Gpu.Buffers.TableWordMemo.Enabled)
                 {
                     if (Gpu.Buffers.TableWordMemo.TryGet(address, out memoValue))
@@ -1123,11 +1142,13 @@ internal static unsafe partial class VulkanVideoPresenter
                         Diagnostics.GpuReadTrace.Record(address, ResourceMaterializationCache.ReadingTable);
                     }
 
+                    var syncProbe = Diagnostics.DrawCostProbe.OnProbeThreadTiming ? BeginSyncProbe(address) : default; // [local] SHARPEMU_DRAWCOST_PROBE
                     Span<byte> mirrored = stackalloc byte[sizeof(uint)]; // [local] SHARPEMU_READBACK_MIRROR
                     if (_bufferCache.TryReadMirrored(address, mirrored))
                     {
                         word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(mirrored);
                         Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordMirror); // [local] SHARPEMU_DRAWCOST_PROBE
+                        EndSyncProbe(syncProbe); // [local]
                         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadSync); // [local]
                         return true;
                     }
@@ -1183,6 +1204,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                     if (!preciseSynced)
                     {
+                        EndSyncProbe(syncProbe); // [local] SHARPEMU_DRAWCOST_PROBE
                         return false;
                     }
 
@@ -1227,6 +1249,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         }
                     }
 
+                    EndSyncProbe(syncProbe); // [local] SHARPEMU_DRAWCOST_PROBE
                     Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadSync); // [local] SHARPEMU_DRAWCOST_PROBE
                 }
                 else
@@ -1257,6 +1280,23 @@ internal static unsafe partial class VulkanVideoPresenter
             if (conservativeVerify) Gpu.Buffers.ConservativeRecords.Verify(word); // [local]
             Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadCopy); // [local] SHARPEMU_DRAWCOST_PROBE
             return true;
+        }
+
+        // [local] SHARPEMU_DRAWCOST_PROBE (SyncReadProbe): a synchronizing word read, with the CPU copy's word before and after.
+        private Diagnostics.SyncReadProbe.Scope BeginSyncProbe(ulong address)
+        {
+            Span<byte> before = stackalloc byte[sizeof(uint)];
+            var ok = _guestMemory.TryRead(address, before);
+            return Diagnostics.SyncReadProbe.Begin(address, ok, System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(before));
+        }
+
+        private void EndSyncProbe(in Diagnostics.SyncReadProbe.Scope scope)
+        {
+            if (!scope.IsActive)
+                return;
+            Span<byte> after = stackalloc byte[sizeof(uint)];
+            var ok = _guestMemory.TryRead(scope.Address, after);
+            Diagnostics.SyncReadProbe.End(scope, ok, System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(after));
         }
 
         // A held-back command write or label lands in guest memory only when its publication runs; a resource

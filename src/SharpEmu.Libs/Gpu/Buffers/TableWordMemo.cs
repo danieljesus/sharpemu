@@ -49,6 +49,7 @@ internal static class TableWordMemo
             _banned.Clear();
             _speculated.Clear();
             _auditSeen = 0;
+            Volatile.Write(ref _epoch, _epoch + 1); // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS: every local entry is stale
         }
     }
 
@@ -124,9 +125,13 @@ internal static class TableWordMemo
         {
             _dirtySort = true;
             Volatile.Write(ref _count, _values.Count);
+            Bump(address); // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS
         }
-        else
+        else if (_values[address] != value)
+        {
             _values[address] = value;
+            Bump(address); // [local]
+        }
     }
 
     public static void Verify(ulong address, uint memo, uint synchronized)
@@ -224,7 +229,8 @@ internal static class TableWordMemo
             if (program != 0 && IsTrusted(word, program))
             {
                 _learnSkips++;
-                _speculated.Add(word);
+                if (_speculated.Add(word))
+                    Bump(word); // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS
                 continue;
             }
 
@@ -234,6 +240,7 @@ internal static class TableWordMemo
                 _dropped[word] = ('g', program, old);
             _values.Remove(word);
             _speculated.Remove(word);
+            Bump(word); // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS
             removed = true;
         }
         if (removed)
@@ -248,7 +255,8 @@ internal static class TableWordMemo
     // The value a synchronizing read got: one survival sample for the program that dropped the word since it was stored.
     private static void LearnLocked(ulong address, uint value)
     {
-        _speculated.Remove(address);
+        if (_speculated.Remove(address))
+            Bump(address); // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS
         if (!_pendingDrops.Remove(address, out var drop))
             return;
         var key = (address, drop.Program);
@@ -277,9 +285,186 @@ internal static class TableWordMemo
             if (speculated)
                 _learnHits++;
             MaybeReportLocked();
+            if (LocalHits != 0 && _values.TryGetValue(address, out var current)) // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS
+                RecordLocal(address, current, speculated);
             return AuditRate > 0 && _auditSeen++ % AuditRate == 0;
         }
     }
+
+    // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS (0 off by default, 1 on, 2 verify): a hit answered without waiting (Mode 1,
+    // FAST_HIT off) takes the memo's lock twice (TryGet, NoteAnsweredHit) for a dictionary and a set lookup, and the lock is
+    // also taken by the guest threads' CPU write faults and emulator writes (NoteOtherWrite) and the readback completions'
+    // audits; DRAWCOST put the hit at ~0.35-0.7 us (read_memo 0.9-1.8 us for ~2.6 hits per dispatch, dmb3/dmb4).
+    // FAST_HIT (one lock instead of two) was neutral. With the switch the reading thread keeps its own copy of what a
+    // locked hit found: the value and whether learning kept the word (speculated), with the version of the word's stripe
+    // (StripeCount stripes of the address) and the memo's epoch. Every change of a word's value, presence or speculated
+    // state bumps its stripe under the lock, before the lock is released (Bump); ResetForTests bumps the epoch. A later
+    // hit whose stripe and epoch are unchanged is answered from the copy without the lock, with the same side effects as
+    // the locked hit: the hit count, the learned-hit count, the audit sampling (the same counter advances, so the same hits
+    // are audited); only the learning report's cadence moves (looked at every 1,024 local hits).
+    //
+    // Exactness: the copy is what the locked lookups would answer as long as no change of the word's state happened since
+    // it was taken, and every change bumps the stripe first. A change made on another thread that the read is ordered
+    // after (a guest CPU write before the submission being recorded) released the lock before the item was queued, so its
+    // bump is visible; a change concurrent with the read is unordered with it. =2 answers from the locked path as without
+    // the switch and compares the local answer first: a different answer with the stripe moved in between is raced,
+    // otherwise wrong (the first 20 printed as [GPU][TABLE_WORD_MEMO_LOCAL_WRONG]); one line every 5 s,
+    //
+    //   [PERF][TABLE_WORD_MEMO_LOCAL] mode=1 local_hits=N recorded=N verified=N wrong=N raced=N wrong_total=N
+    internal static int LocalHits = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS"), out var localHits) &&
+        localHits is 1 or 2 ? localHits : 0;
+
+    private const int StripeBits = 12;
+    private const int LocalSlots = 4096;
+    private static readonly int[] _stripes = new int[1 << StripeBits];
+    private static int _epoch;
+
+    private struct LocalEntry
+    {
+        public ulong Tag; // address + 1; 0 = empty
+        public uint Value;
+        public bool Speculated;
+        public int Version;
+        public int Epoch;
+    }
+
+    [ThreadStatic] private static LocalEntry[]? _local;
+    [ThreadStatic] private static int _localSinceReport;
+    private static long _localHits, _localRecorded, _localVerified, _localWrong, _localRaced, _localWrongTotal;
+    private static int _localDumps;
+    private static long _localReport = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    internal static long LocalWrongTotal => Interlocked.Read(ref _localWrongTotal);
+
+    // Tests: a value changed without its bump, the inexactness =2 has to catch.
+    internal static void OverwriteWithoutBumpForTests(ulong address, uint value)
+    {
+        lock (_lock)
+            _values[address] = value;
+    }
+
+    private static int StripeOf(ulong address) => (int)(((address >> 2) * 0x9E37_79B9_7F4A_7C15UL) >> (64 - StripeBits));
+
+    private static int SlotOf(ulong address) => (int)((address >> 2) & (LocalSlots - 1));
+
+    // Under the lock: the word's value, presence or speculated state changed.
+    private static void Bump(ulong address)
+    {
+        ref var stripe = ref _stripes[StripeOf(address)];
+        Volatile.Write(ref stripe, stripe + 1);
+    }
+
+    // Under the lock: what the locked hit found, with the stripe's version at that point.
+    private static void RecordLocal(ulong address, uint value, bool speculated)
+    {
+        var local = _local ??= new LocalEntry[LocalSlots];
+        local[SlotOf(address)] = new LocalEntry
+        {
+            Tag = address + 1,
+            Value = value,
+            Speculated = speculated,
+            Version = Volatile.Read(ref _stripes[StripeOf(address)]),
+            Epoch = Volatile.Read(ref _epoch),
+        };
+        Interlocked.Increment(ref _localRecorded);
+    }
+
+    private static bool TryLocal(ulong address, out uint value, out bool speculated, out int version)
+    {
+        value = 0;
+        speculated = false;
+        version = 0;
+        if (_local is not { } local)
+            return false;
+        ref var entry = ref local[SlotOf(address)];
+        if (entry.Tag != address + 1 || entry.Epoch != Volatile.Read(ref _epoch))
+            return false;
+        version = entry.Version;
+        if (version != Volatile.Read(ref _stripes[StripeOf(address)]))
+            return false;
+        value = entry.Value;
+        speculated = entry.Speculated;
+        return true;
+    }
+
+    // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS: in place of TryGet + NoteHit + NoteAnsweredHit for a GPU-dirty word in Mode 1.
+    // True when answered from the thread's copy (=1); =2 compares the copy with the locked answer and returns false, so the
+    // caller takes the locked path as without the switch.
+    internal static bool TryAnswerLocal(ulong address, out uint value, out bool audit, out bool speculated)
+    {
+        audit = false;
+        if (!TryLocal(address, out value, out speculated, out var version))
+            return false;
+        if (LocalHits == 2)
+        {
+            VerifyLocal(address, value, speculated, version);
+            return false;
+        }
+
+        Interlocked.Increment(ref _hits);
+        Interlocked.Increment(ref _localHits);
+        if ((++_localSinceReport & 1023) == 0)
+        {
+            lock (_lock)
+                MaybeReportLocked();
+            MaybeReportLocal();
+        }
+
+        if (LearnThreshold == 0 && AuditRate == 0)
+        {
+            speculated = false;
+            return true;
+        }
+
+        if (speculated)
+            _learnHits++;
+        audit = AuditRate > 0 && _auditSeen++ % AuditRate == 0;
+        return true;
+    }
+
+    private static void VerifyLocal(ulong address, uint value, bool speculated, int version)
+    {
+        bool present, realSpeculated, moved;
+        uint real;
+        lock (_lock)
+        {
+            present = _values.TryGetValue(address, out real);
+            realSpeculated = (LearnThreshold != 0 || AuditRate != 0) && _speculated.Contains(address);
+            moved = Volatile.Read(ref _stripes[StripeOf(address)]) != version;
+        }
+
+        Interlocked.Increment(ref _localVerified);
+        var expectedSpeculated = (LearnThreshold != 0 || AuditRate != 0) && speculated;
+        if (present && real == value && realSpeculated == expectedSpeculated)
+        {
+            MaybeReportLocal();
+            return;
+        }
+
+        if (moved)
+        {
+            Interlocked.Increment(ref _localRaced);
+            return;
+        }
+
+        Interlocked.Increment(ref _localWrong);
+        Interlocked.Increment(ref _localWrongTotal);
+        if (Interlocked.Increment(ref _localDumps) <= 20)
+            Console.Error.WriteLine($"[GPU][TABLE_WORD_MEMO_LOCAL_WRONG] address=0x{address:X} local=0x{value:X8} local_speculated={speculated} present={present} real=0x{real:X8} real_speculated={realSpeculated}");
+    }
+
+    private static void MaybeReportLocal()
+    {
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var last = Interlocked.Read(ref _localReport);
+        if (now - last < 5 * System.Diagnostics.Stopwatch.Frequency || Interlocked.CompareExchange(ref _localReport, now, last) != last)
+            return;
+        Console.Error.WriteLine(TakeLocalReport());
+    }
+
+    internal static string TakeLocalReport() =>
+        $"[PERF][TABLE_WORD_MEMO_LOCAL] mode={LocalHits} local_hits={Interlocked.Exchange(ref _localHits, 0)} recorded={Interlocked.Exchange(ref _localRecorded, 0)} " +
+        $"verified={Interlocked.Exchange(ref _localVerified, 0)} wrong={Interlocked.Exchange(ref _localWrong, 0)} raced={Interlocked.Exchange(ref _localRaced, 0)} wrong_total={LocalWrongTotal}";
 
     public static void NoteAudit(ulong address, uint memo, uint device, bool speculated, bool checkedOnDevice)
     {
@@ -345,7 +530,13 @@ internal static class TableWordMemo
                     continue;
                 if (word >= address && word + 4 <= end)
                 {
-                    _values[word] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[(int)(word - address)..]);
+                    var updated = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[(int)(word - address)..]);
+                    if (_values[word] != updated)
+                    {
+                        _values[word] = updated;
+                        Bump(word); // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS
+                    }
+
                     _cpUpdates++;
                 }
                 else if (Invalidate(word, 4, 'p', 0))
@@ -413,8 +604,11 @@ internal static class TableWordMemo
         {
             if (SharpEmu.ShaderCompiler.Resources.SrtReadProbe.Enabled && _values.TryGetValue(_sorted[index], out var old))
                 _dropped[_sorted[index]] = (kind, program, old);
-            removed |= _values.Remove(_sorted[index]);
-            _speculated.Remove(_sorted[index]);
+            var removedValue = _values.Remove(_sorted[index]);
+            var removedSpeculated = _speculated.Remove(_sorted[index]);
+            removed |= removedValue;
+            if (removedValue || removedSpeculated)
+                Bump(_sorted[index]); // [local] SHARPEMU_TABLE_WORD_MEMO_LOCAL_HITS
         }
         if (removed)
         {

@@ -280,6 +280,9 @@ internal static class DrawCostProbe
 
     internal static bool Timing => Enabled && _active;
 
+    // [local] A timed item on the probe's own thread (SyncReadProbe).
+    internal static bool OnProbeThreadTiming => Enabled && _active && Environment.CurrentManagedThreadId == _thread;
+
     private static string[] Names<T>(int count) where T : struct, Enum
     {
         var names = new string[count];
@@ -613,6 +616,7 @@ internal static class DrawCostProbe
         _gaps = 0;
         LiteObtainProbe.Report(); // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_PLAN_PROBE: the same window, after its lines
         PlanProbe.Report();
+        SyncReadProbe.Report(frames); // [local] the synchronizing table-word reads of the same window
         Gpu.Buffers.LiteObtainUse.Report(Gpu.Buffers.LiteObtainUse.DefaultMode); // [local] SHARPEMU_LITE_OBTAIN
         _windowStart = Stopwatch.GetTimestamp();
     }
