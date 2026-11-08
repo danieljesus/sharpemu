@@ -268,6 +268,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
         GpuWaitSiteProfile.End(waitStart);
         if (Render2Probe.Enabled) Render2Probe.NoteBlocked(Render2Probe.SpinSite.Tick, System.Diagnostics.Stopwatch.GetTimestamp() - probeStart); // [local]
         RenderWaitProbe.Record("timeline", probeStart, (long)tick - (long)probeCompleted);
+        if (SharpEmu.Libs.Diagnostics.SyncReadProbe.Active) SharpEmu.Libs.Diagnostics.SyncReadProbe.NoteWait(System.Diagnostics.Stopwatch.GetTimestamp() - probeStart); // [local] SHARPEMU_DRAWCOST_PROBE
         failure = result.ToString();
         return result == Result.Success;
     }
