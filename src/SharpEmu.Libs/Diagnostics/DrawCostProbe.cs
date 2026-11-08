@@ -47,7 +47,134 @@ internal static class DrawCostProbe
     {
         Draw,
         Dispatch,
+        // [local] gta/parres3 (SHARPEMU_FRONT_SLICES): the recording of a captured item (a DeferredWork) on the render thread
+        // (in line: short rests, stolen, invalid, serial and tail items) and on a render worker. BeginRecord/EndRecord.
+        InlineDraw,
+        InlineDispatch,
+        WorkerDraw,
+        WorkerDispatch,
         Count,
+    }
+
+    private static readonly string[] KindNames = ["draw", "dispatch", "inline_draw", "inline_dispatch", "worker_draw", "worker_dispatch"];
+
+    // [local] gta/parres3: a render worker's own probe state; the report adds every lane into the worker kinds.
+    private sealed class Lane
+    {
+        public bool Active;
+        public int Kind;
+        public int Depth;
+        public long Start, Last;
+        public readonly long[] StepTicks = new long[(int)DrawCostProbe.Kind.Count * (int)Step.Count];
+        public readonly long[] StepPasses = new long[(int)DrawCostProbe.Kind.Count * (int)Step.Count];
+        public readonly long[] Counts = new long[(int)DrawCostProbe.Kind.Count * (int)Counter.Count];
+        public readonly long[] Items = new long[(int)DrawCostProbe.Kind.Count];
+        public readonly long[] Timed = new long[(int)DrawCostProbe.Kind.Count];
+        public readonly long[] ItemTicks = new long[(int)DrawCostProbe.Kind.Count];
+    }
+
+    [ThreadStatic] private static Lane? _lane;
+    private static readonly System.Collections.Concurrent.ConcurrentBag<Lane> Lanes = new();
+
+    // [local] gta/parres3: the recording of one captured item, on the render thread (in line) or on a render worker.
+    internal static void BeginRecord(bool dispatch, bool worker)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        if (!worker)
+        {
+            BeginCore(dispatch ? Kind.InlineDispatch : Kind.InlineDraw);
+            return;
+        }
+
+        var lane = _lane;
+        if (lane is null)
+        {
+            _lane = lane = new Lane();
+            Lanes.Add(lane);
+        }
+
+        if (lane.Depth++ != 0)
+        {
+            return;
+        }
+
+        lane.Kind = (int)(dispatch ? Kind.WorkerDispatch : Kind.WorkerDraw);
+        lane.Items[lane.Kind]++;
+        lane.Active = true;
+        lane.Start = lane.Last = Stopwatch.GetTimestamp();
+    }
+
+    // completed false: the item stopped (a Serial on the worker); its time is not counted.
+    internal static void EndRecord(bool worker, bool completed = true)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        if (!worker)
+        {
+            EndCore();
+            return;
+        }
+
+        var lane = _lane;
+        if (lane is null || lane.Depth == 0 || --lane.Depth != 0)
+        {
+            return;
+        }
+
+        if (lane.Active && completed)
+        {
+            LapLane(lane, Step.Exit);
+            lane.Timed[lane.Kind]++;
+            lane.ItemTicks[lane.Kind] += lane.Last - lane.Start;
+        }
+        else if (!completed)
+        {
+            lane.Items[lane.Kind]--;
+        }
+
+        lane.Active = false;
+    }
+
+    private static void LapLane(Lane lane, Step step)
+    {
+        var now = Stopwatch.GetTimestamp();
+        var slot = lane.Kind * (int)Step.Count + (int)step;
+        lane.StepTicks[slot] += now - lane.Last;
+        lane.StepPasses[slot]++;
+        lane.Last = now;
+    }
+
+    private static void MergeLanes()
+    {
+        foreach (var lane in Lanes)
+        {
+            for (var kind = (int)Kind.WorkerDraw; kind <= (int)Kind.WorkerDispatch; kind++)
+            {
+                for (var step = 0; step < (int)Step.Count; step++)
+                {
+                    var slot = kind * (int)Step.Count + step;
+                    _stepTicks[slot] += Interlocked.Exchange(ref lane.StepTicks[slot], 0);
+                    _stepPasses[slot] += Interlocked.Exchange(ref lane.StepPasses[slot], 0);
+                }
+
+                for (var counter = 0; counter < (int)Counter.Count; counter++)
+                {
+                    var slot = kind * (int)Counter.Count + counter;
+                    _counts[slot] += Interlocked.Exchange(ref lane.Counts[slot], 0);
+                }
+
+                _items[kind] += Interlocked.Exchange(ref lane.Items[kind], 0);
+                _timed[kind] += Interlocked.Exchange(ref lane.Timed[kind], 0);
+                _itemTicks[kind] += Interlocked.Exchange(ref lane.ItemTicks[kind], 0);
+            }
+        }
     }
 
     // In the order a draw (then a dispatch) reaches them; the report keeps this order.
@@ -218,7 +345,7 @@ internal static class DrawCostProbe
     private static int _gen0, _gen1, _gen2;
     private static long _contention;
 
-    internal static bool Timing => Enabled && _active;
+    internal static bool Timing => Enabled && ((_active && Environment.CurrentManagedThreadId == _thread) || _lane is { Active: true }); // [local] gta/parres3: per thread
 
     private static string[] Names<T>(int count) where T : struct, Enum
     {
@@ -327,7 +454,7 @@ internal static class DrawCostProbe
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void Lap(Step step)
     {
-        if (Enabled && _active)
+        if (Enabled)
         {
             LapCore(step);
         }
@@ -337,6 +464,12 @@ internal static class DrawCostProbe
     private static void LapCore(Step step)
     {
         if (Environment.CurrentManagedThreadId != _thread)
+        {
+            if (_lane is { Active: true } lane) LapLane(lane, step); // [local] gta/parres3: a render worker
+            return;
+        }
+
+        if (!_active)
         {
             return;
         }
@@ -357,7 +490,7 @@ internal static class DrawCostProbe
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void Count(Counter counter, long amount = 1)
     {
-        if (Enabled && _active)
+        if (Enabled)
         {
             CountCore(counter, amount);
         }
@@ -368,7 +501,11 @@ internal static class DrawCostProbe
     {
         if (Environment.CurrentManagedThreadId == _thread)
         {
-            _counts[(int)_kind * Counters + (int)counter] += amount;
+            if (_active) _counts[(int)_kind * Counters + (int)counter] += amount;
+        }
+        else if (_lane is { Active: true } lane) // [local] gta/parres3: a render worker
+        {
+            lane.Counts[lane.Kind * Counters + (int)counter] += amount;
         }
     }
 
@@ -472,6 +609,7 @@ internal static class DrawCostProbe
             $"[PERF][DRAWCOST] window_s={seconds:F1} frames={frames} sample={SampleEvery} lap_ns={CalibrateLapNanoseconds():F0} ") +
             FormattableString.Invariant($"gap={(_gaps == 0 ? 0 : _gapTicks * toMs * 1000 / _gaps):F2}us/n{_gaps} gc={gen0}/{gen1}/{gen2} lock_contention={contention}");
         Console.Error.WriteLine(header);
+        MergeLanes(); // [local] gta/parres3
         for (var kind = 0; kind < Kinds; kind++)
         {
             var items = _items[kind];
@@ -481,7 +619,7 @@ internal static class DrawCostProbe
                 var scale = timed == 0 ? 0 : items / (double)timed;
                 var line = new StringBuilder(2048);
                 line.Append(FormattableString.Invariant(
-                    $"[PERF][DRAWCOST] kind={(kind == (int)Kind.Draw ? "draw" : "dispatch")} items_per_frame={items / (double)perFrame:F0} timed={timed} "));
+                    $"[PERF][DRAWCOST] kind={KindNames[kind]} items_per_frame={items / (double)perFrame:F0} timed={timed} "));
                 line.Append(FormattableString.Invariant(
                     $"us_per_item={(timed == 0 ? 0 : _itemTicks[kind] * toMs * 1000 / timed):F2} ms_per_frame={_itemTicks[kind] * toMs * scale / perFrame:F2} steps="));
                 var first = true;

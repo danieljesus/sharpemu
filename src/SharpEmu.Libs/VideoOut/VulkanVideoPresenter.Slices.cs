@@ -928,7 +928,27 @@ internal static unsafe partial class VulkanVideoPresenter
                         }
                         else
                         {
-                            _presenter._translation.RunDeferred(slice.Items[index].Work!, _workerRecorder!);
+                            var costed = false; // [local] gta/parres3: SHARPEMU_DRAWCOST_PROBE on the worker
+                            if (Diagnostics.DrawCostProbe.Enabled)
+                            {
+                                Diagnostics.DrawCostProbe.BeginRecord(slice.Items[index].Work!.IsDispatch, worker: true);
+                                costed = true;
+                            }
+
+                            try
+                            {
+                                _presenter._translation.RunDeferred(slice.Items[index].Work!, _workerRecorder!);
+                            }
+                            catch
+                            {
+                                if (costed) Diagnostics.DrawCostProbe.EndRecord(worker: true, completed: false);
+                                costed = false;
+                                throw;
+                            }
+                            finally
+                            {
+                                if (costed) Diagnostics.DrawCostProbe.EndRecord(worker: true);
+                            }
                         }
 
                         segment!.Count++;

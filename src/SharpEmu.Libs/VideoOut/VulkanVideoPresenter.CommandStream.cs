@@ -484,12 +484,14 @@ internal static unsafe partial class VulkanVideoPresenter
                 : RenderPhaseProfile.Phase.CommandDrawTranslation);
             var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_DRAW_TIMING_GATE
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
+            Diagnostics.DrawCostProbe.BeginRecord(work.IsDispatch, worker: false); // [local] gta/parres3: in line
             try
             {
                 _translation.RunDeferred(work);
             }
             finally
             {
+                Diagnostics.DrawCostProbe.EndRecord(worker: false); // [local]
                 if (PerfDrawTiming) Interlocked.Add(ref _perfDrawTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
                 if (ResolveProfile.Enabled) EndResolveDraw(in resolveToken, dispatch: work.IsDispatch); // [local]
             }
