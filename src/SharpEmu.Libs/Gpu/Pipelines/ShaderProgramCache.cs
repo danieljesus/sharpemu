@@ -417,6 +417,10 @@ internal sealed class ShaderProgramCache
             ReadResidentSpan = SharpEmu.ShaderCompiler.Resources.PageSpanReads.DefaultMode != 0 && _prefetchResidentGuestBytes is not null
                 ? host.TryReadResidentGuestSpan
                 : null,
+            // [local] SHARPEMU_DIRTY_RUN_READS: likewise beside the resident reader.
+            ReadResidentRun = SharpEmu.ShaderCompiler.Resources.DirtyRunReads.DefaultMode != 0 && _prefetchResidentGuestBytes is not null
+                ? host.TryReadResidentGuestRun
+                : null,
             SynchronizeRanges = synchronizeRanges,
             SynchronizeTableRange = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableSyncMode != 0 ? host.TrySynchronizeTableRange : null, // [local]
             CompareTableChunk = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.CompareModeConfigured != 0 ? host.CompareResidentTableChunk : null, // [local] SHARPEMU_STORE_TABLE_COMPARE

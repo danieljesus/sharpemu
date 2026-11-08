@@ -135,6 +135,8 @@ internal sealed class PendingGuestPublications
         {
             ThrowIfFailed();
             if (size == 0 || address > ulong.MaxValue - size) return false;
+            SharpEmu.Libs.Diagnostics.DrawCostProbe.Count(SharpEmu.Libs.Diagnostics.DrawCostProbe.Counter.PublicationScans); // [local] SHARPEMU_DRAWCOST_PROBE
+            SharpEmu.Libs.Diagnostics.DrawCostProbe.Count(SharpEmu.Libs.Diagnostics.DrawCostProbe.Counter.PublicationEntriesScanned, _entries.Count); // [local]
             foreach (var entry in _entries)
                 if ((entry.DeferredLabel || entry.HeldWrite) && address < entry.Address + entry.Size && entry.Address < address + size) return true;
             return false;

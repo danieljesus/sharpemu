@@ -144,6 +144,11 @@ internal interface IShaderPipelineHost
     // alike, as one span (see PageSpanReads); a host without it reads no spans.
     ResidentSpanRead TryReadResidentGuestSpan(ulong address, Span<byte> destination) => ResidentSpanRead.OtherThread;
 
+    // [local] SHARPEMU_DIRTY_RUN_READS: one run of adjacent words as TryReadResidentGuestBytes, or else TryReadGuestWord
+    // word by word, would answer it (see DirtyRunReads); a host without it reads runs as before.
+    ResidentRunRead TryReadResidentGuestRun(ulong address, Span<byte> destination, ReadOnlySpan<ulong> wordAddresses, Span<uint> words, Span<bool> ok) =>
+        ResidentRunRead.OtherThread;
+
     // [local] SHARPEMU_VALIDATE_IN_PLACE: TryReadResidentGuestBytes's bytes compared in place; false when not compared.
     bool TryCompareResidentGuestBytes(ulong address, ReadOnlySpan<byte> expected, bool clean, out bool equal)
     {

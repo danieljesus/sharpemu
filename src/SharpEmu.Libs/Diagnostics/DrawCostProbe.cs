@@ -74,6 +74,25 @@ internal static class DrawCostProbe
         MaterializeSteps,
         MaterializeEmit,
         MaterializeOutput,
+        // [local] Inside the render thread's guest reads of the materialization (TryReadGuestWord, TryReadResidentGuestBytes,
+        // the run reader): ReadEnter = the program's own work since the lap before plus the word reader's prelude (thread
+        // role, conservative records), ReadPublications = the pending publications' completion, ReadPage = the clean-read
+        // page and the mapping check, ReadDirty = the GPU-modified check (and the side paths before it), ReadMemo = the
+        // table word memo's answer, ReadAudit = its audit copy, ReadSync = a synchronizing read (mirror, flush, readback,
+        // memo store), ReadCopy = the word's copy (alias or guest memory) and the reader's tail; ResidentChecks = the
+        // resident read's ownership checks (and its entry), ResidentCopy = its copy; RunChecks = the run reader's checks
+        // before it answers the words one by one.
+        ReadEnter,
+        ReadPublications,
+        ReadPage,
+        ReadDirty,
+        ReadMemo,
+        ReadAudit,
+        ReadSync,
+        ReadCopy,
+        ResidentChecks,
+        ResidentCopy,
+        RunChecks,
         ProgramMaterialize,
         ProgramStage,
         // Dispatch: the executor's resolution.
@@ -191,6 +210,10 @@ internal static class DrawCostProbe
         MatSpanRefused,
         MatSpanCallsSaved,
         MatSpanCallsPossible,
+        MatRunReads,
+        MatRunReadBytes,
+        MatRunReadWords,
+        MatRunReadRefused,
         // [local] The render thread's word reads (TryReadGuestWord): through a clean page's alias, from guest memory after
         // the ownership checks, GPU-owned (the table word memo, the mirror or a synchronization), synchronized. And the
         // render thread's resident reads (TryReadResidentGuestBytes) and the ones it refused.
@@ -200,6 +223,19 @@ internal static class DrawCostProbe
         ReadWordSync,
         ReadResident,
         ReadResidentRefused,
+        // [local] The GPU-owned words' outcomes (memo answer, its audit, mirror), the resident refusals by reason (unmapped,
+        // GPU-owned bytes, a clean read over GPU-dirty pages or image bytes), the reads that completed a pending publication,
+        // and the publication checks that passed the page filter and scanned the pending entries under the lock (with the
+        // entries scanned).
+        ReadWordMemo,
+        ReadWordAudit,
+        ReadWordMirror,
+        ResidentRefusedUnmapped,
+        ResidentRefusedDirty,
+        ResidentRefusedCleanOnly,
+        PublicationCompletions,
+        PublicationScans,
+        PublicationEntriesScanned,
         AllocatedBytes,
         Count,
     }
