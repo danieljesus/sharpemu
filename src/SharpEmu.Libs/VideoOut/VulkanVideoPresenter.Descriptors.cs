@@ -1942,6 +1942,7 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = BufferUploadProfile.BeginSweep(vertexProgramHash, pixelProgramHash, computeProgramHash);
             var memory = GuestGpuMemoryHook.Current ?? throw SubmissionScheduler.Fatal("A device-address program needs the guest GPU memory registry.");
             var spans = DeviceAddressSpans(memory);
+            Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BdaPrelude); // [local] SHARPEMU_BDA_COST_PROBE
             var traceAddress = GuestGpuMemoryHook.TraceAddress;
             if (traceAddress != 0)
             {
@@ -1976,6 +1977,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
+            Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BdaWindows); // [local] SHARPEMU_BDA_COST_PROBE
+
             // [local] One CPU-dirty sweep per guest submission (SHARPEMU_BDA_SWEEP_PER_SUBMIT=0 sweeps per dispatch).
             // The data a submission reads is what the CPU wrote before submitting it; later CPU
             // writes belong to the next submission, so a second sweep inside one only re-protects.
@@ -1984,12 +1987,16 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 Interlocked.Increment(ref GuestBufferCache.BdaPreparationsRepeated); // [local]
                 preludeScope.Dispose();
+                Diagnostics.BdaCostProbe.Count(Diagnostics.BdaCostProbe.Counter.Gated); // [local] SHARPEMU_BDA_COST_PROBE
+                Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BdaGate); // [local]
                 return;
             }
 
             _bdaSweepSubmitId = submitId;
             _bdaSweepSubmitMapping = _bdaSpanMapping;
             preludeScope.Dispose();
+            Diagnostics.BdaCostProbe.Count(Diagnostics.BdaCostProbe.Counter.Prepared); // [local] SHARPEMU_BDA_COST_PROBE
+            Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BdaGate); // [local]
             _bufferCache.PrepareBda(spans, _bdaSpanMapping);
         }
 
@@ -2009,6 +2016,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return cached;
             }
 
+            Diagnostics.BdaCostProbe.Count(Diagnostics.BdaCostProbe.Counter.SpansRebuilt); // [local] SHARPEMU_BDA_COST_PROBE
             var spans = new List<GuestSpan>();
             memory.ForEachSpan((address, size) => spans.Add(new GuestSpan(address, size)));
             _bdaSpans = spans;
@@ -2042,6 +2050,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingBuffers)) // [local]
                     BindBuffers(stage);
                 Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResBuffers); // [local] SHARPEMU_DRAWCOST_PROBE
+                Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.ResBuffers); // [local] SHARPEMU_BDA_COST_PROBE
                 using (DescriptorStallProfile.Measure(DescriptorStallProfile.Operation.ObtainAddressRanges, stage.Program.Hash, info.Buffers.Count, info.Images.Count, info.Samplers.Count))
                 using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.BindingDeviceRanges)) // [local]
                     ObtainDeviceAddressRanges(stage);
@@ -2389,12 +2398,13 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (!range.Planned)
                 {
-                    if (!range.Written) continue;
+                    if (!range.Written) { Diagnostics.BdaCostProbe.Count(Diagnostics.BdaCostProbe.Counter.Skipped); continue; } // [local] SHARPEMU_BDA_COST_PROBE
                     throw SubmissionScheduler.Fatal($"A written device-address range cannot be planned: handle={range.Handle} hash=0x{program.Hash:X16}.");
                 }
 
                 if (range.Size == 0)
                 {
+                    Diagnostics.BdaCostProbe.Count(Diagnostics.BdaCostProbe.Counter.Skipped); // [local] SHARPEMU_BDA_COST_PROBE
                     continue;
                 }
 
@@ -2406,10 +2416,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 // Unmapped read-only pointers resolve to zero through the page table.
                 if (!range.Written && !_guestMemory.CanRead(range.Base, 1))
                 {
+                    Diagnostics.BdaCostProbe.Count(Diagnostics.BdaCostProbe.Counter.Skipped); // [local] SHARPEMU_BDA_COST_PROBE
                     continue;
                 }
 
                 var size = ClampMappedSize(range.Base, range.Size);
+                Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.RangeCheck); // [local] SHARPEMU_BDA_COST_PROBE
                 if (range.Written)
                 {
                     if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TracesExtra(range.Base, size)) SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(range.Base, size, $"bda-written-range hash=0x{program.Hash:X16} submission_tick={_scheduler.CurrentTick}"); // [local]
@@ -2421,15 +2433,20 @@ internal static unsafe partial class VulkanVideoPresenter
                     else
                     {
                         _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true, traceShaderHash: program.Hash, conservativeWrite: range.Conservative); // [local] conservativeWrite
+                        Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.WObtain); // [local] SHARPEMU_BDA_COST_PROBE
                         _imageCache.InvalidateMemoryCopiesFromGpu(range.Base, size);
+                        Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.WInvalidate); // [local]
+                        Diagnostics.BdaCostProbe.NoteRange(written: true, size); // [local]
                     }
                 }
                 else
                 {
                     // A held command write or a pending dump lands before the shader reads the range.
                     CompleteOverlappingPublications(range.Base, size, includeLabels: false);
+                    Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.RPublications); // [local] SHARPEMU_BDA_COST_PROBE
                     // Stream buffers do not populate the device-address page table.
                     _ = FindBuffer(range.Base, size);
+                    Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.RFind); // [local] SHARPEMU_BDA_COST_PROBE
                     if (_worker)
                     {
                         Requests.SyncRanges.Add((range.Base, size));
@@ -2437,9 +2454,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     else
                     {
                         _bufferCache.SynchronizeBuffersInRange(range.Base, size);
+                        Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.RSync); // [local]
+                        Diagnostics.BdaCostProbe.NoteRange(written: false, size); // [local]
                     }
                 }
             }
+
+            Diagnostics.BdaCostProbe.End(); // [local] SHARPEMU_BDA_COST_PROBE: range_tail
         }
 
         private const int MaxRebindPasses = 3;

@@ -385,6 +385,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
     {
         Buffers.TableWordMemo.CurrentProgram = stage.Program?.Hash ?? 0; // [local] until the draw or dispatch is recorded
         var bindings = _host.PrepareBindings(stage);
+        Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BindHost); // [local] SHARPEMU_BDA_COST_PROBE
         NoteSampledTextures(stage);
         return bindings;
     }
