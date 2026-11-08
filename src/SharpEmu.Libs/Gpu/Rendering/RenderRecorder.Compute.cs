@@ -175,16 +175,21 @@ internal sealed partial class RenderRecorder
 
             Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DispatchPipeline); // [local] SHARPEMU_DRAWCOST_PROBE
             if (Buffers.WriteDiffProbe.Enabled) Buffers.WriteDiffProbe.Arm(program.Hash); // [local] SHARPEMU_WRITE_DIFF
+            if (Diagnostics.BdaCostProbe.Enabled && !OnWorker) Diagnostics.BdaCostProbe.Begin(program.Hash); // [local] SHARPEMU_BDA_COST_PROBE
             var bindings = PrepareBindings(input.Stage);
+            Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BindNote); // [local] SHARPEMU_BDA_COST_PROBE
             var bindScope = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchBind); // [local]
             if (program.UsesDeviceAddresses)
             {
+                Diagnostics.BdaCostProbe.Count(Diagnostics.BdaCostProbe.Counter.UsesBda); // [local] SHARPEMU_BDA_COST_PROBE
                 using (VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.DispatchBda)) // [local]
                     _host.PrepareDeviceAddresses();
             }
 
+            Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BdaExit); // [local] SHARPEMU_BDA_COST_PROBE
             Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.Bda); // [local] SHARPEMU_DRAWCOST_PROBE
             _host.BindResources(bindings);
+            Diagnostics.BdaCostProbe.End(); // [local] SHARPEMU_BDA_COST_PROBE: a no-op when the host's ranges ended it
             bindScope.Dispose();
             Span<IPreparedBindings> stages = [bindings];
             var dispatchEmit = VideoOut.RenderPhaseProfile.MeasureDetail(VideoOut.RenderPhaseProfile.Phase.PartDispatchEmit); // [local] SHARPEMU_PARREC_PROBE

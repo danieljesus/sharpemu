@@ -2638,7 +2638,10 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 _bdaTouchTick = _retirementPolicy.CurrentTick;
                 _bdaTouchMapping = mapping;
                 Interlocked.Increment(ref BdaTouches);
+                Diagnostics.BdaCostProbe.Count(Diagnostics.BdaCostProbe.Counter.Touches); // [local] SHARPEMU_BDA_COST_PROBE
             }
+
+            Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BdaTouch); // [local] SHARPEMU_BDA_COST_PROBE
 
             var epoch = _tracker.CpuDirtyEpoch;
             if (mapping != _bdaSweepMapping || (epoch != _bdaSweepEpoch && (!ObservationGated || _observation != _bdaSweepObservation)))
@@ -2674,6 +2677,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 finally
                 {
                     walkScope.Dispose();
+                    Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BdaWalk); // [local] SHARPEMU_BDA_COST_PROBE
                     using var closeScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DispatchBdaClose); // [local]
                     DiscardClearedRuns();
                     _sweepActive = false;
@@ -2695,6 +2699,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 _bdaSweepMapping = mapping;
                 _bdaSweepObservation = _observation;
                 Interlocked.Increment(ref BdaSweeps);
+                Diagnostics.BdaCostProbe.Count(Diagnostics.BdaCostProbe.Counter.Sweeps); // [local] SHARPEMU_BDA_COST_PROBE
+                Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BdaClose); // [local]
             }
             else if (epoch != _bdaSweepEpoch)
             {

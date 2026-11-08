@@ -258,6 +258,7 @@ internal static class DrawCostProbe
 
         LiteObtainProbe.NoteFrame(); // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_PLAN_PROBE
         PlanProbe.NoteFrame();
+        BdaCostProbe.NoteFrame(); // [local] SHARPEMU_BDA_COST_PROBE
     }
 
     internal static void Begin(Kind kind)
@@ -546,6 +547,7 @@ internal static class DrawCostProbe
         PlanProbe.Report();
         Gpu.Buffers.LiteObtainUse.Report(Gpu.Buffers.LiteObtainUse.DefaultMode); // [local] SHARPEMU_LITE_OBTAIN
         Gpu.Rendering.DrawPlan.Report(); // [local] SHARPEMU_DRAW_PLAN
+        BdaCostProbe.Report(); // [local] SHARPEMU_BDA_COST_PROBE: at its next dispatch, on its thread
         _windowStart = Stopwatch.GetTimestamp();
     }
 
