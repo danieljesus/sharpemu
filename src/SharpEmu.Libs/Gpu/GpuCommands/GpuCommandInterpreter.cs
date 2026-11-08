@@ -816,6 +816,7 @@ public sealed partial class GpuCommandInterpreter
     {
         if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, (ulong)source.Length)) // [local]
             Diagnostics.LabelLatencyProbe.FrontWrite(source, address, _probeOpcode, ProbeSubmissionEnqueued, ProbeSubmission);
+        if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.CpWrite(address, (ulong)source.Length, Diagnostics.JoinProbe.KindOfCaller(caller)); // [local] SHARPEMU_JOIN_PROBE
         if (TryDeferOrderedWrite(address, source))
         {
             return;
@@ -844,6 +845,7 @@ public sealed partial class GpuCommandInterpreter
     {
         if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, (ulong)source.Length)) // [local]
             Diagnostics.LabelLatencyProbe.FrontWrite(source, address, _probeOpcode, ProbeSubmissionEnqueued, ProbeSubmission);
+        if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.CpWrite(address, (ulong)source.Length, Diagnostics.JoinProbe.KindOfCaller(caller)); // [local] SHARPEMU_JOIN_PROBE
         if (TryDeferOrderedWrite(address, source))
         {
             return;

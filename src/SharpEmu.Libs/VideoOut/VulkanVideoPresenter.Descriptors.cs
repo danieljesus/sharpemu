@@ -2432,6 +2432,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     var repeat = _bufferCache.TryRepeatBdaWrite(range.Base, range.Size, range.Conservative, program.Hash, bdaMapping, bdaResets, out var repeated);
                     if (repeat != GuestBufferCache.BdaRepeat.Miss)
                     {
+                        if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.BdaWrite(range.Base, repeated, program.Hash); // [local] SHARPEMU_JOIN_PROBE
                         if (repeat == GuestBufferCache.BdaRepeat.Verified)
                             GuestBufferCache.NoteBdaWriteClamp(range.Base, range.Size, repeated, ClampMappedSize(range.Base, range.Size));
                         if (SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.TracesExtra(range.Base, repeated)) SharpEmu.HLE.GpuMemory.GuestGpuMemoryHook.Trace(range.Base, repeated, $"bda-written-range hash=0x{program.Hash:X16} submission_tick={_scheduler.CurrentTick} memo={repeat}");
@@ -2455,10 +2456,17 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                     else
                     {
+                        if (Diagnostics.JoinProbe.Enabled) // [local] SHARPEMU_JOIN_PROBE: classified here, not again in the obtain
+                        {
+                            Diagnostics.JoinProbe.BdaWrite(range.Base, size, program.Hash);
+                            Diagnostics.JoinProbe.SuppressObtain = true;
+                        }
+
                         if (bdaMemo) // [local] SHARPEMU_BDA_WRITE_MEMO: the same obtain, remembered for the tick
                             _bufferCache.ObtainBdaWrite(range.Base, range.Size, size, range.Conservative, program.Hash, bdaMapping, bdaResets);
                         else
                             _ = _bufferCache.ObtainBuffer(range.Base, size, isWritten: true, traceShaderHash: program.Hash, conservativeWrite: range.Conservative); // [local] conservativeWrite
+                        Diagnostics.JoinProbe.SuppressObtain = false; // [local]
                         Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.WObtain); // [local] SHARPEMU_BDA_COST_PROBE
                         _imageCache.InvalidateMemoryCopiesFromGpu(range.Base, size);
                         Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.WInvalidate); // [local]

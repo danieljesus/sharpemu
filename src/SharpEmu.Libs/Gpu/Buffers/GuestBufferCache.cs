@@ -812,10 +812,13 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     public bool TrySynchronizeCpuRead(ulong address, ulong size) =>
         TrySynchronizeCpuRead(address, size, GuestMemoryProfile.ReadbackSource.CpuReadSynchronization);
 
-    public bool TrySynchronizeCpuRead(ulong address, ulong size, GuestMemoryProfile.ReadbackSource source) =>
-        !_tracker.MayHaveGpuDirtyPages(address, size) ||
-        !_tracker.HasGpuDirtyPages(address, size) ||
-        ReadMemoryOrAwaitShutdown(address, size, isWrite: false, source);
+    public bool TrySynchronizeCpuRead(ulong address, ulong size, GuestMemoryProfile.ReadbackSource source)
+    {
+        if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.RenderRead(address, size); // [local] SHARPEMU_JOIN_PROBE (render thread only)
+        return !_tracker.MayHaveGpuDirtyPages(address, size) ||
+            !_tracker.HasGpuDirtyPages(address, size) ||
+            ReadMemoryOrAwaitShutdown(address, size, isWrite: false, source);
+    }
 
     // [local] SHARPEMU_MATERIALIZE_SYNC_VALIDATE: the synchronizing read of ranges[0] (as TrySynchronizeCpuRead) with
     // the other ranges brought back in the same readback when their last writer has already completed, so nothing is
@@ -824,6 +827,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // inline and the waits block it, as the synchronous download does.
     public bool TrySynchronizeCpuReads(IReadOnlyList<(ulong Address, ulong Size)> ranges, GuestMemoryProfile.ReadbackSource source)
     {
+        if (Diagnostics.JoinProbe.Enabled) // [local] SHARPEMU_JOIN_PROBE (render thread only)
+            for (var index = 0; index < ranges.Count; index++) Diagnostics.JoinProbe.RenderRead(ranges[index].Address, ranges[index].Size);
         var (primary, primarySize) = ranges[0];
         if (ranges.Count == 1 || (!_relay.IsGpuQueueThread && SubmissionScheduler.InDeferredOperation) || AsyncReadback is not { } readback ||
             !GuestReadsAwaitOffQueue)
@@ -1142,6 +1147,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
 
     public bool DownloadToCpu(ulong address, ulong size)
     {
+        if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.GameReadQueued(address, size); // [local] SHARPEMU_JOIN_PROBE
         if (Diagnostics.LabelLatencyProbe.Enabled && Diagnostics.LabelLatencyProbe.Overlaps(address, size)) // [local] SHARPEMU_LABEL_PROBE
         {
             var probeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -1353,6 +1359,12 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         ResourceSlotIdentifier bufferIdentifier = default, ulong traceShaderHash = 0, bool allowStream = true, bool requiresDeviceAddress = false,
         bool conservativeWrite = false) // [local] conservativeWrite: SHARPEMU_WRITE_DIFF / SHARPEMU_STORE_TABLE_EXACT=2
     {
+        if (Diagnostics.JoinProbe.Enabled && !Diagnostics.JoinProbe.SuppressObtain) // [local] SHARPEMU_JOIN_PROBE (BDA writes come classified)
+        {
+            if (isWritten) Diagnostics.JoinProbe.GpuWrite(guestAddress, size, conservativeWrite, traceShaderHash);
+            else Diagnostics.JoinProbe.GpuRead(guestAddress, size);
+        }
+
         if (!isWritten && LiteObtainMode != 0) // [local] SHARPEMU_LITE_OBTAIN (see LiteObtainUse)
         {
             if (LiteObtainMode != 2)

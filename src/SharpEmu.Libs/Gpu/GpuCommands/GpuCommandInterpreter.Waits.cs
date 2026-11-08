@@ -38,6 +38,7 @@ public sealed partial class GpuCommandInterpreter
             WaitOperation.TryCompare(ownValue, reference, mask, compareFunction, out var ownSatisfied) && ownSatisfied)
         {
             if (WaitOwnProbe) NoteWaitOwn(ownFirst: true, 0);
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Wait(Diagnostics.JoinProbe.WaitBranch.Own, address, is64Bit ? 8UL : 4UL); // [local] SHARPEMU_JOIN_PROBE
             if (SharpEmu.Libs.VideoOut.LabelTrace.Enabled) SharpEmu.Libs.VideoOut.LabelTrace.WaitPolled(QueueId, address, ownValue, reference, compareFunction, true); // [local]
             return;
         }
@@ -45,6 +46,7 @@ public sealed partial class GpuCommandInterpreter
         // A deferred label is visible here at once; guest CPU threads see it after the dump before it.
         if (!_host.TryReadDeferredLabel(QueueId, address, is64Bit ? 8UL : 4UL, out var deferred, out var value))
         {
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Wait(Diagnostics.JoinProbe.WaitBranch.Blocked, address, is64Bit ? 8UL : 4UL); // [local]
             Suspend();
             return;
         }
@@ -71,9 +73,11 @@ public sealed partial class GpuCommandInterpreter
             }
         }
 
+        var joinBranch = deferred ? Diagnostics.JoinProbe.WaitBranch.Deferred : Diagnostics.JoinProbe.WaitBranch.Memory; // [local] SHARPEMU_JOIN_PROBE
         if (!WaitOwnFirst && !satisfied && TryReadOwnWrite(address, is64Bit, out var lateOwnValue))
         {
             _ = WaitOperation.TryCompare(lateOwnValue, reference, mask, compareFunction, out satisfied);
+            if (satisfied) joinBranch = Diagnostics.JoinProbe.WaitBranch.Own; // [local]
         }
 
         // [local] SHARPEMU_FRONT_PENDING_LABELS=1: another queue's release the front queued and the render thread has
@@ -83,7 +87,10 @@ public sealed partial class GpuCommandInterpreter
             _ = WaitOperation.TryCompare(pendingValue, reference, mask, compareFunction, out satisfied);
             if (satisfied)
                 value = pendingValue;
+            if (satisfied) joinBranch = Diagnostics.JoinProbe.WaitBranch.Pending; // [local]
         }
+
+        if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Wait(satisfied ? joinBranch : Diagnostics.JoinProbe.WaitBranch.Blocked, address, is64Bit ? 8UL : 4UL); // [local] SHARPEMU_JOIN_PROBE
 
         if (SharpEmu.Libs.VideoOut.LabelTrace.Enabled) SharpEmu.Libs.VideoOut.LabelTrace.WaitPolled(QueueId, address, value, reference, compareFunction, satisfied); // [local]
 
@@ -240,6 +247,7 @@ public sealed partial class GpuCommandInterpreter
 
     internal void WaitForRewind(bool valid)
     {
+        if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Wait(Diagnostics.JoinProbe.WaitBranch.Rewind, 0, 0); // [local] SHARPEMU_JOIN_PROBE
         if (!valid)
         {
             Suspend(SharpEmu.Libs.VideoOut.FrontProfile.SuspendKind.Rewind, 0);

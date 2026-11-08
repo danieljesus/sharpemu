@@ -110,6 +110,7 @@ public sealed partial class GpuCommandInterpreter
         }
 
         SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidateTables(destination, byteCount, SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.InvalidationSource.DmaFront); // [local]
+        if (Diagnostics.JoinProbe.Enabled && !destinationIsGds) Diagnostics.JoinProbe.CpWrite(destination, byteCount, Diagnostics.JoinProbe.WKind.Dma); // [local] SHARPEMU_JOIN_PROBE
         if (sourceSelect == 2)
         {
             _host.FillBuffer(destination, byteCount, (uint)sourceOrImmediate, destinationIsGds);

@@ -256,6 +256,7 @@ internal static class DrawCostProbe
             Interlocked.Increment(ref _frames);
         }
 
+        if (JoinProbe.Enabled) JoinProbe.NoteFrame(); // [local] SHARPEMU_JOIN_PROBE
         LiteObtainProbe.NoteFrame(); // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_PLAN_PROBE
         PlanProbe.NoteFrame();
         BdaCostProbe.NoteFrame(); // [local] SHARPEMU_BDA_COST_PROBE

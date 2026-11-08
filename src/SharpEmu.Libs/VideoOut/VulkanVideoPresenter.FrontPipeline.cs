@@ -278,7 +278,11 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool OnBackThread => _backThreadId == Environment.CurrentManagedThreadId;
 
-        public void BindBackThread() => _backThreadId = Environment.CurrentManagedThreadId;
+        public void BindBackThread()
+        {
+            _backThreadId = Environment.CurrentManagedThreadId;
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.BindRender(); // [local] SHARPEMU_JOIN_PROBE
+        }
 
         public void Enqueue(Action work, Action? beforeWait = null, Action? afterWait = null)
         {
@@ -320,6 +324,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 wasEmpty = _items.Count == 0;
                 _items.Enqueue(work);
                 Volatile.Write(ref Enqueued, Enqueued + 1);
+                if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Enqueued(); // [local] SHARPEMU_JOIN_PROBE
                 Volatile.Write(ref _count, _items.Count);
                 if (_items.Count > MaxDepth) MaxDepth = _items.Count;
             }
@@ -422,6 +427,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                 }
 
+                if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.BeginItem(); // [local] SHARPEMU_JOIN_PROBE
                 try
                 {
                     work();
@@ -434,6 +440,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
                 ran++;
                 Volatile.Write(ref Executed, Executed + 1);
+                if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.EndItem(); // [local]
                 AfterItem?.Invoke();
                 if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline)
                 {
@@ -501,6 +508,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var buffer = new byte[destination.Length];
             FrontSyncStats.Note(1);
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Drain(Diagnostics.JoinProbe.DrainKind.CmdRead); // [local] SHARPEMU_JOIN_PROBE
             FrontSyncStats.NoteSite(address, destination.Length);
             var ok = queue.Run(() => presenter.TryReadGuest(address, buffer), _pauseAlias, _resumeAlias);
             buffer.CopyTo(destination);
@@ -525,9 +533,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void FlushFrame() => queue.Enqueue(_flushFrame, _pauseAlias, _resumeAlias);
 
-        public void FlushAndWait() { FrontSyncStats.Note(3); queue.Run(() => { presenter.FlushAndWait(); return true; }, _pauseAlias, _resumeAlias); }
+        public void FlushAndWait() { FrontSyncStats.Note(3); if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Drain(Diagnostics.JoinProbe.DrainKind.FlushWait); queue.Run(() => { presenter.FlushAndWait(); return true; }, _pauseAlias, _resumeAlias); }
 
-        public void SynchronizeGpu() => queue.Run(() => { presenter.SynchronizeGpu(); return true; }, _pauseAlias, _resumeAlias);
+        public void SynchronizeGpu() { if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Drain(Diagnostics.JoinProbe.DrainKind.SyncGpu); queue.Run(() => { presenter.SynchronizeGpu(); return true; }, _pauseAlias, _resumeAlias); }
 
         public void RunGarbageCollector() => queue.Enqueue(_collect, _pauseAlias, _resumeAlias);
 
@@ -541,6 +549,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void ReadGds(Span<uint> destination, uint wordOffset, uint wordCount)
         {
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Drain(Diagnostics.JoinProbe.DrainKind.Gds); // [local] SHARPEMU_JOIN_PROBE
             var words = queue.Run(() =>
             {
                 var read = new uint[wordCount];
@@ -631,6 +640,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void DrawIndexed(ulong submitId, in DrawIndexedArguments arguments)
         {
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawBegin(); // [local] SHARPEMU_JOIN_PROBE
             if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
             var snapshot = Snapshot();
             var registers = DrawRegisters();
@@ -652,6 +662,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         _snapshots.Push(snapshot);
                     }
                 }, _pauseAlias, _resumeAlias);
+                if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawQueued(); // [local]
                 return;
             }
 
@@ -686,11 +697,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     _snapshots.Push(snapshot);
                 }
             }, _pauseAlias, _resumeAlias);
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawQueued(); // [local] SHARPEMU_JOIN_PROBE
             Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
         public void DrawAuto(ulong submitId, in DrawAutoArguments arguments)
         {
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawBegin(); // [local] SHARPEMU_JOIN_PROBE
             if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
             var snapshot = Snapshot();
             var registers = DrawRegisters();
@@ -712,6 +725,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         _snapshots.Push(snapshot);
                     }
                 }, _pauseAlias, _resumeAlias);
+                if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawQueued(); // [local]
                 return;
             }
 
@@ -746,11 +760,13 @@ internal static unsafe partial class VulkanVideoPresenter
                     _snapshots.Push(snapshot);
                 }
             }, _pauseAlias, _resumeAlias);
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawQueued(); // [local] SHARPEMU_JOIN_PROBE
             Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
         public void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0)
         {
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawBegin(); // [local] SHARPEMU_JOIN_PROBE
             if (FrontProfile.LoopEnabled) FrontProfile.Dispatches++;
             var snapshot = Snapshot();
             if (indirectArgumentsAddress != 0) Interlocked.Increment(ref presenter.IndirectDirect); // [local]
@@ -775,6 +791,7 @@ internal static unsafe partial class VulkanVideoPresenter
                         _snapshots.Push(snapshot);
                     }
                 }, _pauseAlias, _resumeAlias);
+                if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawQueued(); // [local]
                 return;
             }
 
@@ -819,6 +836,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     _snapshots.Push(snapshot);
                 }
             }, _pauseAlias, _resumeAlias);
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawQueued(); // [local] SHARPEMU_JOIN_PROBE
             Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
@@ -834,6 +852,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void DispatchIndirectDeferred(ulong submitId, ulong argumentsAddress, uint dispatchInitiator)
         {
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawBegin(); // [local] SHARPEMU_JOIN_PROBE
             Interlocked.Increment(ref presenter.IndirectDeferred); // [local]
             if (FrontProfile.LoopEnabled) FrontProfile.Dispatches++;
             var snapshot = Snapshot();
@@ -857,6 +876,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     _snapshots.Push(snapshot);
                 }
             }, _pauseAlias, _resumeAlias);
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontDrawQueued(); // [local] SHARPEMU_JOIN_PROBE
             Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.Enqueue); // [local] SHARPEMU_FRONTCOST_PROBE
         }
 
@@ -929,6 +949,7 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!WriteOverlay)
             {
                 FrontSyncStats.Note(2);
+                if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Drain(Diagnostics.JoinProbe.DrainKind.WriteNow); // [local] SHARPEMU_JOIN_PROBE
                 queue.Run(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(address, bytes.Length); return true; }, _pauseAlias, _resumeAlias);
                 return;
             }
@@ -960,7 +981,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public void RunControlBarrier(Action work) => queue.Enqueue(work, _pauseAlias, _resumeAlias);
 
         // Waits until the render thread ran everything queued so far.
-        public void Drain() => queue.Run(static () => true, _pauseAlias, _resumeAlias);
+        public void Drain() { if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Drain(Diagnostics.JoinProbe.DrainKind.Drain); queue.Run(static () => true, _pauseAlias, _resumeAlias); }
 
         public Exception Fatal(string message) => SubmissionScheduler.Fatal(message);
     }
@@ -1311,6 +1332,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             Diagnostics.DrawCostProbe.Begin(Diagnostics.DrawCostProbe.Kind.Draw); // [local] SHARPEMU_DRAWCOST_PROBE
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.RenderDraw(dispatch: false); // [local] SHARPEMU_JOIN_PROBE
             try
             {
                 _translation.ExecuteDraw(submitId, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs, drawRegisters);
@@ -1332,6 +1354,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             Diagnostics.DrawCostProbe.Begin(Diagnostics.DrawCostProbe.Kind.Dispatch); // [local] SHARPEMU_DRAWCOST_PROBE
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.RenderDraw(dispatch: true); // [local] SHARPEMU_JOIN_PROBE
             try
             {
                 _translation.ExecuteDispatch(submitId, banks, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, prepared);

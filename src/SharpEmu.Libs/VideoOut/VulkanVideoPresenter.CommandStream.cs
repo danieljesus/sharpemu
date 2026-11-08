@@ -751,6 +751,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return ReadOnCommandThread(address, destination);
             }
 
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.RenderRead(address, (ulong)destination.Length); // [local] SHARPEMU_JOIN_PROBE (render thread only)
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemorySync))
             {
                 if (HasPendingMemoryPublication(address, (ulong)destination.Length))

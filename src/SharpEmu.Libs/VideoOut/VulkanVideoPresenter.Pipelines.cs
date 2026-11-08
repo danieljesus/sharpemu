@@ -246,6 +246,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var timer = Diagnostics.FrontCostProbe.TimerStart(); // [local] SHARPEMU_FRONTCOST_PROBE
             var needs = NeedsBackReadCore(address, size);
+            if (!needs && Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.FrontRead(address, size); // [local] SHARPEMU_JOIN_PROBE: a direct read on the front
             Diagnostics.FrontCostProbe.TimerEnd(Diagnostics.FrontCostProbe.Timer.ReadCheck, timer);
             Diagnostics.FrontCostProbe.Count(needs ? Diagnostics.FrontCostProbe.Counter.BackReads : Diagnostics.FrontCostProbe.Counter.DirectReads);
             return needs;
@@ -851,6 +852,7 @@ internal static unsafe partial class VulkanVideoPresenter
                             Console.Error.WriteLine($"[FRONT_SYNC_READ] total={FrontSyncedReadCount} count~{value} site={key}");
                 }
             }
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.Drain(Diagnostics.JoinProbe.DrainKind.BackRead); // [local] SHARPEMU_JOIN_PROBE
             return _back!.Run(() =>
             {
                 _backReading = true;
@@ -1011,6 +1013,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             word = 0;
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.RenderRead(address, sizeof(uint)); // [local] SHARPEMU_JOIN_PROBE
             CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             var synchronized = false;
             if (IsCleanReadPage(address, sizeof(uint)))
@@ -1293,6 +1296,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             word = 0;
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.RenderRead(address, sizeof(uint)); // [local] SHARPEMU_JOIN_PROBE
             CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             if (!_guestMemory.CanRead(address, sizeof(uint)))
             {
@@ -1576,6 +1580,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.RenderRead(address, size); // [local] SHARPEMU_JOIN_PROBE
             if (!ResidentReadAllowed(address, size, clean))
             {
                 return false;

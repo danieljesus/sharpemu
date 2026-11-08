@@ -253,6 +253,7 @@ public sealed partial class GpuCommandInterpreter
         var completion = write with { WaitForGpu = CompletionLabelsRequireGpu };
         if (_host.TryDeferEndOfPipe(QueueId, in completion))
         {
+            if (Diagnostics.JoinProbe.Enabled) Diagnostics.JoinProbe.CpWrite(write.Destination, is64Bit ? 8UL : 4UL, Diagnostics.JoinProbe.WKind.Label); // [local] SHARPEMU_JOIN_PROBE
             _lastWriteLength = 0;
             return;
         }
