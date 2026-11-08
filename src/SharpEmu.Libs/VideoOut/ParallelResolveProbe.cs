@@ -345,6 +345,14 @@ internal static class ParallelResolveProbe
             .Select(pair => string.Create(CultureInfo.InvariantCulture, $"{pair.Key}:{pair.Value / frames:F1}")));
         text.Append(']');
         stats.Cuts.Clear();
+        // [local] gta/parres3: the cutter replayed on its real runs (checks the model) and on the runs it would have if command
+        // writes and label posts did not cut; long = share of taken items in virtual runs of 256 or more.
+        text.Append(CultureInfo.InvariantCulture,
+            $" slice_model=real:runs:{stats.RealRuns / frames:F1},slices:{stats.RealSlices / frames:F1},short:{stats.RealShort / frames:F1}" +
+            $",virtual:runs:{stats.VirtualRuns / frames:F1},slices:{stats.VirtualSlices / frames:F1},short:{stats.VirtualShort / frames:F1},long_items:{stats.VirtualLong / frames:F0}" +
+            $",transparent:writes:{stats.TransparentWrites / frames:F1},posts:{stats.TransparentPosts / frames:F1},workers:{stats.ModelWorkers},min:{stats.ModelMinimumItems},items:{stats.ModelSliceItems}");
+        stats.RealRuns = stats.RealSlices = stats.RealShort = stats.VirtualRuns = stats.VirtualSlices = stats.VirtualShort = stats.VirtualLong = 0;
+        stats.TransparentWrites = stats.TransparentPosts = 0;
         // [local] SHARPEMU_FRONT_SLICE_WRITES: the command writes met while something was open (FrontSliceStats.NoteWrite).
         text.Append(CultureInfo.InvariantCulture,
             $" slice_writes=open:{stats.WritesOpen / frames:F1},taken:{stats.WritesTaken / frames:F1},tables:{stats.WritesTables / frames:F1},in_bounds:{stats.WritesInBounds / frames:F1},registered:{stats.WritesRegistered / frames:F1},pending:{stats.WritesPending / frames:F1}");

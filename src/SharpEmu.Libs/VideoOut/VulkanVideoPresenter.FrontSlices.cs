@@ -164,6 +164,8 @@ internal static unsafe partial class VulkanVideoPresenter
             _barrier = front.BarrierItem;
             _betweenItems = presenter.FrontSliceRelay;
             _cutter = new FrontSliceCutter<FrontSliceItem, RenderSlice>(this, FrontSliceStats.Shared, SliceItems, MinimumItems);
+            FrontSliceStats.Shared.ModelSliceItems = SliceItems; // [local] gta/parres3: the virtual cutter replays with these
+            FrontSliceStats.Shared.ModelMinimumItems = MinimumItems;
         }
 
         public bool HasOpen => _cutter.HasOpen;
@@ -203,8 +205,32 @@ internal static unsafe partial class VulkanVideoPresenter
                 NoteCut(work);
             }
 
+            if (ParallelResolveProbe.Enabled) // [local] gta/parres3: the cut, as the virtual cutter sees it
+            {
+                _cutWrite = work.Target is FrontCommandStreamHost.FrontWrite;
+                _cutPost = !_cutWrite && IsLabelPost(work);
+            }
+
             Flush(FrontSliceFlush.Item);
+            _cutWrite = _cutPost = false;
             return false;
+        }
+
+        // [local] gta/parres3 (SHARPEMU_PARRES_PROBE): the end-of-pipe and interrupt posts that follow a label.
+        private bool _cutWrite, _cutPost;
+        private readonly Dictionary<System.Reflection.MethodInfo, bool> _labelPosts = new();
+
+        private bool IsLabelPost(Action work)
+        {
+            var target = work.Target is FrontCommandStreamHost.FrontPost post ? post.Work.Run : work;
+            if (!_labelPosts.TryGetValue(target.Method, out var label))
+            {
+                var name = target.Method.Name;
+                label = name.Contains("RecordEndOfPipe", StringComparison.Ordinal) || name.Contains("TriggerInterrupt", StringComparison.Ordinal);
+                _labelPosts[target.Method] = label;
+            }
+
+            return label;
         }
 
         // [local] SHARPEMU_FRONT_SLICE_WRITES: whether a command write met while something is open is taken; with the probe, the
@@ -295,6 +321,12 @@ internal static unsafe partial class VulkanVideoPresenter
 
         public void Flush(FrontSliceFlush reason)
         {
+            if (ParallelResolveProbe.Enabled) // [local] gta/parres3: real and virtual runs
+            {
+                FrontSliceStats.Shared.ModelWorkers = Math.Max(_presenter.WorkerCount, 1);
+                FrontSliceStats.Shared.NoteBoundary(reason == FrontSliceFlush.Item && _cutWrite, reason == FrontSliceFlush.Item && _cutPost);
+            }
+
             _cutter.Flush(reason);
             if (!_cutter.HasOpen)
             {

@@ -179,6 +179,47 @@ internal sealed class FrontSliceStats
 
     public void NoteCut(string name) => Cuts[name] = Cuts.GetValueOrDefault(name) + 1;
 
+    // [local] SHARPEMU_PARRES_PROBE, gta/parres3: what the cutter would do if the command writes (FrontWrite) and the
+    // end-of-pipe and interrupt posts that follow labels did not cut (rediseno-draws §10.5): every taken item counts in
+    // a real run (ended by any flush) and in a virtual run (ended by any flush but those "transparent" ones). A run of L
+    // items is replayed as the cutter splits it: L / SliceItems full slices, then the rest in PartsFor parts, or on this
+    // thread when it is shorter than MinimumItems. The real replay checks the model against the real counters; reads
+    // that would join on a pending command write are not counted (JOIN_PROBE: ~1-2 per frame).
+    public int ModelSliceItems = 64, ModelMinimumItems = 32, ModelWorkers = 4;
+    private long _realRun, _virtualRun;
+    public long RealRuns, RealSlices, RealShort, VirtualRuns, VirtualSlices, VirtualShort, VirtualLong, TransparentWrites, TransparentPosts;
+
+    public void NoteTaken()
+    {
+        _realRun++;
+        _virtualRun++;
+    }
+
+    public void NoteBoundary(bool transparentWrite, bool transparentPost)
+    {
+        Replay(ref _realRun, ref RealRuns, ref RealSlices, ref RealShort, out _);
+        if (transparentWrite) TransparentWrites++;
+        else if (transparentPost) TransparentPosts++;
+        else
+        {
+            Replay(ref _virtualRun, ref VirtualRuns, ref VirtualSlices, ref VirtualShort, out var length);
+            if (length >= 256) VirtualLong += length;
+        }
+    }
+
+    private void Replay(ref long run, ref long runs, ref long slices, ref long shortItems, out long length)
+    {
+        length = run;
+        run = 0;
+        if (length == 0) return;
+        runs++;
+        var full = length / ModelSliceItems;
+        var rest = (int)(length - full * ModelSliceItems);
+        var parts = FrontSliceCutter<object, object>.PartsFor(rest, ModelWorkers, ModelMinimumItems);
+        slices += full + parts;
+        if (parts == 0) shortItems += rest;
+    }
+
     // [local] SHARPEMU_PARRES_PROBE: the command writes (FrontWrite) met while something was open: how many, taken
     // (SHARPEMU_FRONT_SLICE_WRITES), refused because a cached store table holds their bytes, inside the planner's table
     // bounds, over a registered buffer (a device copy is recorded), over a pending GPU write of an open item; and by the
@@ -322,6 +363,7 @@ internal sealed class FrontSliceCutter<TItem, TSlice> where TSlice : class
     public void Add(TItem item)
     {
         _items.Add(item);
+        if (ParallelResolveProbe.Enabled) _stats.NoteTaken(); // [local] gta/parres3: the virtual cutter
         if (_items.Count - _cutStart >= _sliceItems && DispatchRange(_cutStart, _items.Count - _cutStart, rest: false))
         {
             _cutStart = _items.Count;
