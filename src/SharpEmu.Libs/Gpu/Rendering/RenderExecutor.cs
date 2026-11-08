@@ -59,6 +59,7 @@ public sealed partial class RenderExecutor
     private readonly IResolvedCommandSink _recorder;
     private readonly RecordPool _pool;
     private readonly Func<string, Exception> _fatal;
+    private readonly int _planMode = DrawPlan.CurrentMode; // [local] SHARPEMU_DRAW_PLAN: the target layout kept by value
 
     public RenderExecutor(IRenderHost host, IShaderPipelineProvider pipelines)
         : this(host, pipelines, DefaultStrictDrawResources)
@@ -619,7 +620,7 @@ public sealed partial class RenderExecutor
         record.ContextStamp = banks.ContextStamp;
         record.DynamicStamp = banks.Stamp(RegisterStamp.ContextDynamic);
         record.TargetVersion = _drawResolution.TargetVersion;
-        if (PlanRegisterShadow.Enabled) // [local] SHARPEMU_PLAN_PROBE: the composite depth extent is depth state no register carries
+        if (PlanRegisterShadow.Enabled) // [local] SHARPEMU_PLAN_PROBE, SHARPEMU_DRAW_PLAN: the composite depth extent is depth state no register carries
         {
             var groups = banks.PlanHashes;
             groups.DepthTargets ^= banks.CompositeDepthSizeXy is { } extent ? PlanRegisterShadow.Mix(0x8000_0000u, extent) : 0;

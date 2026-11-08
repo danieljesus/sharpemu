@@ -22,5 +22,12 @@ internal static class DeviceDataReadsDefault
         {
             Environment.SetEnvironmentVariable("SHARPEMU_PIPELINE_CACHE_WRITE_ASYNC", "0");
         }
+
+        // [local] SHARPEMU_DRAW_PLAN: the context group hashes follow every register write the tests make, so the plan
+        // tests can turn the plan on per recorder (DrawPlan.ModeOverride). The plan itself stays off.
+        if (Environment.GetEnvironmentVariable("SHARPEMU_PLAN_SHADOW") is null)
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_PLAN_SHADOW", "1");
+        }
     }
 }

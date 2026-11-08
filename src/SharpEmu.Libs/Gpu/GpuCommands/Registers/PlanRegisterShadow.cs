@@ -33,9 +33,13 @@ public struct PlanGroupHashes : IEquatable<PlanGroupHashes>
 
 // [local] SHARPEMU_PLAN_PROBE: the raw context dwords a bank was written with (only while the probe is on), to update
 // the group hashes by the change of each written register.
+// [local] Also on with SHARPEMU_DRAW_PLAN (1 or 2), whose plans compare these hashes, and with SHARPEMU_PLAN_SHADOW=1
+// (the shadow alone: the tests turn it on so the hashes follow every register write they make). The hashes cost the
+// thread that writes the registers (the front) a mix and two XORs per written register whose value changes.
 public sealed class PlanRegisterShadow
 {
-    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_PLAN_PROBE") == "1";
+    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_PLAN_PROBE") == "1" ||
+        Environment.GetEnvironmentVariable("SHARPEMU_DRAW_PLAN") is "1" or "2" || Environment.GetEnvironmentVariable("SHARPEMU_PLAN_SHADOW") == "1";
 
     private static readonly bool[] TargetAddress = BuildTargetAddresses();
 

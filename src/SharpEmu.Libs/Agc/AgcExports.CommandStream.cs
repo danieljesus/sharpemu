@@ -697,6 +697,7 @@ public static partial class AgcExports
             banks.Context.ColorTargets[0] = words;
             banks.Context.RenderTargetMask = 0xF;
             banks.MarkWritten(RegisterStamps.ContextBits);
+            banks.ForgetPlanHashes(); // [local] SHARPEMU_DRAW_PLAN: written past the register writers
             var arguments = retained.Arguments;
             if (RenderTrace.Enabled)
             {

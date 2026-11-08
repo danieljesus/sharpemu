@@ -58,7 +58,7 @@ namespace SharpEmu.Libs.Diagnostics;
 // runs of 16 or more, run_start_share the runs started per draw.
 internal static class PlanProbe
 {
-    internal static readonly bool Enabled = PlanRegisterShadow.Enabled;
+    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_PLAN_PROBE") == "1"; // [local] the shadow it reads is on with it
 
     private static readonly long ReportTicks = (long)((double.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PLAN_REPORT_S"),
         NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds) && seconds > 0 ? seconds : 5.0) * Stopwatch.Frequency);

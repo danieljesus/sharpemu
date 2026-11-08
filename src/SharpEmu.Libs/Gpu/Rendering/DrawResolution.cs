@@ -18,11 +18,27 @@ internal sealed class DrawResolution
     public DepthTargetState? Depth;
     public bool PixelActive;
 
+    // [local] SHARPEMU_DRAW_PLAN: the value hashes of the groups the layout was resolved from (PlanTargetsKey).
+    public bool PlanTargetsValid;
+    public PlanTargetsKey PlanTargets;
+
     public ulong ValidatedContextStamp;
     public ulong ValidatedUserConfigStamp;
 
     public DynamicStateKey DynamicKey;
     public DynamicDrawState Dynamic;
+}
+
+// [local] SHARPEMU_DRAW_PLAN: what a target layout is a function of, by value: the ColorTargets, DepthTargets and
+// ShaderInterface register groups (the stamps ResolveTargetLayout keys on) and the composite depth extent, which moves
+// the DepthTargets stamp too. The shader-program stamp's part, whether the pixel stage runs, is checked apart.
+internal readonly record struct PlanTargetsKey(ulong ColorTargets, ulong DepthTargets, ulong ShaderInterface, uint? CompositeDepthSizeXy)
+{
+    public static PlanTargetsKey Of(GpuCommands.Registers.RegisterBanks banks)
+    {
+        var hashes = banks.PlanHashes;
+        return new PlanTargetsKey(hashes.ColorTargets, hashes.DepthTargets, hashes.ShaderInterface, banks.CompositeDepthSizeXy);
+    }
 }
 
 internal readonly record struct DynamicStateKey(

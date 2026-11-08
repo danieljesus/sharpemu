@@ -215,6 +215,9 @@ internal sealed class RecordingRenderHost : IRenderHost
 
     public ResourceSlotIdentifier ImageOf(ulong address) => _images[address];
 
+    // [local] SHARPEMU_DRAW_PLAN tests: the image at an address is replaced by a new one (its next lookup finds it).
+    public void ReplaceImage(ulong address) => _images[address] = new ResourceSlotIdentifier(_nextImage++, 1);
+
     public void BindRenderTarget(ResourceSlotIdentifier image) => Calls.Add($"bind_target {image.Index}");
 
     public void ResetBindings() => Calls.Add("reset_bindings");
@@ -551,8 +554,11 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
         DisableBlendingRequests.Add(disableBlending);
         PipelineRenderings.Add(rendering);
         PipelineRequests.Add((topology, primitiveRestartEnabled, pixelInput is not null));
-        return new PipelineHandle(0xA1, 0xB1, false);
+        return GraphicsHandle;
     }
+
+    // [local] The handle every graphics pipeline creation returns (SHARPEMU_DRAW_PLAN tests plant another).
+    public PipelineHandle GraphicsHandle { get; set; } = new(0xA1, 0xB1, false);
 
     public List<bool> DisableBlendingRequests { get; } = new();
 

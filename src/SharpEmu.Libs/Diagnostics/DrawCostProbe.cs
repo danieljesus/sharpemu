@@ -103,6 +103,9 @@ internal static class DrawCostProbe
         DrawBuffers,
         DrawAttachments,
         DrawStageImages,
+        // [local] SHARPEMU_DRAW_PLAN: the shape key and store lookup, then the comparison of the kept inputs.
+        PlanLookup,
+        PlanCompare,
         DrawPipeline,
         DrawBindVertex,
         // Host CommitBindings: the descriptor writes built (with the stage image work and checks), their push, the
@@ -157,6 +160,10 @@ internal static class DrawCostProbe
         PipelineWouldKeep8,
         ContextUnchanged,
         TargetsInPlace,
+        // [local] SHARPEMU_DRAW_PLAN: draws whose pipeline the plan answered, missed, and answered wrong (=2).
+        PlanHit,
+        PlanMiss,
+        PlanWrong,
         Barriers,
         ScopeBegin,
         ScopeEnd,
@@ -538,6 +545,7 @@ internal static class DrawCostProbe
         LiteObtainProbe.Report(); // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_PLAN_PROBE: the same window, after its lines
         PlanProbe.Report();
         Gpu.Buffers.LiteObtainUse.Report(Gpu.Buffers.LiteObtainUse.DefaultMode); // [local] SHARPEMU_LITE_OBTAIN
+        Gpu.Rendering.DrawPlan.Report(); // [local] SHARPEMU_DRAW_PLAN
         _windowStart = Stopwatch.GetTimestamp();
     }
 

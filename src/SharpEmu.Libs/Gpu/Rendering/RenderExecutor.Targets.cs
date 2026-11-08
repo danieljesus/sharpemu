@@ -115,6 +115,18 @@ public sealed partial class RenderExecutor
                 VerifyTargetLayout(banks, resolution);
             }
 
+            if (_planMode != 0) DrawPlan.LayoutStamp++; // [local] SHARPEMU_DRAW_PLAN
+            return resolution;
+        }
+
+        // [local] SHARPEMU_DRAW_PLAN: the stamps moved, the values they cover may not have.
+        var planKey = _planMode != 0 ? PlanTargetsKey.Of(banks) : default;
+        if (_planMode != 0 && resolution.PlanTargetsValid && resolution.PlanTargets == planKey && resolution.PixelActive == HasActivePixelShader(banks) &&
+            KeepsTargetLayout(banks, resolution))
+        {
+            DrawPlan.LayoutValue++;
+            resolution.TargetContextStamp = contextStamp;
+            resolution.TargetProgramsStamp = programsStamp;
             return resolution;
         }
 
@@ -123,7 +135,79 @@ public sealed partial class RenderExecutor
         resolution.TargetProgramsStamp = programsStamp;
         resolution.TargetVersion = (uint)Interlocked.Increment(ref _targetVersions);
         Interlocked.Increment(ref _layoutResolves); // [local]
+        if (_planMode != 0) // [local] SHARPEMU_DRAW_PLAN
+        {
+            DrawPlan.LayoutResolve++;
+            resolution.PlanTargetsValid = true;
+            resolution.PlanTargets = planKey;
+        }
+
         return resolution;
+    }
+
+    // [local] SHARPEMU_DRAW_PLAN=2: a layout kept by value is resolved again and compared; the fresh one is used when
+    // they differ (false: the caller resolves).
+    private bool KeepsTargetLayout(RegisterBanks banks, DrawResolution kept)
+    {
+        if (_planMode != 2)
+        {
+            return true;
+        }
+
+        var fresh = _layoutCheck ??= new DrawResolution();
+        ResolveTargetLayoutInto(banks, fresh);
+        DrawPlan.LayoutVerified++;
+        if (SameTargetLayout(fresh, kept))
+        {
+            return true;
+        }
+
+        if (DrawPlan.NoteWrong(layout: true))
+        {
+            Console.Error.WriteLine(FormattableString.Invariant(
+                $"[GPU][DRAW_PLAN_WRONG] kind=layout total={DrawPlan.WrongTotal} colors={kept.ColorCount}/{fresh.ColorCount} depth={kept.Depth is not null}/{fresh.Depth is not null} ") +
+                FormattableString.Invariant($"pixel={kept.PixelActive}/{fresh.PixelActive} key=0x{kept.PlanTargets.ColorTargets:X16}/0x{kept.PlanTargets.DepthTargets:X16}/0x{kept.PlanTargets.ShaderInterface:X16}"));
+        }
+
+        return false;
+    }
+
+    // Every output of a resolution. The requests hold inline arrays (no built-in Equals) and references, so they are
+    // compared by their raw bytes (references included, as ATTACH_REPEAT does), and bytes that differ are walked field
+    // by field (PlanProbe.FieldDiff) before they count as a difference.
+    internal static bool SameTargetLayout(DrawResolution fresh, DrawResolution kept)
+    {
+        if (fresh.ColorCount != kept.ColorCount || fresh.PixelActive != kept.PixelActive ||
+            !fresh.ColorSlots.AsSpan(0, fresh.ColorCount).SequenceEqual(kept.ColorSlots.AsSpan(0, kept.ColorCount)) ||
+            fresh.Depth.HasValue != kept.Depth.HasValue)
+        {
+            return false;
+        }
+
+        if (fresh.Depth is { } freshDepth && kept.Depth is { } keptDepth && !SameValue(in freshDepth, in keptDepth))
+        {
+            return false;
+        }
+
+        for (var index = 0; index < fresh.ColorCount; index++)
+        {
+            if (!SameValue(in fresh.Colors[index], in kept.Colors[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool SameValue<T>(in T left, in T right) where T : struct
+    {
+        var size = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        var a = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+            ref System.Runtime.CompilerServices.Unsafe.As<T, byte>(ref System.Runtime.CompilerServices.Unsafe.AsRef(in left)), size);
+        var b = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+            ref System.Runtime.CompilerServices.Unsafe.As<T, byte>(ref System.Runtime.CompilerServices.Unsafe.AsRef(in right)), size);
+        return a.SequenceEqual(b) || Diagnostics.PlanProbe.FieldDiff(left, right, 0).Length == 0;
     }
 
     private void VerifyTargetLayout(RegisterBanks banks, DrawResolution kept)

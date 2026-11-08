@@ -34,6 +34,9 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         Diagnostics.DrawCostProbe.Enabled ? new() : null;
     private ulong _probeContextStamp;
     private readonly InPlaceDraw _inPlace = new();
+    // [local] SHARPEMU_DRAW_PLAN: the render thread's pipelines per draw shape (null when off and on a worker).
+    private readonly int _planMode;
+    private readonly DrawPlan.Store? _plan;
     private long _sequence;
     private static readonly ThreadCounter _inPlaceDraws = new();
     private static readonly ThreadCounter _inPlaceRefused = new();
@@ -177,6 +180,8 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         _strictDrawResources = strictDrawResources;
         _pendingWrites = pendingWrites;
         _pool = pool ?? new RecordPool();
+        _planMode = returnsRecords ? DrawPlan.CurrentMode : 0; // [local] SHARPEMU_DRAW_PLAN: the render thread's recorder only
+        _plan = _planMode != 0 ? new DrawPlan.Store(DrawPlan.StoreCapacity) : null;
     }
 
     public long NextSequence() => ++_sequence;
@@ -1018,8 +1023,74 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         return rendering;
     }
 
+    // [local] SHARPEMU_DRAW_PLAN: the pipeline of the last draw of the same shape when its PipelineKey inputs are equal
+    // by value (DrawPlan); =2 also runs the generic path and compares. The plan's lookup and comparison are their own
+    // DRAWCOST steps (plan_lookup, plan_compare); a hit leaves draw_pipeline empty.
     private bool TryResolvePipeline(ResolvedDraw record, ref DrawState state, VertexInputInfo vertexInput, PixelInputInfo? pixelInput,
         out PipelineHandle pipeline) // [local] false: SHARPEMU_ASYNC_GRAPHICS_PIPELINES left the draw out
+    {
+        if (_plan is not { } plan)
+        {
+            return TryResolvePipelineGeneric(record, ref state, vertexInput, pixelInput, out pipeline);
+        }
+
+        DrawPlan.MaybeReport(_planMode);
+        DrawPlan.Draws++;
+        DrawPlan.Entry? entry = null;
+        var shaped = DrawPlan.TryShape(record, in state, vertexInput, pixelInput, out var shape);
+        if (shaped)
+        {
+            entry = plan.Take(shape.Key);
+        }
+
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.PlanLookup); // [local] SHARPEMU_DRAWCOST_PROBE
+        var miss = entry is null ? DrawPlan.Miss.Excluded : DrawPlan.Compare(entry, in shape, in record.PlanGroups, in state.Rendering);
+        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.PlanCompare); // [local]
+        if (miss is null)
+        {
+            DrawPlan.Hits++;
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PlanHit); // [local]
+            if (_planMode == 1)
+            {
+                pipeline = entry!.Handle;
+                return true;
+            }
+        }
+        else
+        {
+            DrawPlan.Misses[(int)miss.Value]++;
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PlanMiss); // [local]
+        }
+
+        if (!TryResolvePipelineGeneric(record, ref state, vertexInput, pixelInput, out pipeline))
+        {
+            return false; // still compiling: nothing is kept
+        }
+
+        if (entry is null)
+        {
+            return true;
+        }
+
+        if (miss is null)
+        {
+            DrawPlan.Verified++;
+            if (entry.Handle != pipeline)
+            {
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PlanWrong); // [local]
+                if (DrawPlan.NoteWrong(layout: false))
+                {
+                    Console.Error.WriteLine(DrawPlan.WrongPipeline(entry, in shape, in record.PlanGroups, pipeline, record.Context));
+                }
+            }
+        }
+
+        DrawPlan.Keep(entry, in shape, in record.PlanGroups, in state.Rendering, pipeline, _planMode == 2 ? record.Context : null);
+        return true;
+    }
+
+    private bool TryResolvePipelineGeneric(ResolvedDraw record, ref DrawState state, VertexInputInfo vertexInput, PixelInputInfo? pixelInput,
+        out PipelineHandle pipeline)
     {
         var boundSlots = 0u;
         for (var index = 0; index < state.ColorCount; index++)

@@ -77,6 +77,21 @@ public sealed class RegisterBanks
         _planShadow.Write(offset, values);
     }
 
+    // [local] SHARPEMU_DRAW_PLAN: the typed context was written without the register writers (a replayed draw's
+    // retargeting, GnmMode's color target translation), so the hashes no longer follow it: from here on they equal no
+    // other state until the context is next reset or cleared, as for a bank whose dwords are not known.
+    internal void ForgetPlanHashes()
+    {
+        if (!PlanRegisterShadow.Enabled)
+        {
+            return;
+        }
+
+        _planShadow = null;
+        _planHashes = PlanRegisterShadow.UniqueHashes(Interlocked.Increment(ref _planUnknownBases));
+        _planBaseUnknown = true;
+    }
+
     private void ClearPlanShadow()
     {
         _planShadow?.Clear();

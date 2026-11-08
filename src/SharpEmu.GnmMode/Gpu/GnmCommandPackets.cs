@@ -584,6 +584,7 @@ internal static class GnmCommandPackets
         var height = ((sliceWord & 0x3FFFFF) + 1) * 64 / pitch;
         if (height is 0 or > 16384) throw new InvalidDataException($"Invalid GCN color extent: pitch={pitch}, slice=0x{sliceWord:X8}.");
         ref var target = ref interpreter.TypedRegisters.ColorTargetsForWrite[slot];
+        interpreter.TypedRegisters.ForgetPlanHashes(); // [local] SHARPEMU_DRAW_PLAN: written past the register writers
         var tileIndex = raw.GetValueOrDefault(start + 5) & 31;
         var linear = (target.Info & 0x80) != 0 || tileIndex is 8 or 31;
         var guestAddress = extents.GuestAddresses[slot] != 0 ? extents.GuestAddresses[slot] : target.BaseAddress;
