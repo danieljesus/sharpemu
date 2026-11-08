@@ -20,6 +20,24 @@ internal static unsafe partial class VulkanVideoPresenter
     // guest-visible writes) is queued to the render thread in stream order.
     internal static readonly bool RenderPipelineEnabled = Environment.GetEnvironmentVariable("SHARPEMU_RENDER_PIPELINE") == "1";
 
+    // [local] SHARPEMU_FRONT_RESOLVE_POOL=1 (with SHARPEMU_RENDER_PIPELINE=1, off by default): before each back-queue item the
+    // render thread hands the next queued draws (up to SHARPEMU_FRONT_RESOLVE_AHEAD, 8 by default) to upstream's resolve pool
+    // while they pass its gate (targets, shaders known not to write memory); the scan stops at the first other item, so a
+    // worker never resolves past a queued write, fill, copy, dispatch or memory-writing draw. The render thread joins each
+    // one at its position (JoinDeferredDraw: validate the worker's reads, record, or resolve it again in order). The front
+    // prepares every draw's programs as without the pool and the worker resolves with them; the draw that runs next and
+    // pairs a worker recently could not resolve stay inline. docs/plan-parallel-resolution-open-world.md, step 2.
+    internal static readonly bool FrontResolvePoolEnabled = RenderPipelineEnabled && Environment.GetEnvironmentVariable("SHARPEMU_FRONT_RESOLVE_POOL") == "1";
+    internal static readonly int FrontResolveAhead =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FRONT_RESOLVE_AHEAD"), out var ahead) && ahead > 0 ? Math.Min(ahead, 256) : 8;
+
+    // [local] SHARPEMU_FRONT_SLICES=1 (with SHARPEMU_RENDER_PIPELINE=1, off by default): the render thread still resolves
+    // every queued draw in order, but the draws that pass the resolve pool's gate and write no memory, with the global
+    // barriers between them, are recorded by upstream's render workers (SHARPEMU_RENDER_WORKERS) into a primary command
+    // buffer per segment and joined in stream order (JoinSegment) before any other item runs. Takes the place of
+    // SHARPEMU_FRONT_RESOLVE_POOL. VulkanVideoPresenter.FrontSlices.cs; docs/plan-parallel-resolution-open-world.md §10, 3a.
+    internal static readonly bool FrontSlicesEnabled = RenderPipelineEnabled && Environment.GetEnvironmentVariable("SHARPEMU_FRONT_SLICES") == "1";
+
     // The work the front queues for the render thread, in order. The front blocks when the
     // queue is full; the render thread runs the items between its other duties. An item that
     // fails fails the queue, and the front sees the failure on its next call.
@@ -251,7 +269,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public int Count => Volatile.Read(ref _count);
     }
 
-    private sealed class BackQueue(Action wake, int capacity)
+    internal sealed class BackQueue(Action wake, int capacity) // [local] internal for BackQueueLookaheadTests
     {
         private readonly object _gate = new();
         private readonly Queue<Action> _items = new();
@@ -271,6 +289,66 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // [local] SHARPEMU_RUNAHEAD_TICKS: run on the render thread after each item.
         public Action? AfterItem { get; set; }
+
+        // [local] SHARPEMU_FRONT_RESOLVE_POOL: offered the queued items after the one about to run, oldest first; the first
+        // refusal ends the scan until that item runs. Render thread only, like the counters below.
+        public Func<Action, bool, bool>? Lookahead { get; set; }
+        private int _aheadOffered;
+        private bool _aheadStopped;
+        private Action[]? _ahead;
+
+        private void OfferAhead(Func<Action, bool, bool> offer)
+        {
+            var depth = FrontResolveAhead;
+            if (_aheadStopped || _aheadOffered > depth / 2) // [local] tops up once half ran: the skip below is O(offered)
+                return;
+            var ahead = _ahead ??= new Action[depth];
+            var count = 0;
+            lock (_gate)
+            {
+                var index = 0;
+                foreach (var item in _items)
+                {
+                    if (index++ < _aheadOffered)
+                        continue;
+                    ahead[count++] = item;
+                    if (_aheadOffered + count >= depth)
+                        break;
+                }
+            }
+
+            for (var index = 0; index < count; index++)
+            {
+                var accepted = offer(ahead[index], _aheadOffered == 0); // [local] nothing before it is offered: it runs next
+                ahead[index] = null!;
+                if (!accepted)
+                {
+                    _aheadStopped = true;
+                    for (var rest = index + 1; rest < count; rest++)
+                        ahead[rest] = null!;
+                    return;
+                }
+
+                _aheadOffered++;
+            }
+        }
+
+        // [local] SHARPEMU_FRONT_SLICES: takes the items it records on the slice workers; joins what it took before any
+        // other item runs and before RunPending returns. Render thread only.
+        internal interface ISlicer
+        {
+            // True: Run(work) takes the item. False: everything taken before it was joined, and it runs as usual.
+            bool Take(Action work);
+
+            void Run(Action work);
+
+            // [local] SHARPEMU_FRONT_SLICE_DEFER: after a taken item ran and was timed.
+            void AfterTaken();
+
+            void Flush(FrontSliceFlush reason);
+        }
+
+        public ISlicer? Slicer { get; set; }
 
         // [local] SHARPEMU_FRONT_STALE_CHECK: items queued so far, and items the render thread has finished.
         internal long Enqueued;
@@ -404,6 +482,7 @@ internal static unsafe partial class VulkanVideoPresenter
         public int RunPending(long deadline)
         {
             var ran = 0;
+            var slicer = Slicer; // [local] SHARPEMU_FRONT_SLICES
             while (true)
             {
                 Action work;
@@ -411,20 +490,57 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     if (_items.Count == 0)
                     {
-                        return ran;
-                    }
+                        if (slicer is null)
+                        {
+                            return ran;
+                        }
 
-                    work = _items.Dequeue();
-                    Volatile.Write(ref _count, _items.Count);
-                    if (_items.Count == capacity - 1)
+                        work = null!;
+                    }
+                    else
                     {
-                        Monitor.PulseAll(_gate);
+                        work = _items.Dequeue();
+                        Volatile.Write(ref _count, _items.Count);
+                        if (_items.Count == capacity - 1)
+                        {
+                            Monitor.PulseAll(_gate);
+                        }
                     }
                 }
 
+                if (work is null) // [local] SHARPEMU_FRONT_SLICES: what the slicer took is joined before returning
+                {
+                    FlushSlices(slicer!, FrontSliceFlush.Exit);
+                    return ran;
+                }
+
+                if (Lookahead is not null) // [local] SHARPEMU_FRONT_RESOLVE_POOL: the item leaves the scanned window
+                {
+                    if (_aheadOffered > 0)
+                        _aheadOffered--;
+                    else
+                        _aheadStopped = false;
+                }
+
+                var taken = false;
+                if (slicer is not null) // [local] SHARPEMU_FRONT_SLICES: an item it does not take first joins what it took
+                {
+                    try
+                    {
+                        taken = slicer.Take(work);
+                    }
+                    catch (Exception exception)
+                    {
+                        Fail(exception);
+                        throw;
+                    }
+                }
+
+                var probeStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
                 try
                 {
-                    work();
+                    if (taken) slicer!.Run(work);
+                    else work();
                 }
                 catch (Exception exception)
                 {
@@ -432,13 +548,52 @@ internal static unsafe partial class VulkanVideoPresenter
                     throw;
                 }
 
+                if (probeStarted != 0) ParallelResolveProbe.EndItem(work, System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted); // [local]
+                if (taken) // [local] SHARPEMU_FRONT_SLICE_DEFER: the slices that are done join here, outside the item's timing
+                {
+                    try
+                    {
+                        slicer!.AfterTaken();
+                    }
+                    catch (Exception exception)
+                    {
+                        Fail(exception);
+                        throw;
+                    }
+                }
+                if (Lookahead is { } offer) // [local] only once the item ran: what follows sees its effects
+                {
+                    var aheadStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
+                    OfferAhead(offer);
+                    if (aheadStarted != 0) ParallelResolveProbe.AddLookaheadTicks(System.Diagnostics.Stopwatch.GetTimestamp() - aheadStarted);
+                }
                 ran++;
                 Volatile.Write(ref Executed, Executed + 1);
-                AfterItem?.Invoke();
+                if (AfterItem is { } after)
+                {
+                    if (slicer is not null) FlushSlices(slicer, FrontSliceFlush.After); // [local] SHARPEMU_FRONT_SLICES: it may wait on the GPU
+                    after();
+                }
+
                 if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline)
                 {
+                    if (slicer is not null) FlushSlices(slicer, FrontSliceFlush.Exit); // [local] SHARPEMU_FRONT_SLICES
                     return ran;
                 }
+            }
+        }
+
+        // [local] SHARPEMU_FRONT_SLICES: a failed join fails the queue, as a failed item does.
+        private void FlushSlices(ISlicer slicer, FrontSliceFlush reason)
+        {
+            try
+            {
+                slicer.Flush(reason);
+            }
+            catch (Exception exception)
+            {
+                Fail(exception);
+                throw;
             }
         }
 
@@ -463,6 +618,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private readonly Action _flush = presenter.Flush;
         private readonly Action _flushFrame = presenter.FlushFrame; // [local] upstream's frame boundary (frame ticks), in stream order
         private readonly Action _barrier = presenter.EmitGlobalBarrier;
+        internal Action BarrierItem => _barrier; // [local] SHARPEMU_PARRES_PROBE
         private readonly Action _collect = presenter.RunGarbageCollector;
         private readonly Action _pauseAlias = presenter.PauseFrontAliasAccess;
         private readonly Action _resumeAlias = presenter.ResumeFrontAliasAccess;
@@ -518,12 +674,50 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             _queueId = queueId;
             _geometrySnapshots = geometrySnapshots is not null;
+            if (PostsDeferred) // [local] SHARPEMU_FRONT_SLICE_DEFER: the translation state at once, the queue context in order
+            {
+                var post = new FrontPost(() => presenter.BeginSubmission(queueId, submissionId, geometrySnapshots),
+                    now: () => presenter.BeginSubmissionTranslation(queueId, submissionId, geometrySnapshots),
+                    later: () => presenter.BeginSubmissionInOrder(queueId, submissionId));
+                queue.Enqueue(post.Run);
+                return;
+            }
+
             queue.Enqueue(() => presenter.BeginSubmission(queueId, submissionId, geometrySnapshots));
         }
 
-        public void Flush() => queue.Enqueue(_flush, _pauseAlias, _resumeAlias);
+        public void Flush() => queue.Enqueue(PostsDeferred ? _flushPost : _flush, _pauseAlias, _resumeAlias);
 
-        public void FlushFrame() => queue.Enqueue(_flushFrame, _pauseAlias, _resumeAlias);
+        public void FlushFrame() => queue.Enqueue(PostsDeferred ? _flushFramePost : _flushFrame, _pauseAlias, _resumeAlias);
+
+        // [local] SHARPEMU_FRONT_SLICE_DEFER: the items upstream's command thread posts to the render thread without waiting
+        // (Flush, EndFrame, BeginSubmissionContext, RecordEndOfPipe, TriggerInterrupt) are queued as FrontPost, which the
+        // front slices take as render units instead of joining (FrontSlices.Defer).
+        private static readonly bool PostsDeferred = FrontSlicesEnabled && FrontSlices.TakesPosts;
+
+        private readonly Action _flushPost = new FrontPost(presenter.Flush).Run;
+        private readonly Action _flushFramePost = new FrontPost(presenter.FlushFrame).Run;
+
+        // [local] SHARPEMU_FRONT_SLICE_DEFER: a post. Not taken (nothing open, or the slices are off), Run does all of it here.
+        // Taken, RunNow does at once what the resolution of the items after it reads, and Work (`later`, or all of it) runs
+        // in stream order when the slice it sits in is joined.
+        internal sealed class FrontPost
+        {
+            private readonly Action _run;
+            private readonly Action? _now;
+            internal readonly FrontPostWork Work;
+
+            public FrontPost(Action run, Action? now = null, Action? later = null)
+            {
+                _run = run;
+                _now = now;
+                Work = new FrontPostWork(later ?? run);
+            }
+
+            public void Run() => _run();
+
+            public void RunNow() => _now?.Invoke();
+        }
 
         public void FlushAndWait() { FrontSyncStats.Note(3); queue.Run(() => { presenter.FlushAndWait(); return true; }, _pauseAlias, _resumeAlias); }
 
@@ -556,12 +750,24 @@ internal static unsafe partial class VulkanVideoPresenter
             if (LabelTrace.Enabled && (write.EventId != 0 || write.Kind is EndOfPipeWriteKind.InterruptOnly || LabelTrace.IsWatched(write.Destination)))
                 LabelTrace.Note(LabelTrace.Kind.EopFront, _queueId, write.Destination, write.Value, (ulong)write.Kind | ((ulong)(uint)write.EventId << 8));
             var copy = write;
+            if (PostsDeferred) // [local] SHARPEMU_FRONT_SLICE_DEFER
+            {
+                queue.Enqueue(new FrontPost(() => presenter.RecordEndOfPipe(in copy)).Run, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             queue.Enqueue(() => presenter.RecordEndOfPipe(in copy), _pauseAlias, _resumeAlias);
         }
 
         public void TriggerInterrupt(int eventId, uint contextId)
         {
             if (LabelTrace.Enabled) LabelTrace.Note(LabelTrace.Kind.FrontTrigger, _queueId, 0, (ulong)(uint)eventId, contextId);
+            if (PostsDeferred) // [local] SHARPEMU_FRONT_SLICE_DEFER
+            {
+                queue.Enqueue(new FrontPost(() => presenter.TriggerInterrupt(eventId, contextId)).Run, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             queue.Enqueue(() => presenter.TriggerInterrupt(eventId, contextId), _pauseAlias, _resumeAlias);
         }
 
@@ -629,9 +835,139 @@ internal static unsafe partial class VulkanVideoPresenter
             return registers;
         }
 
+        // [local] SHARPEMU_FRONT_RESOLVE_POOL: a queued draw the render thread can hand to the resolve pool before it runs.
+        // The front prepares its programs as for any queued draw; a worker resolves with that preparation, and the draw's
+        // position checks it as the inline path does (a preparation discarded there sends the draw to a resolve in order).
+        internal sealed class FrontDraw(FrontCommandStreamHost host, ulong submitId, RegisterBanks snapshot, bool indexed,
+            DrawIndexedArguments indexedArguments, DrawAutoArguments autoArguments, KeyValuePair<uint, uint>[]? registers, long version) : IFrontSliceOwner
+        {
+            private AgcExports.DeferredDraw? _deferred;
+            internal GraphicsPrograms? Prepared;
+            internal RenderExecutor.DrawProgramInputs Inputs;
+            internal FrontPrepReads.Pages? PrepPages;
+            internal long TableMark;
+
+            // [local] SHARPEMU_FRONT_SLICES: the banks a captured record still reads (its Context); the slice returns them
+            // to the front once the record was joined or recorded here (ReleaseSnapshot).
+            internal bool HoldSnapshot;
+
+            internal RegisterBanks Banks => snapshot;
+
+            public void ReleaseSnapshot() => host._snapshots.Push(snapshot);
+
+            // The lookahead's offer; false ends the scan. `next` is the item the render thread runs next.
+            public bool Offer(bool next)
+            {
+                _deferred = host.Presenter.Translation.TryDeferFrontDraw(submitId, snapshot, indexed, in indexedArguments, in autoArguments,
+                    Prepared, in Inputs, next, out var passes);
+                return passes;
+            }
+
+            public void Run()
+            {
+                try
+                {
+                    var rangesVerify = false; // [local] SHARPEMU_FRONT_PREP_RANGES=2
+                    var lent = Prepared;
+                    var prepStarted = ParallelResolveProbe.CaptureKind >= 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] slice_capture
+                    if (Prepared is null)
+                        FrontPrepReads.Release(PrepPages);
+                    else if (!host.Presenter.BeforeFrontPreparationCheck(PrepPages) || // [local] SHARPEMU_FRONT_SLICE_DISPATCHES
+                             !host.Presenter.FrontPreparationStillValid(version, PrepPages, out rangesVerify) || !host.Presenter.TablesStillValid(TableMark))
+                    {
+                        Prepared = null;
+                        Inputs = default;
+                    }
+
+                    if (prepStarted != 0) ParallelResolveProbe.AddPrepTicks(System.Diagnostics.Stopwatch.GetTimestamp() - prepStarted);
+
+                    if (Prepared is not null && (FrontPrepVerify.Enabled || rangesVerify)) // [local] SHARPEMU_FRONT_PREP_VERIFY
+                        Prepared = Presenter.VerifyGraphics(Prepared, ref Inputs, Prepare, rangesVerify);
+
+                    if (_deferred is { } deferred)
+                        host.Presenter.ExecuteFrontDeferredDraw(deferred, registers, ReferenceEquals(lent, Prepared), Prepared, in Inputs);
+                    else
+                        host.Presenter.ExecuteQueuedDraw(submitId, snapshot, indexed, in indexedArguments, in autoArguments, Prepared, in Inputs, registers);
+                }
+                finally
+                {
+                    _deferred = null;
+                    Prepared = null;
+                    PrepPages = null;
+                    if (!HoldSnapshot) host._snapshots.Push(snapshot); // [local] SHARPEMU_FRONT_SLICES
+                }
+            }
+
+            internal (GraphicsPrograms? Programs, RenderExecutor.DrawProgramInputs Inputs) Prepare() =>
+                host.Presenter.Translation.PrepareGraphicsPrograms(snapshot, out var prepareInputs) is { } programs ? (programs, prepareInputs) : default;
+        }
+
+        // [local] SHARPEMU_FRONT_SLICE_DISPATCHES: the queued direct dispatch of the inline path below as an object the
+        // front slices recognize (FrontSlices.Take); Run does what that closure does.
+        internal sealed class FrontDispatch(FrontCommandStreamHost host, ulong submitId, RegisterBanks snapshot, uint groupsX, uint groupsY, uint groupsZ,
+            uint dispatchInitiator, ulong indirectArgumentsAddress, long version, int timelineQueue, long tableMark, Func<ComputeProgram?> prepareOnFront)
+        {
+            internal ComputeProgram? Prepared;
+            internal FrontPrepReads.Pages? PrepPages;
+            internal FrontSpeculation.Reads? Speculated;
+
+            public void Run()
+            {
+                try
+                {
+                    var presenter = host.Presenter;
+                    var rangesVerify = false;
+                    var prepStarted = ParallelResolveProbe.CaptureKind >= 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] slice_capture
+                    if (Prepared is null)
+                        FrontPrepReads.Release(PrepPages);
+                    else if (!presenter.BeforeFrontPreparationCheck(PrepPages) ||
+                             !presenter.FrontPreparationStillValid(version, PrepPages, out rangesVerify) || !presenter.TablesStillValid(tableMark))
+                        Prepared = null;
+                    if (prepStarted != 0) ParallelResolveProbe.AddPrepTicks(System.Diagnostics.Stopwatch.GetTimestamp() - prepStarted);
+                    if (Prepared is not null && (FrontPrepVerify.Enabled || rangesVerify))
+                        Prepared = Presenter.VerifyCompute(Prepared, prepareOnFront, rangesVerify);
+                    if (Speculated is not null)
+                    {
+                        if (Prepared is null) Interlocked.Increment(ref FrontSpeculation.Invalidated);
+                        Prepared = presenter.ArmSpeculation(snapshot.Shader.Compute.Address, Prepared, Speculated, prepareOnFront);
+                        Speculated = null;
+                    }
+                    Diagnostics.LabelTimeline.RenderQueue = timelineQueue;
+                    presenter.ExecuteQueuedDispatch(submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, Prepared);
+                    Diagnostics.LabelTimeline.RenderQueue = -1;
+                }
+                finally
+                {
+                    Prepared = null;
+                    PrepPages = null;
+                    host._snapshots.Push(snapshot);
+                }
+            }
+        }
+
+        internal Presenter Presenter => presenter; // [local]
+
+        // [local] As the inline path below: the front prepares the programs; the render thread checks them at the draw.
+        private void EnqueueFrontDraw(ulong submitId, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments)
+        {
+            var snapshot = Snapshot();
+            var draw = new FrontDraw(this, submitId, snapshot, indexed, indexedArguments, autoArguments, DrawRegisters(), presenter.FrontPreparationVersion);
+            var tableMark = Presenter.BeginTableMark(); // [local] SHARPEMU_STORE_TABLE_APPLIED_CHECK
+            draw.Prepared = presenter.TryPrepareOnFront(GraphicsKey(snapshot), draw.Prepare, out draw.Inputs);
+            draw.PrepPages = Presenter.TakePrepPages(); // [local] SHARPEMU_FRONT_PREP_RANGES
+            draw.TableMark = Presenter.EndTableMark(tableMark);
+            queue.Enqueue(draw.Run, _pauseAlias, _resumeAlias);
+        }
+
         public void DrawIndexed(ulong submitId, in DrawIndexedArguments arguments)
         {
             if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
+            if (FrontResolvePoolEnabled || FrontSlicesEnabled) // [local] SHARPEMU_FRONT_RESOLVE_POOL, SHARPEMU_FRONT_SLICES
+            {
+                EnqueueFrontDraw(submitId, true, in arguments, default);
+                return;
+            }
+
             var snapshot = Snapshot();
             var registers = DrawRegisters();
             var version = presenter.FrontPreparationVersion; // [local]
@@ -692,6 +1028,12 @@ internal static unsafe partial class VulkanVideoPresenter
         public void DrawAuto(ulong submitId, in DrawAutoArguments arguments)
         {
             if (FrontProfile.LoopEnabled) FrontProfile.Draws++;
+            if (FrontResolvePoolEnabled || FrontSlicesEnabled) // [local] SHARPEMU_FRONT_RESOLVE_POOL, SHARPEMU_FRONT_SLICES
+            {
+                EnqueueFrontDraw(submitId, false, default, in arguments);
+                return;
+            }
+
             var snapshot = Snapshot();
             var registers = DrawRegisters();
             var version = presenter.FrontPreparationVersion; // [local]
@@ -793,6 +1135,14 @@ internal static unsafe partial class VulkanVideoPresenter
             computeScope.Dispose();
             if (prepared is null) Diagnostics.FrontCostProbe.Count(Diagnostics.FrontCostProbe.Counter.PrepEmpty); // [local] SHARPEMU_FRONTCOST_PROBE
             Diagnostics.FrontCostProbe.Lap(Diagnostics.FrontCostProbe.Step.PrepEnd);
+            if (FrontSlicesEnabled && FrontSlices.Dispatches) // [local] SHARPEMU_FRONT_SLICE_DISPATCHES
+            {
+                var dispatch = new FrontDispatch(this, submitId, snapshot, groupsX, groupsY, groupsZ, dispatchInitiator, indirectArgumentsAddress, version,
+                    timelineQueue, tableMark, prepareOnFront) { Prepared = prepared, PrepPages = prepPages, Speculated = speculated };
+                queue.Enqueue(dispatch.Run, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             queue.Enqueue(() =>
             {
                 try
@@ -866,7 +1216,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
         // A label or event store lands after the work queued before it, so the guest cannot
         // reuse memory a queued draw still has to capture.
-        public void WriteGuest(ulong address, ReadOnlySpan<byte> source)
+        public void WriteGuest(ulong address, ReadOnlySpan<byte> source) => WriteGuest(address, source, "?");
+
+        public void WriteGuest(ulong address, ReadOnlySpan<byte> source, string caller)
         {
             FrontProfile.NoteStreamWrite(address, 1);
             byte[] bytes;
@@ -901,6 +1253,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            if (FrontSlicesEnabled) // [local] SHARPEMU_FRONT_SLICES: typed, for the slice census and SHARPEMU_FRONT_SLICE_WRITES
+            {
+                queue.Enqueue(new FrontWrite(presenter, address, bytes, labelSerial, caller).Run, _pauseAlias, _resumeAlias);
+                return;
+            }
+
             if (labelSerial != 0)
             {
                 queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.FrontLabels.Retire(address, labelSerial); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
@@ -908,6 +1266,24 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             queue.Enqueue(() => { presenter.WriteGuest(address, bytes); presenter.NoteGuestWriteApplied(address, bytes.Length); }, _pauseAlias, _resumeAlias);
+        }
+
+        // [local] SHARPEMU_FRONT_SLICES: a queued WriteGuest (a label, end-of-pipe or event store, an occlusion or GDS dump) as an
+        // object the front slices recognize (FrontSlices.Take). Run does what the closure did: the device-ordered command
+        // write, the pending label retired, the waiting heads told. With SHARPEMU_FRONT_SLICE_WRITES the slices take it as a
+        // render unit: Run then happens when the slice it sits in is joined, between the segment before it and the one after.
+        internal sealed class FrontWrite(Presenter presenter, ulong address, byte[] bytes, long labelSerial, string caller)
+        {
+            internal ulong Address => address;
+            internal int Length => bytes.Length;
+            internal string Caller => caller;
+
+            public void Run()
+            {
+                presenter.WriteGuest(address, bytes);
+                presenter.FrontLabels.Retire(address, labelSerial);
+                presenter.NoteGuestWriteApplied(address, bytes.Length);
+            }
         }
 
         // [local] SHARPEMU_FRONT_PENDING_LABELS=1: a memory wait also sees the label writes this front queued and the
@@ -1035,6 +1411,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 _back.AfterItem = () => Gpu.Scheduling.RunaheadBound.Hold(_scheduler.Timeline, () => _scheduler.CurrentTick - 1, RunPendingCommands);
             }
             _front = new FrontCommandStreamHost(this, _back);
+            if (ParallelResolveProbe.Enabled) ParallelResolveProbe.BarrierItem = _front.BarrierItem; // [local]
+            if (FrontSlicesEnabled) // [local] SHARPEMU_FRONT_SLICES, in place of the resolve pool
+            {
+                _back.Slicer = _frontSlicer = new FrontSlices(this, _front);
+                Console.Error.WriteLine($"[LOADER][INFO] The render workers record the front's draws (SHARPEMU_FRONT_SLICES=1, items={FrontSlices.SliceItems}, minimum={FrontSlices.MinimumItems})." +
+                    (FrontResolvePoolEnabled ? " SHARPEMU_FRONT_RESOLVE_POOL is ignored." : ""));
+            }
+            else if (FrontResolvePoolEnabled) // [local] SHARPEMU_FRONT_RESOLVE_POOL
+                _back.Lookahead = static (work, next) => work.Target is FrontCommandStreamHost.FrontDraw draw && draw.Offer(next);
             RenderPhaseProfile.FrontReport = TakeFrontReport;
             ShaderPipelineCache.BeforeGuestWrite = _front.Drain;
         }
@@ -1314,6 +1699,7 @@ internal static unsafe partial class VulkanVideoPresenter
             try
             {
                 _translation.ExecuteDraw(submitId, banks, indexed, in indexedArguments, in autoArguments, prepared, in preparedInputs, drawRegisters);
+                if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDrawScope(Recording.DrawScope); // [local] SHARPEMU_PARRES_PROBE
                 if (Diagnostics.LabelTimeline.Enabled) Interlocked.Increment(ref Diagnostics.LabelTimeline.Draws); // [local]
             }
             finally
@@ -1324,11 +1710,24 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
+        // [local] SHARPEMU_FRONT_RESOLVE_POOL: a draw the resolve pool took, at its position in the stream.
+        // preparationHeld: the front's preparation the worker resolved with is still the one to use here.
+        internal void ExecuteFrontDeferredDraw(AgcExports.DeferredDraw deferred, KeyValuePair<uint, uint>[]? drawRegisters, bool preparationHeld,
+            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs)
+        {
+            using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDrawTranslation);
+            Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.Draws);
+            if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDraw(ParallelResolveProbe.GateOk);
+            _translation.ExecuteFrontDeferredDraw(deferred, drawRegisters, preparationHeld, prepared, in preparedInputs);
+            if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDrawScope(Recording.DrawScope);
+        }
+
         internal void ExecuteQueuedDispatch(ulong submitId, RegisterBanks banks, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator,
             ulong indirectArgumentsAddress, ComputeProgram? prepared)
         {
             using var translationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandDispatchTranslation);
             Diagnostics.FrameMissProbe.Count(Diagnostics.FrameMissProbe.Counter.Dispatches); // [local]
+            if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDispatch(); // [local] SHARPEMU_PARRES_PROBE
             var started = PerfDrawTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             var resolveToken = ResolveProfile.Enabled ? ResolveProfile.BeginDraw() : default; // [local] SHARPEMU_PROFILE_RESOLVE
             Diagnostics.DrawCostProbe.Begin(Diagnostics.DrawCostProbe.Kind.Dispatch); // [local] SHARPEMU_DRAWCOST_PROBE

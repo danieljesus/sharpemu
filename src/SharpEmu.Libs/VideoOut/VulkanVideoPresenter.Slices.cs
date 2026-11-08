@@ -422,6 +422,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
 
                     _workerBusyTicks.Add(System.Diagnostics.Stopwatch.GetTimestamp() - busyStarted);
+                    if (ParallelResolveProbe.Enabled) ParallelResolveProbe.AddSliceWorkerTicks(System.Diagnostics.Stopwatch.GetTimestamp() - busyStarted); // [local]
                     slice.Done.Set();
                     slice.Progress.Set();
                 }
@@ -778,7 +779,16 @@ internal static unsafe partial class VulkanVideoPresenter
             slice.Chunks = [];
             if (slice.Submitted)
             {
-                _scheduler.QueueCompletionAction(() => chunks.ForEach(_arenaPool!.Return));
+                // [local] The action can run after StopRenderWorkers (the scheduler's Finish at shutdown), when the pool is
+                // gone and its Dispose already released every chunk.
+                var pool = _arenaPool!;
+                _scheduler.QueueCompletionAction(() =>
+                {
+                    if (ReferenceEquals(_arenaPool, pool))
+                    {
+                        chunks.ForEach(pool.Return);
+                    }
+                });
             }
             else
             {
@@ -876,11 +886,13 @@ internal static unsafe partial class VulkanVideoPresenter
                 for (var index = 0; index < slice.Items.Count; index++)
                 {
                     var started = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var probeStarted = started; // [local] SHARPEMU_PARRES_PROBE: after BeginSegment
                     try
                     {
-                        if (!_presenter._translation.CanRecordDeferred(slice.Items[index].Work!))
+                        var renderUnit = slice.Items[index].Work is FrontPostWork; // [local] SHARPEMU_FRONT_SLICE_DEFER: the render thread runs it
+                        if (renderUnit || !_presenter._translation.CanRecordDeferred(slice.Items[index].Work!))
                         {
-                            const string reason = "unresolved draw";
+                            var reason = renderUnit ? "render unit" : "unresolved draw";
                             Interlocked.Increment(ref _serialReasons.GetOrAdd(reason, static _ => new StrongBox<long>()).Value);
                             if (segment is null)
                             {
@@ -897,7 +909,18 @@ internal static unsafe partial class VulkanVideoPresenter
                             continue;
                         }
 
-                        segment ??= BeginSegment(index);
+                        if (segment is null)
+                        {
+                            segment = BeginSegment(index);
+                            if (ParallelResolveProbe.Enabled) // [local] SHARPEMU_PARRES_PROBE
+                            {
+                                var begun = System.Diagnostics.Stopwatch.GetTimestamp();
+                                Interlocked.Increment(ref ParallelResolveProbe.WorkerSegments);
+                                Interlocked.Add(ref ParallelResolveProbe.WorkerBeginTicks, begun - started);
+                                probeStarted = begun;
+                            }
+                        }
+
                         _itemSequence = slice.Items[index].Sequence;
                         if (slice.Items[index].Work is SharpEmu.Libs.Agc.AgcExports.GlobalBarrierWork)
                         {
@@ -910,9 +933,28 @@ internal static unsafe partial class VulkanVideoPresenter
 
                         segment!.Count++;
                         NoteReadsVersion(segment.Requests, slice.Items[index].Work!);
+                        if (ParallelResolveProbe.Enabled) // [local]
+                        {
+                            var ticks = System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted;
+                            var dispatch = slice.Items[index].Work!.IsDispatch;
+                            Interlocked.Increment(ref dispatch ? ref ParallelResolveProbe.WorkerDispatches : ref ParallelResolveProbe.WorkerItems);
+                            Interlocked.Add(ref dispatch ? ref ParallelResolveProbe.WorkerDispatchTicks : ref ParallelResolveProbe.WorkerItemTicks, ticks);
+                        }
+                    }
+                    catch (Exception exception) when (exception is not SerialRequiredException) // [local] which item: no pdb in Release
+                    {
+                        var work = slice.Items[index].Work;
+                        throw new InvalidOperationException(FormattableString.Invariant(
+                            $"Recording slice item {index} of {slice.Items.Count} failed: work={work?.GetType().Name ?? "null"} sequence={slice.Items[index].Sequence} segment_first={segment?.First} segment_count={segment?.Count}."), exception);
                     }
                     catch (SerialRequiredException serial)
                     {
+                        if (ParallelResolveProbe.Enabled) // [local] SHARPEMU_PARRES_PROBE: the time spent on the item before it stopped
+                        {
+                            Interlocked.Increment(ref ParallelResolveProbe.WorkerSerial);
+                            Interlocked.Add(ref ParallelResolveProbe.WorkerSerialTicks, System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted);
+                        }
+
                         segment!.SerialReason = serial.Message;
                         Interlocked.Increment(ref _serialReasons.GetOrAdd(serial.Message, static _ => new StrongBox<long>()).Value);
                         EndSegment(slice, segment);
@@ -925,7 +967,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                     finally
                     {
-                        Diagnostics.ItemCostTally.Note(slice.Items[index].Work!.CostKind, Diagnostics.ItemCostTally.Record,
+                        Diagnostics.ItemCostTally.Note(slice.Items[index].Work?.CostKind ?? Diagnostics.ItemCostTally.Other, Diagnostics.ItemCostTally.Record, // [local] see FrontSlices.Return
                             System.Diagnostics.Stopwatch.GetTimestamp() - started);
                     }
                 }
@@ -957,7 +999,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
-            _presenter.RecordGlobalBarrier(BeginBatchedGuestCommands());
+            _presenter.RecordGlobalBarrier(BeginBatchedGuestCommands(), mainStream: !_worker); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         }
 
         private static void NoteReadsVersion(SliceRequests requests, SharpEmu.Libs.Agc.AgcExports.DeferredWork work)
@@ -1000,6 +1042,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private void EndSegment(RenderSlice slice, SliceSegment segment)
         {
+            var started = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
             EndRendering();
             if (segment.Count == 0)
             {
@@ -1012,6 +1055,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             segment.Buffer = _workerBuffer;
             segment.DrawCount = _sliceDrawCount;
+            if (started != 0) Interlocked.Add(ref ParallelResolveProbe.WorkerEndTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started); // [local]
             slice.Segments.Enqueue(segment);
             slice.Progress.Set();
         }
@@ -1099,7 +1143,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     _sliceUseHits.Increment();
                     NoteSliceWrite(cached, isWritten);
-                    Requests.AddBuffer(new BufferSliceUse(address, size, isWritten, isTexelBuffer, invalidateImages, cached));
+                    Requests.AddBuffer(new BufferSliceUse(address, size, isWritten, isTexelBuffer, invalidateImages, cached, isWritten ? Gpu.Buffers.TableWordMemo.CurrentProgram : 0)); // [local]
                     return (cached, cached.Offset(address), cached.Size - cached.Offset(address));
                 }
 
@@ -1114,8 +1158,9 @@ internal static unsafe partial class VulkanVideoPresenter
             if (!isWritten && !imageBytes && _bufferCache.PrefersStreamCopy(address, size, isTexelBuffer) &&
                 _presenter._translation.PendingWrites is { } pending && !pending.MayHavePending(address, size))
             {
-                var thread = _presenter._commandThread!;
-                if (thread.HasPendingRange(address, size))
+                // [local] No command thread with the front (SHARPEMU_FRONT_SLICES): no copy of guest memory while the render
+                // thread resolves ahead; the buffer is used through the slice's prologue instead.
+                if (_presenter._commandThread is not { } thread || thread.HasPendingRange(address, size))
                 {
                     _streamFallbacks.Increment();
                 }
@@ -1137,7 +1182,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             entry = new SliceUseEntry(address, size, isWritten, isTexelBuffer, invalidateImages, _buffers, buffer);
             NoteSliceWrite(buffer, isWritten);
-            Requests.AddBuffer(new BufferSliceUse(address, size, isWritten, isTexelBuffer, invalidateImages, buffer));
+            Requests.AddBuffer(new BufferSliceUse(address, size, isWritten, isTexelBuffer, invalidateImages, buffer, isWritten ? Gpu.Buffers.TableWordMemo.CurrentProgram : 0)); // [local]
             return (buffer, buffer.Offset(address), buffer.Size - buffer.Offset(address));
         }
 
@@ -1253,6 +1298,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             if (TryKeptAttachment(target.ImageIdentifier, target.Request, out var keptView, out var keptImage))
             {
+                if (ParallelResolveProbe.Enabled) Interlocked.Increment(ref ParallelResolveProbe.WorkerKept); // [local] SHARPEMU_PARRES_PROBE
                 target.View = keptView;
                 target.Image = keptImage;
                 var keptRange = target.Request.View;
@@ -1263,6 +1309,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return;
             }
 
+            var probeStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
             if (_imageCache.IsStaleForSlice(target.ImageIdentifier))
             {
                 throw Serial("stale color target");
@@ -1308,11 +1355,25 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _attachments.Add((target.ImageIdentifier, target.Request, view, image));
+            NoteAttachTicks(probeStarted);
+        }
+
+        // [local] SHARPEMU_PARRES_PROBE: an attachment acquired (not kept) on a worker.
+        private static void NoteAttachTicks(long started)
+        {
+            if (started == 0)
+            {
+                return;
+            }
+
+            Interlocked.Increment(ref ParallelResolveProbe.WorkerAttach);
+            Interlocked.Add(ref ParallelResolveProbe.WorkerAttachTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
         }
 
         private DepthAttachmentAcquisition AcquireDepthAttachmentForSlice(in DepthAttachmentState depth)
         {
             var resolution = depth.Target.Target;
+            var probeStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
             if (_imageCache.IsStaleForSlice(depth.Image))
             {
                 throw Serial("stale depth target");
@@ -1326,6 +1387,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (TryKeptAttachment(depth.Image, resolution.Request, out var keptView, out var keptImage))
             {
+                if (probeStarted != 0) Interlocked.Increment(ref ParallelResolveProbe.WorkerKept); // [local]
                 return new DepthAttachmentAcquisition(keptView, keptImage.Backing.Samples, false);
             }
 
@@ -1337,6 +1399,7 @@ internal static unsafe partial class VulkanVideoPresenter
             var image = Image(depth.Image);
             Requests.AddImage(new ImageSliceUse(depth.Image, image, resolution.Request));
             _attachments.Add((depth.Image, resolution.Request, view, image));
+            NoteAttachTicks(probeStarted);
             return new DepthAttachmentAcquisition(view, image.Backing.Samples, false);
         }
 

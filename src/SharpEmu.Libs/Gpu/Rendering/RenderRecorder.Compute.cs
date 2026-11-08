@@ -34,13 +34,20 @@ internal sealed partial class RenderRecorder
     // [local] Hooks of ours that keep process-wide state, record host work of their own or submit the batch
     // (SHARPEMU_TLAS_HLE, SHARPEMU_RT_RAYQUERY, SHARPEMU_EARLY_WRITER_SUBMIT, SHARPEMU_CUT_POLICY and the dispatch
     // probes, all off by default) run on the render thread only: a worker hands such a dispatch back to it.
-    private static bool NeedsSerialDispatch =>
+    internal static bool NeedsSerialDispatch => // [local] read by SHARPEMU_PARRES_PROBE
         Buffers.TlasHle.Instance is not null || Buffers.RayQueryHle.Instance is not null ||
         Buffers.GuestBufferCache.EarlyWriterSubmit || Buffers.CutPolicy.Words || Buffers.CutPolicy.GuestWindows ||
         Buffers.WriteDiffProbe.Enabled || Vulkan.IndirectArgsProbe.Enabled || Vulkan.ArgsWriterProbe.Enabled || Buffers.RangeDumpProbe.Enabled ||
         Buffers.GuestBufferCache.PostDispatchHook is not null || Buffers.GuestBufferCache.PostDispatchHooks.Count != 0;
 
     private static int _dispatchExecLogs; // [local] SHARPEMU_DISPATCH_EXEC_LOG
+
+    // [local] SHARPEMU_SLICE_THREAD_INDIRECT=1 (off by default): a slice worker records the thread-unit indirect dispatches
+    // (SHARPEMU_GPU_THREAD_INDIRECT) as it records the group-unit ones: the counts' buffer is a slice use
+    // (ObtainBufferForSlice, validated and synchronized at the join), the copy into the dispatch's own shader data and
+    // the indirect dispatch go into the worker's command buffer, in the same order and with the same barriers as on the
+    // render thread. Without it the worker hands each one back (Serial "indirect thread dispatch"), which ends its segment.
+    internal static readonly bool SliceThreadIndirect = Environment.GetEnvironmentVariable("SHARPEMU_SLICE_THREAD_INDIRECT") == "1";
 
     private void RecordDispatch(ResolvedDispatch record)
     {
@@ -57,7 +64,8 @@ internal sealed partial class RenderRecorder
 
         // [local] SHARPEMU_GPU_THREAD_INDIRECT: the host records it on the render thread only (TryDispatchIndirectThreads
         // throws there otherwise); handing it back before anything is recorded keeps the rest of the slice on the worker.
-        if (OnWorker && record.IndirectThreads && !record.Skipped)
+        // SHARPEMU_SLICE_THREAD_INDIRECT=1 lets the worker record it (TryDispatchIndirectThreads on a worker).
+        if (OnWorker && record.IndirectThreads && !record.Skipped && !SliceThreadIndirect)
         {
             throw new VideoOut.SerialRequiredException("indirect thread dispatch", resumable: true);
         }

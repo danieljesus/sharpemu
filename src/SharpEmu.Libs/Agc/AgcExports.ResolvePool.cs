@@ -30,6 +30,11 @@ public static partial class AgcExports
         public Exception? Failure;
         public readonly ResolveReadLog Reads = new();
         public readonly ManualResetEventSlim Done = new(false);
+        // [local] SHARPEMU_FRONT_RESOLVE_POOL: the front's preparation the worker resolves with (checked at the draw's
+        // position), and whether the banks are the front's snapshot, borrowed until the draw ran.
+        public GraphicsPrograms? Prepared;
+        public RenderExecutor.DrawProgramInputs PreparedInputs;
+        public bool Front;
 
         public override int CostKind =>
             (Indexed ? IndexedArguments.OffsetSource : AutoArguments.OffsetSource) == DrawOffsetSource.IndirectArguments
@@ -42,6 +47,8 @@ public static partial class AgcExports
             SerialReason = null;
             Failure = null;
             FrontendImageVersion = 0;
+            Prepared = null; // [local]
+            PreparedInputs = default; // [local]
             Reads.Clear();
             Done.Reset();
         }
@@ -58,6 +65,7 @@ public static partial class AgcExports
     private static long _recordWaits;
     private static long _recordWaitTicks;
     private static long _poolAllocated;
+    private static long _frontInlineNext, _frontInlineSerialPair, _frontPreparationDiscarded; // [local] SHARPEMU_FRONT_RESOLVE_POOL
     private static readonly ConcurrentDictionary<string, long> _deferredSerialReasons = new();
 
     private static readonly long[] _workerShadowSources = new long[3];
@@ -82,6 +90,7 @@ public static partial class AgcExports
             FormattableString.Invariant($"shadow_sources=dispatch:{Interlocked.Exchange(ref _workerShadowSources[0], 0)},fill:{Interlocked.Exchange(ref _workerShadowSources[1], 0)},copy:{Interlocked.Exchange(ref _workerShadowSources[2], 0)} ") +
             FormattableString.Invariant($"record_waits={Interlocked.Exchange(ref _recordWaits, 0)} record_wait_ms={Interlocked.Exchange(ref _recordWaitTicks, 0) * 1000.0 / Stopwatch.Frequency:F1} ") +
             FormattableString.Invariant($"alloc_mb={Interlocked.Exchange(ref _poolAllocated, 0) / 1048576.0:F0} ") +
+            FormattableString.Invariant($"front_inline_next={Interlocked.Exchange(ref _frontInlineNext, 0)} front_inline_serial_pair={Interlocked.Exchange(ref _frontInlineSerialPair, 0)} front_prep_discarded={Interlocked.Exchange(ref _frontPreparationDiscarded, 0)} ") + // [local]
             "serial=" + string.Join(",", reasons.OrderByDescending(reason => reason.Value)
                 .Select(reason => reason.Key.Replace(' ', '_') + ":" + reason.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     }
@@ -110,11 +119,138 @@ public static partial class AgcExports
             return false;
         }
 
+        // [local] SHARPEMU_FRONT_SLICES: the pool's gate (targets, shaders known not to write memory), without counting.
+        internal bool DrawPassesSliceGate(RegisterBanks banks) =>
+            _executor is { } executor && executor.DrawHasTargets(banks) &&
+            _drawWrites.TryGetValue((banks.Shader.Vertex.ExportAddress, banks.Shader.Pixel.Address), out var known) &&
+            known.Registrations == ShaderHeaderRegistry.Registrations && !known.Writes;
+
+        // [local] SHARPEMU_PARRES_PROBE: the pool's gate for this draw, without counting it as held.
+        private int ProbeDrawGate(RegisterBanks banks)
+        {
+            if (!_executor!.DrawHasTargets(banks))
+            {
+                return ParallelResolveProbe.GateNoTargets;
+            }
+
+            if (!_drawWrites.TryGetValue((banks.Shader.Vertex.ExportAddress, banks.Shader.Pixel.Address), out var known))
+            {
+                return ParallelResolveProbe.GateUnknownPair;
+            }
+
+            return known.Registrations != ShaderHeaderRegistry.Registrations ? ParallelResolveProbe.GateStalePair
+                : known.Writes ? ParallelResolveProbe.GateWrites : ParallelResolveProbe.GateOk;
+        }
+
         private void LearnDrawWrites(ResolvedDraw record)
         {
             if (record.Kind == ResolvedDrawKind.Draw && _learningKey != default)
             {
                 _drawWrites[_learningKey] = (record.WritesMemory, ShaderHeaderRegistry.Registrations);
+            }
+        }
+
+        // [local] SHARPEMU_FRONT_RESOLVE_POOL: the pool the render thread feeds from the front's queue, and the stream
+        // positions its draws carry (increasing in stream order, so pending-write marks release in order).
+        private ResolvePool? _frontPool;
+        private long _frontSequence;
+
+        // [local] Draws of a shader pair a worker could not resolve (a serial reason) run inline for the next
+        // FrontSerialPairSkip draws of that pair, then the pool tries the pair again.
+        internal const int FrontSerialPairSkip = 64;
+        private readonly Dictionary<(ulong Vertex, ulong Pixel), int> _frontSerialPairs = new();
+        private readonly ConcurrentQueue<DeferredDraw> _spareFrontDeferred = new();
+
+        // [local] Deferred draws wait in a worker's queue; a pair's run spills sooner than upstream's 32, since the
+        // lookahead keeps only SHARPEMU_FRONT_RESOLVE_AHEAD draws offered and one queue would otherwise hold them all.
+        private const int FrontSpillQueueLength = 2;
+
+        // [local] On the render thread, for a queued draw ahead of the one running. `passes`: the draw passes the pool's
+        // gate (targets, shaders known not to write memory), so the scan may go on past it. Null when it runs inline:
+        // refused; `next` (nothing runs before it, so a worker could only make the render thread wait for it); or of a
+        // pair a worker recently could not resolve. The banks are the front's snapshot, which outlives the join.
+        internal DeferredDraw? TryDeferFrontDraw(ulong submitId, RegisterBanks banks, bool indexed, in DrawIndexedArguments indexedArguments, in DrawAutoArguments autoArguments,
+            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs, bool next, out bool passes)
+        {
+            passes = false;
+            if (_executor is not { } executor || _host.RenderHost is not { } renderHost || _host.ResolveWorkerCount <= 0 || !_pipelines!.SupportsParallelResolution)
+            {
+                return null;
+            }
+
+            if (!executor.DrawHasTargets(banks) || !DrawKnownNotToWrite(banks))
+            {
+                return null;
+            }
+
+            passes = true;
+            if (next)
+            {
+                _frontInlineNext++;
+                return null;
+            }
+
+            if (_frontSerialPairs.Count != 0 && TakeFrontSerialSkip(_frontSerialPairs, (banks.Shader.Vertex.ExportAddress, banks.Shader.Pixel.Address)))
+            {
+                _frontInlineSerialPair++;
+                return null;
+            }
+
+            var pool = _frontPool ??= new ResolvePool(this, renderHost, _host.ResolveWorkerCount, FrontSpillQueueLength);
+            var work = _spareFrontDeferred.TryDequeue(out var spare) ? spare : new DeferredDraw { Front = true };
+            work.Banks = banks;
+            work.SubmitId = submitId;
+            work.Indexed = indexed;
+            work.IndexedArguments = indexedArguments;
+            work.AutoArguments = autoArguments;
+            work.Prepared = prepared;
+            work.PreparedInputs = preparedInputs;
+            work.Sequence = ++_frontSequence;
+            Interlocked.Increment(ref _deferredDraws);
+            pool.Dispatch(work);
+            return work;
+        }
+
+        // [local] Counts one inline draw of `pair` against `skips`; true while the pair had skips left.
+        internal static bool TakeFrontSerialSkip(Dictionary<(ulong Vertex, ulong Pixel), int> skips, (ulong Vertex, ulong Pixel) pair)
+        {
+            if (!skips.TryGetValue(pair, out var left))
+            {
+                return false;
+            }
+
+            if (left <= 1)
+            {
+                skips.Remove(pair);
+            }
+            else
+            {
+                skips[pair] = left - 1;
+            }
+
+            return true;
+        }
+
+        // [local] At the draw's position: the stream state the inline path records first, then the join.
+        internal void ExecuteFrontDeferredDraw(DeferredDraw deferred, KeyValuePair<uint, uint>[]? drawRegisters, bool preparationHeld,
+            GraphicsPrograms? prepared, in RenderExecutor.DrawProgramInputs preparedInputs)
+        {
+            if (deferred.Indexed) RecordIndexedDrawState(in deferred.IndexedArguments, drawRegisters);
+            else RecordAutoDrawState(in deferred.AutoArguments, drawRegisters);
+            var state = RequireCurrent();
+            RecordKnownColorTargets(state, deferred.Banks);
+            state.FrameDrawCount++;
+            state.SawIndexedDraw |= deferred.Indexed;
+            var drawStarted = DcbParseProfile.Begin();
+            try
+            {
+                JoinDeferredDraw(deferred, preparationHeld, prepared, in preparedInputs);
+            }
+            finally
+            {
+                DcbParseProfile.RecordDraw(drawStarted);
+                state.CurrentIndexSnapshot = null;
+                state.CurrentVertexSnapshot = null;
             }
         }
 
@@ -183,7 +319,10 @@ public static partial class AgcExports
             _spareDeferred.Enqueue(deferred);
         }
 
-        private void JoinDeferredDraw(DeferredDraw deferred)
+        // [local] preparationHeld false: the front's preparation the worker used was discarded at the draw's position, so
+        // the draw resolves again in order, with `prepared` (what holds there, or nothing).
+        private void JoinDeferredDraw(DeferredDraw deferred, bool preparationHeld = true, GraphicsPrograms? prepared = null,
+            in RenderExecutor.DrawProgramInputs preparedInputs = default)
         {
             var waitStarted = Stopwatch.GetTimestamp();
             WaitResolved(deferred);
@@ -197,36 +336,59 @@ public static partial class AgcExports
             if (deferred.SerialReason is { } reason)
             {
                 _deferredSerialReasons.AddOrUpdate(reason, 1, static (_, count) => count + 1);
-                record = ResolveOnThisThread(deferred);
+                if (deferred.Front) _frontSerialPairs[(deferred.Banks.Shader.Vertex.ExportAddress, deferred.Banks.Shader.Pixel.Address)] = FrontSerialPairSkip; // [local]
+                record = ResolveOnThisThread(deferred, prepared, in preparedInputs);
             }
             else if (record is null)
             {
                 throw _host.Fatal("A deferred draw resolved to nothing.");
             }
+            else if (!preparationHeld) // [local] SHARPEMU_FRONT_RESOLVE_POOL
+            {
+                _frontPreparationDiscarded++;
+                _pool!.Return(record);
+                record = ResolveOnThisThread(deferred, prepared, in preparedInputs);
+            }
             else if (!ValidateDeferredReads(deferred))
             {
                 Interlocked.Increment(ref _deferredInvalid);
                 _pool!.Return(record);
-                record = ResolveOnThisThread(deferred);
+                record = ResolveOnThisThread(deferred, prepared, in preparedInputs);
             }
             else
             {
                 Interlocked.Increment(ref _deferredValid);
             }
 
+            var probeStarted = ParallelResolveProbe.Enabled ? Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
             _recorder!.Record(record);
+            if (probeStarted != 0) ParallelResolveProbe.AddRecordTicks(Stopwatch.GetTimestamp() - probeStarted); // [local]
             deferred.Reset();
+            if (deferred.Front) // [local] the banks go back with the front's snapshot
+            {
+                deferred.Banks = null!;
+                _spareFrontDeferred.Enqueue(deferred);
+                return;
+            }
+
             _spareDeferred.Enqueue(deferred);
         }
 
-        private ResolvedDraw ResolveOnThisThread(DeferredDraw deferred)
+        // [local] `prepared`: programs the front prepared that hold at the draw's position; the resolve then skips the
+        // preparation, as the inline path does.
+        private ResolvedDraw ResolveOnThisThread(DeferredDraw deferred, GraphicsPrograms? prepared = null, in RenderExecutor.DrawProgramInputs preparedInputs = default)
         {
             var started = Stopwatch.GetTimestamp();
             var sink = _joinSink ??= new CapturingSink();
             var executor = _joinExecutor ??= new RenderExecutor(_host.RenderHost!, _pipelines!, sink, _executor!.PendingWrites, _pool);
             sink.Sequence = deferred.Sequence;
             sink.Draw = null;
-            if (deferred.Indexed)
+            if (prepared is not null) // [local]
+            {
+                if (deferred.Indexed) executor.DrawIndexed(deferred.SubmitId, deferred.Banks, in deferred.IndexedArguments, prepared, in preparedInputs);
+                else executor.DrawAuto(deferred.SubmitId, deferred.Banks, in deferred.AutoArguments, prepared, in preparedInputs);
+            }
+            else if (deferred.Indexed)
             {
                 executor.DrawIndexed(deferred.SubmitId, deferred.Banks, in deferred.IndexedArguments);
             }
@@ -259,6 +421,7 @@ public static partial class AgcExports
             private readonly CommandStreamTranslation _owner;
             private readonly Worker[] _workers;
             private readonly object _drained = new();
+            private readonly int _spillQueueLength; // [local]
             private int _pending;
 
             private sealed class Worker
@@ -269,9 +432,10 @@ public static partial class AgcExports
                 public RenderExecutor Executor = null!;
             }
 
-            public ResolvePool(CommandStreamTranslation owner, IRenderHost host, int count)
+            public ResolvePool(CommandStreamTranslation owner, IRenderHost host, int count, int spillQueueLength = SpillQueueLength)
             {
                 _owner = owner;
+                _spillQueueLength = spillQueueLength; // [local]
                 _workers = new Worker[count];
                 for (var index = 0; index < count; index++)
                 {
@@ -291,7 +455,7 @@ public static partial class AgcExports
             {
                 var shader = work.Banks.Shader;
                 var route = (int)((uint)HashCode.Combine(shader.Vertex.ExportAddress, shader.Pixel.Address) % (uint)_workers.Length);
-                if (_workers[route].Queue.Count > SpillQueueLength)
+                if (_workers[route].Queue.Count > _spillQueueLength) // [local] per pool
                 {
                     var preferred = route;
                     for (var index = 0; index < _workers.Length; index++)
@@ -369,7 +533,12 @@ public static partial class AgcExports
                 {
                     worker.Sink.Sequence = work.Sequence;
                     worker.Sink.Draw = null;
-                    if (work.Indexed)
+                    if (work.Prepared is { } prepared) // [local] SHARPEMU_FRONT_RESOLVE_POOL: the front's preparation
+                    {
+                        if (work.Indexed) worker.Executor.DrawIndexed(work.SubmitId, work.Banks, in work.IndexedArguments, prepared, in work.PreparedInputs);
+                        else worker.Executor.DrawAuto(work.SubmitId, work.Banks, in work.AutoArguments, prepared, in work.PreparedInputs);
+                    }
+                    else if (work.Indexed)
                     {
                         worker.Executor.DrawIndexed(work.SubmitId, work.Banks, in work.IndexedArguments);
                     }

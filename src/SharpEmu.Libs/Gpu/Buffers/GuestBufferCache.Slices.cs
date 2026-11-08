@@ -3,7 +3,9 @@
 
 namespace SharpEmu.Libs.Gpu.Buffers;
 
-public readonly record struct BufferSliceUse(ulong Address, ulong Size, bool Written, bool Texel, bool InvalidateImages, GpuBuffer Buffer);
+// [local] Program: the program whose bindings the worker was preparing (TableWordMemo.CurrentProgram on its thread), so
+// the join marks a written use as that program's write, as the render thread does when it prepares the bindings.
+public readonly record struct BufferSliceUse(ulong Address, ulong Size, bool Written, bool Texel, bool InvalidateImages, GpuBuffer Buffer, ulong Program = 0);
 
 // A frozen view of the registered buffers for recording threads that run ahead of the stream order,
 // rebuilt by the render thread whenever a registration changed.
@@ -146,7 +148,24 @@ public sealed unsafe partial class GuestBufferCache
 
     public void ApplySliceUse(in BufferSliceUse use)
     {
-        _ = ObtainBuffer(use.Address, use.Size, use.Written, use.Texel, allowStream: false);
+        if (use.Written && use.Program != 0) // [local] SHARPEMU_TABLE_WORD_MEMO: the write is the worker's program's
+        {
+            var program = TableWordMemo.CurrentProgram;
+            TableWordMemo.CurrentProgram = use.Program;
+            try
+            {
+                _ = ObtainBuffer(use.Address, use.Size, use.Written, use.Texel, allowStream: false);
+            }
+            finally
+            {
+                TableWordMemo.CurrentProgram = program;
+            }
+        }
+        else
+        {
+            _ = ObtainBuffer(use.Address, use.Size, use.Written, use.Texel, allowStream: false);
+        }
+
         if (use.InvalidateImages)
         {
             RequireImageCache().InvalidateMemoryFromGpu(use.Address, use.Size);

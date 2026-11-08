@@ -710,6 +710,7 @@ internal static class RenderPhaseProfile
     public static void RecordFrame()
     {
         if (Gpu.Vulkan.VulkanCommandProfile.PassesEnabled) Gpu.Vulkan.VulkanCommandProfile.CountFrame(); // [local] SHARPEMU_PROFILE_GPU_PASSES
+        if (ParallelResolveProbe.Enabled) ParallelResolveProbe.OnFrame(); // [local] SHARPEMU_PARRES_PROBE
         if (!Enabled)
         {
             return;

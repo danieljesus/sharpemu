@@ -365,7 +365,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw new SerialResolveRequiredException("pending write read");
             }
 
-            if (!_commandThread!.ReadOverlayBefore(address, destination, worker.Sequence))
+            if (!ReadOverlayForWorker(address, destination, worker.Sequence))
             {
                 return false;
             }
@@ -375,12 +375,26 @@ internal static unsafe partial class VulkanVideoPresenter
             return true;
         }
 
+        // [local] SHARPEMU_FRONT_RESOLVE_POOL: with the front, no command thread holds stores or known GPU writes ahead of the
+        // render thread for a worker (it never resolves past a queued write), so guest memory is what the stream position sees.
+        private bool ReadOverlayForWorker(ulong address, Span<byte> destination, long sequence) =>
+            _commandThread is { } thread ? thread.ReadOverlayBefore(address, destination, sequence) : _guestMemory.TryRead(address, destination);
+
+        private bool TryReadShadowBeforeForWorker(ulong address, Span<byte> destination, long sequence, out long shadowSequence, out CommandThread.ShadowSource source) // [local]
+        {
+            if (_commandThread is { } thread)
+                return thread.TryReadShadowBefore(address, destination, sequence, out shadowSequence, out source);
+            shadowSequence = 0;
+            source = default;
+            return false;
+        }
+
         // A known GPU write before the draw serves the read as it does on the stream thread; a write
         // marked between the two makes the known bytes stale, so the draw resolves in order instead.
         private bool TryReadShadowForWorker(ulong address, Span<byte> destination)
         {
             var sequence = _resolveWorker!.Sequence;
-            if (!_commandThread!.TryReadShadowBefore(address, destination, sequence, out var shadowSequence, out var shadowSource))
+            if (!TryReadShadowBeforeForWorker(address, destination, sequence, out var shadowSequence, out var shadowSource)) // [local]
             {
                 return false;
             }
@@ -390,7 +404,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw new SerialResolveRequiredException("shadowed pending write read");
             }
 
-            if (_commandThread.HasPendingRangeBetween(address, (ulong)destination.Length, shadowSequence, sequence))
+            if (_commandThread!.HasPendingRangeBetween(address, (ulong)destination.Length, shadowSequence, sequence)) // [local] only after a shadow read, which needs the command thread
             {
                 throw new SerialResolveRequiredException("shadowed pending range read");
             }
@@ -408,7 +422,7 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             var sequence = _resolveWorker!.Sequence;
             return (_translation.PendingWrites is { } pending && pending.HasPendingBetween(address, size, pending.Released, sequence)) ||
-                _commandThread!.HasShadowBefore(address, size, sequence);
+                (_commandThread?.HasShadowBefore(address, size, sequence) ?? false); // [local] no command thread with the front
         }
 
         // Items run in batches; completions are collected between them so blocked waits retry.
@@ -557,6 +571,7 @@ internal static unsafe partial class VulkanVideoPresenter
             {
                 if (presenter.OnResolveWorker)
                     return presenter.ReadOnResolveWorker(virtualAddress, destination);
+                presenter.BeforeFrontSliceRead(virtualAddress, (ulong)destination.Length); // [local] SHARPEMU_FRONT_SLICES (render thread only)
                 if (presenter.HasPendingMemoryPublication(virtualAddress, (ulong)destination.Length))
                     presenter.CompleteOverlappingPublications(virtualAddress, (ulong)destination.Length);
                 return presenter.OnCommandThread
@@ -655,6 +670,8 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             RenderPhaseProfile.RecordCleanRead(hit: false);
+            if (!_guestMemory.CanRead(address, size)) return false; // [local] an unmapped read fails instead of reaching the page tracker's fatal range check (mb13)
+
             var thread = _commandThread!;
             if (thread.TryReadShadow(address, destination, out var shadowSequence, out var shadowSource) &&
                 !NewerPendingWrite(address, size, shadowSequence) && !thread.HasPendingRangeAfter(address, size, shadowSequence))
@@ -751,6 +768,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return ReadOnCommandThread(address, destination);
             }
 
+            BeforeFrontSliceRead(address, (ulong)destination.Length); // [local] SHARPEMU_FRONT_SLICES
             using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.CommandMemorySync))
             {
                 if (HasPendingMemoryPublication(address, (ulong)destination.Length))
@@ -804,6 +822,13 @@ internal static unsafe partial class VulkanVideoPresenter
             BeginSubmissionContext(queueId, submissionId);
             _translation.BeginSubmission(queueId, submissionId, geometrySnapshots, _commandStream.GetInterpreter(queueId));
         }
+
+        // [local] SHARPEMU_FRONT_SLICE_DEFER: BeginSubmission in two parts, as the command thread splits it above: the
+        // translation state when the front's item is taken, the queue context in stream order (FrontPost).
+        internal void BeginSubmissionTranslation(int queueId, ulong submissionId, object? geometrySnapshots) =>
+            _translation.BeginSubmission(queueId, submissionId, geometrySnapshots, _commandStream.GetInterpreter(queueId));
+
+        internal void BeginSubmissionInOrder(int queueId, ulong submissionId) => BeginSubmissionContext(queueId, submissionId);
 
         private void BeginSubmissionContext(int queueId, ulong submissionId)
         {
@@ -922,10 +947,12 @@ internal static unsafe partial class VulkanVideoPresenter
             if (probeSuppress) Gpu.Buffers.CpWriteDeferProbe.Suppress = false;
         }
 
-        internal void RecordGlobalBarrier(CommandBuffer commandBuffer)
+        // [local] mainStream false: a slice worker's barrier, recorded into a buffer submitted later; the scope-barrier
+        // tracker and the probe follow the render thread's stream only.
+        internal void RecordGlobalBarrier(CommandBuffer commandBuffer, bool mainStream = true)
         {
-            if (Gpu.Vulkan.ScopeBarrierTracker.Enabled) Gpu.Vulkan.ScopeBarrierTracker.NoteFullBarrier(); // [local]
-            if (Gpu.Buffers.CpWriteDeferProbe.Enabled) Gpu.Buffers.CpWriteDeferProbe.OnFullBarrier(); // [local]
+            if (Gpu.Vulkan.ScopeBarrierTracker.Enabled && mainStream) Gpu.Vulkan.ScopeBarrierTracker.NoteFullBarrier(); // [local]
+            if (Gpu.Buffers.CpWriteDeferProbe.Enabled && mainStream) Gpu.Buffers.CpWriteDeferProbe.OnFullBarrier(); // [local]
             var barrier = new MemoryBarrier2
             {
                 SType = StructureType.MemoryBarrier2,

@@ -41,6 +41,10 @@ internal sealed partial class ShaderPipelineCache : IShaderPipelineProvider
     // [local] SHARPEMU_PROGRAM_GATE=0: program lookups (materialization included) run under this gate, as before the
     // lock-free lookups. The program cache shares it (its shared materialization cache is only safe under it).
     private readonly object _gate = new();
+
+    // [local] SHARPEMU_FRONT_SLICES: whether this thread is inside a gate a render worker may take (pipeline creation, the
+    // program gate): a join that waits for the workers there could wait forever.
+    internal bool HoldsGates => Monitor.IsEntered(_gate) || Monitor.IsEntered(_pipelineGate);
     // [local] Called before the masked-copy adaptation wrote guest memory; upstream removed that adaptation, so
     // nothing invokes it now (the front pipeline still sets it).
     internal static Action? BeforeGuestWrite;

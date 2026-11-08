@@ -1010,6 +1010,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            BeforeFrontSliceRead(address, sizeof(uint)); // [local] SHARPEMU_FRONT_SLICES: a pending write of a taken draw or dispatch is joined first
             word = 0;
             CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             var synchronized = false;
@@ -1292,6 +1293,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            BeforeFrontSliceRead(address, sizeof(uint)); // [local] SHARPEMU_FRONT_SLICES: a pending write of a taken draw or dispatch is joined first
             word = 0;
             CompletePendingPublicationsForResourceRead(address, sizeof(uint));
             if (!_guestMemory.CanRead(address, sizeof(uint)))
@@ -1307,7 +1309,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 Span<byte> cleanBytes = stackalloc byte[sizeof(uint)];
-                if (!_commandThread!.ReadOverlayBefore(address, cleanBytes, _resolveWorker!.Sequence))
+                if (!ReadOverlayForWorker(address, cleanBytes, _resolveWorker!.Sequence)) // [local]
                 {
                     return false;
                 }
@@ -1377,10 +1379,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (!clean && _commandThread!.TryReadShadowBefore(address, destination, worker.Sequence, out var shadowSequence, out var shadowSource))
+            if (!clean && TryReadShadowBeforeForWorker(address, destination, worker.Sequence, out var shadowSequence, out var shadowSource)) // [local]
             {
                 if ((_translation.PendingWrites is { } pending && pending.HasPendingBetween(address, size, shadowSequence, worker.Sequence)) ||
-                    _commandThread.HasPendingRangeBetween(address, size, shadowSequence, worker.Sequence))
+                    _commandThread!.HasPendingRangeBetween(address, size, shadowSequence, worker.Sequence)) // [local] only after a shadow read, which needs the command thread
                 {
                     return false;
                 }
@@ -1394,7 +1396,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return false;
             }
 
-            if (!_commandThread!.ReadOverlayBefore(address, destination, worker.Sequence))
+            if (!ReadOverlayForWorker(address, destination, worker.Sequence)) // [local]
             {
                 return false;
             }
@@ -1444,6 +1446,12 @@ internal static unsafe partial class VulkanVideoPresenter
         {
             CommandReadCounts[3].Increment();
             Span<byte> bytes = stackalloc byte[sizeof(uint)];
+            if (!_guestMemory.CanRead(address, sizeof(uint))) // [local] an unmapped word fails the read instead of reaching the page tracker's fatal range check (mb13)
+            {
+                word = 0;
+                return false;
+            }
+
             if (!HasPendingMemoryPublication(address, sizeof(uint)) && IsCleanReadPage(address, sizeof(uint)) && TryReadAliasBytes(address, bytes))
             {
                 CommandReadCounts[4].Increment();
@@ -1576,6 +1584,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            BeforeFrontSliceRead(address, size); // [local] SHARPEMU_FRONT_SLICES
             if (!ResidentReadAllowed(address, size, clean))
             {
                 return false;
@@ -1805,10 +1814,10 @@ internal static unsafe partial class VulkanVideoPresenter
 
         private bool MayBeCleanReadPage(ulong page)
         {
-            var thread = _commandThread!;
-            return !_bufferCache.MayHaveGpuDirtyPages(page, CleanReadPageBytes) && !thread.HasPendingStores(page, CleanReadPageBytes) &&
+            var thread = _commandThread; // [local] null with the front (SHARPEMU_FRONT_RESOLVE_POOL)
+            return !_bufferCache.MayHaveGpuDirtyPages(page, CleanReadPageBytes) && (thread is null || !thread.HasPendingStores(page, CleanReadPageBytes)) && // [local]
                 (_translation.PendingWrites is not { } pending || !pending.MayHavePending(page, CleanReadPageBytes)) &&
-                !thread.HasShadow(page, CleanReadPageBytes);
+                (thread is null || !thread.HasShadow(page, CleanReadPageBytes)); // [local]
         }
 
         private void NoteCleanReadPage(ulong address, ulong size)

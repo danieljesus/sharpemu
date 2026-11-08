@@ -439,8 +439,17 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
 
     private long _lastEventPumpTimestamp;
 
+    // [local] The longest time the window went without pumping its events, and the previous pump: logged with a close
+    // event, since Windows ghosts a window that pumps nothing for 5 s and input sent to the ghost can close it.
+    private long _previousPumpTicks;
+    private long _longestPumpGapTicks;
+
     private void PumpEvents()
     {
+        var pumpTimestamp = Stopwatch.GetTimestamp(); // [local]
+        if (_previousPumpTicks != 0) _longestPumpGapTicks = Math.Max(_longestPumpGapTicks, pumpTimestamp - _previousPumpTicks);
+        var pumpGapTicks = _previousPumpTicks == 0 ? 0 : pumpTimestamp - _previousPumpTicks;
+        _previousPumpTicks = pumpTimestamp;
         if (RenderPhaseProfile.Enabled)
         {
             var timestamp = Stopwatch.GetTimestamp();
@@ -460,6 +469,8 @@ internal sealed unsafe class SdlHostWindow : IDisposable, IHostGamepadOutput
             {
                 case SDL_EventType.SDL_EVENT_QUIT:
                 case SDL_EventType.SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                    Console.Error.WriteLine($"[LOADER][WARN] SDL close event: type={windowEvent.Type} pump_gap_ms={pumpGapTicks * 1000.0 / Stopwatch.Frequency:F0} " +
+                        $"longest_pump_gap_ms={_longestPumpGapTicks * 1000.0 / Stopwatch.Frequency:F0}"); // [local]
                     _closedByUser = true;
                     Volatile.Write(ref _closeRequested, 1);
                     break;

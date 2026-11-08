@@ -319,7 +319,9 @@ public static partial class AgcExports
 
         private sealed class ExecutorSink(CommandStreamTranslation owner) : IResolvedCommandSink
         {
-            public long NextSequence() => owner.Producing ? owner.Sink!.NextSequence : 0;
+            // [local] SHARPEMU_FRONT_SLICES: a captured draw takes a stream position, so its pending writes stay marked until
+            // its slice is joined.
+            public long NextSequence() => owner.Producing ? owner.Sink!.NextSequence : owner._sliceCapture is not null ? ++owner._frontSequence : 0;
 
             public void Record(ResolvedDraw record)
             {
@@ -328,17 +330,31 @@ public static partial class AgcExports
                 {
                     owner.Sink!.EnqueueDeferred(new ResolvedDrawWork(record), isDraw: true);
                 }
+                else if (owner._sliceCapture is { } capture) // [local] SHARPEMU_FRONT_SLICES: the render thread records it later, in order
+                {
+                    capture.Add(new ResolvedDrawWork(record));
+                }
                 else
                 {
+                    var probeStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
                     owner._recorder!.Record(record);
+                    if (probeStarted != 0) ParallelResolveProbe.AddRecordTicks(System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted); // [local]
                 }
             }
 
             public void Record(ResolvedDispatch record)
             {
+                if (owner._sliceCapture is { } capture) // [local] SHARPEMU_FRONT_SLICES: the front's dispatches (SHARPEMU_FRONT_SLICE_DISPATCHES)
+                {
+                    capture.Add(new ResolvedDispatchWork(record));
+                    return;
+                }
+
                 if (!owner.Producing)
                 {
+                    var probeStarted = ParallelResolveProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local] SHARPEMU_PARRES_PROBE
                     owner._recorder!.Record(record);
+                    if (probeStarted != 0) ParallelResolveProbe.AddRecordTicks(System.Diagnostics.Stopwatch.GetTimestamp() - probeStarted); // [local]
                     return;
                 }
 
@@ -352,6 +368,43 @@ public static partial class AgcExports
                 sink.EnqueueDeferred(new ResolvedDispatchWork(record), isDraw: false);
             }
         }
+
+        // [local] SHARPEMU_FRONT_SLICES: while set, the executor's draw records are added here instead of being recorded;
+        // the render thread hands them to the slice workers or records them itself, in stream order.
+        private List<DeferredWork>? _sliceCapture;
+
+        internal void BeginSliceCapture(List<DeferredWork> into) => _sliceCapture = into;
+
+        internal void EndSliceCapture() => _sliceCapture = null;
+
+        // [local] SHARPEMU_FRONT_SLICES: see ShaderPipelineCache.HoldsGates.
+        internal bool PipelineGatesHeld => _pipelines?.HoldsGates == true;
+
+        // [local] A captured record a slice worker may record: a draw (or a skipped one) that writes no memory, so what
+        // the stream resolves after it cannot read anything it writes except its render targets (pending writes).
+        internal static bool IsSliceableDraw(DeferredWork work) =>
+            work is ResolvedDrawWork { Record: { WritesMemory: false, Kind: ResolvedDrawKind.Draw or ResolvedDrawKind.Skipped } };
+
+        // [local] SHARPEMU_FRONT_SLICE_DISPATCHES: or any captured dispatch; its writes are marked pending until it is joined.
+        // A program with call records binds device-address ranges the host finds only when it records them
+        // (PrepareCallRecords; a worker hands it back with Serial), so their writes are not among the pending writes and a
+        // read resolved after the record would not wait for them: such a record is recorded in order, on the render thread.
+        internal static bool IsSliceableRecord(DeferredWork work, bool dispatches) =>
+            (IsSliceableDraw(work) || (dispatches && work is ResolvedDispatchWork)) && !RecordHasCallRecords(work);
+
+        private static bool HasCallRecords(ShaderProgramInfo? program) => program is { CallRecordCallees.Count: not 0 };
+
+        private static bool RecordHasCallRecords(DeferredWork work) => work switch
+        {
+            ResolvedDrawWork { Record: { Kind: ResolvedDrawKind.Draw, State.Programs: { } programs } } =>
+                HasCallRecords(programs.VertexInput.Stage.Program) || HasCallRecords(programs.PixelInput.Stage.Program) ||
+                (programs.Tessellation is { } tessellation && HasCallRecords(tessellation.Hull.Input.Stage.Program)),
+            ResolvedDispatchWork { Record: { Skipped: false, Program: { } program } } => HasCallRecords(program.Input.Stage.Program),
+            _ => false,
+        };
+
+        internal static long SequenceOf(DeferredWork work) =>
+            work is ResolvedDrawWork draw ? draw.Record.Sequence : work is ResolvedDispatchWork dispatch ? dispatch.Record.Sequence : 0;
 
         public void RunDeferred(DeferredWork work)
         {
@@ -465,6 +518,7 @@ public static partial class AgcExports
             RecordKnownColorTargets(state, banks);
             state.FrameDrawCount++;
             state.SawIndexedDraw |= indexed;
+            if (ParallelResolveProbe.Enabled) ParallelResolveProbe.NoteDraw(ProbeDrawGate(banks)); // [local] SHARPEMU_PARRES_PROBE
             if (_resolvePool is { } pool && Producing && _executor.DrawHasTargets(banks) && DrawKnownNotToWrite(banks))
             {
                 var deferStarted = DcbParseProfile.Begin();
