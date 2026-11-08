@@ -274,6 +274,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
                 break;
             case ResolvedDrawKind.Draw:
             {
+                if (Diagnostics.DrawCostProbe.DepthSplit) Diagnostics.DrawCostDepth.NoteRecorded(record, in state); // [local] SHARPEMU_DRAWCOST_DEPTH: when the executor did not
                 var targetsScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ExecTargets); // [local]
                 var inPlace = RepeatsPreviousTargets(record, in state, _host.DrawScope);
                 if (inPlace)
@@ -520,6 +521,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             using var bindingsScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepBindings); // [local]
             vertexBindings = PrepareBindings(vertexInput.Stage);
             pixelBindings = state.PixelActive ? PrepareBindings(pixelInput.Stage) : null;
+            if (Diagnostics.DrawCostProbe.DepthSplit) Diagnostics.DrawCostDepth.NotePixelBindings(pixelBindings is not null, pixelInput.Stage); // [local] SHARPEMU_DRAWCOST_DEPTH
         }
         catch (DrawImageTypeMismatchException rejection)
         {
@@ -723,6 +725,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         }
 
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawTail); // [local] SHARPEMU_DRAWCOST_PROBE
+        if (Diagnostics.DrawCostProbe.DepthSplit) Diagnostics.DrawCostDepth.NoteShape(record, ref state, vertexInput); // [local] SHARPEMU_DRAWCOST_DEPTH: timed as depth_note
     }
 
     // [local] Disposes a resource preparation under its own profile phase.

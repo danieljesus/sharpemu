@@ -31,9 +31,13 @@ namespace SharpEmu.Libs.Diagnostics;
 // the window, process-wide. The gap also holds the queue items that are not draws or dispatches (labels, barriers).
 // pipeline_would_keep8 counts the graphics pipeline lookups that eight kept pipelines (SHARPEMU_KEPT_PIPELINES=8) would
 // have answered; pipeline_kept_older the ones the older kept pipelines did answer.
+// [local] SHARPEMU_DRAWCOST_DEPTH=1 (with the probe) reports the depth-only draws on their own kind=draw_depth line,
+// between kind=draw (then the other draws only) and kind=dispatch; see DrawCostDepth.
 internal static class DrawCostProbe
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_DRAWCOST_PROBE") == "1";
+
+    internal static readonly bool DepthSplit = Enabled && DrawCostDepth.Requested; // [local] SHARPEMU_DRAWCOST_DEPTH
 
     private static readonly int SampleEvery =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_DRAWCOST_SAMPLE"), out var every) && every > 0 ? every : 1;
@@ -46,6 +50,7 @@ internal static class DrawCostProbe
     internal enum Kind
     {
         Draw,
+        DrawDepth, // [local] SHARPEMU_DRAWCOST_DEPTH: before Dispatch, so the dispatch line stays the last of a window
         Dispatch,
         Count,
     }
@@ -126,6 +131,9 @@ internal static class DrawCostProbe
         // Both: the preparation closes (stage scratch returns), the bindings reset, the record returns to its pool.
         PrepEnd,
         RecReturn,
+        // [local] SHARPEMU_DRAWCOST_DEPTH: the switch's own notes (classification, pixel class, draw shape); with the
+        // switch off no item reaches it.
+        DepthNote,
         // Both: from the record's return back to the front's queue.
         Exit,
         Count,
@@ -176,6 +184,23 @@ internal static class DrawCostProbe
         FastMemoSkipped,
         MaterializeCacheHit,
         MaterializeFull,
+        // [local] SHARPEMU_DRAWCOST_DEPTH (both draw kinds): the pixel class at the classification, the pixel stage
+        // prepared and with resources, and the draw shape against the previous draw of the same kind (DrawCostDepth).
+        PsNone,
+        PsKill,
+        PsExport,
+        PsOther,
+        PsIdle,
+        PixelBound,
+        PixelResources,
+        WritesMemory,
+        Shaped,
+        SameVertex,
+        SameIndex,
+        SameTargets,
+        SameDynamic,
+        SamePixel,
+        SameAll,
         AllocatedBytes,
         Count,
     }
@@ -185,28 +210,13 @@ internal static class DrawCostProbe
     private static readonly bool AllocPerStep = Enabled && Environment.GetEnvironmentVariable("SHARPEMU_DRAWCOST_ALLOC") == "1";
     private static long _lastAllocated;
 
-    private static readonly string[] StepNames = Names<Step>((int)Step.Count);
-    private static readonly string[] CounterNames = Names<Counter>((int)Counter.Count);
-
-    private const int Steps = (int)Step.Count;
-    private const int Counters = (int)Counter.Count;
-    private const int Kinds = (int)Kind.Count;
-
-    private static readonly long[] _stepTicks = new long[Kinds * Steps];
-    private static readonly long[] _stepPasses = new long[Kinds * Steps];
-    private static readonly long[] _stepBytes = new long[Kinds * Steps]; // [local] SHARPEMU_DRAWCOST_ALLOC
-    private static readonly long[] _counts = new long[Kinds * Counters];
-    private static readonly long[] _items = new long[Kinds];
-    private static readonly long[] _timed = new long[Kinds];
-    private static readonly long[] _itemTicks = new long[Kinds];
+    // [local] The window's sums per kind and the open item (DrawCostTally).
+    private static readonly DrawCostTally _tally = new(DepthSplit);
 
     // The recording thread's state: the first thread that begins an item owns the probe.
     private static int _thread;
     private static int _depth;
     private static bool _active;
-    private static Kind _kind;
-    private static long _start;
-    private static long _last;
     private static long _allocated;
     private static long _ring;
     private static long _lastEnd;
@@ -220,33 +230,21 @@ internal static class DrawCostProbe
 
     internal static bool Timing => Enabled && _active;
 
-    private static string[] Names<T>(int count) where T : struct, Enum
-    {
-        var names = new string[count];
-        for (var index = 0; index < count; index++)
-        {
-            names[index] = Snake(((T)(object)index).ToString());
-        }
+    // [local] SHARPEMU_DRAWCOST_DEPTH: a timed item is open on this thread (its notes are taken).
+    internal static bool DepthTiming => DepthSplit && _active && Environment.CurrentManagedThreadId == _thread;
 
-        return names;
-    }
+    // [local] SHARPEMU_DRAWCOST_DEPTH: the open draw's targets are known; a depth-only draw is counted as draw_depth,
+    // timed or not. The first call of an item decides.
+    // True when this call classified it.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool Classify(bool depthOnly) => DepthSplit && _depth != 0 && ClassifyCore(depthOnly);
 
-    private static string Snake(string name)
-    {
-        var builder = new StringBuilder(name.Length + 4);
-        for (var index = 0; index < name.Length; index++)
-        {
-            var character = name[index];
-            if (char.IsUpper(character) && index != 0)
-            {
-                builder.Append('_');
-            }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool ClassifyCore(bool depthOnly) =>
+        Environment.CurrentManagedThreadId == _thread && _tally.Classify(depthOnly);
 
-            builder.Append(char.ToLowerInvariant(character));
-        }
-
-        return builder.ToString();
-    }
+    // [local] SHARPEMU_DRAWCOST_DEPTH: the kind the open item is counted as.
+    internal static Kind CurrentKind => _tally.CurrentKind;
 
     // Called once per presented frame, from any thread.
     internal static void NoteFrame()
@@ -295,7 +293,6 @@ internal static class DrawCostProbe
             return;
         }
 
-        _items[(int)kind]++;
         long now = 0;
         if (_lastEnd != 0)
         {
@@ -313,12 +310,12 @@ internal static class DrawCostProbe
         if (++_sequence % SampleEvery != 0)
         {
             _active = false;
+            _tally.Begin(kind, timed: false, 0); // [local] counted, not timed
             return;
         }
 
         _active = true;
-        _kind = kind;
-        _start = _last = now != 0 ? now : Stopwatch.GetTimestamp();
+        _tally.Begin(kind, timed: true, now != 0 ? now : Stopwatch.GetTimestamp()); // [local]
         _allocated = GC.GetAllocatedBytesForCurrentThread();
         _lastAllocated = _allocated;
         _ring = Gpu.Vulkan.CommandRing.Active?.Produced ?? 0;
@@ -342,16 +339,15 @@ internal static class DrawCostProbe
         }
 
         var now = Stopwatch.GetTimestamp();
-        var slot = (int)_kind * Steps + (int)step;
-        _stepTicks[slot] += now - _last;
-        _stepPasses[slot]++;
-        _last = now;
+        long bytes = 0; // [local]
         if (AllocPerStep) // [local]
         {
             var allocated = GC.GetAllocatedBytesForCurrentThread();
-            _stepBytes[slot] += allocated - _lastAllocated;
+            bytes = allocated - _lastAllocated; // [local]
             _lastAllocated = allocated;
         }
+
+        _tally.Lap(step, now, bytes); // [local] DrawCostTally
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -368,7 +364,7 @@ internal static class DrawCostProbe
     {
         if (Environment.CurrentManagedThreadId == _thread)
         {
-            _counts[(int)_kind * Counters + (int)counter] += amount;
+            _tally.Count(counter, amount); // [local] DrawCostTally
         }
     }
 
@@ -400,20 +396,14 @@ internal static class DrawCostProbe
 
         if (!_active)
         {
+            _tally.End(); // [local]
             return;
         }
 
         LapCore(Step.Exit);
-        var now = _last;
-        var kind = (int)_kind;
-        _timed[kind]++;
-        _itemTicks[kind] += now - _start;
-        _counts[kind * Counters + (int)Counter.AllocatedBytes] += GC.GetAllocatedBytesForCurrentThread() - _allocated;
-        if (Gpu.Vulkan.CommandRing.Active is { } ring)
-        {
-            _counts[kind * Counters + (int)Counter.RingRecords] += ring.Produced - _ring;
-        }
-
+        var now = _tally.Last; // [local]
+        _tally.End(GC.GetAllocatedBytesForCurrentThread() - _allocated, // [local]
+            Gpu.Vulkan.CommandRing.Active is { } ring ? ring.Produced - _ring : 0); // [local]
         _active = false;
         if (now - _windowStart >= ReportTicks)
         {
@@ -467,80 +457,18 @@ internal static class DrawCostProbe
         var frames = Interlocked.Exchange(ref _frames, 0);
         TakeProcessCounters(out var gen0, out var gen1, out var gen2, out var contention);
         var toMs = 1000.0 / Stopwatch.Frequency;
-        var perFrame = frames > 0 ? frames : 1;
         var header = FormattableString.Invariant(
             $"[PERF][DRAWCOST] window_s={seconds:F1} frames={frames} sample={SampleEvery} lap_ns={CalibrateLapNanoseconds():F0} ") +
             FormattableString.Invariant($"gap={(_gaps == 0 ? 0 : _gapTicks * toMs * 1000 / _gaps):F2}us/n{_gaps} gc={gen0}/{gen1}/{gen2} lock_contention={contention}");
         Console.Error.WriteLine(header);
-        for (var kind = 0; kind < Kinds; kind++)
+        var kindLines = new List<string>(DrawCostTally.Kinds); // [local] DrawCostTally
+        _tally.Format(kindLines, frames, Stopwatch.Frequency, AllocPerStep); // [local]
+        foreach (var line in kindLines) // [local]
         {
-            var items = _items[kind];
-            var timed = _timed[kind];
-            if (items != 0)
-            {
-                var scale = timed == 0 ? 0 : items / (double)timed;
-                var line = new StringBuilder(2048);
-                line.Append(FormattableString.Invariant(
-                    $"[PERF][DRAWCOST] kind={(kind == (int)Kind.Draw ? "draw" : "dispatch")} items_per_frame={items / (double)perFrame:F0} timed={timed} "));
-                line.Append(FormattableString.Invariant(
-                    $"us_per_item={(timed == 0 ? 0 : _itemTicks[kind] * toMs * 1000 / timed):F2} ms_per_frame={_itemTicks[kind] * toMs * scale / perFrame:F2} steps="));
-                var first = true;
-                for (var step = 0; step < Steps; step++)
-                {
-                    var slot = kind * Steps + step;
-                    var passes = _stepPasses[slot];
-                    if (passes == 0)
-                    {
-                        continue;
-                    }
-
-                    if (!first)
-                    {
-                        line.Append(',');
-                    }
-
-                    first = false;
-                    line.Append(FormattableString.Invariant(
-                        $"{StepNames[step]}={_stepTicks[slot] * toMs * 1000 / passes:F2}/{_stepTicks[slot] * toMs * scale / perFrame:F2}/{passes / (double)Math.Max(timed, 1):F2}"));
-                }
-
-                line.Append(" counts=");
-                first = true;
-                for (var counter = 0; counter < Counters; counter++)
-                {
-                    var count = _counts[kind * Counters + counter];
-                    if (count == 0)
-                    {
-                        continue;
-                    }
-
-                    if (!first)
-                    {
-                        line.Append(',');
-                    }
-
-                    first = false;
-                    line.Append(FormattableString.Invariant($"{CounterNames[counter]}={count / (double)Math.Max(timed, 1):F2}"));
-                }
-
-                for (var step = 0; AllocPerStep && step < Steps; step++) // [local] SHARPEMU_DRAWCOST_ALLOC
-                {
-                    var bytes = _stepBytes[kind * Steps + step];
-                    if (bytes != 0)
-                        line.Append(FormattableString.Invariant($",alloc_{StepNames[step]}={bytes / (double)Math.Max(timed, 1):F2}"));
-                }
-
-                Console.Error.WriteLine(line.ToString());
-            }
+            Console.Error.WriteLine(line); // [local]
         }
 
-        Array.Clear(_stepTicks);
-        Array.Clear(_stepPasses);
-        Array.Clear(_stepBytes);
-        Array.Clear(_counts);
-        Array.Clear(_items);
-        Array.Clear(_timed);
-        Array.Clear(_itemTicks);
+        _tally.Clear(); // [local]
         _gapTicks = 0;
         _gaps = 0;
         LiteObtainProbe.Report(); // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_PLAN_PROBE: the same window, after its lines
@@ -589,12 +517,6 @@ internal static class DrawCostProbe
         _active = false;
         _lastEnd = 0;
         _sequence = 0;
-        Array.Clear(_stepTicks);
-        Array.Clear(_stepPasses);
-        Array.Clear(_stepBytes);
-        Array.Clear(_counts);
-        Array.Clear(_items);
-        Array.Clear(_timed);
-        Array.Clear(_itemTicks);
+        _tally.Reset(); // [local]
     }
 }

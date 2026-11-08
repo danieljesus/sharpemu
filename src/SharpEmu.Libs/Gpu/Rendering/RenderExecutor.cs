@@ -345,6 +345,7 @@ public sealed partial class RenderExecutor
 
         record.TargetsResolved = true;
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecTargets); // [local]
+        if (Diagnostics.DrawCostProbe.DepthSplit) Diagnostics.DrawCostDepth.NoteTargets(banks, in state); // [local] SHARPEMU_DRAWCOST_DEPTH: classified as its targets are known
         if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
         {
             Record(record);
@@ -522,6 +523,7 @@ public sealed partial class RenderExecutor
 
         record.TargetsResolved = true;
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ExecTargets); // [local]
+        if (Diagnostics.DrawCostProbe.DepthSplit) Diagnostics.DrawCostDepth.NoteTargets(banks, in state); // [local] SHARPEMU_DRAWCOST_DEPTH: classified as its targets are known
         if (arguments.IndirectArgumentsAddress != 0 && state.ColorCount == 0 && !state.Depth.HasTarget)
         {
             Record(record);
