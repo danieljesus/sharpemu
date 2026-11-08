@@ -2672,8 +2672,18 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                     else
                     {
                         var upload = _uploadDirtyBuffersInRange ??= UploadDirtyBuffersInRange;
-                        for (var index = 0; index < spans.Count; index++)
-                            _tracker.ForEachPossiblyCpuDirtyRange(spans[index].Address, spans[index].Size, upload);
+                        // [local] SHARPEMU_BDA_DIRTY_LOG: the ranges dirtied since the previous sweep, unless the mapping
+                        // changed or the log overflowed.
+                        if (_tracker.DirtyLogMode != 0 && _tracker.TakeCpuDirtyLog(out var dirtyLogCut) is { } dirtyLog &&
+                            mapping == _bdaSweepMapping)
+                        {
+                            SweepDirtyLog(dirtyLog, dirtyLogCut, spans, mapping, upload);
+                        }
+                        else
+                        {
+                            for (var index = 0; index < spans.Count; index++)
+                                _tracker.ForEachPossiblyCpuDirtyRange(spans[index].Address, spans[index].Size, upload);
+                        }
                     }
                 }
                 finally
@@ -3036,6 +3046,141 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             $"[DIRTY_LOG_PROBE] window_s={seconds:F1} sweeps_per_s={_dirtyLogSweeps / seconds:F1} entries_per_sweep={_dirtyLogEntries / (double)Math.Max(1, _dirtyLogSweeps):F0} overlapping_per_sweep={_dirtyLogOverlapping / (double)Math.Max(1, _dirtyLogSweeps):F0} overlap_pages_per_sweep={_dirtyLogOverlapPages / (double)Math.Max(1, _dirtyLogSweeps):F0} {DirtyLogProbe.TakeCounters()}"));
         _dirtyLogSweeps = _dirtyLogEntries = _dirtyLogOverlapping = _dirtyLogOverlapPages = 0;
         _dirtyLogWindow = now;
+    }
+
+    // [local] SHARPEMU_BDA_DIRTY_LOG: visits the logged ranges in address order, merged and clipped to the mapped spans
+    // the walk covers, with the visit of every buffer (UploadDirtyBuffersInRange: the same test and synchronized range
+    // per buffer). A range still CPU-dirty over a buffer after its visit is logged again for the next sweep; a buffer
+    // registers its range in the log, for pages dirtied while no buffer owned them. =2 then walks every possibly-dirty block as before and counts
+    // the buffers it still finds dirty: "missed" when a dirty page of theirs was logged at or before the cut (or never),
+    // "raced" when every dirty page was logged after it, and synchronizes them. Printed every 5 s.
+    private long _logVerifyCut, _logChecked, _logMissed, _logRaced, _logCarried, _logCarriedSeen, _logRanges, _logSweeps;
+    private readonly List<(ulong Address, ulong Size)> _logCarriedRanges = new();
+    private long _logWindow = System.Diagnostics.Stopwatch.GetTimestamp();
+    private Action<ulong, ulong>? _verifyDirtyLogRange;
+    private GuestSpan[] _logSpans = [];
+    private ulong _logSpansMapping;
+    private bool _logSpansBuilt;
+
+    private void SweepDirtyLog(List<(ulong Address, ulong Size)> log, long cut, IReadOnlyList<GuestSpan> spans, ulong mapping,
+        Action<ulong, ulong> upload)
+    {
+        _logCarriedRanges.Clear();
+        if (!_logSpansBuilt || mapping != _logSpansMapping)
+        {
+            _logSpans = spans.OrderBy(span => span.Address).ToArray();
+            _logSpansMapping = mapping;
+            _logSpansBuilt = true;
+        }
+
+        var entries = CollectionsMarshal.AsSpan(log);
+        entries.Sort(static (left, right) => left.Address.CompareTo(right.Address));
+        ulong runStart = 0, runEnd = 0;
+        var open = false;
+        foreach (var (address, size) in entries)
+        {
+            if (open && address <= runEnd)
+            {
+                runEnd = Math.Max(runEnd, address + size);
+                continue;
+            }
+
+            if (open)
+                VisitDirtyLogRun(runStart, runEnd - runStart, upload);
+            runStart = address;
+            runEnd = address + size;
+            open = true;
+        }
+
+        if (open)
+            VisitDirtyLogRun(runStart, runEnd - runStart, upload);
+        _logSweeps++;
+        if (_tracker.DirtyLogMode != 2)
+            return;
+
+        _logVerifyCut = cut;
+        var verify = _verifyDirtyLogRange ??= VerifyDirtyLogRange;
+        for (var index = 0; index < spans.Count; index++)
+            _tracker.ForEachPossiblyCpuDirtyRange(spans[index].Address, spans[index].Size, verify);
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (now - _logWindow >= 5 * System.Diagnostics.Stopwatch.Frequency)
+        {
+            _logWindow = now;
+            Console.Error.WriteLine(FormattableString.Invariant(
+                $"[PERF][BDA_DIRTY_LOG] sweeps={_logSweeps} ranges={_logRanges} carried={_logCarried} carried_seen={_logCarriedSeen} checked={_logChecked} missed={_logMissed} raced={_logRaced}"));
+        }
+    }
+
+    private void VisitDirtyLogRun(ulong address, ulong size, Action<ulong, ulong> upload)
+    {
+        var end = address + size;
+        var spans = _logSpans;
+        int low = 0, high = spans.Length;
+        while (low < high)
+        {
+            var middle = (low + high) / 2;
+            if (spans[middle].Address + spans[middle].Size <= address)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        for (var index = low; index < spans.Length && spans[index].Address < end; index++)
+        {
+            var start = Math.Max(address, spans[index].Address);
+            var finish = Math.Min(end, spans[index].Address + spans[index].Size);
+            if (start >= finish)
+                continue;
+            _logRanges++;
+            upload(start, finish - start);
+            if (_tracker.MayHaveCpuDirtyPages(start, finish - start) && _registry.HasOverlap(start, finish - start))
+            {
+                _logCarried++;
+                _logCarriedRanges.Add((start, finish - start));
+                _tracker.CarryCpuDirtyLog(start, finish - start);
+            }
+        }
+    }
+
+    // The carried ranges are added in address order: a buffer range overlapping one was left dirty on purpose.
+    private bool OverlapsCarried(ulong address, ulong size)
+    {
+        var ranges = CollectionsMarshal.AsSpan(_logCarriedRanges);
+        int low = 0, high = ranges.Length;
+        while (low < high)
+        {
+            var middle = (low + high) / 2;
+            if (ranges[middle].Address + ranges[middle].Size <= address)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        return low < ranges.Length && ranges[low].Address < address + size;
+    }
+
+    private void VerifyDirtyLogRange(ulong guestAddress, ulong size)
+    {
+        var end = guestAddress + size;
+        var index = _registry.FindFirstOverlappingIndex(guestAddress);
+        for (; index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end; index++)
+        {
+            var buffer = _registry.GetBuffer(_registry.GetRegisteredIdentifier(index));
+            var start = Math.Max(buffer.CpuAddress, guestAddress);
+            var finish = Math.Min(buffer.CpuAddress + buffer.Size, end);
+            if (start >= finish)
+                continue;
+            _logChecked++;
+            if (!_tracker.MayHaveCpuDirtyPages(start, finish - start))
+                continue;
+            if (OverlapsCarried(start, finish - start))
+                _logCarriedSeen++;
+            else if (_tracker.HasCpuDirtyPageLoggedBy(start, finish - start, _logVerifyCut))
+                _logMissed++;
+            else
+                _logRaced++;
+            _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: BdaPreserveHot);
+        }
     }
 
     // A visited buffer's copies wait for the end of the sweep. The tracker has protected its pages
@@ -5300,6 +5445,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         {
             _bufferPages.Set(buffer.CpuAddress, buffer.Size, covered: true);
             _registry.RegisterBuffer(bufferIdentifier, _retirementPolicy.CurrentTick);
+            if (_tracker.DirtyLogMode != 0) // [local] SHARPEMU_BDA_DIRTY_LOG: pages dirtied before this buffer owned them
+                _tracker.CarryCpuDirtyLog(buffer.CpuAddress, buffer.Size);
             var addresses = new ulong[sizePages];
             for (ulong page = 0; page < sizePages; page++)
             {

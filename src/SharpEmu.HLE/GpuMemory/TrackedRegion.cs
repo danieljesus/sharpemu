@@ -64,6 +64,7 @@ public sealed class TrackedRegion
         _summary?.Set(BaseAddress / BlockBytes, dirty: true);
         _summary?.NoteDirtied();
         if (DirtyLogProbe.Enabled) DirtyLogProbe.Note(DirtyLogProbe.Gate.Birth, baseAddress, BlockBytes); // [local]
+        NoteDirtyLog(0, (int)(BlockBytes / PageBytes)); // [local] SHARPEMU_BDA_DIRTY_LOG
     }
 
     public RegionLock Lock { get; } = new();
@@ -219,8 +220,10 @@ public sealed class TrackedRegion
 
         Volatile.Write(ref _cpuDirtyings, _cpuDirtyings + 1); // [local]
         if (DirtyLogProbe.Enabled) DirtyLogProbe.Note(DirtyLogProbe.Gate.KeepProtection, address, size); // [local]
+        MarkDirtyLogPending(start, end); // [local] SHARPEMU_BDA_DIRTY_LOG
         _cpuDirty.SetRange(start, end);
         UpdateCpuProtection(ProtectionCause.UploadReprotect, ProtectionCause.EmulatorWrite);
+        NoteDirtyLog(start, end); // [local] SHARPEMU_BDA_DIRTY_LOG
     }
 
     public void ChangeState(WriteOrigin side, bool enable, ulong address, ulong size)
@@ -260,6 +263,7 @@ public sealed class TrackedRegion
         }
         else if (enable)
         {
+            MarkDirtyLogPending(start, end); // [local] SHARPEMU_BDA_DIRTY_LOG
             bits.SetRange(start, end);
         }
         else
@@ -270,11 +274,51 @@ public sealed class TrackedRegion
         if (side == WriteOrigin.Cpu)
         {
             UpdateCpuProtection();
+            if (enable)
+                NoteDirtyLog(start, end); // [local] SHARPEMU_BDA_DIRTY_LOG
         }
         else
         {
             UpdateGpuProtection();
         }
+    }
+
+    // [local] SHARPEMU_BDA_DIRTY_LOG: logs pages [start, end) that turned CPU-dirty, after their bits and the block
+    // summary were published; with =2 stamps them with the entry's sequence. Called with the lock held.
+    private long[]? _dirtyLogStamps;
+
+    // With =2, pages about to turn dirty read as logged after any cut until their entry is appended and stamped.
+    private void MarkDirtyLogPending(int start, int end)
+    {
+        if (_owner is { DirtyLogMode: 2 } && start < end)
+            Array.Fill(_dirtyLogStamps ??= new long[BlockBytes / PageBytes], long.MaxValue, start, end - start);
+    }
+
+    private void NoteDirtyLog(int start, int end)
+    {
+        if (_owner is not { DirtyLogMode: not 0 } owner || start >= end)
+            return;
+        var sequence = owner.NoteCpuDirtied(BaseAddress + (ulong)start * PageBytes, (ulong)(end - start) * PageBytes);
+        if (owner.DirtyLogMode == 2)
+            Array.Fill(_dirtyLogStamps ??= new long[BlockBytes / PageBytes], sequence, start, end - start);
+    }
+
+    // SHARPEMU_BDA_DIRTY_LOG=2: whether a CPU-dirty page of the range carries no stamp or one at or before cut. Read
+    // without the lock.
+    public bool HasCpuDirtyPageLoggedBy(ulong offset, ulong size, long cut)
+    {
+        var (start, end) = GetPageRange(BaseAddress + offset, size);
+        var stamps = _dirtyLogStamps;
+        foreach (var (first, last) in new PageMask(_cpuDirty, start, end))
+        {
+            for (var page = first; page < last; page++)
+            {
+                if (stamps is null || Volatile.Read(ref stamps[page]) <= cut)
+                    return true;
+            }
+        }
+
+        return false;
     }
 
     // Hot read-only pages stay writable and dirty, so each obtain observes current CPU bytes.

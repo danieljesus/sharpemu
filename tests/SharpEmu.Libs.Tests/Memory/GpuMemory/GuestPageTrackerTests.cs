@@ -1328,6 +1328,86 @@ public sealed class GuestPageTrackerTests : IDisposable
     {
     }
 
+    // [local] SHARPEMU_BDA_DIRTY_LOG
+    private GuestPageTracker DirtyLogTracker(int mode)
+    {
+        GuestPageTracker.DirtyLogModeOverride.Value = mode;
+        try
+        {
+            return new GuestPageTracker(_gpu.Pages);
+        }
+        finally
+        {
+            GuestPageTracker.DirtyLogModeOverride.Value = null;
+        }
+    }
+
+    [NativePageProtectionFact]
+    public void DirtyLogHandsTheNextSweepThePagesThatTurnedCpuDirty()
+    {
+        var tracker = DirtyLogTracker(1);
+        var address = Allocate(2);
+        tracker.ForEachUploadRange(address, Page * 2, false, NoRange, NoUpload, preserveCpuWriteHotPages: false);
+
+        Assert.Null(tracker.TakeCpuDirtyLog(out _));
+        Assert.Empty(tracker.TakeCpuDirtyLog(out _)!);
+
+        Assert.True(tracker.MarkCpuDirtyPages(address + Page + 16, 8));
+        Assert.False(tracker.MarkCpuDirtyPages(address + Page + 16, 8));
+        Assert.Equal([(address + Page, Page)], tracker.TakeCpuDirtyLog(out _)!);
+        Assert.Empty(tracker.TakeCpuDirtyLog(out _)!);
+
+        tracker.CarryCpuDirtyLog(address, Page);
+        Assert.Equal([(address, Page)], tracker.TakeCpuDirtyLog(out _)!);
+
+        tracker.UntrackMemory(address, Page * 2);
+        Release(address, Page * 2);
+    }
+
+    [NativePageProtectionFact]
+    public void DirtyLogLogsARegionBornDirty()
+    {
+        var tracker = DirtyLogTracker(1);
+        const ulong address = 0x2_0300_0000;
+        Assert.Null(tracker.TakeCpuDirtyLog(out _));
+
+        Assert.True(tracker.HasCpuDirtyPages(address, Page));
+        Assert.Equal([(address & ~(Region - 1), Region)], tracker.TakeCpuDirtyLog(out _)!);
+    }
+
+    [NativePageProtectionFact]
+    public void DirtyLogIsEmptyWhenOff()
+    {
+        var tracker = DirtyLogTracker(0);
+        var address = Allocate(1);
+        tracker.ForEachUploadRange(address, Page, false, NoRange, NoUpload, preserveCpuWriteHotPages: false);
+        _ = tracker.TakeCpuDirtyLog(out _);
+
+        Assert.True(tracker.MarkCpuDirtyPages(address + 16, 8));
+        Assert.Empty(tracker.TakeCpuDirtyLog(out _)!);
+
+        tracker.UntrackMemory(address, Page);
+        Release(address, Page);
+    }
+
+    [NativePageProtectionFact]
+    public void DirtyLogVerifyStampsEachDirtyPageWithItsEntry()
+    {
+        var tracker = DirtyLogTracker(2);
+        var address = Allocate(2);
+        tracker.ForEachUploadRange(address, Page * 2, false, NoRange, NoUpload, preserveCpuWriteHotPages: false);
+        _ = tracker.TakeCpuDirtyLog(out _);
+
+        Assert.True(tracker.MarkCpuDirtyPages(address + 16, 8));
+        _ = tracker.TakeCpuDirtyLog(out var cut);
+        Assert.True(tracker.HasCpuDirtyPageLoggedBy(address, Page * 2, cut));
+        Assert.False(tracker.HasCpuDirtyPageLoggedBy(address, Page * 2, cut - 1));
+        Assert.False(tracker.HasCpuDirtyPageLoggedBy(address + Page, Page, cut));
+
+        tracker.UntrackMemory(address, Page * 2);
+        Release(address, Page * 2);
+    }
+
     private static void NoUpload()
     {
     }

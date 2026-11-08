@@ -71,6 +71,75 @@ public sealed class GuestPageTracker
 
     public bool DefersGpuWriteProtection { get; set; }
 
+    // [local] SHARPEMU_BDA_DIRTY_LOG (0 off by default, 1 on, 2 verify): the ranges that turned CPU-dirty since the
+    // previous BDA sweep, so the sweep visits the buffers over them instead of every buffer of every 4 MiB block that
+    // may hold a dirty page (bw02/bw03: ~5,330 visits per sweep for ~50-100 synchronizations; dl01: ~1,450 new ranges
+    // per sweep, all over registered buffers). A region appends after its bits and block summary are published, under
+    // its lock: a sweep that takes the entry then sees the page dirty. Past DirtyLogCapacity entries the log is marked
+    // overflowed and the next sweep walks everything, as does the first one. With =2 every logged page also keeps the
+    // sequence number of its entry, so the verify can tell a page the log lost (dirty, stamped at or before the sweep's
+    // cut) from one dirtied while the sweep ran. Fixed per tracker at construction (tests set DirtyLogModeOverride).
+    public static readonly AsyncLocal<int?> DirtyLogModeOverride = new();
+    private static readonly int DirtyLogModeDefault =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_DIRTY_LOG"), out var dirtyLogMode) ? dirtyLogMode : 0;
+    public int DirtyLogMode { get; } = DirtyLogModeOverride.Value ?? DirtyLogModeDefault;
+    private const int DirtyLogCapacity = 1 << 18;
+    private readonly object _dirtyLogGate = new();
+    private List<(ulong Address, ulong Size)> _dirtyLog = new(4096);
+    private List<(ulong Address, ulong Size)> _dirtyLogTaken = new(4096);
+    private bool _dirtyLogOverflowed = true;
+    private long _dirtyLogSequence;
+
+    // A range a sweep left CPU-dirty over a buffer, logged again for the next sweep (its pages keep their stamps).
+    public void CarryCpuDirtyLog(ulong address, ulong size) => NoteCpuDirtied(address, size);
+
+    // Appends a range that turned CPU-dirty and returns its sequence number.
+    internal long NoteCpuDirtied(ulong address, ulong size)
+    {
+        lock (_dirtyLogGate)
+        {
+            if (_dirtyLog.Count < DirtyLogCapacity)
+                _dirtyLog.Add((address, size));
+            else
+                _dirtyLogOverflowed = true;
+            return ++_dirtyLogSequence;
+        }
+    }
+
+    // The ranges logged since the previous call, or null when the log overflowed (or nothing was taken yet) and the
+    // caller must walk everything. The list is the caller's until the next call; cut is the last sequence in it.
+    public List<(ulong Address, ulong Size)>? TakeCpuDirtyLog(out long cut)
+    {
+        lock (_dirtyLogGate)
+        {
+            cut = _dirtyLogSequence;
+            var overflowed = _dirtyLogOverflowed;
+            _dirtyLogOverflowed = false;
+            (_dirtyLog, _dirtyLogTaken) = (_dirtyLogTaken, _dirtyLog);
+            _dirtyLog.Clear();
+            return overflowed ? null : _dirtyLogTaken;
+        }
+    }
+
+    // SHARPEMU_BDA_DIRTY_LOG=2: whether a CPU-dirty page of the range was logged at or before cut (or never logged).
+    public bool HasCpuDirtyPageLoggedBy(ulong vaddr, ulong size, long cut)
+    {
+        var remaining = size;
+        var index = vaddr / BlockBytes;
+        var offset = vaddr % BlockBytes;
+        while (remaining != 0)
+        {
+            var bytes = Math.Min(BlockBytes - offset, remaining);
+            if (Volatile.Read(ref _regions[index]) is not { } region || region.HasCpuDirtyPageLoggedBy(offset, bytes, cut))
+                return true;
+            remaining -= bytes;
+            offset = 0;
+            index++;
+        }
+
+        return false;
+    }
+
     internal void QueueGpuProtection(TrackedRegion region)
     {
         GpuProtectionsDeferred.Increment();
