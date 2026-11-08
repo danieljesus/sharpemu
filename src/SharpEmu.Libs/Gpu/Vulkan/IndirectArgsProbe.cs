@@ -76,6 +76,7 @@ internal sealed class IndirectArgsLedger
         public ulong MaxGroups;
         public long Big;
         public long CpuMismatches;
+        public long Zero, ZeroCpuClean; // [local] no groups on the GPU; of those, the CPU saw zero too and no GPU write was pending
     }
 
     // Reads one ring slot: the three copied words and the sequence word.
@@ -171,6 +172,12 @@ internal sealed class IndirectArgsLedger
         var mismatch = !entry.GpuDirty && (entry.CpuX != x || entry.CpuY != y || entry.CpuZ != z);
         if (mismatch)
             stats.CpuMismatches++;
+        if (groups == 0)
+        {
+            stats.Zero++;
+            if (!entry.GpuDirty && (ulong)entry.CpuX * entry.CpuY * entry.CpuZ == 0)
+                stats.ZeroCpuClean++;
+        }
         if (groups >= BigGroups)
         {
             stats.Big++;
@@ -188,10 +195,12 @@ internal sealed class IndirectArgsLedger
     private string Summary()
     {
         var builder = new StringBuilder("[GPU][INDIRECT_ARGS] summary");
+        builder.Append(CultureInfo.InvariantCulture,
+            $" total_n={_stats.Values.Sum(stats => stats.Count)} total_zero={_stats.Values.Sum(stats => stats.Zero)} total_zero_cpu_clean={_stats.Values.Sum(stats => stats.ZeroCpuClean)}");
         foreach (var (shader, stats) in _stats.OrderByDescending(pair => pair.Value.MaxGroups))
         {
             builder.Append(CultureInfo.InvariantCulture,
-                $" 0x{shader:X}:n={stats.Count},max={stats.MaxX}x{stats.MaxY}x{stats.MaxZ},groups={stats.MaxGroups},big={stats.Big},cpu_mismatch={stats.CpuMismatches}");
+                $" 0x{shader:X}:n={stats.Count},max={stats.MaxX}x{stats.MaxY}x{stats.MaxZ},groups={stats.MaxGroups},big={stats.Big},cpu_mismatch={stats.CpuMismatches},zero={stats.Zero},zero_cpu_clean={stats.ZeroCpuClean}");
         }
 
         return builder.ToString();

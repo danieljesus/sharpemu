@@ -197,6 +197,7 @@ internal static unsafe partial class VulkanVideoPresenter
 
             using var preparationScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PresentationPreparation);
             Presentation presentation;
+            var windowQueryStarted = Gpu.Rendering.WindowQueryProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
             if (_window.IsMinimized)
             {
                 return;
@@ -228,6 +229,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     Result.SuboptimalKhr);
                 return;
             }
+            if (windowQueryStarted != 0) Gpu.Rendering.WindowQueryProbe.Note(windowQueryStarted); // [local]
 
             // [local] SHARPEMU_ASYNC_PRESENT: the previous flip is reported before the next one is paced. While its present
             // is in flight and commands are queued, the render thread records them and takes no presentation this pass.

@@ -633,6 +633,8 @@ public sealed partial class RenderExecutor
         record.SetBindDebug = setBindDebug;
         record.SetAutoDebug = setAutoDebug;
         record.ResetBindings = true;
+        if (EarlyOutProbe.Enabled)
+            EarlyOutProbe.NoteDraw(in record.Dynamic, draw.Count, topology, vertexBufferWrites);
     }
 
     private byte[] ConvertRestartIndices(ulong indexAddress, uint indexCount, IndexType indexType, uint restartIndex)
