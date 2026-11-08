@@ -28,21 +28,41 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // (max with the same tick), the precise and ever-written sets and the GPU-modified add (sticky until a removal).
 // Off (counted as guard) while a diagnostic that watches every written obtain is on, or SHARPEMU_WRITTEN_OBTAIN_MEMO.
 //
+// Re-tick (SHARPEMU_BDA_WRITE_MEMO_RETICK, on with the memo, =0 off): an entry of an earlier tick answers too, under the
+// same checks, since none of the skipped steps depends on the tick except the write ticks: the mapping generation (and
+// resets) keep the clamp and the backing, the page owner keeps FindBuffer, and the range staying in the GPU-modified and
+// precise sets keeps SynchronizeBuffer and the adds a no-op. Both sets shrink only through RemoveGpuModified (the removal
+// count): nothing prunes them when ticks complete. The hit then runs the full GpuBuffer.NoteGpuWrite (block ticks,
+// LastGpuWriteTick, WriteTickMap.Assign at this tick, a pruned chunk created again, the prune check) instead of the
+// repeat's prefix, touches the buffer when the collection tick moved, and becomes the entry of this tick. The other
+// effects of the real path that read the tick or the batch (CutPolicy, hot windows and words, the table-read census,
+// the readback tick log) belong to diagnostics or switches that turn the memo off. In GTA V (bwv1, =2) ~90 % of the
+// misses were entries of an earlier tick.
+//
 // =2 answers every hit from the real path and first checks that it had nothing left to do: the range in the GPU-modified
 // set (and in the precise set below 16 MB) and in the ever-written set, the buffer's write ticks at the current tick over
 // the range, the page owner the remembered buffer and its use tick current; after it, the same buffer and offset, no
 // upload, no GPU-modified change, no registry change and no table word dropped when the memo would have skipped the drop;
 // the presenter clamps the size again and compares. Any difference is wrong ([GPU][BDA_WRITE_MEMO_WRONG], the first 20).
 //
-// [PERF][BDA_WRITE_MEMO] mode=N obtains=N hits=N miss=cold:N,tick:N,mapping:N,registry:N,removed:N,guard:N
-//     table_replays=N verified=N wrong=N wrong_total=N
+// [PERF][BDA_WRITE_MEMO] mode=N obtains=N hits=N hits_retick=N miss=cold:N,tick:N,mapping:N,registry:N,removed:N,guard:N
+//     table_replays=N verified=N wrong=N wrong_total=N ticks=N retick_cpu_dirty=N
+//     [retick_cut=other:N,cap:N,idle:N,readback:N,learn:N,policy:N]
 // once per SHARPEMU_DRAWCOST_PROBE window, or every 5 s without it. obtains = written device-address ranges the memo was
 // asked about; cold = no entry for the key (first obtain, or the slot held another key); tick = an entry of an earlier
-// tick; table_replays = hits that still ran TableWordMemo.NoteGpuWrite.
+// tick with re-tick off; hits_retick = hits on an entry of an earlier tick (hits counts the same-tick ones);
+// table_replays = hits that still ran TableWordMemo.NoteGpuWrite. =2 checks re-tick hits as above, except that the write
+// ticks are checked after the real path (at this tick) instead of before it. ticks = submission ticks the memo saw
+// (per frame with DRAWCOST's frames of the same window); retick_cpu_dirty (=2) = verified re-tick hits whose range had a
+// CPU-dirty page (MayHaveCpuDirtyPages) and whose real path still uploaded nothing: a written range already GPU-modified
+// ignores CPU-dirty pages (SynchronizeBuffer), so they are no hit condition. retick_cut (with
+// SHARPEMU_READBACK_ORIGIN_PROBE=1) = re-tick hits and tick misses by what ended the presenter's last batch.
 internal static class BdaWriteMemo
 {
     internal static readonly int DefaultMode =
         int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_WRITE_MEMO"), out var mode) ? mode : 0;
+
+    internal static readonly bool Retick = Environment.GetEnvironmentVariable("SHARPEMU_BDA_WRITE_MEMO_RETICK") != "0";
 
     private const int DumpLimit = 20;
 
@@ -62,6 +82,11 @@ internal static class BdaWriteMemo
     // The window's counts: plain increments on the render thread, diagnostics only, except the wrong total.
     internal static long Obtains;
     internal static long Hits;
+    internal static long HitsRetick;
+    internal static long Ticks;
+    internal static ulong LastTick = ulong.MaxValue;
+    internal static long RetickCpuDirty;
+    internal static readonly long[] RetickByCut = new long[Diagnostics.ReadbackOriginProbe.CutReasons];
     internal static long TableReplays;
     internal static long Verified;
     internal static long Wrong;
@@ -73,6 +98,13 @@ internal static class BdaWriteMemo
     internal static long WrongTotal => Interlocked.Read(ref _wrongTotal);
 
     internal static void NoteMiss(Miss cause) => MissCounts[(int)cause]++;
+
+    // A re-tick hit or a tick miss: what ended the batch before this tick.
+    internal static void NoteRetick()
+    {
+        if (Diagnostics.ReadbackOriginProbe.Enabled)
+            RetickByCut[(int)Diagnostics.ReadbackOriginProbe.LastCut]++;
+    }
 
     internal static void NoteWrong(string reason, ulong address, ulong size, string detail)
     {
@@ -112,9 +144,13 @@ internal static class BdaWriteMemo
     {
         var miss = string.Join(",", MissNames.Select((name, index) => FormattableString.Invariant($"{name}:{MissCounts[index]}")));
         var line = FormattableString.Invariant(
-            $"[PERF][BDA_WRITE_MEMO] mode={mode} obtains={Obtains} hits={Hits} miss={miss} table_replays={TableReplays} verified={Verified} wrong={Wrong} wrong_total={WrongTotal}");
-        Obtains = Hits = TableReplays = Verified = Wrong = 0;
+            $"[PERF][BDA_WRITE_MEMO] mode={mode} obtains={Obtains} hits={Hits} hits_retick={HitsRetick} miss={miss} table_replays={TableReplays} verified={Verified} wrong={Wrong} wrong_total={WrongTotal} ticks={Ticks} retick_cpu_dirty={RetickCpuDirty}");
+        if (Diagnostics.ReadbackOriginProbe.Enabled)
+            line += " retick_cut=" + string.Join(",", RetickByCut.Select((count, index) =>
+                FormattableString.Invariant($"{Diagnostics.ReadbackOriginProbe.CutName(index)}:{count}")));
+        Obtains = Hits = HitsRetick = TableReplays = Verified = Wrong = Ticks = RetickCpuDirty = 0;
         Array.Clear(MissCounts);
+        Array.Clear(RetickByCut);
         return line;
     }
 
@@ -122,6 +158,7 @@ internal static class BdaWriteMemo
     internal static void ResetForTests()
     {
         FormatAndClear(0);
+        LastTick = ulong.MaxValue;
         Interlocked.Exchange(ref _wrongTotal, 0);
         _dumps = 0;
     }

@@ -106,6 +106,13 @@ internal static class ReadbackOriginProbe
         }
     }
 
+    // [local] SHARPEMU_BDA_WRITE_MEMO: what ended the presenter's last batch (render thread; with the probe on).
+    internal static CutReason LastCut { get; private set; }
+
+    internal static string CutName(int reason) => CutReasonNames[reason];
+
+    internal const int CutReasons = 6;
+
     // On the render thread, right before a submit: what is ending the presenter's batch.
     public static void NoteCutReason(CutReason reason)
     {
@@ -118,6 +125,7 @@ internal static class ReadbackOriginProbe
     public static void NoteBatch(int draws, long openTicks)
     {
         var reason = (int)_cutReason;
+        LastCut = _cutReason; // [local] SHARPEMU_BDA_WRITE_MEMO: the cut before the next tick
         _cutReason = CutReason.Other;
         var drawBucket = draws <= 0 ? 0 : Math.Min(BatchBuckets - 1, 1 + System.Numerics.BitOperations.Log2((uint)draws));
         var openMs = openTicks * 1000.0 / Stopwatch.Frequency;

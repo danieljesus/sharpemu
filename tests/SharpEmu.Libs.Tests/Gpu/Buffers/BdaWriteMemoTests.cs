@@ -10,9 +10,9 @@ using Xunit;
 
 namespace SharpEmu.Libs.Tests.Gpu.Buffers;
 
-// [local] SHARPEMU_BDA_WRITE_MEMO: a written device-address range obtained again in the same tick answers from the memo
-// while the real path would do nothing new, and misses after a new tick, a mapping change, a GPU-modified removal over
-// it or a new page owner. =2 runs the real path on every hit and finds nothing the memo skipped.
+// [local] SHARPEMU_BDA_WRITE_MEMO: a written device-address range obtained again answers from the memo while the real path
+// would do nothing new (in a later tick, nothing but the write ticks), and misses after a mapping change, a GPU-modified
+// removal over it or a new page owner. =2 runs the real path on every hit and finds nothing the memo skipped.
 [Collection(SchedulingStateCollection.Name)]
 public sealed class BdaWriteMemoTests : IClassFixture<HeadlessVulkanFixture>, IDisposable
 {
@@ -80,20 +80,110 @@ public sealed class BdaWriteMemoTests : IClassFixture<HeadlessVulkanFixture>, ID
         harness.Shutdown();
     }
 
+    // Re-tick: an entry of an earlier tick answers, and the hit marks the write at the new tick as the real path would.
     [Fact]
-    public void ANewTickMisses()
+    public void ANewTickHitsAgainAndMovesTheWriteTicks()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var (harness, address) = Mapped(_vulkan!, 1);
+        using var disposer = harness;
+        Obtain(harness, address + Offset);
+        var buffer = Owner(harness, address + Offset);
+        var before = harness.Scheduler.CurrentTick;
+        harness.Worker.Run(() => harness.Scheduler.Flush());
+        var tick = harness.Scheduler.CurrentTick;
+        Assert.True(tick > before);
+        var writes = buffer.GpuWrites;
+        var uploads = harness.Cache.SyncUploadsForTests;
+
+        var (repeat, size) = Repeat(harness, address + Offset);
+
+        Assert.True(repeat == GuestBufferCache.BdaRepeat.Hit, string.Join(",", BdaWriteMemo.MissCounts));
+        Assert.Equal(Size, size);
+        Assert.Equal(1, BdaWriteMemo.HitsRetick);
+        Assert.Equal(0, BdaWriteMemo.Hits);
+        Assert.Equal(writes + 1, buffer.GpuWrites);
+        Assert.Equal(uploads, harness.Cache.SyncUploadsForTests);
+        Assert.Equal(tick, buffer.LastGpuWriteTick);
+        Assert.True(buffer.WriteTicksHold(address + Offset - buffer.CpuAddress, Size, tick));
+        Assert.Equal(tick, buffer.LastGpuWriteTickIn(address + Offset - buffer.CpuAddress, Size));
+
+        // The entry now belongs to this tick: the next repeat is a same-tick hit.
+        Assert.Equal(GuestBufferCache.BdaRepeat.Hit, Repeat(harness, address + Offset).Repeat);
+        Assert.Equal(1, BdaWriteMemo.Hits);
+        Assert.Equal(0, Missed(BdaWriteMemo.Miss.Tick));
+        Assert.Equal(1, BdaWriteMemo.Ticks);
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void ANewTickStillMissesAfterARemovalOrANewOwner()
     {
         if (!GatePrerequisites.Ready(_vulkan)) return;
         var (harness, address) = Mapped(_vulkan!, 1);
         using var disposer = harness;
         Obtain(harness, address + Offset);
         harness.Worker.Run(() => harness.Scheduler.Flush());
-
+        harness.Worker.Run(() => harness.Cache.NoteKnownGpuContents(address + Offset + 0x100, [0x33333333u]));
         Assert.Equal(GuestBufferCache.BdaRepeat.Miss, Repeat(harness, address + Offset).Repeat);
-        Assert.Equal(1, Missed(BdaWriteMemo.Miss.Tick));
+        Assert.Equal(1, Missed(BdaWriteMemo.Miss.Removed));
 
         Obtain(harness, address + Offset);
-        Assert.Equal(GuestBufferCache.BdaRepeat.Hit, Repeat(harness, address + Offset).Repeat);
+        var first = Owner(harness, address + Offset);
+        harness.Worker.Run(() => harness.Scheduler.Flush());
+        _ = harness.Worker.Run(() => harness.Cache.FindBuffer(first.CpuAddress + first.Size - 0x100, 0x8000));
+        Assert.NotSame(first, Owner(harness, address + Offset));
+        Assert.Equal(GuestBufferCache.BdaRepeat.Miss, Repeat(harness, address + Offset).Repeat);
+        Assert.Equal(1, Missed(BdaWriteMemo.Miss.Registry));
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void ANewTickAfterARemapMisses()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var (harness, address) = Mapped(_vulkan!, 1);
+        using var disposer = harness;
+        Obtain(harness, address + Offset, mapping: harness.Memory.MappingGeneration);
+        harness.Worker.Run(() => harness.Scheduler.Flush());
+        _ = harness.MapBacked(0x10000, ReadWrite);
+
+        Assert.Equal(GuestBufferCache.BdaRepeat.Miss, Repeat(harness, address + Offset, mapping: harness.Memory.MappingGeneration).Repeat);
+        Assert.Equal(1, Missed(BdaWriteMemo.Miss.Mapping));
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void VerifyFindsNothingTheMemoSkippedAcrossTicks()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        var (harness, address) = Mapped(_vulkan!, 2);
+        using var disposer = harness;
+        var other = address + 0x20000;
+        Obtain(harness, address + Offset);
+        Obtain(harness, other, 0x200);
+        harness.Worker.Run(() => harness.Scheduler.Flush());
+        Assert.Equal(GuestBufferCache.BdaRepeat.Verified, Repeat(harness, address + Offset).Repeat);
+        Assert.Equal(GuestBufferCache.BdaRepeat.Verified, Repeat(harness, address + Offset).Repeat);
+
+        // Completed ticks, a collection, and other writes of the same buffer in between.
+        for (var round = 0; round < 4; round++)
+        {
+            harness.Worker.Run(() =>
+            {
+                harness.Scheduler.Finish();
+                harness.Cache.RunGarbageCollector();
+            });
+            for (var write = 0UL; write < 8; write++)
+                Obtain(harness, address + 0x30000 + write * 0x400, 0x100);
+            Assert.Equal(GuestBufferCache.BdaRepeat.Verified, Repeat(harness, address + Offset).Repeat);
+            Assert.Equal(GuestBufferCache.BdaRepeat.Verified, Repeat(harness, other, 0x200).Repeat);
+        }
+
+        Assert.Equal(10, BdaWriteMemo.Verified);
+        Assert.Equal(9, BdaWriteMemo.HitsRetick);
+        Assert.Equal(0, BdaWriteMemo.Wrong);
+        Assert.Equal(0, BdaWriteMemo.WrongTotal);
         harness.Shutdown();
     }
 
