@@ -102,6 +102,65 @@ public sealed class WriteTickMap
         return tick;
     }
 
+    // [local] SHARPEMU_BDA_WRITE_MEMO=2: whether Assign(begin, size, tick) would change nothing (no chunk to create, no tick
+    // to raise), following Assign's two cases.
+    public bool Holds(ulong begin, ulong size, ulong tick)
+    {
+        if (size == 0)
+        {
+            return true;
+        }
+
+        var end = begin + size;
+        var lastChunk = (end - 1) >> ChunkShift;
+        if (lastChunk >= (ulong)_chunks.Length)
+        {
+            return false;
+        }
+
+        for (var index = begin >> ChunkShift; index <= lastChunk; index++)
+        {
+            if (_chunks[index] is not { } chunk)
+            {
+                return false;
+            }
+
+            var chunkBegin = index << ChunkShift;
+            var from = Math.Max(begin, chunkBegin) - chunkBegin;
+            var to = Math.Min(end, chunkBegin + ChunkBytes) - chunkBegin;
+            if (from == 0 && to == ChunkBytes)
+            {
+                if (chunk.UniformTick < tick || chunk.MaxTick < tick)
+                {
+                    return false;
+                }
+
+                continue;
+            }
+
+            if (tick <= chunk.UniformTick)
+            {
+                continue;
+            }
+
+            if (chunk.Granules is not { } granules || chunk.MaxTick < tick)
+            {
+                return false;
+            }
+
+            var last = (int)((to - 1) >> GranuleShift);
+            for (var granule = (int)(from >> GranuleShift); granule <= last; granule++)
+            {
+                if (granules[granule] < tick)
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
     public void Prune(ulong below)
     {
         for (var index = 0; index < _chunks.Length; index++)

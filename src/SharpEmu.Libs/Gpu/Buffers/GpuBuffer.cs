@@ -286,6 +286,56 @@ public unsafe class GpuBuffer : IDisposable
         }
     }
 
+    // [local] SHARPEMU_BDA_WRITE_MEMO: what NoteGpuWrite does again for a range it already marked at the current tick (the
+    // rest, the write ticks, is the max with the same tick): the write count, the observer, the history entry, the flag.
+    internal void NoteRepeatedGpuWrite(ulong offset, ulong size)
+    {
+        GpuWrites++;
+        var whole = !RangeWriteTicks || size == 0 || (offset == 0 && size >= Size);
+        GpuWriteObserver?.Invoke(whole ? CpuAddress : CpuAddress + offset, whole ? Size : size);
+        GpuWriteHistory.Note(whole ? CpuAddress : CpuAddress + offset, whole ? Size : size, _scheduler.CurrentTick);
+        if (_mapped != null)
+        {
+            _scheduler.NoteMappedMemoryWrite();
+        }
+    }
+
+    // [local] SHARPEMU_BDA_WRITE_MEMO=2: whether NoteGpuWrite(offset, size) at `tick` would leave the write ticks as they are.
+    internal bool WriteTicksHold(ulong offset, ulong size, ulong tick)
+    {
+        if (LastGpuWriteTick < tick)
+        {
+            return false;
+        }
+
+        var whole = !RangeWriteTicks || size == 0 || (offset == 0 && size >= Size);
+        if (whole)
+        {
+            if (_wholeWriteTick < tick)
+            {
+                return false;
+            }
+        }
+        else
+        {
+            if (_blockWriteTicks is not { } ticks)
+            {
+                return false;
+            }
+
+            var last = (int)(Math.Min(offset + size - 1, Size - 1) >> WriteTickBlockShift);
+            for (var block = (int)(offset >> WriteTickBlockShift); block <= last; block++)
+            {
+                if (ticks[block] != tick)
+                {
+                    return false;
+                }
+            }
+        }
+
+        return size == 0 || offset >= Size || _writeTicks.Holds(offset, Math.Min(size, Size - offset), tick);
+    }
+
     // [local] Last writer tick per 16 KB block (SHARPEMU_RANGE_WRITE_TICKS=0 keeps one tick per buffer), so a readback of bytes
     // written in an earlier, finished batch does not wait for the batch being recorded (rt418: ~70 % of the
     // readbacks that waited for the current batch read blocks last written in a completed one).

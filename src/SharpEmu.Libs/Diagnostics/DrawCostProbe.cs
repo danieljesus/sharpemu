@@ -547,6 +547,7 @@ internal static class DrawCostProbe
         PlanProbe.Report();
         Gpu.Buffers.LiteObtainUse.Report(Gpu.Buffers.LiteObtainUse.DefaultMode); // [local] SHARPEMU_LITE_OBTAIN
         Gpu.Rendering.DrawPlan.Report(); // [local] SHARPEMU_DRAW_PLAN
+        Gpu.Buffers.BdaWriteMemo.Report(Gpu.Buffers.BdaWriteMemo.DefaultMode); // [local] SHARPEMU_BDA_WRITE_MEMO
         BdaCostProbe.Report(); // [local] SHARPEMU_BDA_COST_PROBE: at its next dispatch, on its thread
         _windowStart = Stopwatch.GetTimestamp();
     }
