@@ -25,6 +25,11 @@ internal static class DeviceDataReadsDefault
 
         // [local] SHARPEMU_DRAW_PLAN: the context group hashes follow every register write the tests make, so the plan
         // tests can turn the plan on per recorder (DrawPlan.ModeOverride). The plan itself stays off.
+        if (Environment.GetEnvironmentVariable("SHARPEMU_DRAW_PLAN") is null)
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_DRAW_PLAN", "0");
+        }
+
         if (Environment.GetEnvironmentVariable("SHARPEMU_PLAN_SHADOW") is null)
         {
             Environment.SetEnvironmentVariable("SHARPEMU_PLAN_SHADOW", "1");

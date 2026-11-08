@@ -57,11 +57,13 @@ namespace SharpEmu.Libs.Gpu.Rendering;
 // clears); layout counts the executor's layouts kept by stamp, kept by value, and resolved.
 internal static class DrawPlan
 {
+    // [local] On by default (dpv1/dpb1/dp1a/dp1b/dpb2 2026-11-08: draw_pipeline 1.22 -> 0.65 us/draw with lookup and
+    // compare, exec_targets -0.27, rec_targets -0.15; dpv1 wrong_total 0, layout_wrong 0); =0 off.
     internal static readonly int DefaultMode = Environment.GetEnvironmentVariable("SHARPEMU_DRAW_PLAN") switch
     {
-        "1" => 1,
+        "0" => 0,
         "2" => 2,
-        _ => 0,
+        _ => 1,
     };
 
     // [local] A test sets the mode for the recorders and executors it creates.
