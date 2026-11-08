@@ -61,20 +61,44 @@ public sealed class RegisterBanks
 
     public PlanGroupHashes PlanHashes => _planShadow?.Hashes ?? _planHashes;
 
-    internal void NotePlanContextWrite(uint offset, ReadOnlySpan<uint> values)
+    internal void NotePlanContextWrite(uint offset, ReadOnlySpan<uint> values) => PlanShadowForWrite().Write(offset, values);
+
+    // [local] One table entry: no span for a single value.
+    internal void NotePlanContextWrite(uint offset, uint value) => PlanShadowForWrite().Write(offset, value);
+
+    private PlanRegisterShadow PlanShadowForWrite()
     {
-        if (_planShadow is null)
+        if (_planShadow is { } shadow)
         {
-            _planShadow = new PlanRegisterShadow();
-            // A bank without a shadow holds either its base hashes (zero: nothing written since a reset) or the
-            // hashes of a state it copied without its dwords.
-            _planShadow.Hashes = _planBaseUnknown || !_planHashes.Equals(default)
-                ? PlanRegisterShadow.UniqueHashes(Interlocked.Increment(ref _planUnknownBases))
-                : default;
-            _planBaseUnknown = false;
+            return shadow;
         }
 
-        _planShadow.Write(offset, values);
+        shadow = new PlanRegisterShadow();
+        // A bank without a shadow holds either its base hashes (zero: nothing written since a reset) or the
+        // hashes of a state it copied without its dwords.
+        shadow.Hashes = _planBaseUnknown || !_planHashes.Equals(default)
+            ? PlanRegisterShadow.UniqueHashes(Interlocked.Increment(ref _planUnknownBases))
+            : default;
+        _planBaseUnknown = false;
+        _planShadow = shadow;
+        return shadow;
+    }
+
+    // [local] SHARPEMU_PLAN_SHADOW_COPY=1: CopyFrom copies the source's shadow dwords as well (a 4 KB copy per copied
+    // bank, and a new shadow whenever the copy had dropped its own because its source had none), as it did when the
+    // front's per-draw snapshot (FrontCommandStreamHost.Snapshot) cost +0.6-0.8 us and +1.2-2.4 KB allocated per draw
+    // with the shadow on (fp1b vs fp0b 2026-11-08: snapshot step 1.93/2.13 vs 1.30/1.35 us). By default it takes the hashes
+    // only, as Snapshot does: a copied bank is read (PlanHashes), never written by the register writers, so its dwords
+    // are not needed; if one were written, it would start from unique hashes (equal to no other state), not wrong ones.
+    internal static readonly bool PlanShadowCopy = Environment.GetEnvironmentVariable("SHARPEMU_PLAN_SHADOW_COPY") == "1";
+
+    // The source's hashes without its dwords, for a bank that is read and not written.
+    private void TakePlanHashesOf(RegisterBanks source)
+    {
+        var hashes = source.PlanHashes;
+        _planShadow = null;
+        _planHashes = hashes;
+        _planBaseUnknown = source._planBaseUnknown || !hashes.Equals(default);
     }
 
     // [local] SHARPEMU_DRAW_PLAN: the typed context was written without the register writers (a replayed draw's
@@ -349,7 +373,10 @@ public sealed class RegisterBanks
 
     // Copies the live banks into this instance without allocating; like Clone, the saved
     // context is not part of it.
-    public void CopyFrom(RegisterBanks source)
+    public void CopyFrom(RegisterBanks source) => CopyFrom(source, PlanShadowCopy);
+
+    // [local] copyPlanShadow: SHARPEMU_PLAN_SHADOW_COPY, a parameter so the tests run both.
+    internal void CopyFrom(RegisterBanks source, bool copyPlanShadow)
     {
         RegisterBankCopier.Copy(source.Context, Context);
         RegisterBankCopier.Copy(source.Shader, Shader);
@@ -359,7 +386,11 @@ public sealed class RegisterBanks
         IndexTypeAndSize = source.IndexTypeAndSize;
         _stamps = source._stamps;
         ForgetRaw(); // [local] SHARPEMU_STAMP_ON_CHANGE: the typed state came from elsewhere
-        if (PlanRegisterShadow.Enabled) // [local] SHARPEMU_PLAN_PROBE: the source's dwords when it has them
+        if (PlanRegisterShadow.Enabled && !copyPlanShadow) // [local] SHARPEMU_PLAN_SHADOW_COPY: the hashes only
+        {
+            TakePlanHashesOf(source);
+        }
+        else if (PlanRegisterShadow.Enabled) // [local] SHARPEMU_PLAN_PROBE: the source's dwords when it has them
         {
             if (source._planShadow is { } shadow)
             {
@@ -413,8 +444,7 @@ public sealed class RegisterBanks
         snapshot._stamps = _stamps;
         if (PlanRegisterShadow.Enabled) // [local] SHARPEMU_PLAN_PROBE: the hashes only; a snapshot is not written
         {
-            snapshot._planShadow = null;
-            snapshot._planHashes = PlanHashes;
+            snapshot.TakePlanHashesOf(this);
         }
 
         SharpEmu.Libs.Diagnostics.RegisterCopyTally.NoteSnapshot();

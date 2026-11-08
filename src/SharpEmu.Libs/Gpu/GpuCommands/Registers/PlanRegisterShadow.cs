@@ -36,12 +36,20 @@ public struct PlanGroupHashes : IEquatable<PlanGroupHashes>
 // [local] Also on with SHARPEMU_DRAW_PLAN (on by default; off only with =0), whose plans compare these hashes, and with SHARPEMU_PLAN_SHADOW=1
 // (the shadow alone: the tests turn it on so the hashes follow every register write they make). The hashes cost the
 // thread that writes the registers (the front) a mix and two XORs per written register whose value changes.
+// [local] A write reads its register's groups from one table (GroupOf, built from RegisterStamps.ContextStampOf and the
+// target addresses), and a repeated value returns before any mix; the hashes are the same as with the stamp lookup.
 public sealed class PlanRegisterShadow
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_PLAN_PROBE") == "1" ||
         Environment.GetEnvironmentVariable("SHARPEMU_DRAW_PLAN") != "0" || Environment.GetEnvironmentVariable("SHARPEMU_PLAN_SHADOW") == "1";
 
     private static readonly bool[] TargetAddress = BuildTargetAddresses();
+
+    // Per context register: the group its value hashes into (the RegisterStamp of ColorTargets, DepthTargets,
+    // ShaderInterface or ContextDynamic; PipelineState for every other register), plus FormatsBit when TargetFormats
+    // takes it too. After TargetAddress, which it reads.
+    private const byte FormatsBit = 0x80;
+    private static readonly byte[] GroupOf = BuildGroups();
 
     private readonly uint[] _values = new uint[RegisterBankLayout.ContextRegisterCount];
     private readonly ulong[] _known = new ulong[(RegisterBankLayout.ContextRegisterCount + 63) / 64];
@@ -68,36 +76,40 @@ public sealed class PlanRegisterShadow
 
     public void Write(uint register, uint value)
     {
-        if (register >= _values.Length)
+        var values = _values;
+        if (register >= (uint)values.Length)
         {
             return;
         }
 
         var word = (int)(register >> 6);
         var bit = 1UL << (int)(register & 63);
-        var delta = Mix(register, value);
+        ulong delta;
         if ((_known[word] & bit) != 0)
         {
-            var old = _values[register];
+            var old = values[register];
             if (old == value)
             {
                 return;
             }
 
-            delta ^= Mix(register, old);
+            delta = Mix(register, value) ^ Mix(register, old);
+        }
+        else
+        {
+            delta = Mix(register, value);
+            _known[word] |= bit;
         }
 
-        _known[word] |= bit;
-        _values[register] = value;
-        switch (RegisterStamps.ContextStampOf(register))
+        values[register] = value;
+        var group = GroupOf[register];
+        switch ((RegisterStamp)(group & ~FormatsBit))
         {
             case RegisterStamp.ColorTargets:
                 Hashes.ColorTargets ^= delta;
-                if (!TargetAddress[register]) Hashes.TargetFormats ^= delta;
                 break;
             case RegisterStamp.DepthTargets:
                 Hashes.DepthTargets ^= delta;
-                if (!TargetAddress[register]) Hashes.TargetFormats ^= delta;
                 break;
             case RegisterStamp.ShaderInterface:
                 Hashes.ShaderInterface ^= delta;
@@ -108,6 +120,11 @@ public sealed class PlanRegisterShadow
             default:
                 Hashes.PipelineState ^= delta;
                 break;
+        }
+
+        if ((group & FormatsBit) != 0)
+        {
+            Hashes.TargetFormats ^= delta;
         }
     }
 
@@ -153,6 +170,23 @@ public sealed class PlanRegisterShadow
     // The target registers a pipeline cannot depend on: base addresses (with their high and extension words) and
     // clear values.
     internal static bool IsTargetAddress(uint register) => register < TargetAddress.Length && TargetAddress[register];
+
+    private static byte[] BuildGroups()
+    {
+        var groups = new byte[RegisterBankLayout.ContextRegisterCount];
+        for (var register = 0u; register < groups.Length; register++)
+        {
+            var stamp = RegisterStamps.ContextStampOf(register);
+            groups[register] = stamp switch
+            {
+                RegisterStamp.ColorTargets or RegisterStamp.DepthTargets => (byte)((byte)stamp | (TargetAddress[register] ? 0 : FormatsBit)),
+                RegisterStamp.ShaderInterface or RegisterStamp.ContextDynamic => (byte)stamp,
+                _ => (byte)RegisterStamp.PipelineState,
+            };
+        }
+
+        return groups;
+    }
 
     private static bool[] BuildTargetAddresses()
     {
