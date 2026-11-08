@@ -42,7 +42,7 @@ internal static class ConservativeRecords
 
     private static readonly HashSet<ulong> Hashes = Words.Select(word => word.Hash).ToHashSet();
 
-    // [local] SHARPEMU_PRECISE_TABLE_READ (0 off by default, 1 on, 2 verify) with SHARPEMU_PRECISE_TABLE_WORDS=<hash>+<hex offset>[,...]
+    // [local] SHARPEMU_PRECISE_TABLE_READ (1 on by default, 0 off, 2 verify) with SHARPEMU_PRECISE_TABLE_WORDS=<hash>+<hex offset>[,...]
     // (default F5EB +0x50/+0x54, 4481 +0xD8..+0xE4 and 994A +0x28/+0x2C/+0x74): the =3/=4 precise read of the listed table words, without the num_records lists above.
     // A listed word's synchronizing read waits only for its own last writer tick (GuestBufferCache.TryPreciseRead), not
     // for its 16 KB block's tick, and copies only the bytes whose own writer finished; exact by construction (a byte is

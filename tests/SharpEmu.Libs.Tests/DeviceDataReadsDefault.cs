@@ -30,6 +30,12 @@ internal static class DeviceDataReadsDefault
             Environment.SetEnvironmentVariable("SHARPEMU_DRAW_PLAN", "0");
         }
 
+        // [local] SHARPEMU_BDA_WRITE_MEMO: on by default in the emulator; the tests that use it set the mode per cache.
+        if (Environment.GetEnvironmentVariable("SHARPEMU_BDA_WRITE_MEMO") is null)
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_BDA_WRITE_MEMO", "0");
+        }
+
         if (Environment.GetEnvironmentVariable("SHARPEMU_PLAN_SHADOW") is null)
         {
             Environment.SetEnvironmentVariable("SHARPEMU_PLAN_SHADOW", "1");

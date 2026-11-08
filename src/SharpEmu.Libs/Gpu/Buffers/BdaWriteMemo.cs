@@ -5,7 +5,7 @@ using System.Diagnostics;
 
 namespace SharpEmu.Libs.Gpu.Buffers;
 
-// [local] SHARPEMU_BDA_WRITE_MEMO (0 off by default, 1 on, 2 verify): a written device-address range of a dispatch
+// [local] SHARPEMU_BDA_WRITE_MEMO (1 on by default, 0 off, 2 verify): a written device-address range of a dispatch
 // (ObtainDeviceAddressRanges on the render thread; the worker slices keep the generic path) obtained again with the same
 // (base, requested size, conservative) in the same submission tick answers from the first obtain instead of repeating it.
 // In GTA V's open world (bdc1) 6A53 and 10CD take ~11,500 written ranges per frame (~251 per dispatch), w_obtain 9.7 ms/f.
@@ -60,7 +60,7 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 internal static class BdaWriteMemo
 {
     internal static readonly int DefaultMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_WRITE_MEMO"), out var mode) ? mode : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_WRITE_MEMO"), out var mode) ? mode : 1; // [local] on by default (bwv2 2026-11-08: wrong_total 0, hits 93 % with re-tick; bwr1/bwr2 vs bwb3/bwb4: res_ranges 5.9 -> 2.3 us/dispatch); =0 off
 
     internal static readonly bool Retick = Environment.GetEnvironmentVariable("SHARPEMU_BDA_WRITE_MEMO_RETICK") != "0";
 
