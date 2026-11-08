@@ -487,10 +487,13 @@ public static partial class ResourceMaterializer
                 return MaterializeFastFromSnapshot(plan, inputs, ref snapshot, ref specialization, out failure);
             }
 
+            MaterializeProbe.Lap(MaterializeProbe.Step.Emit); // [local] SHARPEMU_DRAWCOST_PROBE
             _programRuns.Increment();
             _fastMaterializations.Increment();
             _lastFastOutcome = MaterializationTally.Outcome.FastMiss;
-            return MaterializeFromOutput(plan, inputs, output, ref snapshot, ref specialization, out failure);
+            var materialized = MaterializeFromOutput(plan, inputs, output, ref snapshot, ref specialization, out failure);
+            MaterializeProbe.Lap(MaterializeProbe.Step.Output); // [local]
+            return materialized;
         }
         finally
         {

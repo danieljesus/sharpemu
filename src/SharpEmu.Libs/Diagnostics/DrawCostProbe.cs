@@ -64,6 +64,16 @@ internal static class DrawCostProbe
         // input of a rebound or resolved compute program, the resource materialization (with its guest reads), the
         // permutation and stage resources. What follows them up to the lap below is the step that holds them.
         ProgramRebind,
+        // [local] Inside the materialization (the hooks of ShaderCompiler's MaterializeProbe): the resolution's prelude up
+        // to the materializer (inputs, gates, profile scopes), then the program's set-up, its levels' guest reads and
+        // scalar steps, the output words and checks, the snapshot assembly. ProgramMaterialize keeps what follows them
+        // (the tallies and probes after the materializer, or the whole of a materialization that is not the fast one).
+        MaterializePrelude,
+        MaterializeSetup,
+        MaterializeReads,
+        MaterializeSteps,
+        MaterializeEmit,
+        MaterializeOutput,
         ProgramMaterialize,
         ProgramStage,
         // Dispatch: the executor's resolution.
@@ -176,6 +186,27 @@ internal static class DrawCostProbe
         FastMemoSkipped,
         MaterializeCacheHit,
         MaterializeFull,
+        // [local] The materialization program's guest reads (ShaderCompiler's MaterializeProbe.Counter, in its order):
+        // runs of adjacent words, their words, refused runs, words read one by one, SHARPEMU_PAGE_SPAN_READS's spans,
+        // their words, refused spans, the reader calls the spans saved and, with that switch off, could have saved.
+        MatRuns,
+        MatRunWords,
+        MatRunRefused,
+        MatWords,
+        MatSpans,
+        MatSpanWords,
+        MatSpanRefused,
+        MatSpanCallsSaved,
+        MatSpanCallsPossible,
+        // [local] The render thread's word reads (TryReadGuestWord): through a clean page's alias, from guest memory after
+        // the ownership checks, GPU-owned (the table word memo, the mirror or a synchronization), synchronized. And the
+        // render thread's resident reads (TryReadResidentGuestBytes) and the ones it refused.
+        ReadWordAlias,
+        ReadWordPlain,
+        ReadWordDirty,
+        ReadWordSync,
+        ReadResident,
+        ReadResidentRefused,
         AllocatedBytes,
         Count,
     }
@@ -285,6 +316,7 @@ internal static class DrawCostProbe
         var thread = Environment.CurrentManagedThreadId;
         if (_thread == 0)
         {
+            InstallMaterializeHooks(); // [local] before any item of this thread materializes
             _thread = thread;
             _windowStart = Stopwatch.GetTimestamp();
             TakeProcessCounters(out _, out _, out _, out _);
@@ -322,6 +354,14 @@ internal static class DrawCostProbe
         _allocated = GC.GetAllocatedBytesForCurrentThread();
         _lastAllocated = _allocated;
         _ring = Gpu.Vulkan.CommandRing.Active?.Produced ?? 0;
+    }
+
+    // [local] ShaderCompiler's laps and counts of the materialization program, mapped onto this probe's steps and counters
+    // (both enums keep ShaderCompiler's order from MaterializeSetup and MatRuns).
+    private static void InstallMaterializeHooks()
+    {
+        SharpEmu.ShaderCompiler.Resources.MaterializeProbe.LapHook ??= static step => Lap((Step)((int)Step.MaterializeSetup + (int)step));
+        SharpEmu.ShaderCompiler.Resources.MaterializeProbe.CountHook ??= static (counter, amount) => Count((Counter)((int)Counter.MatRuns + (int)counter), amount);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
