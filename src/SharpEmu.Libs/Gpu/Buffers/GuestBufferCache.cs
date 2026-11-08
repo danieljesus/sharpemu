@@ -2647,6 +2647,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             if (mapping != _bdaSweepMapping || (epoch != _bdaSweepEpoch && (!ObservationGated || _observation != _bdaSweepObservation)))
             {
                 var walkScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DispatchBdaWalk); // [local]
+                var walkStarted = Diagnostics.BdaWalkProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
                 if (BdaSweepPlan && (!_bdaSweepPlanBuilt || mapping != _bdaSweepPlanMapping))
                 {
                     _bdaSweepPlan = GuestPageTracker.PlanSweep(spans);
@@ -2677,6 +2678,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
                 finally
                 {
                     walkScope.Dispose();
+                    if (walkStarted != 0) Diagnostics.BdaWalkProbe.NoteSweep(walkStarted); // [local]
                     Diagnostics.BdaCostProbe.Lap(Diagnostics.BdaCostProbe.Step.BdaWalk); // [local] SHARPEMU_BDA_COST_PROBE
                     using var closeScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DispatchBdaClose); // [local]
                     DiscardClearedRuns();
@@ -2908,6 +2910,8 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     // The upload half of SynchronizeBuffersInRange, for a range that may hold CPU-dirty pages.
     private void UploadDirtyBuffersInRange(ulong guestAddress, ulong size)
     {
+        var callbackStarted = Diagnostics.BdaWalkProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+        var visitedBefore = Diagnostics.BdaWalkProbe.Buffers;
         var end = guestAddress + size;
         var index = _registry.FindFirstOverlappingIndex(guestAddress);
         for (; index < _registry.RegisteredCount && _registry.GetRegisteredAddress(index) < end; index++)
@@ -2915,9 +2919,16 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             var buffer = _registry.GetBuffer(_registry.GetRegisteredIdentifier(index));
             var start = Math.Max(buffer.CpuAddress, guestAddress);
             var finish = Math.Min(buffer.CpuAddress + buffer.Size, end);
+            if (Diagnostics.BdaWalkProbe.Enabled) Diagnostics.BdaWalkProbe.Buffers++; // [local]
             if (start < finish && _tracker.MayHaveCpuDirtyPages(start, finish - start))
+            {
+                var started = Diagnostics.BdaWalkProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
                 _ = SynchronizeBuffer(buffer, start, finish - start, false, false, preserveCpuWriteHotPages: BdaPreserveHot);
+                if (started != 0) Diagnostics.BdaWalkProbe.NoteSync(started, finish - start); // [local]
+            }
         }
+
+        if (callbackStarted != 0) Diagnostics.BdaWalkProbe.NoteRange(callbackStarted, size, Diagnostics.BdaWalkProbe.Buffers == visitedBefore); // [local]
     }
 
     // A visited buffer's copies wait for the end of the sweep. The tracker has protected its pages
