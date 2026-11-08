@@ -97,6 +97,8 @@ internal static class ResolveProfile
 
     private static double _tscHz;
     private static ulong _windowCycles;
+    private static long _windowKernel;
+    private static long _windowUser;
     private static long _windowAllocated;
     private static int[] _gcCounts = new int[3];
     private static TimeSpan _gcPause;
@@ -111,6 +113,14 @@ internal static class ResolveProfile
     private static extern nint GetCurrentThread();
 
     private static ulong ThreadCycles() => QueryThreadCycleTime(GetCurrentThread(), out var cycles) ? cycles : 0;
+
+    [DllImport("kernel32.dll")]
+    private static extern bool GetThreadTimes(nint thread, out long creation, out long exit, out long kernel, out long user);
+
+    // [local] The render thread's kernel and user time in 100 ns units (clock-tick granular, fine over a 5 s window):
+    // page faults, VirtualProtect and the other system calls land in kernel.
+    private static (long Kernel, long User) ThreadTimes() =>
+        GetThreadTimes(GetCurrentThread(), out _, out _, out var kernel, out var user) ? (kernel, user) : (0, 0);
 
     // Phase scopes, called by RenderPhaseProfile.Measure and Scope.Dispose when Enabled.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -251,6 +261,7 @@ internal static class ResolveProfile
     {
         _windowStarted = true;
         _windowCycles = ThreadCycles();
+        (_windowKernel, _windowUser) = ThreadTimes();
         _windowAllocated = GC.GetAllocatedBytesForCurrentThread();
         for (var gen = 0; gen < 3; gen++)
             _gcCounts[gen] = GC.CollectionCount(gen);
@@ -291,6 +302,9 @@ internal static class ResolveProfile
         var f = (double)frames;
         var cyclesNow = ThreadCycles();
         var windowCycles = cyclesNow - _windowCycles;
+        var (kernelNow, userNow) = ThreadTimes();
+        var kernelMs = (kernelNow - _windowKernel) / 1e4;
+        var userMs = (userNow - _windowUser) / 1e4;
         var renderAllocated = GC.GetAllocatedBytesForCurrentThread() - _windowAllocated;
         var gc = new int[3];
         for (var gen = 0; gen < 3; gen++)
@@ -310,7 +324,7 @@ internal static class ResolveProfile
         var sampledWallMs = Ms(_sampledTicks);
         var sampledCpuMs = _tscHz > 0 ? _sampledCycles * 1000.0 / _tscHz : double.NaN;
         var threadCpuMs = _tscHz > 0 ? windowCycles * 1000.0 / _tscHz : double.NaN;
-        yield return Inv($"[PERF][RESOLVE] frames={frames} phase_frames={phaseFrames} window_s={seconds:F1} scope_ns={scopeNs:F1} charges_per_frame={windowCharges / f:F0} profiler_est_ms={windowCharges / 2.0 * scopeNs / 1e6 / f:F2} tsc_ghz={_tscHz / 1e9:F3} thread_cpu_ms={threadCpuMs / f:F2} wall_ms={seconds * 1000.0 / f:F2} draws={_draws / f:F0} dispatches={_dispatches / f:F0} draw_ms={Ms(_drawTicks) / f:F2} dispatch_ms={Ms(_dispatchTicks) / f:F2} sample_every={SampleEvery} sampled={_sampled} sampled_wall_ms={sampledWallMs:F1} sampled_cpu_ms={sampledCpuMs:F1} offcpu_pct={(sampledWallMs > 0 ? 100.0 * (1 - sampledCpuMs / sampledWallMs) : double.NaN):F1} gc0={gc[0]} gc1={gc[1]} gc2={gc[2]} gc_pause_ms={gcPause.TotalMilliseconds / f:F2} alloc_mb={gcAllocated / 1048576.0 / f:F2} render_alloc_kb={renderAllocated / 1024.0 / f:F0} monitor_contention={contention / f:F1} rl_tracker_waits={waits[0] / f:F2} rl_tracker_wait_ms={Ms(waitTicks[0]) / f:F3} rl_image_waits={waits[2] / f:F2} rl_image_wait_ms={Ms(waitTicks[2]) / f:F3} rl_other_thread_waits={(waits[1] + waits[3]) / f:F2} rl_other_thread_wait_ms={Ms(waitTicks[1] + waitTicks[3]) / f:F3}");
+        yield return Inv($"[PERF][RESOLVE] frames={frames} phase_frames={phaseFrames} window_s={seconds:F1} scope_ns={scopeNs:F1} charges_per_frame={windowCharges / f:F0} profiler_est_ms={windowCharges / 2.0 * scopeNs / 1e6 / f:F2} tsc_ghz={_tscHz / 1e9:F3} thread_cpu_ms={threadCpuMs / f:F2} kernel_ms={kernelMs / f:F2} user_ms={userMs / f:F2} wall_ms={seconds * 1000.0 / f:F2} draws={_draws / f:F0} dispatches={_dispatches / f:F0} draw_ms={Ms(_drawTicks) / f:F2} dispatch_ms={Ms(_dispatchTicks) / f:F2} sample_every={SampleEvery} sampled={_sampled} sampled_wall_ms={sampledWallMs:F1} sampled_cpu_ms={sampledCpuMs:F1} offcpu_pct={(sampledWallMs > 0 ? 100.0 * (1 - sampledCpuMs / sampledWallMs) : double.NaN):F1} gc0={gc[0]} gc1={gc[1]} gc2={gc[2]} gc_pause_ms={gcPause.TotalMilliseconds / f:F2} alloc_mb={gcAllocated / 1048576.0 / f:F2} render_alloc_kb={renderAllocated / 1024.0 / f:F0} monitor_contention={contention / f:F1} rl_tracker_waits={waits[0] / f:F2} rl_tracker_wait_ms={Ms(waitTicks[0]) / f:F3} rl_image_waits={waits[2] / f:F2} rl_image_wait_ms={Ms(waitTicks[2]) / f:F3} rl_other_thread_waits={(waits[1] + waits[3]) / f:F2} rl_other_thread_wait_ms={Ms(waitTicks[1] + waitTicks[3]) / f:F3}");
 
         yield return Inv($"[PERF][RESOLVE_BIND] frames={frames} prepares={_prepares / f:F0} images={_images / f:F0} storage_images={_storageImages / f:F0} samplers={_samplers / f:F0} buffers={_buffers / f:F0} null_buffers={_nullBuffers / f:F0} device_ranges={_deviceRanges / f:F0} find_texture={FindImageRoles[0] / f:F0} find_storage={FindImageRoles[1] / f:F0} find_color={FindImageRoles[2] / f:F0} find_depth={FindImageRoles[3] / f:F0} find_display={FindImageRoles[4] / f:F0} find_outside_draws={_findImageOutside / f:F0}");
 
