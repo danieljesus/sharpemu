@@ -9,7 +9,7 @@ using SharpEmu.Libs.Gpu.GpuCommands.Registers;
 
 namespace SharpEmu.Libs.Gpu.Rendering;
 
-// [local] SHARPEMU_DRAW_PLAN (0 off by default, 1 on, 2 verify): stage 1 of the plan per draw shape (option B of
+// [local] SHARPEMU_DRAW_PLAN (1 on by default, 0 off, 2 verify): stage 1 of the plan per draw shape (option B of
 // sharpemu-rediseno-draws.md, §4.5): on the render thread, the state decisions of a draw are taken from the last draw
 // of the same shape when the inputs they were made from are equal by value.
 //
