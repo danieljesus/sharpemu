@@ -36,6 +36,7 @@ public sealed class LiteObtainTests : IClassFixture<HeadlessVulkanFixture>, IDis
     private static (CacheHarness Harness, ulong Address, GpuBuffer Buffer) CleanBuffer(HeadlessVulkan vulkan, ulong mapped = 0x10000)
     {
         var harness = new CacheHarness(vulkan);
+        harness.Cache.LiteObtainMode = 0;
         var address = harness.MapBacked(mapped, ReadWrite);
         harness.Write(address, Pattern(0x10000, 1));
         var (buffer, _) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(address, 0x10000, isWritten: false));

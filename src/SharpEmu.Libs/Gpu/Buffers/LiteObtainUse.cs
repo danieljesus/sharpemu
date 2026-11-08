@@ -43,7 +43,7 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 internal static class LiteObtainUse
 {
     internal static readonly int DefaultMode =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_LITE_OBTAIN"), out var mode) ? mode : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_LITE_OBTAIN"), out var mode) ? mode : 1; // [local] on by default (lb0b/lb1a/lb1b 2026-11-08: -0.3-0.4 us/draw; lb2: wrong_total 0); =0 off
 
     private const int DumpLimit = 20;
 
@@ -110,7 +110,7 @@ internal static class LiteObtainUse
     // =2 without the DRAWCOST window: a line every 5 s from the verified obtains.
     internal static void MaybeReport()
     {
-        if (Diagnostics.DrawCostProbe.Enabled)
+        if (DefaultMode != 2 || Diagnostics.DrawCostProbe.Enabled)
         {
             return;
         }
