@@ -1010,8 +1010,19 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadEnter); // [local] SHARPEMU_DRAWCOST_PROBE
+            return ReadWordOnRender(address, out word, conservativeVerify, conservativePrecise, preciseInFlight, rangeChecked: false);
+        }
+
+        // [local] SHARPEMU_DIRTY_RUN_READS: TryReadGuestWord's render-thread body, shared with the run reader. rangeChecked: the
+        // caller established, for a mapped range holding the word, that no publication is pending over it after completing
+        // the ones that were, so the word's own completion and mapping check are skipped: they would find nothing to do.
+        private bool ReadWordOnRender(ulong address, out uint word, bool conservativeVerify, bool conservativePrecise, bool preciseInFlight, bool rangeChecked)
+        {
             word = 0;
-            CompletePendingPublicationsForResourceRead(address, sizeof(uint));
+            if (!rangeChecked)
+                CompletePendingPublicationsForResourceRead(address, sizeof(uint));
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadPublications); // [local] SHARPEMU_DRAWCOST_PROBE
             var synchronized = false;
             if (IsCleanReadPage(address, sizeof(uint)))
             {
@@ -1020,6 +1031,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 {
                     word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cachedBytes);
                     Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordAlias); // [local] SHARPEMU_DRAWCOST_PROBE
+                    Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadCopy); // [local]
                     return true;
                 }
             }
@@ -1030,10 +1042,12 @@ internal static unsafe partial class VulkanVideoPresenter
                 // page tracker: it treats that as an emulator invariant violation and
                 // terminates the process.  A failed read lets the materializer reject or
                 // specialize the source normally.
-                if (!_guestMemory.CanRead(address, sizeof(uint)))
+                if (!rangeChecked && !_guestMemory.CanRead(address, sizeof(uint))) // [local] SHARPEMU_DIRTY_RUN_READS: the run's check stands for it
                 {
                     return false;
                 }
+
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadPage); // [local] SHARPEMU_DRAWCOST_PROBE
 
                 if (SpeculativeTableReads != 0 && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint)) &&
                     !_bufferCache.HasPreciseGpuDirtyBytes(address, sizeof(uint))) // [local] dirty only through a broad binding
@@ -1073,6 +1087,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var fastHit = Gpu.Buffers.TableWordMemo.FastHit; // [local] SHARPEMU_TABLE_WORD_MEMO_FAST_HIT
                 var gpuDirty = !NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint));
                 if (gpuDirty) Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordDirty); // [local] SHARPEMU_DRAWCOST_PROBE
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadDirty); // [local]
                 if (fastHit && gpuDirty && Gpu.Buffers.TableWordMemo.Enabled && Gpu.Buffers.TableWordMemo.Mode == 1)
                 {
                     if (Gpu.Buffers.TableWordMemo.TryAnswer(address, out memoValue, out var audit, out var speculated))
@@ -1094,8 +1109,16 @@ internal static unsafe partial class VulkanVideoPresenter
                         Gpu.Buffers.TableWordMemo.NoteHit();
                         if (Gpu.Buffers.TableWordMemo.Mode == 1)
                         {
-                            if (Gpu.Buffers.TableWordMemo.NoteAnsweredHit(address, out var speculated)) // [local] SHARPEMU_TABLE_WORD_MEMO_AUDIT
+                            var auditHit = Gpu.Buffers.TableWordMemo.NoteAnsweredHit(address, out var speculated);
+                            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordMemo); // [local] SHARPEMU_DRAWCOST_PROBE
+                            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadMemo); // [local]
+                            if (auditHit) // [local] SHARPEMU_TABLE_WORD_MEMO_AUDIT
+                            {
                                 _bufferCache.AuditMemoWord(address, memoValue, speculated);
+                                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordAudit); // [local] SHARPEMU_DRAWCOST_PROBE
+                                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadAudit); // [local]
+                            }
+
                             if (speculated && Gpu.Buffers.CutPolicy.Words) // [local] SHARPEMU_CUT_POLICY=1
                                 _bufferCache.NoteCutWord(address);
                             if (speculated && Gpu.Buffers.TableWordMemo.LearnFlush) // [local] SHARPEMU_TABLE_WORD_MEMO_LEARN_FLUSH
@@ -1123,6 +1146,8 @@ internal static unsafe partial class VulkanVideoPresenter
                     if (_bufferCache.TryReadMirrored(address, mirrored))
                     {
                         word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(mirrored);
+                        Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordMirror); // [local] SHARPEMU_DRAWCOST_PROBE
+                        Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadSync); // [local]
                         return true;
                     }
 
@@ -1220,6 +1245,8 @@ internal static unsafe partial class VulkanVideoPresenter
                             Gpu.Buffers.TableWordMemo.Store(address, syncedWord);
                         }
                     }
+
+                    Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadSync); // [local] SHARPEMU_DRAWCOST_PROBE
                 }
                 else
                 {
@@ -1247,6 +1274,7 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             if (conservativeVerify) Gpu.Buffers.ConservativeRecords.Verify(word); // [local]
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ReadCopy); // [local] SHARPEMU_DRAWCOST_PROBE
             return true;
         }
 
@@ -1255,6 +1283,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private void CompletePendingPublicationsForResourceRead(ulong address, ulong size)
         {
             if (!HasPendingMemoryPublication(address, size)) return;
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.PublicationCompletions); // [local] SHARPEMU_DRAWCOST_PROBE
             if (OnResolveWorker)
                 throw new Gpu.GpuCommands.SerialResolveRequiredException("pending publication read");
             CompleteOverlappingPublications(address, size);
@@ -1581,18 +1610,69 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadResident); // [local] SHARPEMU_DRAWCOST_PROBE
-            if (!ResidentReadAllowed(address, size, clean))
+            var allowed = ResidentReadAllowed(address, size, clean);
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResidentChecks); // [local]
+            if (!allowed)
             {
                 Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadResidentRefused); // [local]
                 return false;
             }
 
-            if (TryReadAliasBytes(address, destination))
+            var copied = TryReadAliasBytes(address, destination) || _guestMemory.TryRead(address, destination);
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResidentCopy); // [local] SHARPEMU_DRAWCOST_PROBE
+            return copied;
+        }
+
+        // [local] SHARPEMU_DIRTY_RUN_READS (see DirtyRunReads): one run of adjacent words on the render thread, answered as the
+        // resident read and then the word reader answer it in the old path. The resident read's checks run once over the
+        // run (ResidentReadAllowed, completing the publications pending over it); allowed, the bytes are copied as there.
+        // Refused because GPU-owned bytes lie in it, each word is answered by the word reader's own render-thread body
+        // (ReadWordOnRender) with its conservative-record flags computed as TryReadGuestWord computes them; the run's
+        // completion and mapping check stand for each word's, so the run is refused instead when a publication is still
+        // pending over it or it is not mapped (the old path then reads it, and finds the same). Refused too whenever the
+        // word reader would take a side path: TLAS HLE consumer notes, conservative records (sentinels, verification),
+        // watched bounds. Every other thread reads its runs as before (OtherThread).
+        public ResidentRunRead TryReadResidentGuestRun(ulong address, Span<byte> destination, ReadOnlySpan<ulong> wordAddresses, Span<uint> words, Span<bool> ok)
+        {
+            if (OnResolveWorker || OnCommandThread || OnFrontThread)
             {
-                return true;
+                return ResidentRunRead.OtherThread;
             }
 
-            return _guestMemory.TryRead(address, destination);
+            if (Gpu.Buffers.TlasHle.Instance is not null || Gpu.Buffers.ConservativeRecords.Mode != 0 || WatchedBounds.Count != 0 || !LazyBackReads)
+            {
+                return ResidentRunRead.Refused;
+            }
+
+            var size = (ulong)destination.Length;
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadResident); // [local] SHARPEMU_DRAWCOST_PROBE
+            if (ResidentReadAllowed(address, size, clean: false))
+            {
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResidentChecks); // [local]
+                var copied = TryReadAliasBytes(address, destination) || _guestMemory.TryRead(address, destination);
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.ResidentCopy); // [local]
+                return copied ? ResidentRunRead.Bytes : ResidentRunRead.Refused;
+            }
+
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadResidentRefused); // [local] SHARPEMU_DRAWCOST_PROBE
+            if (HasPendingMemoryPublication(address, size) || !_guestMemory.CanRead(address, size))
+            {
+                Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.RunChecks); // [local]
+                return ResidentRunRead.Refused;
+            }
+
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.RunChecks); // [local]
+            for (var index = 0; index < wordAddresses.Length; index++)
+            {
+                var word = wordAddresses[index];
+                using var profile = ResourceMaterializationProfile.Measure(ResourceMaterializationProfile.Phase.GuestRead);
+                var precise = Gpu.Buffers.ConservativeRecords.PreciseTableMode != 0 &&
+                    Gpu.Buffers.ConservativeRecords.MatchesPrecise(Gpu.Buffers.ConservativeRecords.CurrentReader, SharpEmu.ShaderCompiler.Resources.SrtReadProbe.CurrentBaseAddress, word);
+                ok[index] = ReadWordOnRender(word, out words[index], conservativeVerify: false, conservativePrecise: precise, preciseInFlight: precise,
+                    rangeChecked: true);
+            }
+
+            return ResidentRunRead.Words;
         }
 
         // [local] SHARPEMU_PAGE_SPAN_READS (see PageSpanReads): the render thread's resident read of one span of a 4 KB
@@ -1627,10 +1707,21 @@ internal static unsafe partial class VulkanVideoPresenter
             CompletePendingPublicationsForResourceRead(address, size);
             if (clean || !IsCleanReadPage(address, size))
             {
-                if (!_guestMemory.CanRead(address, size) ||
-                    _bufferCache.HasGpuDirtyBytes(address, size) ||
-                    (clean && (_bufferCache.HasGpuDirtyPages(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size))))
+                if (!_guestMemory.CanRead(address, size))
                 {
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ResidentRefusedUnmapped); // [local] SHARPEMU_DRAWCOST_PROBE
+                    return false;
+                }
+
+                if (_bufferCache.HasGpuDirtyBytes(address, size))
+                {
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ResidentRefusedDirty); // [local] SHARPEMU_DRAWCOST_PROBE
+                    return false;
+                }
+
+                if (clean && (_bufferCache.HasGpuDirtyPages(address, size) || _imageCache.HasGpuModifiedImageBytes(address, size)))
+                {
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ResidentRefusedCleanOnly); // [local] SHARPEMU_DRAWCOST_PROBE
                     return false;
                 }
 

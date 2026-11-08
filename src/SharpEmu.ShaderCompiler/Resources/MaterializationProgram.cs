@@ -54,6 +54,20 @@ internal sealed class MaterializationProgram
         public byte[] Bytes = new byte[1024];
         public int Count;
         public ulong PlanHash; // [local] SHARPEMU_PAGE_SPAN_READS=2: names the plan in a wrong span's dump
+        public ulong[] RunAddresses = new ulong[16]; // [local] SHARPEMU_DIRTY_RUN_READS: a run's word reads and answers
+        public uint[] RunWords = new uint[16];
+        public bool[] RunOk = new bool[16];
+
+        public void EnsureRun(int words)
+        {
+            if (RunAddresses.Length < words)
+            {
+                var length = Math.Max(words, RunAddresses.Length * 2);
+                RunAddresses = new ulong[length];
+                RunWords = new uint[length];
+                RunOk = new bool[length];
+            }
+        }
 
         public void Ensure(int registers)
         {
@@ -767,22 +781,145 @@ internal sealed class MaterializationProgram
         if (words >= MinimumRunWords && resident is not null && inputs.ReadMemory is not null)
         {
             MaterializeProbe.Count(MaterializeProbe.Counter.Runs); // [local] SHARPEMU_DRAWCOST_PROBE
-            if (ReadRun(resident, inputs.ReadsClean, scratch, start, end))
+            // [local] SHARPEMU_DIRTY_RUN_READS: =1 reads the run through the host first; =2 reads it as before, then compares.
+            var runMode = inputs.ReadResidentRun is not null && !inputs.ReadsClean && !DirtyRunReads.OtherThread ? DirtyRunReads.Mode : 0;
+            if (runMode == 1 && ReadRunThroughHost(inputs, scratch, start, end))
             {
-                MaterializeProbe.Count(MaterializeProbe.Counter.RunWords, end - start); // [local]
                 return end;
             }
 
-            MaterializeProbe.Count(MaterializeProbe.Counter.RunRefused); // [local]
+            if (ReadRun(resident, inputs.ReadsClean, scratch, start, end))
+            {
+                MaterializeProbe.Count(MaterializeProbe.Counter.RunWords, end - start); // [local]
+            }
+            else
+            {
+                MaterializeProbe.Count(MaterializeProbe.Counter.RunRefused); // [local]
+                ReadWords(inputs, scratch, start, end);
+            }
+
+            if (runMode == 2)
+            {
+                VerifyRun(inputs, scratch, start, end);
+            }
+
+            return end;
         }
 
-        MaterializeProbe.Count(MaterializeProbe.Counter.Words, end - start); // [local]
+        ReadWords(inputs, scratch, start, end);
+        return end;
+    }
+
+    private static void ReadWords(ResourceRuntimeInputs inputs, Scratch scratch, int start, int end)
+    {
+        MaterializeProbe.Count(MaterializeProbe.Counter.Words, end - start); // [local] SHARPEMU_DRAWCOST_PROBE
         for (var index = start; index < end; index++)
         {
-            ReadWord(inputs, addresses[index], bases[index], scratch.Absolute[index], scratch.Targets[index], scratch.Values, scratch.Valid);
+            ReadWord(inputs, scratch.Addresses[index], scratch.NullBases[index], scratch.Absolute[index], scratch.Targets[index], scratch.Values, scratch.Valid);
+        }
+    }
+
+    // [local] SHARPEMU_DIRTY_RUN_READS: the run through the host's run reader, into the scratch's run buffers.
+    private static ResidentRunRead ReadRunOnHost(ResourceRuntimeInputs inputs, Scratch scratch, int start, int end, out Span<byte> bytes)
+    {
+        var addresses = scratch.Addresses;
+        var first = addresses[start];
+        var length = checked((int)(addresses[end - 1] - first) + sizeof(uint));
+        if (scratch.Bytes.Length < length)
+        {
+            scratch.Bytes = new byte[Math.Max(length, scratch.Bytes.Length * 2)];
         }
 
-        return end;
+        var words = end - start;
+        scratch.EnsureRun(words);
+        Array.Copy(addresses, start, scratch.RunAddresses, 0, words);
+        bytes = scratch.Bytes.AsSpan(0, length);
+        var outcome = inputs.ReadResidentRun!(first, bytes, scratch.RunAddresses.AsSpan(0, words), scratch.RunWords.AsSpan(0, words), scratch.RunOk.AsSpan(0, words));
+        DirtyRunReads.Note(outcome, words);
+        return outcome;
+    }
+
+    // [local] SHARPEMU_DIRTY_RUN_READS=1: true when the host answered the run (its bytes, or each word as the word reader).
+    private static bool ReadRunThroughHost(ResourceRuntimeInputs inputs, Scratch scratch, int start, int end)
+    {
+        var outcome = ReadRunOnHost(inputs, scratch, start, end, out var bytes);
+        if (outcome is not (ResidentRunRead.Bytes or ResidentRunRead.Words))
+        {
+            return false;
+        }
+
+        var first = scratch.Addresses[start];
+        for (var index = start; index < end; index++)
+        {
+            var target = scratch.Targets[index];
+            if (outcome == ResidentRunRead.Bytes)
+            {
+                scratch.Values[target] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes[(int)(scratch.Addresses[index] - first)..]);
+                scratch.Valid[target] = true;
+            }
+            else
+            {
+                AssignWord(inputs, scratch.RunOk[index - start], scratch.RunWords[index - start], scratch.NullBases[index], scratch.Absolute[index], target,
+                    scratch.Values, scratch.Valid);
+            }
+        }
+
+        return true;
+    }
+
+    // [local] SHARPEMU_DIRTY_RUN_READS=2: the host's answer for the run against the one the old path left.
+    private static void VerifyRun(ResourceRuntimeInputs inputs, Scratch scratch, int start, int end)
+    {
+        var outcome = ReadRunOnHost(inputs, scratch, start, end, out var bytes);
+        if (outcome is not (ResidentRunRead.Bytes or ResidentRunRead.Words))
+        {
+            return;
+        }
+
+        DirtyRunReads.NoteVerified();
+        var first = scratch.Addresses[start];
+        for (var index = start; index < end; index++)
+        {
+            var target = scratch.Targets[index];
+            var address = scratch.Addresses[index];
+            bool hostValid;
+            uint hostWord;
+            if (outcome == ResidentRunRead.Bytes)
+            {
+                hostValid = true;
+                hostWord = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes[(int)(address - first)..]);
+            }
+            else if (scratch.RunOk[index - start])
+            {
+                hostValid = true;
+                hostWord = scratch.RunWords[index - start];
+            }
+            else
+            {
+                hostValid = FailedWordValid(inputs, scratch.NullBases[index], scratch.Absolute[index]);
+                hostWord = 0;
+            }
+
+            var realValid = scratch.Valid[target];
+            var realWord = (uint)scratch.Values[target];
+            if (realValid == hostValid && (!realValid || realWord == hostWord))
+            {
+                continue;
+            }
+
+            var rereadOk = inputs.ReadMemory!(address, out var reread);
+            if (realValid && hostValid && rereadOk && reread == hostWord)
+            {
+                DirtyRunReads.NoteRaced();
+                continue;
+            }
+
+            if (DirtyRunReads.NoteWrong())
+            {
+                DirtyRunReads.Dump(realValid != hostValid ? "validity" : "wrong", scratch.PlanHash, first, bytes.Length, outcome, address,
+                    scratch.NullBases[index], realValid, realWord, hostValid, hostWord, rereadOk, reread);
+            }
+        }
     }
 
     private static int UnitEnd(ulong[] addresses, ulong[] bases, int start, int limit, out int words)
@@ -939,7 +1076,21 @@ internal sealed class MaterializationProgram
 
     private static void ReadWord(ResourceRuntimeInputs inputs, ulong address, ulong baseAddress, bool absolute, int target, ulong[] values, bool[] valid)
     {
-        if (inputs.ReadMemory is not null && inputs.ReadMemory(address, out var word))
+        var ok = false;
+        var word = 0u;
+        if (inputs.ReadMemory is not null)
+        {
+            ok = inputs.ReadMemory(address, out word);
+        }
+
+        AssignWord(inputs, ok, word, baseAddress, absolute, target, values, valid);
+    }
+
+    // A word read's answer as the program keeps it: the word, or after a failed read zero, valid for a null base or an
+    // absolute read the word reader may refuse.
+    private static void AssignWord(ResourceRuntimeInputs inputs, bool ok, uint word, ulong baseAddress, bool absolute, int target, ulong[] values, bool[] valid)
+    {
+        if (ok)
         {
             values[target] = word;
             valid[target] = true;
@@ -947,6 +1098,9 @@ internal sealed class MaterializationProgram
         }
 
         values[target] = 0;
-        valid[target] = (baseAddress & ~3ul) == 0 || (absolute && inputs.ReadMemory is not null && !inputs.ReadsClean);
+        valid[target] = FailedWordValid(inputs, baseAddress, absolute);
     }
+
+    private static bool FailedWordValid(ResourceRuntimeInputs inputs, ulong baseAddress, bool absolute) =>
+        (baseAddress & ~3ul) == 0 || (absolute && inputs.ReadMemory is not null && !inputs.ReadsClean);
 }

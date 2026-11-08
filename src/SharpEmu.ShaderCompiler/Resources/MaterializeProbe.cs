@@ -21,7 +21,9 @@ namespace SharpEmu.ShaderCompiler.Resources;
 // = the runs the resident reader refused (their words then went one by one), Words = the words read one by one
 // (singles and refused runs). Spans/SpanWords/SpanRefused = SHARPEMU_PAGE_SPAN_READS's span reads, their words and the
 // spans refused; SpanCallsSaved = the reader calls the read spans replaced (units - 1 each); SpanCallsPossible = with
-// the switch off, the calls spans would have saved at the configured span size.
+// the switch off, the calls spans would have saved at the configured span size. RunReads/RunReadBytes/RunReadWords/
+// RunReadRefused = SHARPEMU_DIRTY_RUN_READS's host run reads, the ones answered as bytes, the words answered one by one
+// by the host, and the runs it refused (then read as before).
 public static class MaterializeProbe
 {
     public static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_DRAWCOST_PROBE") == "1";
@@ -46,6 +48,10 @@ public static class MaterializeProbe
         SpanRefused,
         SpanCallsSaved,
         SpanCallsPossible,
+        RunReads,
+        RunReadBytes,
+        RunReadWords,
+        RunReadRefused,
     }
 
     public static Action<Step>? LapHook;
