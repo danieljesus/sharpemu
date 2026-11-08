@@ -2648,6 +2648,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             {
                 var walkScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DispatchBdaWalk); // [local]
                 var walkStarted = Diagnostics.BdaWalkProbe.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0; // [local]
+                if (DirtyLogProbe.Enabled) NoteDirtyLogSweep(); // [local]
                 if (BdaSweepPlan && (!_bdaSweepPlanBuilt || mapping != _bdaSweepPlanMapping))
                 {
                     _bdaSweepPlan = GuestPageTracker.PlanSweep(spans);
@@ -3007,6 +3008,34 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
             _pageRunVerifyWindow = now;
             Console.Error.WriteLine(FormattableString.Invariant($"[PERF][BDA_PAGE_RUNS] checks={_pageRunVerifyChecks} missed={_pageRunVerifyMisses}"));
         }
+    }
+
+    // [local] SHARPEMU_DIRTY_LOG_PROBE: the CPU-dirty ranges recorded since the previous sweep, and how many of them
+    // overlap a registered buffer (what an incremental dirty log would hand this sweep). Printed every 5 s.
+    private static long _dirtyLogSweeps, _dirtyLogEntries, _dirtyLogOverlapping, _dirtyLogOverlapPages, _dirtyLogWindow = System.Diagnostics.Stopwatch.GetTimestamp();
+
+    private void NoteDirtyLogSweep()
+    {
+        var ranges = DirtyLogProbe.Take();
+        _dirtyLogSweeps++;
+        _dirtyLogEntries += ranges.Count;
+        foreach (var (address, size) in CollectionsMarshal.AsSpan(ranges))
+        {
+            if (_registry.HasOverlap(address, size))
+            {
+                _dirtyLogOverlapping++;
+                _dirtyLogOverlapPages += (long)((size + 4095) / 4096);
+            }
+        }
+
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var seconds = (now - _dirtyLogWindow) / (double)System.Diagnostics.Stopwatch.Frequency;
+        if (seconds < 5)
+            return;
+        Console.Error.WriteLine(FormattableString.Invariant(
+            $"[DIRTY_LOG_PROBE] window_s={seconds:F1} sweeps_per_s={_dirtyLogSweeps / seconds:F1} entries_per_sweep={_dirtyLogEntries / (double)Math.Max(1, _dirtyLogSweeps):F0} overlapping_per_sweep={_dirtyLogOverlapping / (double)Math.Max(1, _dirtyLogSweeps):F0} overlap_pages_per_sweep={_dirtyLogOverlapPages / (double)Math.Max(1, _dirtyLogSweeps):F0} {DirtyLogProbe.TakeCounters()}"));
+        _dirtyLogSweeps = _dirtyLogEntries = _dirtyLogOverlapping = _dirtyLogOverlapPages = 0;
+        _dirtyLogWindow = now;
     }
 
     // A visited buffer's copies wait for the end of the sweep. The tracker has protected its pages

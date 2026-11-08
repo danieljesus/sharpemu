@@ -63,6 +63,7 @@ public sealed class TrackedRegion
         _readable.Fill();
         _summary?.Set(BaseAddress / BlockBytes, dirty: true);
         _summary?.NoteDirtied();
+        if (DirtyLogProbe.Enabled) DirtyLogProbe.Note(DirtyLogProbe.Gate.Birth, baseAddress, BlockBytes); // [local]
     }
 
     public RegionLock Lock { get; } = new();
@@ -217,6 +218,7 @@ public sealed class TrackedRegion
         }
 
         Volatile.Write(ref _cpuDirtyings, _cpuDirtyings + 1); // [local]
+        if (DirtyLogProbe.Enabled) DirtyLogProbe.Note(DirtyLogProbe.Gate.KeepProtection, address, size); // [local]
         _cpuDirty.SetRange(start, end);
         UpdateCpuProtection(ProtectionCause.UploadReprotect, ProtectionCause.EmulatorWrite);
     }
@@ -248,6 +250,7 @@ public sealed class TrackedRegion
         if (enable && side == WriteOrigin.Cpu)
         {
             _protectedWhileDirty.UnsetRange(start, end);
+            if (DirtyLogProbe.Enabled) DirtyLogProbe.Note(DirtyLogProbe.Gate.Change, address, size); // [local]
         }
 
         if (enable && side == WriteOrigin.Gpu)
