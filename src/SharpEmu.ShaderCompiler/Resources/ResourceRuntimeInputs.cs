@@ -30,6 +30,10 @@ public sealed class ResourceRuntimeInputs
 
     public ResidentGuestBytesReader? ReadResidentMemory { get; init; }
 
+    // [local] SHARPEMU_PAGE_SPAN_READS: the words of one page ReadMemory and ReadResidentMemory would answer, as one span.
+    // Not carried by WithReader or WithCallArguments, nor by any wrapper: a span would bypass a replaced reader.
+    public ResidentGuestSpanReader? ReadResidentSpan { get; init; }
+
     // [local] SHARPEMU_STORE_TABLE_COMPARE: what ReadResidentMemory would read, compared in place. Only on inputs whose
     // resident reads are not recorded (or whose store-table scans bypass the recorder), since a compare records nothing.
     public ResidentTableChunkComparer? CompareTableChunk { get; init; }

@@ -140,6 +140,10 @@ internal interface IShaderPipelineHost
     // the resource cache then re-materializes instead of trusting a stale copy.
     bool TryReadResidentGuestBytes(ulong address, Span<byte> destination, bool clean) => false;
 
+    // [local] SHARPEMU_PAGE_SPAN_READS: the bytes of one 4 KB page the word reader and the resident reader would answer
+    // alike, as one span (see PageSpanReads); a host without it reads no spans.
+    ResidentSpanRead TryReadResidentGuestSpan(ulong address, Span<byte> destination) => ResidentSpanRead.OtherThread;
+
     // [local] SHARPEMU_VALIDATE_IN_PLACE: TryReadResidentGuestBytes's bytes compared in place; false when not compared.
     bool TryCompareResidentGuestBytes(ulong address, ReadOnlySpan<byte> expected, bool clean, out bool equal)
     {

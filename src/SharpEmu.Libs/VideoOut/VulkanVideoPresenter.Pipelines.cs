@@ -1000,6 +1000,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 if (TryReadAliasBytes(address, cachedBytes))
                 {
                     word = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(cachedBytes);
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordAlias); // [local] SHARPEMU_DRAWCOST_PROBE
                     return true;
                 }
             }
@@ -1052,6 +1053,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 var memoValue = 0u;
                 var fastHit = Gpu.Buffers.TableWordMemo.FastHit; // [local] SHARPEMU_TABLE_WORD_MEMO_FAST_HIT
                 var gpuDirty = !NoSyncTableReads && _bufferCache.HasGpuDirtyBytes(address, sizeof(uint));
+                if (gpuDirty) Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordDirty); // [local] SHARPEMU_DRAWCOST_PROBE
                 if (fastHit && gpuDirty && Gpu.Buffers.TableWordMemo.Enabled && Gpu.Buffers.TableWordMemo.Mode == 1)
                 {
                     if (Gpu.Buffers.TableWordMemo.TryAnswer(address, out memoValue, out var audit, out var speculated))
@@ -1137,6 +1139,7 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
 
                     bool preciseSynced;
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordSync); // [local] SHARPEMU_DRAWCOST_PROBE
                     try
                     {
                         preciseSynced = _bufferCache.TrySynchronizeCpuRead(address, sizeof(uint),
@@ -1201,6 +1204,7 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
                 else
                 {
+                    Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadWordPlain); // [local] SHARPEMU_DRAWCOST_PROBE
                     NoteCleanReadPage(address, sizeof(uint));
                 }
             }
@@ -1557,8 +1561,10 @@ internal static unsafe partial class VulkanVideoPresenter
                 return true;
             }
 
+            Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadResident); // [local] SHARPEMU_DRAWCOST_PROBE
             if (!ResidentReadAllowed(address, size, clean))
             {
+                Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ReadResidentRefused); // [local]
                 return false;
             }
 
@@ -1568,6 +1574,32 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             return _guestMemory.TryRead(address, destination);
+        }
+
+        // [local] SHARPEMU_PAGE_SPAN_READS (see PageSpanReads): the render thread's resident read of one span of a 4 KB
+        // page, refused where the word reader would answer one of its words differently from the bytes or take a side
+        // path. On the render thread both readers copy the same bytes (the clean-read page's alias, or guest memory) for
+        // a word that no pending publication overlaps, the GPU does not own and whose page is mapped; ResidentReadAllowed
+        // refuses a span with any GPU-owned or unmapped byte. A pending publication over any byte refuses the span too,
+        // where the word reader would complete the ones under its own words (a publication this item must see was
+        // registered before the item was queued, so a check at one instant sees it). The word reader's side paths: TLAS
+        // HLE consumer notes, conservative records (sentinels, verification), watched bounds. Every other thread reads its
+        // spans word by word as before (OtherThread).
+        public ResidentSpanRead TryReadResidentGuestSpan(ulong address, Span<byte> destination)
+        {
+            if (OnResolveWorker || OnCommandThread || OnFrontThread)
+            {
+                return ResidentSpanRead.OtherThread;
+            }
+
+            var size = (ulong)destination.Length;
+            if (Gpu.Buffers.TlasHle.Instance is not null || Gpu.Buffers.ConservativeRecords.Mode != 0 || WatchedBounds.Count != 0 ||
+                HasPendingMemoryPublication(address, size) || !ResidentReadAllowed(address, size, clean: false))
+            {
+                return ResidentSpanRead.Refused;
+            }
+
+            return TryReadAliasBytes(address, destination) || _guestMemory.TryRead(address, destination) ? ResidentSpanRead.Read : ResidentSpanRead.Refused;
         }
 
         // The render thread's ownership checks of TryReadResidentGuestBytes, shared with the in-place compare.

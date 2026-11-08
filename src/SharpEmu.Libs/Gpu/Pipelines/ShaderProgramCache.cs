@@ -413,6 +413,10 @@ internal sealed class ShaderProgramCache
             ReadMemory = _readGuestWord,
             ReadCleanMemory = _readCleanGuestWord,
             ReadResidentMemory = _prefetchResidentGuestBytes,
+            // [local] SHARPEMU_PAGE_SPAN_READS: only beside the resident reader the spans stand in for.
+            ReadResidentSpan = SharpEmu.ShaderCompiler.Resources.PageSpanReads.DefaultMode != 0 && _prefetchResidentGuestBytes is not null
+                ? host.TryReadResidentGuestSpan
+                : null,
             SynchronizeRanges = synchronizeRanges,
             SynchronizeTableRange = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.TableSyncMode != 0 ? host.TrySynchronizeTableRange : null, // [local]
             CompareTableChunk = SharpEmu.ShaderCompiler.Resources.DeviceStoreTablePlanner.CompareModeConfigured != 0 ? host.CompareResidentTableChunk : null, // [local] SHARPEMU_STORE_TABLE_COMPARE
@@ -769,6 +773,7 @@ internal sealed class ShaderProgramCache
             var waitTicksBefore = resolveStarted != 0 ? SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaitTicks : 0;
             var coldStarted = Diagnostics.FrameMissProbe.Cold ? started : 0; // [local] SHARPEMU_COLDRES_PROBE
             var coldWaited = Diagnostics.FrameMissProbe.ThreadReadbackTicks;
+            Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.MaterializePrelude); // [local] SHARPEMU_DRAWCOST_PROBE
             if (sharedForTables)
             {
                 SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);

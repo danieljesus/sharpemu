@@ -53,6 +53,7 @@ internal sealed class MaterializationProgram
         public bool[] Absolute = new bool[64];
         public byte[] Bytes = new byte[1024];
         public int Count;
+        public ulong PlanHash; // [local] SHARPEMU_PAGE_SPAN_READS=2: names the plan in a wrong span's dump
 
         public void Ensure(int registers)
         {
@@ -400,6 +401,7 @@ internal sealed class MaterializationProgram
         _scratch = null;
         try
         {
+            scratch.PlanHash = plan.Hash; // [local] SHARPEMU_PAGE_SPAN_READS
             return Run(plan, inputs, additionalTableWords, scratch, activeSources, out sources, out table, out ranges);
         }
         finally
@@ -432,6 +434,7 @@ internal sealed class MaterializationProgram
         _scratch = null;
         try
         {
+            scratch.PlanHash = plan.Hash; // [local] SHARPEMU_PAGE_SPAN_READS
             Evaluate(inputs, scratch);
             return Emit(plan, additionalTableWords, scratch, activeSources, output);
         }
@@ -449,17 +452,21 @@ internal sealed class MaterializationProgram
         Array.Copy(_constants, values, _registerCount);
         Array.Copy(_constantValid, valid, _registerCount);
         Span<ulong> operands = stackalloc ulong[8];
+        MaterializeProbe.Lap(MaterializeProbe.Step.Setup); // [local] SHARPEMU_DRAWCOST_PROBE
         foreach (var level in _levels)
         {
             if (level.Reads.Length != 0)
             {
                 ReadLevel(level.Reads, inputs, scratch);
+                MaterializeProbe.Lap(MaterializeProbe.Step.Reads); // [local]
             }
 
             foreach (var step in level.Steps)
             {
                 Execute(step, inputs, values, valid, operands);
             }
+
+            MaterializeProbe.Lap(MaterializeProbe.Step.Steps); // [local]
         }
     }
 
@@ -724,34 +731,183 @@ internal sealed class MaterializationProgram
         }
 
         var resident = inputs.ReadResidentMemory;
+        // [local] SHARPEMU_PAGE_SPAN_READS: a span is a whole number of the units this loop forms, read as one; a refused
+        // one is read unit by unit as without the switch. With the probe and the switch off, possibleUntil marks the end
+        // of the last span counted as possible.
+        var spanEligible = resident is not null && inputs.ReadMemory is not null && !inputs.ReadsClean;
+        var spanMode = spanEligible && inputs.ReadResidentSpan is not null && !PageSpanReads.OtherThread ? PageSpanReads.Mode : 0;
+        var possibleUntil = MaterializeProbe.Enabled && spanEligible && spanMode == 0 ? 0 : int.MaxValue;
         var start = 0;
         while (start < count)
         {
-            var end = start + 1;
-            var words = 1;
-            while (end < count && addresses[end] - addresses[end - 1] <= sizeof(uint) && addresses[end] - addresses[start] < MaximumRunBytes &&
-                   (bases[end] & ~3ul) != 0 && (bases[start] & ~3ul) != 0)
+            if (spanMode != 0 && SpanEnd(addresses, bases, start, count, out var spanEnd, out var units))
             {
-                if (addresses[end] != addresses[end - 1])
-                {
-                    words++;
-                }
-
-                end++;
-            }
-
-            if (words >= MinimumRunWords && resident is not null && inputs.ReadMemory is not null && ReadRun(resident, inputs.ReadsClean, scratch, start, end))
-            {
-                start = end;
+                ReadSpan(inputs.ReadResidentSpan!, spanMode, inputs, resident!, scratch, start, spanEnd, units);
+                start = spanEnd;
                 continue;
             }
 
-            for (var index = start; index < end; index++)
+            if (start >= possibleUntil && SpanEnd(addresses, bases, start, count, out var possibleEnd, out var possibleUnits)) // [local] probe only
             {
-                ReadWord(inputs, addresses[index], bases[index], absolute[index], targets[index], values, valid);
+                MaterializeProbe.Count(MaterializeProbe.Counter.SpanCallsPossible, possibleUnits - 1);
+                possibleUntil = possibleEnd;
             }
 
-            start = end;
+            start = ReadUnit(inputs, resident, scratch, start, count);
+        }
+    }
+
+    // One unit of a level's sorted reads: a run of adjacent words with usable bases read as one resident read, or else
+    // its words one by one. Returns the unit's end; limit bounds it (the level's count, or a span's end).
+    private static int ReadUnit(ResourceRuntimeInputs inputs, ResidentGuestBytesReader? resident, Scratch scratch, int start, int limit)
+    {
+        var addresses = scratch.Addresses;
+        var bases = scratch.NullBases;
+        var end = UnitEnd(addresses, bases, start, limit, out var words);
+        if (words >= MinimumRunWords && resident is not null && inputs.ReadMemory is not null)
+        {
+            MaterializeProbe.Count(MaterializeProbe.Counter.Runs); // [local] SHARPEMU_DRAWCOST_PROBE
+            if (ReadRun(resident, inputs.ReadsClean, scratch, start, end))
+            {
+                MaterializeProbe.Count(MaterializeProbe.Counter.RunWords, end - start); // [local]
+                return end;
+            }
+
+            MaterializeProbe.Count(MaterializeProbe.Counter.RunRefused); // [local]
+        }
+
+        MaterializeProbe.Count(MaterializeProbe.Counter.Words, end - start); // [local]
+        for (var index = start; index < end; index++)
+        {
+            ReadWord(inputs, addresses[index], bases[index], scratch.Absolute[index], scratch.Targets[index], scratch.Values, scratch.Valid);
+        }
+
+        return end;
+    }
+
+    private static int UnitEnd(ulong[] addresses, ulong[] bases, int start, int limit, out int words)
+    {
+        var end = start + 1;
+        words = 1;
+        while (end < limit && addresses[end] - addresses[end - 1] <= sizeof(uint) && addresses[end] - addresses[start] < MaximumRunBytes &&
+               (bases[end] & ~3ul) != 0 && (bases[start] & ~3ul) != 0)
+        {
+            if (addresses[end] != addresses[end - 1])
+            {
+                words++;
+            }
+
+            end++;
+        }
+
+        return end;
+    }
+
+    // [local] SHARPEMU_PAGE_SPAN_READS: the units from start, whole, that lie in start's 4 KB page within the span cap and
+    // have usable bases (a null base keeps its own read and validity rule). True for two units or more.
+    private static bool SpanEnd(ulong[] addresses, ulong[] bases, int start, int count, out int spanEnd, out int units)
+    {
+        spanEnd = start;
+        units = 0;
+        var first = addresses[start];
+        var pageEnd = (first & ~(PageSpanReads.PageBytes - 1)) + PageSpanReads.PageBytes;
+        var capEnd = first + (ulong)PageSpanReads.SpanBytes;
+        while (spanEnd < count && (bases[spanEnd] & ~3ul) != 0)
+        {
+            var unitEnd = UnitEnd(addresses, bases, spanEnd, count, out _);
+            var last = addresses[unitEnd - 1] + sizeof(uint);
+            if (last > pageEnd || last > capEnd)
+            {
+                break;
+            }
+
+            units++;
+            spanEnd = unitEnd;
+        }
+
+        return units >= 2;
+    }
+
+    // [local] SHARPEMU_PAGE_SPAN_READS: =1 takes the span's words from one span read, or reads its units as before when
+    // the span is refused; =2 reads the units as before (that answer is kept) and compares the span read with it.
+    private static void ReadSpan(ResidentGuestSpanReader spans, int mode, ResourceRuntimeInputs inputs, ResidentGuestBytesReader resident,
+        Scratch scratch, int start, int end, int units)
+    {
+        if (mode == 2)
+        {
+            for (var index = start; index < end;)
+            {
+                index = ReadUnit(inputs, resident, scratch, index, end);
+            }
+        }
+
+        var addresses = scratch.Addresses;
+        var first = addresses[start];
+        var length = checked((int)(addresses[end - 1] - first) + sizeof(uint));
+        if (scratch.Bytes.Length < length)
+        {
+            scratch.Bytes = new byte[Math.Max(length, scratch.Bytes.Length * 2)];
+        }
+
+        var bytes = scratch.Bytes.AsSpan(0, length);
+        var outcome = spans(first, bytes);
+        if (outcome != ResidentSpanRead.Read)
+        {
+            PageSpanReads.NoteRefused(outcome);
+            for (var index = start; mode != 2 && index < end;)
+            {
+                index = ReadUnit(inputs, resident, scratch, index, end);
+            }
+
+            return;
+        }
+
+        if (mode == 2)
+        {
+            VerifySpan(inputs, scratch, start, end, bytes);
+            return;
+        }
+
+        var targets = scratch.Targets;
+        for (var index = start; index < end; index++)
+        {
+            var target = targets[index];
+            scratch.Values[target] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes[(int)(addresses[index] - first)..]);
+            scratch.Valid[target] = true;
+        }
+
+        PageSpanReads.NoteRead(end - start, units);
+    }
+
+    // [local] SHARPEMU_PAGE_SPAN_READS=2: the span's words against the answers the units' reads left.
+    private static void VerifySpan(ResourceRuntimeInputs inputs, Scratch scratch, int start, int end, ReadOnlySpan<byte> bytes)
+    {
+        PageSpanReads.NoteVerified();
+        var addresses = scratch.Addresses;
+        var first = addresses[start];
+        for (var index = start; index < end; index++)
+        {
+            var target = scratch.Targets[index];
+            var spanWord = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes[(int)(addresses[index] - first)..]);
+            var realValid = scratch.Valid[target];
+            var realWord = (uint)scratch.Values[target];
+            if (realValid && realWord == spanWord)
+            {
+                continue;
+            }
+
+            var rereadOk = inputs.ReadMemory!(addresses[index], out var reread);
+            if (realValid && rereadOk && reread == spanWord)
+            {
+                PageSpanReads.NoteRaced();
+                continue;
+            }
+
+            if (PageSpanReads.NoteWrong())
+            {
+                PageSpanReads.Dump(realValid ? "wrong" : "invalid", scratch.PlanHash, first, bytes.Length, end - start, addresses[index],
+                    scratch.NullBases[index], realValid, realWord, spanWord, rereadOk, reread);
+            }
         }
     }
 
