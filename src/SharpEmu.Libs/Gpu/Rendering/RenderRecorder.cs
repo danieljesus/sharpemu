@@ -571,6 +571,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
         if (inPlace && TryRestoreAttachments(ref state))
         {
             _inPlaceDraws.Increment();
+            NoteInPlaceAttachments(in state.Rendering); // [local] SHARPEMU_ATTACH_REPEAT_INPLACE
         }
         else
         {

@@ -41,6 +41,26 @@ internal sealed partial class RenderRecorder
     }
 
     private readonly AttachRecord _attachRecord = new();
+
+    // [local] SHARPEMU_ATTACH_REPEAT_INPLACE (on by default, =0 off): an in-place draw (upstream's TryRestoreAttachments)
+    // with the record's rendering state keeps the record's chain. Its BeginRendering, a no-op on the open scope, counted
+    // as another draw's and refused the next repeat (ag02: 85-87 % of the host refusals, ~20 % of the acquisitions). The
+    // token moves only when the chain was intact up to this draw; the next repeat still checks the scope, the rendering
+    // state and the attachments' state versions, and =2 still compares it with the full acquisition (ag03: repeats
+    // 57 -> 76 %, 0 mismatches; ag04-ag07: draw_attachments -0.2 us per draw).
+    private static readonly bool AttachRepeatInPlace = Environment.GetEnvironmentVariable("SHARPEMU_ATTACH_REPEAT_INPLACE") != "0";
+
+    private void NoteInPlaceAttachments(in RenderingState rendering)
+    {
+        if (!AttachRepeatInPlace || AttachRepeatMode == 0 || OnWorker)
+            return;
+        var record = _attachRecord;
+        if (!record.Valid || record.Rendering != rendering)
+            return;
+        var token = _host.AttachmentRepeatToken;
+        if (token.Tick == record.Token.Tick && token.BeginCalls == record.Token.BeginCalls + 1)
+            record.Token = token;
+    }
     // [local] No record to repeat (the last acquisition had clears), and targets that differ from the record.
     internal static readonly long[] InputMisses = new long[4]; // no record, other targets, image registrations moved, host refused
     public static Func<string>? HostMissReport { get; set; }
