@@ -71,7 +71,7 @@ public sealed class GuestPageTracker
 
     public bool DefersGpuWriteProtection { get; set; }
 
-    // [local] SHARPEMU_BDA_DIRTY_LOG (0 off by default, 1 on, 2 verify): the ranges that turned CPU-dirty since the
+    // [local] SHARPEMU_BDA_DIRTY_LOG (1 on by default, 0 off, 2 verify): the ranges that turned CPU-dirty since the
     // previous BDA sweep, so the sweep visits the buffers over them instead of every buffer of every 4 MiB block that
     // may hold a dirty page (bw02/bw03: ~5,330 visits per sweep for ~50-100 synchronizations; dl01: ~1,450 new ranges
     // per sweep, all over registered buffers). A region appends after its bits and block summary are published, under
@@ -81,7 +81,7 @@ public sealed class GuestPageTracker
     // cut) from one dirtied while the sweep ran. Fixed per tracker at construction (tests set DirtyLogModeOverride).
     public static readonly AsyncLocal<int?> DirtyLogModeOverride = new();
     private static readonly int DirtyLogModeDefault =
-        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_DIRTY_LOG"), out var dirtyLogMode) ? dirtyLogMode : 0;
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_BDA_DIRTY_LOG"), out var dirtyLogMode) ? dirtyLogMode : 1;
     public int DirtyLogMode { get; } = DirtyLogModeOverride.Value ?? DirtyLogModeDefault;
     private const int DirtyLogCapacity = 1 << 18;
     private readonly object _dirtyLogGate = new();

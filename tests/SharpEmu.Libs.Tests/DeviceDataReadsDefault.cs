@@ -36,6 +36,12 @@ internal static class DeviceDataReadsDefault
             Environment.SetEnvironmentVariable("SHARPEMU_BDA_WRITE_MEMO", "0");
         }
 
+        // [local] SHARPEMU_BDA_DIRTY_LOG: on by default in the emulator; the tests that use it set the mode per tracker.
+        if (Environment.GetEnvironmentVariable("SHARPEMU_BDA_DIRTY_LOG") is null)
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_BDA_DIRTY_LOG", "0");
+        }
+
         if (Environment.GetEnvironmentVariable("SHARPEMU_PLAN_SHADOW") is null)
         {
             Environment.SetEnvironmentVariable("SHARPEMU_PLAN_SHADOW", "1");
