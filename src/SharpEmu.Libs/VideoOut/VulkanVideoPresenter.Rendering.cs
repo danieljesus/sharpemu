@@ -1586,7 +1586,19 @@ internal static unsafe partial class VulkanVideoPresenter
         (object? Backing, long Version) IRenderHost.AttachmentStateVersion(ResourceSlotIdentifier image) => _imageCache.TargetStateVersion(image);
 
         // [local] Why repeats are refused, by reason (reported with [ATTACH_REPEAT]).
-        internal static readonly long[] AttachRepeatMisses = new long[12];
+        internal static readonly long[] AttachRepeatMisses = InitAttachRepeatMisses();
+
+        private static long[] InitAttachRepeatMisses()
+        {
+            var misses = new long[12];
+            RenderRecorder.HostMissReport = () =>
+            {
+                var text = string.Join(",", misses.Select((count, reason) => FormattableString.Invariant($"{reason}:{count}")));
+                Array.Clear(misses);
+                return text;
+            };
+            return misses;
+        }
 
         private static bool Miss(int reason)
         {

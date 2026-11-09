@@ -42,7 +42,7 @@ internal sealed partial class RenderRecorder
 
     private readonly AttachRecord _attachRecord = new();
     // [local] No record to repeat (the last acquisition had clears), and targets that differ from the record.
-    internal static readonly long[] InputMisses = new long[2];
+    internal static readonly long[] InputMisses = new long[4]; // no record, other targets, image registrations moved, host refused
     public static Func<string>? HostMissReport { get; set; }
     private static long _attachDraws, _attachWindow = System.Diagnostics.Stopwatch.GetTimestamp();
     // [local] SHARPEMU_ATTACH_REPORT_TICK (on by default, =0 off): the per-draw check for the 5 s report reads the
@@ -65,7 +65,7 @@ internal sealed partial class RenderRecorder
         if (seconds < 5 && !AttachReportTick)
             return;
         Console.Error.WriteLine(FormattableString.Invariant(
-            $"[ATTACH_REPEAT] window_s={seconds:F1} draws={_attachDraws} repeats={AttachRepeatHits} ({100.0 * AttachRepeatHits / Math.Max(1, _attachDraws):F1}%) checked={AttachRepeatChecked} mismatches={AttachRepeatMismatches} mismatches_total={AttachRepeatMismatchTotal} generation={GuestImageCache.StateGeneration} no_record={InputMisses[0]} other_targets={InputMisses[1]} host=[{HostMissReport?.Invoke()}]"));
+            $"[ATTACH_REPEAT] window_s={seconds:F1} draws={_attachDraws} repeats={AttachRepeatHits} ({100.0 * AttachRepeatHits / Math.Max(1, _attachDraws):F1}%) checked={AttachRepeatChecked} mismatches={AttachRepeatMismatches} mismatches_total={AttachRepeatMismatchTotal} generation={GuestImageCache.StateGeneration} no_record={InputMisses[0]} other_targets={InputMisses[1]} registrations={InputMisses[2]} host_refused={InputMisses[3]} registration_generation={GuestImageCache.RegistrationGeneration} host=[{HostMissReport?.Invoke()}]"));
         Array.Clear(InputMisses);
         _attachDraws = AttachRepeatHits = AttachRepeatChecked = AttachRepeatMismatches = 0;
         _attachWindow = now;
@@ -104,11 +104,13 @@ internal sealed partial class RenderRecorder
         var sameInputs = SameAttachmentInputs(ref state); // [local] compared once; false without a record
         if (!record.Valid) InputMisses[0]++;
         else if (!sameInputs) InputMisses[1]++;
+        else if (record.Registrations != GuestImageCache.RegistrationGeneration) InputMisses[2]++;
         var repeat = sameInputs && record.Registrations == GuestImageCache.RegistrationGeneration && _host.TryRepeatAttachments(
             ((ReadOnlySpan<ColorTargetState>)record.Outputs)[..(int)record.ColorCount],
             ((ReadOnlySpan<ImageLayout>)record.ColorLayouts)[..(int)record.ColorCount],
             in record.DepthInput, record.DepthLayout, in record.Rendering, record.Token,
             ((ReadOnlySpan<(object? Backing, long Version)>)record.Versions)[..((int)record.ColorCount + 1)], apply: AttachRepeatMode != 2);
+        if (sameInputs && !repeat && record.Registrations == GuestImageCache.RegistrationGeneration) InputMisses[3]++;
         if (repeat && AttachRepeatMode != 2)
         {
             AttachRepeatHits++;
