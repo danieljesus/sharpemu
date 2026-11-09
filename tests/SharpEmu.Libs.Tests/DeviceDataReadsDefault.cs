@@ -42,6 +42,12 @@ internal static class DeviceDataReadsDefault
             Environment.SetEnvironmentVariable("SHARPEMU_BDA_DIRTY_LOG", "0");
         }
 
+        // [local] SHARPEMU_TABLE_WORD_MEMO_WRITERS: the emulator also trusts 0x5F74; the memo tests use it as an untrusted writer.
+        if (Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_WRITERS") is null)
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_WRITERS", "5981037B07E391D5");
+        }
+
         if (Environment.GetEnvironmentVariable("SHARPEMU_PLAN_SHADOW") is null)
         {
             Environment.SetEnvironmentVariable("SHARPEMU_PLAN_SHADOW", "1");

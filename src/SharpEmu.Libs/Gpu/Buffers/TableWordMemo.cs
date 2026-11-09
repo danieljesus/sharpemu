@@ -7,13 +7,16 @@ namespace SharpEmu.Libs.Gpu.Buffers;
 // remembers the value it got. A later read of the same word reuses it, without waiting, while every GPU write marked
 // over the word since then came from a program in SHARPEMU_TABLE_WORD_MEMO_WRITERS (hex hashes separated by '/', 0x5981 by
 // default: the BLAS refit, whose written binding spans the whole blob, header included, though the refit rewrites
-// nodes only) and no command-processor or CPU write touched it. =1 uses the value; =2 still synchronizes and counts
+// nodes only, and [local] 0x5F74, which works on the TLAS header the CP writes and leaves 994A's +0x28/+0x2C/+0x74
+// as the CP put them: wv5f1 and the 25-minute walk wk5f1 in =2 verified 312,213 and 1,289,634 hits, 0 wrong; read_sync
+// -1.1 us per dispatch, ~ -2 ms per frame; trusted by program, not exact by construction) and no command-processor or CPU
+// write touched it. =1 uses the value; =2 still synchronizes and counts
 // how often the value would have been wrong ([PERF][TABLE_WORD_MEMO]). Render thread only.
 internal static class TableWordMemo
 {
     public static readonly int Mode = int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO"), out var mode) ? mode : 1;
     public static bool Enabled => Mode != 0;
-    private static readonly HashSet<ulong> Writers = (Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_WRITERS") ?? "5981037B07E391D5")
+    private static readonly HashSet<ulong> Writers = (Environment.GetEnvironmentVariable("SHARPEMU_TABLE_WORD_MEMO_WRITERS") ?? "5981037B07E391D5/5F7405747C3FE001")
         .Split(['/', ','], StringSplitOptions.RemoveEmptyEntries).Select(hash => Convert.ToUInt64(hash, 16)).ToHashSet();
 
     private static readonly object _lock = new();
