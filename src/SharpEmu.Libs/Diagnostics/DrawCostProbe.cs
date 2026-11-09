@@ -259,6 +259,7 @@ internal static class DrawCostProbe
         LiteObtainProbe.NoteFrame(); // [local] SHARPEMU_LITE_OBTAIN_PROBE, SHARPEMU_PLAN_PROBE
         PlanProbe.NoteFrame();
         BdaCostProbe.NoteFrame(); // [local] SHARPEMU_BDA_COST_PROBE
+        GpuResolveProbe.NoteFrame(); // [local] SHARPEMU_GPU_RESOLVE_PROBE
     }
 
     internal static void Begin(Kind kind)
@@ -276,6 +277,22 @@ internal static class DrawCostProbe
         if (LiteObtainProbe.Enabled) // [local] SHARPEMU_LITE_OBTAIN_PROBE: the item kind of the obtains
         {
             LiteObtainProbe.Begin(kind == Kind.Dispatch);
+        }
+
+        if (GpuResolveProbe.Enabled) // [local] SHARPEMU_GPU_RESOLVE_PROBE: the item its entries belong to
+        {
+            GpuResolveProbe.Begin(kind == Kind.Dispatch);
+        }
+    }
+
+    // [local] Takes `ticks` a shadow probe spent inside the current step out of the timed item: the step and the item
+    // end that much later than they would otherwise have.
+    internal static void Exclude(long ticks)
+    {
+        if (Enabled && _active && ticks > 0 && Environment.CurrentManagedThreadId == _thread)
+        {
+            _last += ticks;
+            _start += ticks;
         }
     }
 
@@ -374,6 +391,11 @@ internal static class DrawCostProbe
 
     internal static void End()
     {
+        if (GpuResolveProbe.Enabled) // [local] SHARPEMU_GPU_RESOLVE_PROBE: before this probe's window may close
+        {
+            GpuResolveProbe.End();
+        }
+
         if (Enabled)
         {
             EndCore();
@@ -532,6 +554,25 @@ internal static class DrawCostProbe
 
                 Console.Error.WriteLine(line.ToString());
             }
+        }
+
+        if (GpuResolveProbe.Enabled) // [local] SHARPEMU_GPU_RESOLVE_PROBE: its line, with this window's step costs
+        {
+            var stepUs = new double[Kinds][];
+            var itemUs = new double[Kinds];
+            for (var kind = 0; kind < Kinds; kind++)
+            {
+                stepUs[kind] = new double[Steps];
+                var timed = Math.Max(_timed[kind], 1);
+                for (var step = 0; step < Steps; step++)
+                {
+                    stepUs[kind][step] = _stepTicks[kind * Steps + step] * toMs * 1000 / timed;
+                }
+
+                itemUs[kind] = _itemTicks[kind] * toMs * 1000 / timed;
+            }
+
+            GpuResolveProbe.Report(stepUs, itemUs);
         }
 
         Array.Clear(_stepTicks);

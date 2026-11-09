@@ -405,6 +405,24 @@ internal sealed class ShaderProgramCache
         _readGuestWord = host.TryReadGuestWord;
         _readCleanGuestWord = host.TryReadCleanGuestWord;
         _readResidentGuestBytes = host.TryReadResidentGuestBytes;
+        if (Diagnostics.GpuResolveProbe.Enabled) // [local] SHARPEMU_GPU_RESOLVE_PROBE: each read classified before it is made
+        {
+            _readGuestWord = (ulong address, out uint word) =>
+            {
+                Diagnostics.GpuResolveProbe.NoteRead(address, sizeof(uint));
+                return host.TryReadGuestWord(address, out word);
+            };
+            _readCleanGuestWord = (ulong address, out uint word) =>
+            {
+                Diagnostics.GpuResolveProbe.NoteRead(address, sizeof(uint));
+                return host.TryReadCleanGuestWord(address, out word);
+            };
+            _readResidentGuestBytes = (ulong address, Span<byte> destination, bool clean) =>
+            {
+                Diagnostics.GpuResolveProbe.NoteRead(address, (ulong)destination.Length);
+                return host.TryReadResidentGuestBytes(address, destination, clean);
+            };
+        }
         _compareResidentGuestBytes = ResourceMaterializationCache.ValidateInPlaceMode != 0 ? host.TryCompareResidentGuestBytes : null; // [local]
         _prefetchResidentGuestBytes = PrefetchEnabled ? _readResidentGuestBytes : null;
         var synchronizeRanges = ResourceMaterializationCache.SyncValidateMode != 0 ? host.TrySynchronizeGuestRanges : (GuestRangeSynchronizer?)null; // [local]
@@ -772,6 +790,7 @@ internal sealed class ShaderProgramCache
             var waitTicksBefore = resolveStarted != 0 ? SharpEmu.Libs.VideoOut.ResolveProfile.CompletionWaitTicks : 0;
             var coldStarted = Diagnostics.FrameMissProbe.Cold ? started : 0; // [local] SHARPEMU_COLDRES_PROBE
             var coldWaited = Diagnostics.FrameMissProbe.ThreadReadbackTicks;
+            var resolveTally = Diagnostics.GpuResolveProbe.BeginMaterialize(); // [local] SHARPEMU_GPU_RESOLVE_PROBE
             if (sharedForTables)
             {
                 SharpEmu.Libs.VideoOut.FrontProfile.Switch(SharpEmu.Libs.VideoOut.FrontProfile.Phase.ProgramGate);
@@ -795,6 +814,7 @@ internal sealed class ShaderProgramCache
                     captureIndirectImageFailure, out outcome);
             }
 
+            Diagnostics.GpuResolveProbe.EndMaterialize(resolveTally, entry.Plan, snapshot, specialization, materialized); // [local]
             MaterializationTally.Note(materialized ? outcome : MaterializationTally.Outcome.Failed,
                 System.Diagnostics.Stopwatch.GetTimestamp() - started, materialized ? snapshot : null);
             if (Diagnostics.DrawCostProbe.Timing) // [local] SHARPEMU_DRAWCOST_PROBE: what the materialization did

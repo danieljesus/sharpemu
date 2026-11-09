@@ -57,6 +57,12 @@ public sealed partial class GuestImageCache
 
     private static bool SliceLookupFailed(SliceLookupFailure reason, ImageRole role)
     {
+        if (_probeLookup) // [local] SHARPEMU_GPU_RESOLVE_PROBE: the probe's lookups stay out of the slice statistics
+        {
+            _probeFailure = reason;
+            return false;
+        }
+
         Interlocked.Increment(ref SliceLookupFailures[(int)reason]);
         Interlocked.Increment(ref SliceLookupRoleFailures[(int)role]);
         return false;
@@ -90,6 +96,60 @@ public sealed partial class GuestImageCache
     {
         using var held = _lock.Read();
         return _slots.TryGet(imageIdentifier);
+    }
+
+    [ThreadStatic] private static bool _probeLookup;
+    [ThreadStatic] private static SliceLookupFailure _probeFailure;
+
+    // [local] SHARPEMU_GPU_RESOLVE_PROBE: would a T# resolved in the shader find its image already registered, with its
+    // contents current, or does the host have to work on it first? The slice lookup on a copy of the request (it only
+    // reads the cache), with the lookup memo and the slice statistics untouched.
+    internal Diagnostics.GpuResolveProbe.TextureOutcome ProbeTextureLookup(ImageRequest request, bool exactFormat)
+    {
+        _probeLookup = true;
+        try
+        {
+            if (ImageDescription.IsEmptyRange(request.Description.Data))
+            {
+                return Diagnostics.GpuResolveProbe.TextureOutcome.Null;
+            }
+
+            if (!TryFindImageForSlice(ref request, exactFormat, out var result))
+            {
+                return _probeFailure switch
+                {
+                    SliceLookupFailure.Display => Diagnostics.GpuResolveProbe.TextureOutcome.Display,
+                    SliceLookupFailure.Format or SliceLookupFailure.Resources or SliceLookupFailure.ViewType => Diagnostics.GpuResolveProbe.TextureOutcome.Format,
+                    SliceLookupFailure.TextureMetadata or SliceLookupFailure.TextureDccSync or SliceLookupFailure.DccClear or SliceLookupFailure.TargetDccSync =>
+                        Diagnostics.GpuResolveProbe.TextureOutcome.Meta,
+                    SliceLookupFailure.NullImage => Diagnostics.GpuResolveProbe.TextureOutcome.Null,
+                    SliceLookupFailure.NoCandidate or SliceLookupFailure.Unregistered or SliceLookupFailure.Grow or SliceLookupFailure.Park or
+                        SliceLookupFailure.Unresolved or SliceLookupFailure.DepthRecreate => Diagnostics.GpuResolveProbe.TextureOutcome.Create,
+                    _ => Diagnostics.GpuResolveProbe.TextureOutcome.Other,
+                };
+            }
+
+            if (PeekImage(result) is not { } image)
+            {
+                return Diagnostics.GpuResolveProbe.TextureOutcome.Other;
+            }
+
+            if (image.IsCpuDirty)
+            {
+                return Diagnostics.GpuResolveProbe.TextureOutcome.Upload;
+            }
+
+            if (image.IsBufferModified)
+            {
+                return Diagnostics.GpuResolveProbe.TextureOutcome.BufferWritten;
+            }
+
+            return image.IsGpuModified ? Diagnostics.GpuResolveProbe.TextureOutcome.RegisteredGpuWritten : Diagnostics.GpuResolveProbe.TextureOutcome.Registered;
+        }
+        finally
+        {
+            _probeLookup = false;
+        }
     }
 
     public bool TryFindImageForSlice(ref ImageRequest request, bool exactFormat, out ResourceSlotIdentifier result)
@@ -328,7 +388,11 @@ public sealed partial class GuestImageCache
             return false;
         }
 
-        memo.Generation = _lookupGeneration;
+        if (!_probeLookup) // [local] the probe leaves the memo as the real lookup will find it
+        {
+            memo.Generation = _lookupGeneration;
+        }
+
         request.View = memo.View;
         result = memo.Result;
         return true;

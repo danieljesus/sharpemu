@@ -118,6 +118,7 @@ public sealed unsafe partial class CachedImage
 
                         (barriers ??= []).Add(MakeBarrier(state, access, level, 1, layer, 1));
                         ImageAccessState.Barriers.Increment();
+                        if (Diagnostics.GpuResolveProbe.Enabled) Diagnostics.GpuResolveProbe.ImageBarriers++; // [local] SHARPEMU_GPU_RESOLVE_PROBE
                         sourceStages |= state.Stage;
                         states[index] = new ImageAccessState(stage, access, ReadyLayout, guest);
                     }
@@ -154,6 +155,7 @@ public sealed unsafe partial class CachedImage
 
             (barriers ??= []).Add(MakeBarrier(state, access, 0, Vk.RemainingMipLevels, 0, Vk.RemainingArrayLayers));
             ImageAccessState.Barriers.Increment();
+            if (Diagnostics.GpuResolveProbe.Enabled) Diagnostics.GpuResolveProbe.ImageBarriers++; // [local] SHARPEMU_GPU_RESOLVE_PROBE
             sourceStages |= state.Stage;
         }
 

@@ -416,6 +416,33 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
         finally { _everGpuWrittenLock.ExitReadLock(); }
     }
 
+    // [local] SHARPEMU_GPU_RESOLVE_PROBE: where the bytes of a materialization's read stand, asked before the read. Off the
+    // GPU queue thread only the sticky ever-written ranges are safe to ask, so a written range there is GpuUnknown. On it,
+    // a GPU-dirty range is placed by its last writer: the tighter of the precise write history and the buffer's block
+    // tick (both upper bounds), against the open tick and the completed one.
+    internal Diagnostics.GpuResolveProbe.ReadOrigin ProbeReadOrigin(ulong guestAddress, ulong size)
+    {
+        if (size == 0 || guestAddress + size < guestAddress || !EverGpuWrittenRanges(guestAddress, size))
+            return Diagnostics.GpuResolveProbe.ReadOrigin.Clean;
+        if (!_relay.IsGpuQueueThread)
+            return Diagnostics.GpuResolveProbe.ReadOrigin.GpuUnknown;
+        if (!HasGpuDirtyBytes(guestAddress, size))
+            return Diagnostics.GpuResolveProbe.ReadOrigin.GpuWrittenClean;
+        var tick = ulong.MaxValue;
+        var identifier = _registry.FindContainingBuffer(guestAddress, size);
+        if (identifier.IsValid && _registry.TryGetRegisteredBuffer(identifier) is { } buffer)
+            tick = buffer.BlockWriteTick(buffer.Offset(guestAddress), size);
+        if (GpuWriteHistory.Enabled)
+            tick = Math.Min(tick, GpuWriteHistory.LastWriteTick(guestAddress, size));
+        if (tick == ulong.MaxValue)
+            return Diagnostics.GpuResolveProbe.ReadOrigin.GpuUnknown;
+        if (tick >= _scheduler.CurrentTick)
+            return Diagnostics.GpuResolveProbe.ReadOrigin.GpuSameBatch;
+        return tick > _scheduler.Timeline.CompletedTick
+            ? Diagnostics.GpuResolveProbe.ReadOrigin.GpuInFlight
+            : Diagnostics.GpuResolveProbe.ReadOrigin.GpuCompleted;
+    }
+
     private SpanSnapshot _gpuModifiedSnapshot = SpanSnapshot.Empty;
     // [local] The lock-free snapshot is rebuilt on the first HasGpuDirtyBytes after a change, not after every change:
     // upstream rebuilt it (O(n): a pair of UInt64[]) on each add and removal, ~580 KB per frame in GTA V (gz08).
@@ -498,6 +525,7 @@ public sealed unsafe partial class GuestBufferCache : IGuestBufferStore, IDispos
     {
         _device = device;
         _scheduler = scheduler;
+        if (Diagnostics.GpuResolveProbe.Enabled) Diagnostics.GpuResolveProbe.Classifier = ProbeReadOrigin; // [local] SHARPEMU_GPU_RESOLVE_PROBE
         if (EarlyWriterSubmit) EarlySubmit = () => { _earlySubmits++; _scheduler.Flush(); }; // [local]
         if (CutPolicy.Words || CutPolicy.GuestWindows) CutPolicy.DispatchCut = () => // [local] SHARPEMU_CUT_POLICY
         {

@@ -663,6 +663,47 @@ internal static unsafe partial class VulkanVideoPresenter
             Interlocked.Increment(ref _stageMemoCaptures);
         }
 
+        // [local] SHARPEMU_GPU_RESOLVE_PROBE: the stage's entries for the probe, with each T# looked up in the image cache
+        // the way a shader-side table by address would find it (read only).
+        private void NoteGpuResolveStage(ShaderProgramInfo program, ShaderCompiler.Resources.ShaderResourceInfo info, ShaderCompiler.Resources.ResourceSnapshot snapshot)
+        {
+            var writtenBuffers = new bool[snapshot.Buffers.Length];
+            for (var index = 0; index < writtenBuffers.Length && index < info.Buffers.Count; index++)
+            {
+                writtenBuffers[index] = info.Buffers[index].Written;
+            }
+
+            var writtenImages = new bool[snapshot.Images.Length];
+            for (var index = 0; index < writtenImages.Length && index < info.Images.Count; index++)
+            {
+                writtenImages[index] = info.Images[index].Written;
+            }
+
+            Diagnostics.GpuResolveProbe.NoteStage(program.Hash, snapshot, info, writtenBuffers, writtenImages,
+                index => index < info.Images.Count ? ProbeTexture(info.Images[index], snapshot.Images[index], program, index) : Diagnostics.GpuResolveProbe.TextureOutcome.Other);
+        }
+
+        private Diagnostics.GpuResolveProbe.TextureOutcome ProbeTexture(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
+        {
+            if (words.Length < 4)
+            {
+                return Diagnostics.GpuResolveProbe.TextureOutcome.Other;
+            }
+
+            try
+            {
+                var shape = ImageRequestBuilders.ShapeOf(image);
+                var resolution = program.Frontend is { } frontend
+                    ? frontend.ResolveTexture(words, shape, program.Hash, index)
+                    : ImageRequestBuilders.Texture(words, shape, program.Hash, index);
+                return _imageCache.ProbeTextureLookup(resolution.Request, resolution.ExactFormat);
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException)
+            {
+                return Diagnostics.GpuResolveProbe.TextureOutcome.Other;
+            }
+        }
+
         private TextureResource ResolveImageBinding(ImageResource image, uint[] words, ShaderProgramInfo program, int index)
         {
             if (words.Length < 4)
@@ -974,6 +1015,11 @@ internal static unsafe partial class VulkanVideoPresenter
                 throw SubmissionScheduler.Fatal(
                     $"The resource snapshot does not match the program: hash=0x{program.Hash:X16} images={snapshot.Images.Length}/{info.Images.Count} " +
                     $"samplers={snapshot.Samplers.Length}/{info.Samplers.Count} buffers={snapshot.Buffers.Length}/{info.Buffers.Count}.");
+            }
+
+            if (Diagnostics.GpuResolveProbe.Owns && !_worker) // [local] SHARPEMU_GPU_RESOLVE_PROBE
+            {
+                NoteGpuResolveStage(program, info, snapshot);
             }
 
             var frontendReady = true;
@@ -2770,7 +2816,9 @@ internal static unsafe partial class VulkanVideoPresenter
 
             if (!stage.TexturesKept || !KeepsTextureSet(stage))
             {
+                var barriersBefore = Diagnostics.GpuResolveProbe.ImageBarriers; // [local] SHARPEMU_GPU_RESOLVE_PROBE
                 RecordStageTextureTransitions(stage.Textures);
+                if (Diagnostics.GpuResolveProbe.Enabled) Diagnostics.GpuResolveProbe.NoteTransitions(Diagnostics.GpuResolveProbe.ImageBarriers - barriersBefore);
             }
 
             foreach (var texture in stage.Textures)
