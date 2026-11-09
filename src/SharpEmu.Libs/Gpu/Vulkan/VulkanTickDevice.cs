@@ -280,6 +280,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public void BeginBuffer(nint buffer)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.NoteBufferBegin(buffer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (_ring != null) // [local]
         {
             _ring.BeginBuffer(buffer);
@@ -292,6 +293,7 @@ internal sealed unsafe class VulkanTickDevice : IGpuTickDevice
 
     public void EndBuffer(nint buffer, bool hostRead)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.NoteBufferEnd(buffer, hostRead); // [local] SHARPEMU_DGC_RUN_PROBE
         if (_ring != null) // [local] the tail marker and host-read barrier are appended before the ring's end
         {
             VulkanCommandPool.RecordTail(_vk, CommandProfile, new CommandBuffer(buffer), hostRead);

@@ -65,7 +65,9 @@ internal static unsafe class VulkanSynchronization
         using (RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.VulkanCommands))
         {
             var vkProbe54 = SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Start(); // [local]
+            if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.t_barrierSource = (int)source + 1; // [local] SHARPEMU_DGC_RUN_PROBE
             SharpEmu.Libs.Gpu.Vulkan.VkRecord.CmdPipelineBarrier2(vk, command, &dependencyInfo); // [local]
+            if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.t_barrierSource = 0;
             SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Stop(SharpEmu.Libs.Gpu.Vulkan.VkCallProbe.Kind.Barrier, vkProbe54); // [local]
         }
     }

@@ -2231,15 +2231,19 @@ internal static unsafe partial class VulkanVideoPresenter
             var setLayout = CreateDescriptorSetLayout(bindings, out var usesPushDescriptors, out var demand);
             var bindlessHeap = UsesBindlessHeap(description.VertexStage) ||
                 (description.PixelStage is { } heapPixelStage && UsesBindlessHeap(heapPixelStage));
+            var pushStages = (description.VertexStage.Stage == ShaderStageKind.Mesh
+                    ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
+                ShaderStageFlags.FragmentBit |
+                (description.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit);
+            var pipelineLayout = CreatePipelineLayout(setLayout, pushStages, bindlessHeap);
+            if (Diagnostics.DgcRunProbe.Enabled) // [local] SHARPEMU_DGC_RUN_PROBE: the layout's structure (one handle per entry)
+                Diagnostics.DgcRunProbe.RegisterLayout(pipelineLayout.Handle, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(bindings), pushStages,
+                    bindlessHeap, usesPushDescriptors);
             return new RenderPipelineEntry
             {
                 SetLayout = setLayout,
                 Demand = demand,
-                Layout = CreatePipelineLayout(setLayout,
-                    (description.VertexStage.Stage == ShaderStageKind.Mesh
-                        ? ShaderStageFlags.MeshBitExt : ShaderStageFlags.VertexBit) |
-                    ShaderStageFlags.FragmentBit |
-                    (description.Tessellation is null ? 0 : ShaderStageFlags.TessellationControlBit | ShaderStageFlags.TessellationEvaluationBit), bindlessHeap),
+                Layout = pipelineLayout,
                 UsesPushDescriptors = usesPushDescriptors,
                 UsesBindlessHeap = bindlessHeap,
                 Description = description,
@@ -2655,6 +2659,10 @@ internal static unsafe partial class VulkanVideoPresenter
                     }
                     Check(creationResult,
                         $"vkCreateGraphicsPipelines(rendering vs=0x{description.VertexStage.Hash:X16} ps=0x{description.PixelStage?.Hash ?? 0:X16})");
+                    if (Diagnostics.DgcRunProbe.Enabled) // [local] SHARPEMU_DGC_RUN_PROBE: what an indirect execution set compares
+                        Diagnostics.DgcRunProbe.RegisterGraphicsPipeline(pipeline.Handle, layout.Handle, description, topology, polygonMode,
+                            rectangleModule.Handle != 0, DynamicDepthBounds, new ReadOnlySpan<DynamicState>(dynamicStates, (int)dynamicStateCount),
+                            vertexAttributes, vertexBindings);
                     if (prewarm || workerCache is not null) // [local]
                     {
                         return pipeline;

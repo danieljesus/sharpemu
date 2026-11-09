@@ -56,12 +56,14 @@ internal static unsafe class VkRecord
     public static void CmdBuildAccelerationStructures(KhrAccelerationStructure api, CommandBuffer command, uint count,
         AccelerationStructureBuildGeometryInfoKHR* infos, AccelerationStructureBuildRangeInfoKHR** ranges)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         Ring(command)?.Drain(RingDrainReason.Fallback);
         api.CmdBuildAccelerationStructures(command, count, infos, ranges);
     }
 
     public static void CmdPipelineBarrier2(Vk vk, CommandBuffer command, DependencyInfo* info)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Barrier(command); // [local] SHARPEMU_DGC_RUN_PROBE
         Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.Barriers); // [local] SHARPEMU_DRAWCOST_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Barrier); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
@@ -125,6 +127,7 @@ internal static unsafe class VkRecord
 
     public static void CmdBindPipeline(Vk vk, CommandBuffer command, PipelineBindPoint bindPoint, Pipeline pipeline)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.BindPipeline(command, bindPoint, pipeline); // [local] SHARPEMU_DGC_RUN_PROBE
         NativeBindingEpoch.Advance(); // [local]
         if (Ring(command) is { } ring)
         {
@@ -181,6 +184,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDraw(Vk vk, CommandBuffer command, uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Draw(command, Diagnostics.DgcRunProbe.DrawType.Draw); // [local] SHARPEMU_DGC_RUN_PROBE
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
@@ -199,6 +203,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDrawIndexed(Vk vk, CommandBuffer command, uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Draw(command, Diagnostics.DgcRunProbe.DrawType.Indexed); // [local] SHARPEMU_DGC_RUN_PROBE
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
@@ -218,6 +223,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDrawIndexedIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset, uint drawCount, uint stride)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Draw(command, Diagnostics.DgcRunProbe.DrawType.IndexedIndirect); // [local] SHARPEMU_DGC_RUN_PROBE
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Draw); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
@@ -236,6 +242,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDispatch(Vk vk, CommandBuffer command, uint x, uint y, uint z)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Dispatch); // [local] SHARPEMU_DGC_RUN_PROBE
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Dispatch); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
@@ -253,6 +260,7 @@ internal static unsafe class VkRecord
 
     public static void CmdDispatchIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Dispatch); // [local] SHARPEMU_DGC_RUN_PROBE
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteCommand(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.Dispatch); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
@@ -269,6 +277,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetViewport(Vk vk, CommandBuffer command, uint first, uint count, Viewport* viewports)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Viewport(command, first, count, viewports); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring && Fits(sizeof(RingArgs.Range) + (int)count * sizeof(Viewport)))
         {
             var payload = ring.Reserve(RingOp.SetViewport, sizeof(RingArgs.Range) + (int)count * sizeof(Viewport));
@@ -285,6 +294,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetScissor(Vk vk, CommandBuffer command, uint first, uint count, Rect2D* scissors)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Scissor(command, first, count, scissors); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring && Fits(sizeof(RingArgs.Range) + (int)count * sizeof(Rect2D)))
         {
             var payload = ring.Reserve(RingOp.SetScissor, sizeof(RingArgs.Range) + (int)count * sizeof(Rect2D));
@@ -309,6 +319,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetLineWidth(Vk vk, CommandBuffer command, float width)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.LineWidth(command, width); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             ((RingArgs.Floats*)ring.Reserve(RingOp.SetLineWidth, sizeof(RingArgs.Floats)))->A = width;
@@ -321,6 +332,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetBlendConstants(Vk vk, CommandBuffer command, float* constants)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.BlendConstants(command, constants); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Floats*)ring.Reserve(RingOp.SetBlendConstants, sizeof(RingArgs.Floats));
@@ -343,6 +355,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetDepthTestEnable(Vk vk, CommandBuffer command, Bool32 enable)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.DepthTest(command, enable.Value); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             PutUInt(ring, RingOp.SetDepthTestEnable, enable.Value);
@@ -354,6 +367,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetDepthWriteEnable(Vk vk, CommandBuffer command, Bool32 enable)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.DepthWrite(command, enable.Value); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             PutUInt(ring, RingOp.SetDepthWriteEnable, enable.Value);
@@ -365,6 +379,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetDepthCompareOp(Vk vk, CommandBuffer command, CompareOp compare)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.DepthCompare(command, compare); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             PutUInt(ring, RingOp.SetDepthCompareOp, (uint)compare);
@@ -376,6 +391,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetDepthBiasEnable(Vk vk, CommandBuffer command, Bool32 enable)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.DepthBiasEnable(command, enable.Value); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             PutUInt(ring, RingOp.SetDepthBiasEnable, enable.Value);
@@ -387,6 +403,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetDepthBias(Vk vk, CommandBuffer command, float constant, float clamp, float slope)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.DepthBias(command, constant, clamp, slope); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Floats*)ring.Reserve(RingOp.SetDepthBias, sizeof(RingArgs.Floats));
@@ -402,6 +419,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetDepthBounds(Vk vk, CommandBuffer command, float min, float max)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.DepthBounds(command, min, max); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Floats*)ring.Reserve(RingOp.SetDepthBounds, sizeof(RingArgs.Floats));
@@ -424,6 +442,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetStencilCompareMask(Vk vk, CommandBuffer command, StencilFaceFlags faces, uint mask)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.StencilCompare(command, faces, mask); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             PutStencil(ring, RingOp.SetStencilCompareMask, faces, mask);
@@ -435,6 +454,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetStencilWriteMask(Vk vk, CommandBuffer command, StencilFaceFlags faces, uint mask)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.StencilWrite(command, faces, mask); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             PutStencil(ring, RingOp.SetStencilWriteMask, faces, mask);
@@ -446,6 +466,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetStencilReference(Vk vk, CommandBuffer command, StencilFaceFlags faces, uint reference)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.StencilReference(command, faces, reference); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             PutStencil(ring, RingOp.SetStencilReference, faces, reference);
@@ -457,6 +478,7 @@ internal static unsafe class VkRecord
 
     public static void CmdSetColorWriteEnable(ExtColorWriteEnable api, CommandBuffer command, uint count, Bool32* enables)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.ColorWrite(command, count, enables); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring && Fits(8 + (int)count * sizeof(Bool32)))
         {
             ring.ColorWriteApi ??= api;
@@ -473,6 +495,7 @@ internal static unsafe class VkRecord
 
     public static void CmdBeginRendering(Vk vk, CommandBuffer command, RenderingInfo* info)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.BeginRendering(command, info); // [local] SHARPEMU_DGC_RUN_PROBE
         Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ScopeBegin); // [local] SHARPEMU_DRAWCOST_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteRendering(command, info); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
@@ -528,6 +551,7 @@ internal static unsafe class VkRecord
 
     public static void CmdEndRendering(Vk vk, CommandBuffer command)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.EndRendering(command); // [local] SHARPEMU_DGC_RUN_PROBE
         Diagnostics.DrawCostProbe.Count(Diagnostics.DrawCostProbe.Counter.ScopeEnd); // [local] SHARPEMU_DRAWCOST_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteEndRendering(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
@@ -581,6 +605,7 @@ internal static unsafe class VkRecord
     public static void CmdPushDescriptorSet(KhrPushDescriptor api, CommandBuffer command, PipelineBindPoint bindPoint, PipelineLayout layout,
         uint set, uint count, WriteDescriptorSet* writes)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.DescriptorsWritten(command, bindPoint); // [local] SHARPEMU_DGC_RUN_PROBE
         NativeBindingEpoch.Advance(); // [local]
         if (Ring(command) is { } ring)
         {
@@ -663,6 +688,7 @@ internal static unsafe class VkRecord
     public static void CmdBindDescriptorSets(Vk vk, CommandBuffer command, PipelineBindPoint bindPoint, PipelineLayout layout, uint first,
         uint count, DescriptorSet* sets, uint dynamicCount, uint* dynamicOffsets)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.DescriptorsWritten(command, bindPoint); // [local] SHARPEMU_DGC_RUN_PROBE
         NativeBindingEpoch.Advance(); // [local]
         var payloadSize = sizeof(RingArgs.DescriptorSets) + (int)count * sizeof(DescriptorSet) + (int)dynamicCount * sizeof(uint);
         if (Ring(command) is { } ring && Fits(payloadSize))
@@ -691,6 +717,7 @@ internal static unsafe class VkRecord
 
     public static void CmdCopyBuffer(Vk vk, CommandBuffer command, VkBuffer source, VkBuffer destination, uint count, BufferCopy* regions)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdCopyBufferCore(vk, command, source, destination, count, regions);
@@ -718,6 +745,7 @@ internal static unsafe class VkRecord
 
     public static void CmdFillBuffer(Vk vk, CommandBuffer command, VkBuffer destination, ulong offset, ulong size, uint data)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdFillBufferCore(vk, command, destination, offset, size, data);
@@ -742,6 +770,7 @@ internal static unsafe class VkRecord
 
     public static void CmdUpdateBuffer(Vk vk, CommandBuffer command, VkBuffer destination, ulong offset, ulong size, void* data)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdUpdateBufferCore(vk, command, destination, offset, size, data);
@@ -797,6 +826,7 @@ internal static unsafe class VkRecord
     public static void CmdCopyImage(Vk vk, CommandBuffer command, Image source, ImageLayout sourceLayout, Image destination,
         ImageLayout destinationLayout, uint count, ImageCopy* regions)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdCopyImageCore(vk, command, source, sourceLayout, destination, destinationLayout, count, regions);
@@ -815,6 +845,7 @@ internal static unsafe class VkRecord
     public static void CmdBlitImage(Vk vk, CommandBuffer command, Image source, ImageLayout sourceLayout, Image destination,
         ImageLayout destinationLayout, uint count, ImageBlit* regions, Filter filter)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdBlitImageCore(vk, command, source, sourceLayout, destination, destinationLayout, count, regions, filter);
@@ -833,6 +864,7 @@ internal static unsafe class VkRecord
     public static void CmdResolveImage(Vk vk, CommandBuffer command, Image source, ImageLayout sourceLayout, Image destination,
         ImageLayout destinationLayout, uint count, ImageResolve* regions)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdResolveImageCore(vk, command, source, sourceLayout, destination, destinationLayout, count, regions);
@@ -877,6 +909,7 @@ internal static unsafe class VkRecord
     public static void CmdCopyBufferToImage(Vk vk, CommandBuffer command, VkBuffer buffer, Image image, ImageLayout layout, uint count,
         BufferImageCopy* regions)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdCopyBufferToImageCore(vk, command, buffer, image, layout, count, regions);
@@ -895,6 +928,7 @@ internal static unsafe class VkRecord
     public static void CmdCopyImageToBuffer(Vk vk, CommandBuffer command, Image image, ImageLayout layout, VkBuffer buffer, uint count,
         BufferImageCopy* regions)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdCopyImageToBufferCore(vk, command, image, layout, buffer, count, regions);
@@ -913,6 +947,7 @@ internal static unsafe class VkRecord
     public static void CmdClearColorImage(Vk vk, CommandBuffer command, Image image, ImageLayout layout, ClearColorValue* color, uint count,
         ImageSubresourceRange* ranges)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdClearColorImageCore(vk, command, image, layout, color, count, ranges);
@@ -943,6 +978,7 @@ internal static unsafe class VkRecord
     public static void CmdClearDepthStencilImage(Vk vk, CommandBuffer command, Image image, ImageLayout layout, ClearDepthStencilValue* value,
         uint count, ImageSubresourceRange* ranges)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.BeforeTransfer(command); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (ScopeBarrierTracker.Enabled) ScopeBarrierTracker.NoteTransfer(); // [local] SHARPEMU_SCOPE_BARRIER_PRUNE
         CmdClearDepthStencilImageCore(vk, command, image, layout, value, count, ranges);
@@ -972,6 +1008,7 @@ internal static unsafe class VkRecord
 
     public static void CmdBeginRenderPass(Vk vk, CommandBuffer command, RenderPassBeginInfo* info, SubpassContents contents)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.RenderPass(command); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.RenderPass); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -999,6 +1036,7 @@ internal static unsafe class VkRecord
 
     public static void CmdEndRenderPass(Vk vk, CommandBuffer command)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Other); // [local] SHARPEMU_DGC_RUN_PROBE
         if (VulkanCommandProfile.PassesEnabled) VulkanCommandProfile.NoteOp(command, VulkanCommandProfile.OpBit.RenderPass); // [local] SHARPEMU_PROFILE_GPU_PASSES
         if (Ring(command) is { } ring)
         {
@@ -1012,6 +1050,7 @@ internal static unsafe class VkRecord
 
     public static void CmdResetQueryPool(Vk vk, CommandBuffer command, QueryPool pool, uint first, uint count)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Query); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Query*)ring.Reserve(RingOp.ResetQueryPool, sizeof(RingArgs.Query));
@@ -1082,6 +1121,7 @@ internal static unsafe class VkRecord
     // [local] Occlusion queries (upstream's occlusion counting) and their reduction.
     public static void CmdBeginQuery(Vk vk, CommandBuffer command, QueryPool pool, uint query, QueryControlFlags flags)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Query); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Query*)ring.Reserve(RingOp.BeginQuery, sizeof(RingArgs.Query));
@@ -1098,6 +1138,7 @@ internal static unsafe class VkRecord
 
     public static void CmdEndQuery(Vk vk, CommandBuffer command, QueryPool pool, uint query)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Query); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Query*)ring.Reserve(RingOp.EndQuery, sizeof(RingArgs.Query));
@@ -1115,6 +1156,7 @@ internal static unsafe class VkRecord
     public static void CmdCopyQueryPoolResults(Vk vk, CommandBuffer command, QueryPool pool, uint first, uint count, VkBuffer destination,
         ulong offset, ulong stride, QueryResultFlags flags)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Note(command, Diagnostics.DgcRunProbe.Cut.Transfer); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.QueryResults*)ring.Reserve(RingOp.CopyQueryPoolResults, sizeof(RingArgs.QueryResults));
@@ -1135,6 +1177,7 @@ internal static unsafe class VkRecord
     // [local] vkCmdDrawIndirect (upstream's non-indexed indirect draws).
     public static void CmdDrawIndirect(Vk vk, CommandBuffer command, VkBuffer buffer, ulong offset, uint drawCount, uint stride)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Draw(command, Diagnostics.DgcRunProbe.DrawType.Indirect); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.Indirect*)ring.Reserve(RingOp.DrawIndirect, sizeof(RingArgs.Indirect));
@@ -1153,6 +1196,7 @@ internal static unsafe class VkRecord
     public static void CmdDrawMeshTasks(delegate* unmanaged<CommandBuffer, uint, uint, uint, void> function, CommandBuffer command,
         uint groupCountX, uint groupCountY, uint groupCountZ)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Draw(command, Diagnostics.DgcRunProbe.DrawType.Mesh); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.MeshTasks*)ring.Reserve(RingOp.DrawMeshTasks, sizeof(RingArgs.MeshTasks));
@@ -1170,6 +1214,7 @@ internal static unsafe class VkRecord
     public static void CmdDrawMeshTasksIndirect(delegate* unmanaged<CommandBuffer, VkBuffer, ulong, uint, uint, void> function, CommandBuffer command,
         VkBuffer buffer, ulong offset, uint drawCount, uint stride)
     {
+        if (Diagnostics.DgcRunProbe.Enabled) Diagnostics.DgcRunProbe.Draw(command, Diagnostics.DgcRunProbe.DrawType.MeshIndirect); // [local] SHARPEMU_DGC_RUN_PROBE
         if (Ring(command) is { } ring)
         {
             var args = (RingArgs.MeshTasksIndirect*)ring.Reserve(RingOp.DrawMeshTasksIndirect, sizeof(RingArgs.MeshTasksIndirect));

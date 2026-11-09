@@ -669,6 +669,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             _host.InsertDrawTraceMarker(IndexedDrawTrace.CreateLabel(trace, submitId, record.PacketAddress));
         }
 
+        if (Diagnostics.DgcRunProbe.Enabled && !OnWorker) Diagnostics.DgcRunProbe.BeginGuestDraw(); // [local] SHARPEMU_DGC_RUN_PROBE: the guest's draw commands
         if (indirectMesh is not null)
         {
             indirectMesh.Draw();
@@ -695,6 +696,7 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             EmitDraw(record.PrimitiveType, vertexInput, in draw, in emission);
         }
 
+        if (Diagnostics.DgcRunProbe.Enabled && !OnWorker) Diagnostics.DgcRunProbe.EndGuestDraw(); // [local] SHARPEMU_DGC_RUN_PROBE
         drawEmit.Dispose();
         Diagnostics.DrawCostProbe.Lap(Diagnostics.DrawCostProbe.Step.DrawEmit); // [local] SHARPEMU_DRAWCOST_PROBE
         using var tailScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawPrepTail); // [local]
@@ -710,8 +712,10 @@ internal sealed partial class RenderRecorder : IResolvedCommandSink
             if (MeshDrawTrace.Active) MeshDrawTrace.Write("write-barrier", $"sourceStages={record.WriteStages}");
             _inPlace.Valid = false;
             using var tailEmit = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.PartScopeEmit); // [local] SHARPEMU_PARREC_PROBE
+            if (Diagnostics.DgcRunProbe.Enabled && !OnWorker) Diagnostics.DgcRunProbe.BeginStoring(); // [local] SHARPEMU_DGC_RUN_PROBE: a dependency cut
             _host.EndRendering(Vulkan.ScopeBreak.StoringDraw);
             _host.ShaderWriteBarrier(record.WriteStages);
+            if (Diagnostics.DgcRunProbe.Enabled && !OnWorker) Diagnostics.DgcRunProbe.EndStoring();
         }
         else
         {

@@ -260,6 +260,7 @@ internal static class DrawCostProbe
         PlanProbe.NoteFrame();
         BdaCostProbe.NoteFrame(); // [local] SHARPEMU_BDA_COST_PROBE
         GpuResolveProbe.NoteFrame(); // [local] SHARPEMU_GPU_RESOLVE_PROBE
+        DgcRunProbe.NoteFrame(); // [local] SHARPEMU_DGC_RUN_PROBE
     }
 
     internal static void Begin(Kind kind)
