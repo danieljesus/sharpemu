@@ -42,6 +42,7 @@ public sealed class DgcRunProbeTests
         Assert.Equal(1, splitter.S1.Runs); // [5 | ...]: depth write
         Assert.Equal(1, Main(splitter.S1, Cut.DynState));
         Assert.Equal(5, splitter.S1.Draws);
+        Assert.Equal(0, splitter.S2.Runs); // the ceiling: no scope, barrier or transfer in between
         Assert.Equal(1, splitter.DescriptorDraws);
         Assert.Equal(5, splitter.ComparedDraws);
     }
@@ -96,6 +97,7 @@ public sealed class DgcRunProbeTests
         Assert.Equal(1, Any(splitter.S1, Cut.PipeState));
         Assert.Equal(1, Any(splitter.S1, Cut.DrawType));
         Assert.Equal(0, splitter.S1.PipeVariants);
+        Assert.Equal(2, splitter.S2.Runs); // the dependency and the dispatch still cut the ceiling
     }
 
     [Fact]
@@ -135,5 +137,53 @@ public sealed class DgcRunProbeTests
         Assert.Equal(1, splitter.S0.Runs);
         Assert.Equal(1, Main(splitter.S0, Cut.PipeState));
         Assert.Equal(3, splitter.UnknownPipe);
+    }
+
+    [Fact]
+    public void APipelineStateCutTellsWhichPiecesDiffer()
+    {
+        var blended = new PipeInfo { Stages = 1, Frag = 1, State = 2, Layout = 1, Family = 5, Parts = [1, 1, 1, 1, 1, 1, 1] };
+        var opaque = new PipeInfo { Stages = 1, Frag = 1, State = 3, Layout = 1, Family = 6, Parts = [2, 1, 1, 1, 1, 1, 9] };
+        var splitter = new Splitter();
+        splitter.Draw(DrawType.Draw, blended, 1);
+        splitter.Draw(DrawType.Draw, opaque, 2);
+        Assert.Equal(1, splitter.S1.StateCuts);
+        Assert.Equal(1, splitter.S1.StateParts[0]);
+        Assert.Equal(0, splitter.S1.StateParts[1]);
+        Assert.Equal(1, splitter.S1.StateParts[6]);
+        Assert.Contains("S1_pstate=blend:100.0,ds:0.0,rast:0.0,topo:0.0,fmt:0.0,dynlist:0.0,vtx:100.0 ", Report(splitter, 5.0, 1, 0, 0));
+    }
+
+    [Fact]
+    public void NormalizedStateIgnoresWhatThePipelineDoesNotUse()
+    {
+        static byte[] Normalized(SharpEmu.Libs.Gpu.Pipelines.PipelineStaticParameters parameters)
+        {
+            var bytes = parameters.Bytes.ToArray();
+            Normalize(bytes, dynamicDepthBounds: false);
+            return bytes;
+        }
+
+        var off = new SharpEmu.Libs.Gpu.Pipelines.PipelineStaticParameters { ColorCount = 1 };
+        off.SetColorMask(0, 0xF);
+        off.SetColorSourceBlend(0, 4);
+        off.SetColorMask(3, 0xF); // past the color count
+        off.StencilFront = new SharpEmu.Libs.Gpu.Rendering.StencilOperations(Silk.NET.Vulkan.StencilOp.Replace, Silk.NET.Vulkan.StencilOp.Keep,
+            Silk.NET.Vulkan.StencilOp.Keep, Silk.NET.Vulkan.CompareOp.Always); // test off
+        var plain = new SharpEmu.Libs.Gpu.Pipelines.PipelineStaticParameters { ColorCount = 1 };
+        plain.SetColorMask(0, 0xF);
+        Assert.Equal(Normalized(plain), Normalized(off));
+
+        var on = new SharpEmu.Libs.Gpu.Pipelines.PipelineStaticParameters { ColorCount = 1 };
+        on.SetColorMask(0, 0xF);
+        on.SetBlendEnable(0, true);
+        on.SetColorSourceBlend(0, 4);
+        on.SetAlphaSourceBlend(0, 7); // follows color: ignored without separate alpha
+        var same = new SharpEmu.Libs.Gpu.Pipelines.PipelineStaticParameters { ColorCount = 1 };
+        same.SetColorMask(0, 0xF);
+        same.SetBlendEnable(0, true);
+        same.SetColorSourceBlend(0, 4);
+        Assert.Equal(Normalized(same), Normalized(on));
+        Assert.NotEqual(Normalized(plain), Normalized(on));
     }
 }

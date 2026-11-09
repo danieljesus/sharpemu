@@ -26,6 +26,8 @@ namespace SharpEmu.Libs.Diagnostics;
 //      or the end of the command buffer cuts the run.
 //   S1 optimistic: as S0, but viewport, scissor, depth bias (and its enable), stencil reference and blend constants go
 //      to push constants or the shader and no longer cut, nor does a layout change.
+//   S2 ceiling (not a DGC scenario): as S1, but no pipeline, dynamic state or draw command difference cuts either; only
+//      what no generated-commands design removes (scopes, barriers, transfers, dispatches, queries, flushes).
 //
 // A cut carries every cause present (the events since the previous guest draw, and what differs from the run's first
 // draw); the line reports the main cause by priority (dispatch, transfer, readback, flush, dependency, targets, pass,
@@ -46,7 +48,8 @@ namespace SharpEmu.Libs.Diagnostics;
 // runs_pf = runs closed per frame, mean = draws per closed run, in8 = % of the draws of closed runs in runs of 8 or more,
 // *_main/*_any/*_sole = % of the cuts. pd_changed = % of the draws after the first whose push descriptors or descriptor
 // sets were written since the previous draw (a cut without bindless); pipe_variant = % of the pipeline cuts between two
-// pipelines of one description (the rectangle list variants).
+// pipelines of one description (the rectangle list variants); *_pstate = % of the pipeline state cuts (both pipelines
+// known) where each piece differs (StatePartNames).
 internal static class DgcRunProbe
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("SHARPEMU_DGC_RUN_PROBE") == "1";
@@ -81,6 +84,7 @@ internal static class DgcRunProbe
     internal const int CutCount = 18;
     internal const Cut AnyPipe = Cut.PipeStages | Cut.PipeFrag | Cut.PipeState;
     internal const Cut S1Ignored = Cut.DynState0 | Cut.Layout;
+    internal const Cut S2Ignored = S1Ignored | AnyPipe | Cut.DynState | Cut.DrawType;
 
     internal static readonly string[] CutNames =
         ["disp", "xfer", "rdbk", "flush", "dep", "tgt", "pass", "bgame", "bemu", "query", "other", "pstage", "pfrag", "pstate", "dyn", "dyn0", "layout", "dtype"];
@@ -104,7 +108,12 @@ internal static class DgcRunProbe
         public ulong State;
         public ulong Layout;
         public ulong Family;
+        public ulong[] Parts = []; // the pieces of State, StatePartNames
     }
+
+    // What a pipeline state cut is made of: blend and color masks, depth and stencil, rasterization (clip, samples,
+    // cull, face), topology and restart, attachment formats, the dynamic state list, the vertex input.
+    internal static readonly string[] StatePartNames = ["blend", "ds", "rast", "topo", "fmt", "dynlist", "vtx"];
 
     private static readonly ConcurrentDictionary<ulong, PipeInfo> _pipelines = new();
     private static readonly ConcurrentDictionary<ulong, ulong> _layouts = new();
@@ -131,7 +140,7 @@ internal static class DgcRunProbe
         _layouts[layout] = hash;
     }
 
-    internal static void RegisterPipeline(ulong pipeline, ulong layout, ulong stages, ulong frag, ulong state, ulong family)
+    internal static void RegisterPipeline(ulong pipeline, ulong layout, ulong stages, ulong frag, ulong state, ulong family, ulong[]? parts = null)
     {
         _pipelines[pipeline] = new PipeInfo
         {
@@ -140,6 +149,7 @@ internal static class DgcRunProbe
             State = state,
             Layout = _layouts.TryGetValue(layout, out var structure) ? structure : layout,
             Family = family,
+            Parts = parts ?? [],
         };
     }
 
@@ -153,42 +163,98 @@ internal static class DgcRunProbe
         var stages = RepeatProbe.Mix(0x57A6);
         Add(ref stages, (mesh ? 1UL : 0) | (description.Tessellation is not null ? 2UL : 0) | (geometryStage ? 4UL : 0) | (pixel ? 8UL : 0));
 
+        Span<byte> parameters = stackalloc byte[Gpu.Pipelines.PipelineStaticParameters.ByteSize];
+        description.StaticParameters.Bytes.CopyTo(parameters);
+        Normalize(parameters, dynamicDepthBounds);
+        var colorCount = Math.Min(System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(parameters[55..]), 8u);
+
         var frag = RepeatProbe.Mix(0xF4A6);
         if (pixel && description.PixelInfo is { } info)
         {
-            Add(ref frag, HashOf<byte>(info.TargetOutputModes));
+            for (var slot = 0; slot < colorCount && slot < info.TargetOutputModes.Length; slot++)
+            {
+                // only the slots written: the output interface of a slot without a write mask can be declared the same
+                Add(ref frag, System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(parameters[(59 + slot * 4)..]) == 0 ? 0xFFUL : info.TargetOutputModes[slot]);
+            }
+
             Add(ref frag, (info.DepthExportEnable ? 1UL : 0) | (info.SampleMaskExportEnable ? 2UL : 0));
         }
 
-        Span<byte> parameters = stackalloc byte[Gpu.Pipelines.PipelineStaticParameters.ByteSize];
-        description.StaticParameters.Bytes.CopyTo(parameters);
-        if (dynamicDepthBounds)
-        {
-            parameters.Slice(14, 8).Clear(); // DepthMinBounds, DepthMaxBounds: dynamic state then
-        }
-
-        var state = RepeatProbe.Mix(0x57A7);
-        Add(ref state, HashOf<byte>(parameters));
-        Add(ref state, (uint)topology | ((ulong)(uint)polygonMode << 32));
+        var parts = new ulong[StatePartNames.Length];
+        parts[0] = HashOf<byte>(parameters.Slice(55, 36)) ^ RepeatProbe.Mix(HashOf<byte>(parameters.Slice(94, 72))); // count, masks; blend
+        parts[1] = HashOf<byte>(parameters.Slice(12, 43));
+        parts[2] = HashOf<byte>(parameters.Slice(0, 2)) ^ RepeatProbe.Mix(HashOf<byte>(parameters.Slice(7, 5))) ^
+            RepeatProbe.Mix(RepeatProbe.Mix(HashOf<byte>(parameters.Slice(91, 3))) ^ (ulong)(uint)polygonMode);
+        parts[3] = HashOf<byte>(parameters.Slice(2, 5)) ^ RepeatProbe.Mix((uint)topology);
         var rendering = description.Rendering;
-        Add(ref state, rendering.ColorCount | ((ulong)(uint)rendering.DepthFormat << 32));
-        Add(ref state, (uint)rendering.StencilFormat);
-        Add(ref state, HashOf<Format>(rendering.ColorFormats.AsSpan(0, (int)Math.Min(rendering.ColorCount, (uint)rendering.ColorFormats.Length))));
-        Add(ref state, HashOf(dynamicStates));
-        Add(ref state, (ulong)attributes.Length);
+        var formats = RepeatProbe.Mix(0xF0F0);
+        Add(ref formats, rendering.ColorCount | ((ulong)(uint)rendering.DepthFormat << 32));
+        Add(ref formats, (uint)rendering.StencilFormat);
+        Add(ref formats, HashOf<Format>(rendering.ColorFormats.AsSpan(0, (int)Math.Min(rendering.ColorCount, (uint)rendering.ColorFormats.Length))));
+        parts[4] = formats;
+        parts[5] = HashOf(dynamicStates);
+        var vertex = RepeatProbe.Mix(0x7E57);
+        Add(ref vertex, (ulong)attributes.Length);
         foreach (var attribute in attributes)
         {
-            Add(ref state, attribute.Location | ((ulong)attribute.Binding << 32));
-            Add(ref state, (uint)attribute.Format | ((ulong)attribute.Offset << 32));
+            Add(ref vertex, attribute.Location | ((ulong)attribute.Binding << 32));
+            Add(ref vertex, (uint)attribute.Format | ((ulong)attribute.Offset << 32));
         }
 
-        Add(ref state, (ulong)bindings.Length);
+        Add(ref vertex, (ulong)bindings.Length);
         foreach (var binding in bindings)
         {
-            Add(ref state, binding.Binding | ((ulong)(uint)binding.InputRate << 32)); // no stride: dynamic with the VB token
+            Add(ref vertex, binding.Binding | ((ulong)(uint)binding.InputRate << 32)); // no stride: dynamic with the VB token
         }
 
-        RegisterPipeline(pipeline, layout, stages, frag, state, (ulong)(uint)RuntimeHelpers.GetHashCode(description));
+        parts[6] = vertex;
+        var state = RepeatProbe.Mix(0x57A7);
+        foreach (var part in parts)
+        {
+            Add(ref state, part);
+        }
+
+        RegisterPipeline(pipeline, layout, stages, frag, state, (ulong)(uint)RuntimeHelpers.GetHashCode(description), parts);
+    }
+
+    // Zeroes what the pipeline ignores, so two pipelines that differ only there count as one state (the emulator builds
+    // them and could write the same values): bounds while dynamic or off, stencil operations with the test off, the
+    // slots past the color count, the blend of a slot not written or not blended, the alpha blend that follows color.
+    internal static void Normalize(Span<byte> parameters, bool dynamicDepthBounds)
+    {
+        if (dynamicDepthBounds || parameters[13] == 0)
+        {
+            parameters.Slice(14, 8).Clear();
+        }
+
+        if (parameters[22] == 0)
+        {
+            parameters.Slice(23, 32).Clear();
+        }
+
+        var colorCount = Math.Min(System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(parameters[55..]), 8u);
+        for (var slot = 0; slot < 8; slot++)
+        {
+            var mask = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(parameters[(59 + slot * 4)..]);
+            if (slot >= colorCount)
+            {
+                parameters.Slice(59 + slot * 4, 4).Clear();
+                mask = 0;
+            }
+
+            var blended = parameters[150 + slot] != 0 && parameters[158 + slot] == 0;
+            if (mask == 0 || !blended)
+            {
+                for (var field = 94; field <= 158; field += 8)
+                {
+                    parameters[field + slot] = 0;
+                }
+            }
+            else if (parameters[142 + slot] == 0)
+            {
+                parameters[118 + slot] = parameters[126 + slot] = parameters[134 + slot] = 0;
+            }
+        }
     }
 
     // ---- The dynamic state shadow.
@@ -248,6 +314,8 @@ internal static class DgcRunProbe
         public long DrawsIn8;
         public long PipeCuts;
         public long PipeVariants;
+        public long StateCuts;
+        public readonly long[] StateParts = new long[StatePartNames.Length];
         public readonly long[] Main = new long[CutCount];
         public readonly long[] Any = new long[CutCount];
         public readonly long[] Sole = new long[CutCount];
@@ -295,6 +363,16 @@ internal static class DgcRunProbe
                 if (pipe is not null && AnchorPipe is not null && pipe.Family == AnchorPipe.Family)
                 {
                     PipeVariants++;
+                }
+            }
+
+            if ((mask & Cut.PipeState) != 0 && pipe is not null && AnchorPipe is not null &&
+                pipe.Parts.Length == StatePartNames.Length && AnchorPipe.Parts.Length == StatePartNames.Length)
+            {
+                StateCuts++;
+                for (var index = 0; index < StatePartNames.Length; index++)
+                {
+                    if (pipe.Parts[index] != AnchorPipe.Parts[index]) StateParts[index]++;
                 }
             }
 
@@ -367,7 +445,8 @@ internal static class DgcRunProbe
             Array.Clear(Main);
             Array.Clear(Any);
             Array.Clear(Sole);
-            Runs = Draws = DrawsIn8 = PipeCuts = PipeVariants = 0;
+            Array.Clear(StateParts);
+            Runs = Draws = DrawsIn8 = PipeCuts = PipeVariants = StateCuts = 0;
         }
 
         public void Reset()
@@ -402,6 +481,7 @@ internal static class DgcRunProbe
         private ulong _scopeHash;
         public readonly Scenario S0 = new((Cut)uint.MaxValue);
         public readonly Scenario S1 = new((Cut)uint.MaxValue & ~S1Ignored);
+        public readonly Scenario S2 = new((Cut)uint.MaxValue & ~S2Ignored);
         public long Draws;
         public long ComparedDraws;
         public long DescriptorDraws;
@@ -470,6 +550,7 @@ internal static class DgcRunProbe
 
             S0.Draw(common, type, pipe, handle);
             S1.Draw(common, type, pipe, handle);
+            S2.Draw(common, type, pipe, handle);
             _previousDyn0 = Dyn0;
             _previousDyn1 = Dyn1;
             _haveDraw = true;
@@ -481,6 +562,7 @@ internal static class DgcRunProbe
         {
             S0.ClearWindow();
             S1.ClearWindow();
+            S2.ClearWindow();
             Draws = ComparedDraws = DescriptorDraws = UnknownPipe = EmulatorDraws = 0;
             Array.Clear(Barriers);
         }
@@ -489,6 +571,7 @@ internal static class DgcRunProbe
         {
             S0.Reset();
             S1.Reset();
+            S2.Reset();
             ClearWindow();
             Gap = Cut.None;
             Storing = DescriptorsWritten = _haveDraw = _haveScope = _endedByStoring = false;
@@ -836,6 +919,7 @@ internal static class DgcRunProbe
             $"[PERF][DGC_RUN] window_s={seconds:F1} frames={frames} draws_per_frame={splitter.Draws / (double)perFrame:F0} "));
         AppendScenario(line, "S0", splitter.S0, perFrame);
         AppendScenario(line, "S1", splitter.S1, perFrame);
+        AppendScenario(line, "S2", splitter.S2, perFrame);
         line.Append(FormattableString.Invariant(
             $"pd_changed={Percent(splitter.DescriptorDraws, splitter.ComparedDraws):F1} unknown_pipe={Percent(splitter.UnknownPipe, splitter.Draws):F1} "));
         line.Append(FormattableString.Invariant(
@@ -865,6 +949,15 @@ internal static class DgcRunProbe
         AppendCauses(line, name + "_main", scenario.Main, scenario.Runs);
         AppendCauses(line, name + "_any", scenario.Any, scenario.Runs);
         AppendCauses(line, name + "_sole", scenario.Sole, scenario.Runs);
+        line.Append(name).Append("_pstate=");
+        for (var index = 0; index < StatePartNames.Length; index++)
+        {
+            if (index != 0) line.Append(',');
+            line.Append(StatePartNames[index]).Append(':')
+                .Append(Percent(scenario.StateParts[index], scenario.StateCuts).ToString("F1", CultureInfo.InvariantCulture));
+        }
+
+        line.Append(' ');
     }
 
     private static void AppendCauses(StringBuilder line, string name, long[] counts, long runs)
